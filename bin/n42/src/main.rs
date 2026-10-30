@@ -28,6 +28,7 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
+#[allow(clippy::iter_with_drain)] // the batch buffer is reused, so it is drained rather than consumed
 fn main() {
     // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
     // left unset. First, before any knob is read (they are cached in
@@ -118,7 +119,7 @@ fn main() {
     // Create router channel for pubsub
     let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(100);
     let router_tx_clone = router_tx.clone();
-    let router_tx_for_bridge = router_tx.clone();
+    let router_tx_for_bridge = router_tx;
     let broadcast_rx_for_bridge = broadcast_tx.subscribe();
 
     // Shared consensus instance holder
@@ -577,18 +578,16 @@ fn main() {
                         tick.tick().await;
                         // `poisoned()` answers None while the forest lock is held,
                         // so a reason once seen is latched rather than re-read.
-                        if !poisoned_seen {
-                            if let Some(reason) = qmdb.poisoned() {
+                        if !poisoned_seen
+                            && let Some(reason) = qmdb.poisoned() {
                                 poisoned_seen = true;
                                 error!(target: "reth::cli", %reason, "QMDB forest is poisoned; state applies are refused");
                             }
-                        }
-                        if !unchecked_seen {
-                            if let Some(reason) = qmdb.unchecked_restart() {
+                        if !unchecked_seen
+                            && let Some(reason) = qmdb.unchecked_restart() {
                                 unchecked_seen = true;
                                 error!(target: "reth::cli", %reason, "QMDB restarted on a tree not checked against its recorded head root");
                             }
-                        }
                         metrics::gauge!("n42_qmdb_forest_poisoned").set(if poisoned_seen { 1.0 } else { 0.0 });
                         metrics::gauge!("n42_qmdb_unchecked_restart").set(if unchecked_seen { 1.0 } else { 0.0 });
                         if let Some(stats) = qmdb.entry_stats() {
@@ -665,8 +664,7 @@ fn main() {
 
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
             let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
-                let eth_signer: PrivateKeySigner = signer_private_key
-                    .to_string()
+                let eth_signer: PrivateKeySigner = signer_private_key.clone()
                     .parse()
                     .map_err(|err| eyre::eyre!("invalid --dev.consensus-signer-private-key: {err}"))?;
                 Some(eth_signer.address())
@@ -1077,7 +1075,7 @@ fn main() {
             let mining_mode = if hotstuff_chain {
                 info!(target: "reth::cli", "chain declares a HotStuff-2 validator set; APoS mining is off");
                 consensus_client::miner::MiningMode::NoMining
-            } else if let Some(_) = consensus_signer_private_key {
+            } else if consensus_signer_private_key.is_some() {
                 let block_time = node_config_dev
                     .dev
                     .block_time

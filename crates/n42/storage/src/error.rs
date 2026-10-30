@@ -49,7 +49,7 @@ impl StorageError {
     }
 
     /// Check if this is a not-found error
-    pub fn is_not_found(&self) -> bool {
+    pub const fn is_not_found(&self) -> bool {
         matches!(
             self,
             Self::BeaconStateNotFound(_)

@@ -94,7 +94,7 @@ impl TestReport {
     }
 
     /// Check if all tests passed
-    pub fn all_passed(&self) -> bool {
+    pub const fn all_passed(&self) -> bool {
         self.summary.failed == 0
     }
 
@@ -163,7 +163,7 @@ impl TestReport {
     }
 
     /// Merge another report into this one
-    pub fn merge(&mut self, other: TestReport) {
+    pub fn merge(&mut self, other: Self) {
         for result in other.results {
             self.add_result(result);
         }

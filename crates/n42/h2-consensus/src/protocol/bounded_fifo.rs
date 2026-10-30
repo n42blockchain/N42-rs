@@ -46,11 +46,10 @@ where
     pub(crate) fn insert(&mut self, key: K, value: V) {
         if !self.map.contains_key(&key) {
             // edition-2021: N42-26 writes this as a let-chain.
-            if self.map.len() >= self.capacity {
-                if let Some(oldest) = self.order.pop_front() {
+            if self.map.len() >= self.capacity
+                && let Some(oldest) = self.order.pop_front() {
                     self.map.remove(&oldest);
                 }
-            }
             self.order.push_back(key.clone());
         }
         self.map.insert(key, value);
@@ -63,11 +62,10 @@ where
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
         let removed = self.map.remove(key);
         // edition-2021: N42-26 writes this as a let-chain.
-        if removed.is_some() {
-            if let Some(pos) = self.order.iter().position(|k| k == key) {
+        if removed.is_some()
+            && let Some(pos) = self.order.iter().position(|k| k == key) {
                 self.order.remove(pos);
             }
-        }
         removed
     }
 

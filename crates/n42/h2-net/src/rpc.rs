@@ -18,7 +18,7 @@ use libp2p::request_response;
 use libp2p::StreamProtocol;
 
 use crate::status::{
-    decode_h256, encode_h256, frame_payload, framed_len_limit, unframe_payload_limit, Status,
+    decode_h256, encode_h256, frame_payload, unframe_payload_limit, Status,
     RESPONSE_CODE_SUCCESS, STATUS_PROTOCOL,
 };
 use alloy_primitives::B256;
@@ -106,7 +106,7 @@ where
                     as u64;
             }
             0x01 => produced += (body_len - 4) as u64,
-            0xff | 0x80..=0xfe => {
+            0x80..=0xff => {
                 skippable += 1;
                 if skippable > MAX_SKIPPABLE_CHUNKS {
                     return Err(io::Error::new(

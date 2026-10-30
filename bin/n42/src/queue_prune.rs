@@ -694,6 +694,7 @@ fn run_pruner(queue: &TxQueue<N42PooledTransaction>, rx: std::sync::mpsc::Receiv
 /// its first item arrived; with `max_fold > 0` (`N42_PRUNE_MAX_FOLD`) what
 /// is over is left in `carry`, and the next wake starts from it without
 /// blocking.
+#[allow(clippy::type_complexity)] // hot-path return type kept as is
 fn next_wake<T>(
     rx: &std::sync::mpsc::Receiver<(T, std::time::Instant)>,
     carry: &mut Vec<(T, std::time::Instant)>,

@@ -30,6 +30,7 @@ use std::time::Instant;
 use tracing::debug;
 
 /// Precompile addresses for Frontier (0x01-0x09)
+#[allow(dead_code)] // helper table kept with is_precompile_address; not used today
 const FRONTIER_PRECOMPILES: [Address; 4] = [
     Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]), // ECRECOVER
     Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]), // SHA256
@@ -38,6 +39,7 @@ const FRONTIER_PRECOMPILES: [Address; 4] = [
 ];
 
 /// Check if an address is a precompile
+#[allow(dead_code)] // helper kept for precompile filtering; not used today
 fn is_precompile_address(addr: &Address) -> bool {
     // Check if the address is in the range 0x01 - 0x09 (standard precompiles)
     let bytes = addr.as_slice();
@@ -70,6 +72,7 @@ fn is_oog_test(test_name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct StateTestExecutor {
     /// Chain specification
+    #[allow(dead_code)] // kept for the executor's configuration; not read today
     chain_spec: Arc<ChainSpec>,
     /// EVM configuration
     #[allow(dead_code)]
@@ -145,15 +148,15 @@ impl StateTestExecutor {
                 .with_logs_hashes(expected.logs, result.logs_hash)
                 .with_variant(variant_index)
         } else {
-            let error = if result.state_root != expected.hash {
-                format!(
-                    "State root mismatch: expected {}, got {}",
-                    expected.hash, result.state_root
-                )
-            } else {
+            let error = if result.state_root == expected.hash {
                 format!(
                     "Logs hash mismatch: expected {}, got {}",
                     expected.logs, result.logs_hash
+                )
+            } else {
+                format!(
+                    "State root mismatch: expected {}, got {}",
+                    expected.hash, result.state_root
                 )
             };
 
@@ -166,7 +169,7 @@ impl StateTestExecutor {
         Ok(test_result)
     }
 
-    /// Build a CacheDB with the pre-state accounts
+    /// Build a `CacheDB` with the pre-state accounts
     fn build_pre_state_db(
         &self,
         pre: &HashMap<Address, Account>,
@@ -201,6 +204,7 @@ impl StateTestExecutor {
     }
 
     /// Execute the transaction and return the execution result
+    #[allow(deprecated)] // spec-test harness stays on the API the fixtures were validated with
     fn execute_transaction(
         &self,
         test: &StateTest,
@@ -225,7 +229,7 @@ impl StateTestExecutor {
                 // Return pre_state root since no state changes should occur
                 return Ok(ExecutionResult {
                     state_root: self.calculate_pre_state_root(&test.pre)?,
-                    logs_hash: keccak256(&[0xc0]), // empty logs hash
+                    logs_hash: keccak256([0xc0]), // empty logs hash
                     gas_used: 0,
                     success: false,
                 });
@@ -304,6 +308,7 @@ impl StateTestExecutor {
     }
 
     /// Build transaction environment from the test
+    #[allow(clippy::field_reassign_with_default)] // fields are filled step by step from the fixture
     fn build_tx_env(
         &self,
         test: &StateTest,
@@ -389,7 +394,7 @@ impl StateTestExecutor {
     fn calculate_logs_hash(&self, logs: &[Log]) -> B256 {
         if logs.is_empty() {
             // Hash of RLP-encoded empty list
-            return keccak256(&[0xc0]);
+            return keccak256([0xc0]);
         }
 
         // RLP encode all logs
@@ -480,7 +485,7 @@ impl StateTestExecutor {
                 if merged_storage.is_empty() {
                     alloy_trie::EMPTY_ROOT_HASH
                 } else {
-                    storage_root_unhashed(merged_storage.into_iter())
+                    storage_root_unhashed(merged_storage)
                 }
             };
 
@@ -532,7 +537,7 @@ impl StateTestExecutor {
                                 if merged_storage.is_empty() {
                                     alloy_trie::EMPTY_ROOT_HASH
                                 } else {
-                                    storage_root_unhashed(merged_storage.into_iter())
+                                    storage_root_unhashed(merged_storage)
                                 }
                             };
                             let reth_account = RethAccount {
@@ -571,8 +576,8 @@ impl StateTestExecutor {
 
         // For pre-Spurious Dragon forks, add touched precompile addresses to the state tree
         // When a precompile is successfully called, it should appear as an empty account
-        if let Some(precompile_addr) = touched_precompile {
-            if include_empty && !included_addresses.contains(&precompile_addr) {
+        if let Some(precompile_addr) = touched_precompile
+            && include_empty && !included_addresses.contains(&precompile_addr) {
                 let reth_account = RethAccount {
                     nonce: 0,
                     balance: U256::ZERO,
@@ -581,7 +586,6 @@ impl StateTestExecutor {
                 let trie_account = reth_account.into_trie_account(alloy_trie::EMPTY_ROOT_HASH);
                 accounts.push((precompile_addr, trie_account));
             }
-        }
 
         // Include accounts from pre_state that were not touched during execution
         // These accounts should still appear in the final state
@@ -589,12 +593,11 @@ impl StateTestExecutor {
         for (address, account) in _pre_state {
             if !included_addresses.contains(address) {
                 // Check if this account was destroyed during execution
-                if let Some(cached) = state.cache.accounts.get(address) {
-                    if cached.status.was_destroyed() {
+                if let Some(cached) = state.cache.accounts.get(address)
+                    && cached.status.was_destroyed() {
                         // Account was destroyed, don't include it
                         continue;
                     }
-                }
 
                 // This account was not modified and not destroyed, include it from pre_state
                 // Skip empty accounts after Spurious Dragon
@@ -627,12 +630,12 @@ impl StateTestExecutor {
         }
 
         // Calculate state root
-        let root = state_root_unhashed(accounts.into_iter());
+        let root = state_root_unhashed(accounts);
 
         Ok(root)
     }
 
-    /// Calculate state root from pre_state (for rejected transactions)
+    /// Calculate state root from `pre_state` (for rejected transactions)
     fn calculate_pre_state_root(
         &self,
         pre_state: &HashMap<Address, Account>,
@@ -669,7 +672,7 @@ impl StateTestExecutor {
         }
 
         // Calculate state root
-        let root = state_root_unhashed(accounts.into_iter());
+        let root = state_root_unhashed(accounts);
 
         Ok(root)
     }
@@ -704,7 +707,7 @@ impl StateTestExecutor {
     }
 
     /// Get the spec ID for the current fork
-    pub fn get_spec_id(&self) -> SpecId {
+    pub const fn get_spec_id(&self) -> SpecId {
         match self.fork {
             ForkSpec::Frontier => SpecId::FRONTIER,
             ForkSpec::Homestead | ForkSpec::DaoFork => SpecId::HOMESTEAD,
@@ -740,8 +743,9 @@ struct ExecutionResult {
 }
 
 /// Empty logs hash (hash of RLP-encoded empty list)
+#[allow(dead_code)] // helper kept for log-hash checks; not used today
 fn empty_logs_hash() -> B256 {
-    keccak256(&[0xc0])
+    keccak256([0xc0])
 }
 
 #[cfg(test)]

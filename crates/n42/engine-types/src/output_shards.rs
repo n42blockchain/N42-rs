@@ -833,6 +833,7 @@ impl OutputShards {
     /// [`LiveDefer::Wait`]); the thread's [`LiveLockCounts`] take the waits,
     /// the time held and the shards left.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::explicit_auto_deref)] // the explicit reborrow is needed: the guard type differs from the argument type
     fn enter_live(
         live: &[Mutex<IndexPart>],
         id: u16,

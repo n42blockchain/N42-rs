@@ -15,13 +15,13 @@ pub fn logs_hash(logs: &[alloy_primitives::Log]) -> B256 {
 /// Empty logs hash (hash of empty RLP list)
 pub fn empty_logs_hash() -> B256 {
     // Hash of RLP-encoded empty list: keccak256([0xc0])
-    keccak256(&[0xc0])
+    keccak256([0xc0])
 }
 
 /// Compute the state root from a map of accounts
 /// Note: This is a simplified implementation. For production use,
 /// a proper Merkle Patricia Trie implementation is needed.
-pub fn compute_state_root(_accounts: &HashMap<Address, Account>) -> B256 {
+pub const fn compute_state_root(_accounts: &HashMap<Address, Account>) -> B256 {
     // This would need a proper MPT implementation
     // For now, return a placeholder
     B256::ZERO
@@ -92,7 +92,7 @@ pub fn pad_left(bytes: &[u8], len: usize) -> Vec<u8> {
 }
 
 /// Convert U256 to 32-byte big-endian representation
-pub fn u256_to_be_bytes(value: U256) -> [u8; 32] {
+pub const fn u256_to_be_bytes(value: U256) -> [u8; 32] {
     value.to_be_bytes()
 }
 
@@ -174,26 +174,26 @@ impl std::fmt::Display for AccountDiff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (&self.expected, &self.actual) {
             (Some(exp), Some(act)) => {
-                write!(f, "Account {} mismatch:\n", self.address)?;
+                writeln!(f, "Account {} mismatch:", self.address)?;
                 if exp.nonce != act.nonce {
-                    write!(f, "  nonce: expected {}, got {}\n", exp.nonce, act.nonce)?;
+                    writeln!(f, "  nonce: expected {}, got {}", exp.nonce, act.nonce)?;
                 }
                 if exp.balance != act.balance {
-                    write!(f, "  balance: expected {}, got {}\n", exp.balance, act.balance)?;
+                    writeln!(f, "  balance: expected {}, got {}", exp.balance, act.balance)?;
                 }
                 if exp.code != act.code {
-                    write!(f, "  code: expected {} bytes, got {} bytes\n", exp.code.len(), act.code.len())?;
+                    writeln!(f, "  code: expected {} bytes, got {} bytes", exp.code.len(), act.code.len())?;
                 }
                 // Storage diffs
                 for (key, exp_val) in &exp.storage {
                     let act_val = act.storage.get(key).copied().unwrap_or_default();
                     if *exp_val != act_val {
-                        write!(f, "  storage[{}]: expected {}, got {}\n", key, exp_val, act_val)?;
+                        writeln!(f, "  storage[{}]: expected {}, got {}", key, exp_val, act_val)?;
                     }
                 }
                 for (key, act_val) in &act.storage {
                     if !exp.storage.contains_key(key) && !act_val.is_zero() {
-                        write!(f, "  storage[{}]: unexpected value {}\n", key, act_val)?;
+                        writeln!(f, "  storage[{}]: unexpected value {}", key, act_val)?;
                     }
                 }
                 Ok(())

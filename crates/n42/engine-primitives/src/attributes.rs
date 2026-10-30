@@ -67,9 +67,11 @@ where
     }
 }
 
+/// Payload attribute builder that can also set the withdrawals and the prev-randao mix.
 pub trait PayloadAttributesBuilderExt<Attributes>:
     PayloadAttributesBuilder<Attributes> + Send + Sync + 'static
 {
+    /// Builds payload attributes for `timestamp` with the given withdrawals and prev-randao.
     fn build_ext(
         &self,
         timestamp: u64,
@@ -83,6 +85,7 @@ impl<ChainSpec> PayloadAttributesBuilderExt<EthPayloadAttributes>
 where
     ChainSpec: Send + Sync + EthereumHardforks + 'static,
 {
+    #[allow(clippy::field_reassign_with_default)] // header is built step by step
     fn build_ext(
         &self,
         timestamp: u64,

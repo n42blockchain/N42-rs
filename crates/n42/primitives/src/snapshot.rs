@@ -7,8 +7,6 @@ use std::error::Error;
 
 use std::time::{Duration, Instant};
 
-use alloy_primitives::Sealable;
-use reth_primitives_traits::AlloyBlockHeader;
 use reth_primitives_traits::BlockHeader as BlockHeaderTrait;
 
 use alloy_primitives::{hex, Address, B256, U256};
@@ -56,6 +54,7 @@ impl std::fmt::Display for VotingError {
     Arbitrary,
     Default,
 )]
+/// A signer's vote to authorize or deauthorize an account.
 pub struct Vote {
     /// Authorized signer that cast this vote
     pub signer: Address,
@@ -79,6 +78,7 @@ pub struct Vote {
     Arbitrary,
     Default,
 )]
+/// Running count of the votes for one proposal.
 pub struct Tally {
     /// Whether the vote is about authorizing or kicking someone
     pub authorize: bool,
@@ -173,11 +173,10 @@ impl Snapshot {
         // Deep copy is handled by the clone method for each type.
     }
 
-    /// ecrecover
+    // /// ecrecover
     // pub fn ecrecover(&self, header: Header) -> Result<Address, Box<dyn Error>> {
     //     (self.ecrecover)(header)
     // }
-
     /// `valid_vote` returns whether it makes sense to cast the specified vote in the
     /// given snapshot context (e.g. don't try to add an already authorized signer).
     pub fn valid_vote(&self, address: Address, authorize: bool) -> bool {
@@ -310,8 +309,8 @@ impl Snapshot {
             }
 
             //If the vote is passed, update the list of signatories
-            if let Some(tally) = snap.tally.get(&header.beneficiary()) {
-                if tally.votes
+            if let Some(tally) = snap.tally.get(&header.beneficiary())
+                && tally.votes
                     > (snap.signers.len() / 2)
                         .try_into()
                         .map_err(|_| VotingError::InvalidVotingChain)?
@@ -348,7 +347,6 @@ impl Snapshot {
                         .retain(|vote| vote.address != header.beneficiary());
                     snap.tally.remove(&header.beneficiary());
                 }
-            }
 
             //If the operation takes too long, notify the user regularly
             if logged.elapsed() > Duration::from_secs(8) {
@@ -385,7 +383,7 @@ impl Snapshot {
 
     /// signers retrieves the list of authorized signers in ascending order.
     pub fn signers(&self) -> Vec<Address> {
-        let sigs: Vec<Address> = self.signers.to_vec();
+        let sigs: Vec<Address> = self.signers.clone();
         //sigs.sort();
         sigs
     }

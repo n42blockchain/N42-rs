@@ -8,7 +8,6 @@
 //use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
 use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
-pub use reth_node_ethereum::EthereumEngineValidator;
 use n42_qmdb_reth::{QmdbEngineValidatorBuilder, QmdbNodeState};
 //use reth_ethereum_consensus::EthBeaconConsensus;
 use crate::consensus::N42ConsensusBuilder;
@@ -108,9 +107,9 @@ impl N42Node {
             .node_types::<Node>()
             .pool(EthereumPoolBuilder::default())
             .executor(EthereumExecutorBuilder::default())
-            .consensus(N42ConsensusBuilder::default())
+            .consensus(N42ConsensusBuilder)
             .payload(
-                N42PayloadServiceBuilder::new(N42ConsensusBuilder::default()).with_qmdb(qmdb),
+                N42PayloadServiceBuilder::new(N42ConsensusBuilder).with_qmdb(qmdb),
             )
             .network(N42NetworkBuilder::default())
     }
@@ -276,7 +275,7 @@ where
 
     fn add_ons(&self) -> Self::AddOns {
         EthereumAddOns::new(RpcAddOns::new(
-            N42EthApiBuilder::default(),
+            N42EthApiBuilder,
             crate::engine_validator::N42EngineValidatorBuilder,
             BasicEngineApiBuilder::default(),
             QmdbEngineValidatorBuilder::new(self.qmdb.clone()),
@@ -487,6 +486,7 @@ where
 
 /// A basic ethereum network builder.
 #[derive(Debug, Default, Clone, Copy)]
+#[allow(dead_code)] // kept as the stock network builder; not constructed today
 pub struct EthereumNetworkBuilder {
     // TODO add closure to modify network
 }

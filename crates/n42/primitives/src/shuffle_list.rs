@@ -27,7 +27,7 @@ impl Buf {
     }
 
     /// Set the shuffling round.
-    fn set_round(&mut self, round: u8) {
+    const fn set_round(&mut self, round: u8) {
         self.0[SEED_SIZE] = round;
     }
 
@@ -61,8 +61,8 @@ impl Buf {
 /// Credits to [@protolambda](https://github.com/protolambda) for defining this algorithm.
 ///
 /// Shuffles if `forwards == true`, otherwise un-shuffles.
-/// It holds that: shuffle_list(shuffle_list(l, r, s, true), r, s, false) == l
-///           and: shuffle_list(shuffle_list(l, r, s, false), r, s, true) == l
+/// It holds that: `shuffle_list(shuffle_list(l`, r, s, true), r, s, false) == l
+///           and: `shuffle_list(shuffle_list(l`, r, s, false), r, s, true) == l
 ///
 /// The Eth2.0 spec mostly uses shuffling with `forwards == false`, because backwards
 /// shuffled lists are slightly easier to specify, and slightly easier to compute.

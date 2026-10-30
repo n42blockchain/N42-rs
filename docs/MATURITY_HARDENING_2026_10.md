@@ -229,9 +229,9 @@ further behind than the epoch history) is unchecked and only the parent link is,
 
 ### 6.7 Lint baseline
 
-CI runs `cargo clippy --workspace --lib --bins --examples` without `-D warnings`. A warning
-baseline per crate, then `-D warnings` on `crates/n42/*`, is the cheap next step once the
-hardening branches are in.
+CI runs `cargo clippy --workspace --lib --bins --examples` without `-D warnings`, and since the
+per-crate step below also runs `scripts/clippy-n42.sh`: `-D warnings` on every N42-owned crate
+(`crates/n42/*` except the two alloy forks, and `bin/n42`).
 
 Baseline on the merged tree (`c07716826`, 2026-10-26 23:29 UTC, the CI command): exit 0,
 0 errors, 1,497 warnings. The bulk is the pre-existing APoS/beacon code: `crates/n42/primitives`
@@ -243,7 +243,34 @@ carry 126 of them (`engine-types` 44, `h2-node` 25, `qmdb-reth` 18, `tx-queue` 1
 `collapsible_if` 28, `doc_markdown` 10, `type_complexity` 9, `missing_const_for_fn` 9, plus three
 uses of revm's deprecated `ExecutionResult::gas_used` (now `tx_gas_used`) that the v2.8.1 bump
 surfaced. No warning is an error class (no `unused_must_use`, no `rust_2018_idioms`). The log is
-`ci/clippy-c07716826.log` under the audit notes; the per-crate `-D warnings` step stays deferred.
+`ci/clippy-c07716826.log` under the audit notes.
+
+The per-crate `-D warnings` step is done (branch `chore/clippy-n42-crates`, merged into main as
+d07ec6584 on 2026-10-30 after a level X22 pair, stage fx VL: win1 4.993/4.849M against main's
+5.027/5.007M, rounds 450.8/446.1M against 445.0/449.8M, gates clean). The N42-owned
+crates went from 1,040 distinct warnings (the same crates in the 1,504-warning baseline of
+`ci/clippy-4e43be3ac.log`; the rest of that baseline is the vendored reth forks, the alloy forks and
+`vendor/dependency-repairs`, which track upstream and are out of scope) to 0. `scripts/clippy-n42.sh`
+runs `cargo clippy --no-deps -p <each N42 crate> --lib --bins --examples -- -D warnings` and a new
+step in `.github/workflows/lint.yml` runs it after the unchanged workspace clippy step; `--no-deps`
+keeps the denied lints off the vendored path dependencies. How the warnings were cleared:
+
+- style lints (`collapsible_if`, `doc_markdown`, `use_self`, `or_fun_call`, redundant borrows and
+  clones, `unused_imports`, `missing_const_for_fn`, `derive_partial_eq_without_eq`) were fixed as
+  clippy suggests, without touching a signature or a data path;
+- `missing_docs` (about 290 items, 194 of them in `primitives/src/beacon.rs`) got real one-line
+  doc comments, including the crate- and module-level ones;
+- what a fix would have changed carries an `#[allow]` with a one-line reason on the item: dead
+  code that is kept (`dead_code`), the `gas_used` calls whose replacement `tx_gas_used` has a
+  different meaning after EIP-8037 (`deprecated`, `engine-types/src/parallel_transfer.rs`,
+  ef-tests), the type-complexity / argument-count / `&mut self` lints on hot-path items in
+  `engine-types`, `tx-queue`, `tx-ingest`, `qmdb-reth`, `h2-node` and `bin/n42`
+  (`type_complexity`, `too_many_arguments`, `needless_pass_by_ref_mut`, `match_same_arms`,
+  `large_enum_variant`, `useless_let_if_seq`), the public snake_case constants of the beacon
+  module (`non_upper_case_globals`) and the public `&Vec` argument of `Beacon::gen_beacon_block`
+  (`ptr_arg`); `unused_crate_dependencies` is switched from warn to allow in the four libs whose
+  dependencies are shared with their bins, tests and examples (`consensus-core`,
+  `consensus-traits`, `ef-tests`, `bin/n42`).
 
 ### 6.8 QMDB health gauges
 
@@ -490,7 +517,7 @@ new knobs through `n42_env`. `design/integration-2026-10-next` adds the 6.1 comp
   section 6.7. The seven new ones are style lints in the items' code (`collapsible_if` in
   `h2-node/src/service.rs`, `qmdb-reth/src/node_state.rs` and `state_reader.rs`; one
   `match_same_arms` and one `use_self` in `node_state.rs`; one `use_self` in `tx-queue/src/road.rs`;
-  one `doc_markdown` in `service.rs`), to be cleared with the per-crate `-D warnings` step.
+  one `doc_markdown` in `service.rs`), cleared by the per-crate `-D warnings` step of section 6.7.
 - Pending at the time of writing, run automatically after the above: the 6.3 field check (`fleet7.sh
   up --fresh` on the integration binaries at 200 tx/s, `roll 1/2/3 --kill`, the forest's recovery
   and fault lines) and the 6.4 bench pairs (loop351 stage fm: `N42_ROAD_TAKEN_BOUND=1

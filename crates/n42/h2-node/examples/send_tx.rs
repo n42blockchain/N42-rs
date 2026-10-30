@@ -4,7 +4,7 @@
 //! Sends signed value transfers to a node's JSON-RPC, for watching them
 //! travel a mixed fleet: submitted to one client, sealed by the other.
 //!
-//!   send_tx --rpc http://127.0.0.1:18545 --key <hex> --to <address> --count 3 [--chain-id 1143]
+//!   `send_tx` --rpc <http://127.0.0.1:18545> --key <hex> --to <address> --count 3 [--chain-id 1143]
 //!
 //! Prints each transaction's hash; `eth_getTransactionReceipt` on any member
 //! then says which block, and whose, sealed it.

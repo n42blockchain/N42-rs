@@ -122,7 +122,7 @@ pub fn enable_receive_timestamps(stream: &TcpStream) -> std::io::Result<()> {
             stream.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_TIMESTAMPNS,
-            (&on as *const libc::c_int).cast(),
+            (&raw const on).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
@@ -144,6 +144,7 @@ pub fn enable_receive_timestamps(_stream: &TcpStream) -> std::io::Result<()> {
 /// `None` for the wait when the kernel attached no timestamp.
 ///
 /// End of stream is `UnexpectedEof`, as `read_u8` says it.
+#[allow(clippy::needless_continue)] // hot loop kept as written
 pub async fn read_kind_timed(stream: &TcpStream) -> std::io::Result<(u8, Option<Duration>)> {
     loop {
         stream.readable().await?;
@@ -165,19 +166,19 @@ pub async fn read_kind_timed(stream: &TcpStream) -> std::io::Result<(u8, Option<
 fn recv_one_stamped(stream: &TcpStream) -> std::io::Result<(u8, Option<std::time::SystemTime>)> {
     use std::os::fd::AsRawFd as _;
     let mut byte = 0u8;
-    let mut iov = libc::iovec { iov_base: (&mut byte as *mut u8).cast(), iov_len: 1 };
+    let mut iov = libc::iovec { iov_base: (&raw mut byte).cast(), iov_len: 1 };
     // u64 words for the cmsghdr alignment; room for a timestamp or two.
     let mut control = [0u64; 16];
     // SAFETY: an all-zero msghdr is a valid empty one; the pointers set below
     // outlive the recvmsg call.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
+    msg.msg_iov = &raw mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
     msg.msg_controllen = std::mem::size_of_val(&control) as _;
     // SAFETY: recvmsg on an open socket into the one-byte buffer and control
     // buffer described by `msg`.
-    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut msg, 0) };
     if n < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -188,7 +189,7 @@ fn recv_one_stamped(stream: &TcpStream) -> std::io::Result<(u8, Option<std::time
     // SAFETY: walking the control messages the kernel wrote into `control`,
     // bounded by `msg.msg_controllen`, with the libc macros meant for it.
     unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_TIMESTAMPNS {
                 let ts: libc::timespec = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
@@ -198,7 +199,7 @@ fn recv_one_stamped(stream: &TcpStream) -> std::io::Result<(u8, Option<std::time
                     );
                 }
             }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
         }
     }
     Ok((byte, stamp))

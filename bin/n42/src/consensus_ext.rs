@@ -20,7 +20,7 @@ use n42_primitives::{
     Snapshot, ValidatorInfo,
 };
 use pubsub_mem::{subscribe, RouterMsg};
-use reth_consensus::{ConsensusError, FullConsensus};
+use reth_consensus::FullConsensus;
 use n42_tx_types::N42Primitives as EthPrimitives;
 use reth_node_core::primitives::AlloyBlockHeader;
 use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
@@ -42,7 +42,7 @@ pub trait ConsensusExtApi {
     #[method(name = "discard")]
     fn discard(&self, address: Address) -> RpcResult<()>;
 
-    /// GetSnapshot in the clique consensus.
+    /// `GetSnapshot` in the clique consensus.
     #[method(name = "get_snapshot")]
     fn get_snapshot(&self, number: u64) -> RpcResult<Snapshot>;
 
@@ -52,8 +52,11 @@ pub trait ConsensusExtApi {
 }
 
 /// The type that implements the `consensus` rpc namespace trait
+#[derive(Debug)]
 pub struct ConsensusExt<Cons, Provider> {
+    /// Consensus engine the namespace reads from.
     pub consensus: Cons,
+    /// Provider used to read chain data.
     pub provider: Provider,
 }
 
@@ -63,11 +66,13 @@ where
     Provider: HeaderProvider + Clone + Send + Sync + 'static,
 {
     fn propose(&self, address: Address, auth: bool) -> RpcResult<()> {
-        Ok(self.consensus.propose(address, auth).unwrap_or_default())
+        let _: () = self.consensus.propose(address, auth).unwrap_or_default();
+        Ok(())
     }
 
     fn discard(&self, address: Address) -> RpcResult<()> {
-        Ok(self.consensus.discard(address).unwrap_or_default())
+        let _: () = self.consensus.discard(address).unwrap_or_default();
+        Ok(())
     }
 
     fn get_snapshot(&self, number: u64) -> RpcResult<Snapshot> {
@@ -94,9 +99,11 @@ where
 #[cfg_attr(test, rpc(server, client, namespace = "consensusBeaconExt"))]
 pub trait ConsensusBeaconExtApi {
     #[subscription(name = "subscribeToVerificationRequest", item = String)]
+    /// Subscribes a validator to the stream of blocks that await its verification.
     fn subscribe_to_verification_request(&self, pubkey: BLSPubkey) -> SubscriptionResult;
 
     #[method(name = "submitVerification")]
+    /// Submits a validator's BLS verification of a block.
     fn submit_verification(
         &self,
         pubkey: String,
@@ -105,44 +112,49 @@ pub trait ConsensusBeaconExtApi {
         block_hash: B256,
     ) -> RpcResult<()>;
 
-    /// get_beacon_block_hash_by_eth1_hash
+    /// `get_beacon_block_hash_by_eth1_hash`
     #[method(name = "get_beacon_block_hash_by_eth1_hash")]
     fn get_beacon_block_hash_by_eth1_hash(&self, eth1_hash: B256) -> RpcResult<Option<B256>>;
 
-    /// get_beacon_block_by_hash
+    /// `get_beacon_block_by_hash`
     #[method(name = "get_beacon_block_by_hash")]
     fn get_beacon_block_by_hash(&self, beacon_block_hash: B256) -> RpcResult<Option<BeaconBlock>>;
 
-    /// get_beacon_block_by_number
+    /// `get_beacon_block_by_number`
     #[method(name = "get_beacon_block_by_number")]
     fn get_beacon_block_by_number(&self, block_id: BlockId) -> RpcResult<Option<BeaconBlock>>;
 
-    /// get_beacon_state_by_beacon_block_hash
+    /// `get_beacon_state_by_beacon_block_hash`
     #[method(name = "get_beacon_state_by_beacon_block_hash")]
     fn get_beacon_state_by_beacon_block_hash(
         &self,
         beacon_block_hash: B256,
     ) -> RpcResult<Option<BeaconState>>;
 
-    /// get_beacon_state_by_number
+    /// `get_beacon_state_by_number`
     #[method(name = "get_beacon_state_by_number")]
     fn get_beacon_state_by_number(&self, state_id: BlockId) -> RpcResult<Option<BeaconState>>;
 
-    /// get_beacon_validator_by_pubkey
+    /// `get_beacon_validator_by_pubkey`
     #[method(name = "get_beacon_validator_by_pubkey")]
     fn get_beacon_validator_by_pubkey(&self, pubkey: BLSPubkey)
         -> RpcResult<Option<ValidatorInfo>>;
 
-    /// get_total_effective_balance
+    /// `get_total_effective_balance`
     #[method(name = "get_total_effective_balance")]
     fn get_total_effective_balance(&self) -> RpcResult<u64>;
 }
 
 /// The type that implements the `consensusBeaconRpc` rpc namespace trait
+#[derive(Debug)]
 pub struct ConsensusBeaconExt<Cons, Provider> {
+    /// Consensus engine the namespace reads from.
     pub consensus: Cons,
+    /// Provider used to read chain data and the beacon tables.
     pub provider: Provider,
+    /// Channel that carries submitted verification results to the miner.
     pub verification_tx: mpsc::Sender<BlockVerifyResult>,
+    /// Channel that routes unverified blocks to the subscribed validators.
     pub router_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
 }
 
@@ -394,7 +406,7 @@ where
             None => {
                 return Err(ErrorObjectOwned::owned(
                     INTERNAL_ERROR_CODE,
-                    format!("beacon state not found"),
+                    "beacon state not found".to_string(),
                     None::<()>,
                 ));
             }

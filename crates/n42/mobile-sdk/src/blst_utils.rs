@@ -6,7 +6,7 @@ use rand::RngCore;
 
 /// Generate a new BLS12-381 keypair.
 ///
-/// Returns a tuple of (private_key_hex, public_key_hex).
+/// Returns a tuple of (`private_key_hex`, `public_key_hex`).
 pub fn generate_bls12_381_keypair() -> eyre::Result<(String, String)> {
     let mut rng = rand::rng();
     let mut ikm = [0u8; 32];

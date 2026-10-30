@@ -230,7 +230,7 @@ impl<'a> Reader<'a> {
         let raw = self.take(n.checked_mul(36).ok_or_else(invalid)?)?;
         let mut frames = Vec::with_capacity(n);
         let mut sum = 0usize;
-        for entry in raw.chunks_exact(36) {
+        for entry in raw.as_chunks::<36>().0 {
             let id = B256::from_slice(&entry[..32]);
             let count = u32::from_le_bytes(entry[32..].try_into().map_err(|_| invalid())?);
             // An empty frame is no frame: a layout with one does not

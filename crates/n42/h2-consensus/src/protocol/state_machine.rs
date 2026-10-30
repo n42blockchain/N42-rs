@@ -1343,11 +1343,10 @@ impl ConsensusEngine {
             if view > current_view && !is_exempt {
                 if view <= current_view + FUTURE_VIEW_WINDOW {
                     // edition-2021: N42-26 writes this as a let-chain.
-                    if let ConsensusMessage::Timeout(ref timeout) = msg {
-                        if self.collect_future_timeout(timeout.clone())? {
+                    if let ConsensusMessage::Timeout(ref timeout) = msg
+                        && self.collect_future_timeout(timeout.clone())? {
                             return Ok(());
                         }
-                    }
                     // A future message inside the buffering window may still
                     // carry a quorum-authenticated QC. Use that proof to catch
                     // up to exactly qc.view+1 before buffering. This preserves
@@ -1407,11 +1406,10 @@ impl ConsensusEngine {
         });
         if let Some(view) = stale_msg_view {
             // edition-2021: N42-26 writes this as a let-chain.
-            if let ConsensusMessage::Proposal(ref proposal) = msg {
-                if self.recover_late_committed_proposal(proposal)? {
+            if let ConsensusMessage::Proposal(ref proposal) = msg
+                && self.recover_late_committed_proposal(proposal)? {
                     return Ok(());
                 }
-            }
             // A late or progress vote for a view this node led: not for the
             // protocol, but for the voters ledger (the stragglers' grace).
             if let ConsensusMessage::Vote(ref vote) = msg {
@@ -1585,13 +1583,12 @@ impl ConsensusEngine {
                 *buffered_view == view && Self::future_message_unchecked(buffered)
             };
             let unchecked_in_view = self.future_msg_buffer.iter().filter(|&e| in_class(e)).count();
-            if unchecked_in_view >= class_cap {
-                if let Some(index) = self.future_msg_buffer.iter().position(in_class) {
+            if unchecked_in_view >= class_cap
+                && let Some(index) = self.future_msg_buffer.iter().position(in_class) {
                     // `remove`, not `swap_remove`: the buffer keeps arrival
                     // order, which is what FIFO and the replay rely on.
                     self.future_msg_buffer.remove(index);
                 }
-            }
         } else if let Some(sender) = sender {
             // Per-sender cap: evict the sender's highest view if the new
             // message is for a lower one.
@@ -1901,14 +1898,13 @@ impl ConsensusEngine {
         self.prepare_qc = None;
         // A proposal this node has not voted for because its block was still
         // importing: remembered, so the import can still tell the leader.
-        if let Some(pending) = self.pending_proposal.take() {
-            if self.progress_votes && self.round_state.last_voted_view() < pending.view {
+        if let Some(pending) = self.pending_proposal.take()
+            && self.progress_votes && self.round_state.last_voted_view() < pending.view {
                 if self.withheld_votes.len() >= VOTERS_SEEN_WINDOW {
                     self.withheld_votes.pop_front();
                 }
                 self.withheld_votes.push_back(pending);
             }
-        }
         // Gov5 keeps successful import evidence across view changes: a new
         // leader commonly reproposes the same uncommitted block, and reth will
         // not emit a second import completion for it. Native optimistic voting

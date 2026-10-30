@@ -462,7 +462,7 @@ fn vote_carrying(svc: &H2Service<MockExecutionLayer>, keys: &[BlsSecretKey], vie
 /// highest TC on votes, commit votes and timeouts (`SyncInfo`) and a lagging
 /// member adopts it at once (`processEmbeddedTC`): it locks on the TC's high
 /// QC and moves to the view after it. This node dropped the field, so a
-/// member that missed the NewView waited out its own timeouts instead. A TC
+/// member that missed the `NewView` waited out its own timeouts instead. A TC
 /// that does not verify, or would not move the node, changes nothing.
 #[tokio::test]
 async fn a_tc_piggybacked_on_a_vote_moves_a_lagging_node_to_the_view_after_it() {

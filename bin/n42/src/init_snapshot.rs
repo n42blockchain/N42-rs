@@ -171,7 +171,7 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
         let provider_rw = provider_factory.database_provider_rw()?;
         let last = provider_rw.last_block_number()?;
         if last == 0 && number > 0 {
-            setup_without_evm(&provider_rw, SealedHeader::new(header.clone(), hash), |n| Header {
+            setup_without_evm(&provider_rw, SealedHeader::new(header, hash), |n| Header {
                 number: n,
                 ..Default::default()
             })?;
@@ -311,7 +311,7 @@ impl<'a> DumpCheck<'a> {
 /// Writes the accounts of a state dump at `block`, as reth 2.5 stores them:
 /// hashed accounts and storage in MDBX, one changeset entry per account and
 /// slot ("created at `block`") in the static files, the history indices in
-/// RocksDB, bytecodes once. Chunked commits keep memory flat. `check` sees
+/// `RocksDB`, bytecodes once. Chunked commits keep memory flat. `check` sees
 /// each account before it is written.
 fn write_state_v2<PF>(
     provider_factory: &PF,

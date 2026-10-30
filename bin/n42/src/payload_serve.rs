@@ -51,14 +51,13 @@ use std::net::SocketAddr;
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::B256;
 use alloy_eips::Encodable2718;
-use alloy_rlp::Encodable;
 use n42_h2_execution::raw_engine::{self, request};
 use reth_engine_primitives::ConsensusEngineHandle;
 use n42_engine_types::N42BuiltPayload;
 use reth_primitives_traits::transaction::TxHashRef as _;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
-use reth_primitives_traits::{Block as _, BlockBody as _, SealedBlock};
+use reth_primitives_traits::{BlockBody as _, SealedBlock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use n42_engine_types::engine_validator::CompactBodyError;
@@ -172,7 +171,7 @@ where
     let transactions_len: usize = transactions.iter().map(Vec::len).sum();
     let transactions_header = alloy_rlp::Header { list: true, payload_length: transactions_len };
     let ommers: &[u8] = &[0xc0];
-    let withdrawals = block.body().withdrawals().map(|w| alloy_rlp::encode(w));
+    let withdrawals = block.body().withdrawals().map(alloy_rlp::encode);
     let payload_length = header.len()
         + transactions_header.length_with_payload()
         + ommers.len()
@@ -225,6 +224,7 @@ pub struct OwnBlockReuse {
     /// without the engine's payload-processor plumbing would cost. An
     /// instrument: it adds its own time to the import, and a leg run with it
     /// is not a measurement of the chain. Returns (ms, gas used, receipts).
+    #[allow(clippy::type_complexity)] // hot-path callback field; its type is kept inline
     pub exec_probe: Option<
         std::sync::Arc<
             dyn Fn(reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Result<(u64, u64, usize), String>
@@ -251,6 +251,7 @@ pub struct OwnBlockReuse {
     /// the wrong state (loop147-152: every header after it rejected). The
     /// head is moved to the sibling's parent first, so the insert extends it.
     /// The head's hash and number.
+    #[allow(clippy::type_complexity)] // hot-path callback field; its type is kept inline
     pub canonical_head: Option<std::sync::Arc<dyn Fn() -> Option<(B256, u64)> + Send + Sync>>,
 }
 
@@ -299,6 +300,7 @@ impl RoadBlock {
     }
 }
 
+/// Callback that imports a block fetched from a peer and returns its executed block and the import result.
 pub type ForeignImport = dyn Fn(
         crate::follower_import::ForeignBlock,
         // The senders, when the caller already has them: the compact body
@@ -343,7 +345,7 @@ async fn reuse_own_build<T>(
 where
     T: PayloadTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
-    use reth_engine_primitives::PayloadValidator as _;
+    
     let v1 = data.payload.as_v1();
     let (parent_hash, number, state_root, receipts_root, gas_used) =
         (v1.parent_hash, v1.block_number, v1.state_root, v1.receipts_root, v1.gas_used);
@@ -641,6 +643,7 @@ fn resealed_for_handoff(
 /// build's execution inserted as executed, the QMDB root filed under the
 /// sealed hash, the queue told, the pool pruned. Shared by the payload path
 /// (`reuse_own_build`) and the header-only path (`request::OWN_BLOCK`).
+#[allow(clippy::extra_unused_type_parameters)] // signature kept; callers name the type
 async fn hand_off_own_build<T>(
     reuse: &OwnBlockReuse,
     built_hash: B256,
@@ -729,11 +732,10 @@ fn file_root_and_fields(reuse: &OwnBlockReuse, built_hash: B256, sealed_hash: B2
     // The build's own execution result, recorded by the builder under the
     // build's hash: under deferred execution the next block's header is
     // checked against it under the sealed hash.
-    if built_hash != sealed_hash {
-        if let Some(fields) = n42_engine_types::executed_fields::get(&built_hash) {
+    if built_hash != sealed_hash
+        && let Some(fields) = n42_engine_types::executed_fields::get(&built_hash) {
             n42_engine_types::executed_fields::remember(sealed_hash, fields);
         }
-    }
     Some((rename_wait_ms, rename_deferred))
 }
 
@@ -1018,8 +1020,8 @@ async fn move_head_to_parent_if_forked<T>(
 ) where
     T: PayloadTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
-    if let Some((head, head_number)) = reuse.canonical_head.as_ref().and_then(|current| current()) {
-        if head_move_needed(handoff_head_move(), head, head_number, header.parent_hash, number) {
+    if let Some((head, head_number)) = reuse.canonical_head.as_ref().and_then(|current| current())
+        && head_move_needed(handoff_head_move(), head, head_number, header.parent_hash, number) {
             let moved_at = std::time::Instant::now();
             // Under the split settlement tags (`n42_h2_execution::settlement`)
             // the parent is committed, not certified or persisted: this head
@@ -1050,11 +1052,10 @@ async fn move_head_to_parent_if_forked<T>(
                 ),
             }
         }
-    }
 }
 
 /// [`own_block_by_header_with`] under `N42_STATE_READY_WITHOUT_MERGE`
-/// (docs/DELTA_LOG_DESIGN.md stage 1): answered VALID once the build's fields
+/// (`docs/DELTA_LOG_DESIGN.md` stage 1): answered VALID once the build's fields
 /// are published, before its merged post-state map lands. What the next
 /// block needs from this one is done before the answer, as on the ordinary
 /// road: the QMDB root and the fields filed under the sealed hash, the queue
@@ -1844,6 +1845,7 @@ fn push_built_payload(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> std::io::
 /// The sealed header a payload describes, given the build it came from: the
 /// payload's fields where the seal may have touched them, the build's where it
 /// cannot. `None` if the shapes disagree; the caller checks the hash.
+#[allow(clippy::suspicious_operation_groupings)] // the comparison is intentional
 fn sealed_header_from_fields(
     data: &alloy_rpc_types_engine::ExecutionData,
     built: &alloy_consensus::Header,
@@ -2393,7 +2395,7 @@ where
         out.push(1);
         out.extend_from_slice(&frame_len(encoded.len())?);
         out.extend_from_slice(&encoded);
-        stream.write_all(&out).await?;
+        stream.write_all(out).await?;
         let answered = started.elapsed().saturating_sub(decoded).as_millis() as u64;
         let oc = once.map(crate::import_once::Owner::counts).unwrap_or_default();
         if let Some(ms) = direct_ms {
@@ -2472,6 +2474,7 @@ where
         if let (Some(prune), Some(hashes)) = (reuse.and_then(|r| r.prune_pool.clone()), mined_hashes.take()) {
             let count = hashes.len();
             let pruned_at = std::time::Instant::now();
+            #[allow(clippy::let_underscore_future)] // the blocking task is detached on purpose
             let _ = tokio::task::spawn_blocking(move || {
                 prune(hashes);
                 if count > 10_000 {
@@ -2580,7 +2583,7 @@ where
                 let pruning = tokio::task::spawn_blocking(move || {
                     let hashes: Vec<B256> = mined_hashes.unwrap_or_else(|| {
                         use rayon::prelude::*;
-                        raw_transactions.par_iter().map(|tx| alloy_primitives::keccak256(tx)).collect()
+                        raw_transactions.par_iter().map(alloy_primitives::keccak256).collect()
                     });
                     prune(hashes);
                     if count > 10_000 {
@@ -2958,6 +2961,7 @@ async fn answer_own_build(
     stream.write_all(out).await
 }
 
+/// Serves the raw payload protocol on `addr` and forwards payload builds and imports to the engine.
 pub async fn serve<T>(
     addr: SocketAddr,
     payloads: PayloadBuilderHandle<T>,
@@ -3065,12 +3069,11 @@ where
     // Measured only when asked: the socket's receive timestamps, read with
     // the request's first byte. A socket that refuses them serves as before.
     let mut stamped = crate::road_runtime::measure_dispatch_wait();
-    if stamped {
-        if let Err(err) = crate::road_runtime::enable_receive_timestamps(&stream) {
+    if stamped
+        && let Err(err) = crate::road_runtime::enable_receive_timestamps(&stream) {
             warn!(target: "n42.payload_serve", %err, "no receive timestamps; dispatch_wait_ms reads 0");
             stamped = false;
         }
-    }
     // Buffers retained across frames. A newPayload frame is ~19 MB at the
     // bench tier and a served payload the same; allocated fresh per block
     // they are fresh pages first-touched on every block on every node --

@@ -2099,6 +2099,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.deferred_execution_time = at;
     }
 
+    /// Whether a block of `timestamp` is under deferred execution: its
+    /// header's execution fields are its parent's.
+    pub fn is_deferred_at(&self, timestamp: u64) -> bool {
+        self.deferred_execution_time.is_some_and(|at| timestamp >= at)
+    }
+
     /// The chain's `deferredExecutionDepth` (see the field): 1 or 2. Anything
     /// else is refused and leaves the depth as it was.
     pub fn set_deferred_depth(&mut self, depth: u64) -> Result<(), String> {

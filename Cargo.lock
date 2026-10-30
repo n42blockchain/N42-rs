@@ -7701,6 +7701,7 @@ dependencies = [
  "alloy-rlp",
  "derive_more 2.1.1",
  "hex",
+ "reth-codecs 0.8.2",
  "reth-primitives-traits 0.8.2",
  "serde",
  "serde_json",

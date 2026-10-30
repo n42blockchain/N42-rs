@@ -15,7 +15,8 @@ workspace = true
 alloy-consensus = { workspace = true, features = ["std", "serde"] }
 alloy-primitives = { workspace = true, features = ["std", "serde", "rlp"] }
 alloy-rlp.workspace = true
-reth-primitives-traits = { workspace = true, features = ["std", "serde"] }
+reth-primitives-traits = { workspace = true, features = ["std", "serde", "reth-codec"] }
+reth-codecs = { workspace = true, features = ["std", "alloy"] }
 derive_more.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
 

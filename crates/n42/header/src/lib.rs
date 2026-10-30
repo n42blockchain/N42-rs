@@ -20,6 +20,9 @@ use alloy_primitives::{keccak256, Address, BlockNumber, Bloom, Bytes, Sealable, 
 use alloy_rlp::{BufMut, Decodable, Encodable, EMPTY_STRING_CODE};
 use serde::{Deserialize, Serialize};
 
+mod compact;
+pub use compact::N42_HEADER_COMPACT_MARKER;
+
 /// Optional elements: 16 `base_fee_per_gas` .. 24 `mobile_registry_root`.
 const OPTIONAL_FIELDS: usize = 9;
 

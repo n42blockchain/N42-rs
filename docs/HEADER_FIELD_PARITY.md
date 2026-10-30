@@ -416,17 +416,15 @@ The format, decided by the first byte:
 - **`mobile_registry_root == None`**: exactly the alloy `Compact` bytes. Every
   header written before the change decodes unchanged, as root `None`, and new
   headers without a root are byte-identical to before.
-- **`Some(root)`**: a marker byte `N42_HEADER_COMPACT_MARKER`, then a version
-  byte `1`, then the 32-byte root, then the alloy `Compact` bytes. The marker
-  must be a first-byte value the alloy layout can never produce. Candidate:
-  every value with all six bits of the `difficulty` length field set (length
-  63 > 32). Pin it with a test that encodes `arbitrary` alloy headers, asserts
-  none starts with the marker, and checks the bit position against
-  reth-codecs 0.8.2 `Header`.
+- **`Some(root)`**: the marker byte `0xFF`, then a version byte `1`, then the
+  32-byte root, then the alloy `Compact` bytes. No alloy `Compact` header can
+  start with `0xFF`. Its first byte is flag bits: bit 0 is `withdrawals_root`'s
+  presence and bits 1-6 are the byte length of `difficulty` (at most 32), so
+  bits 1-6 can never all be set.
 
-  If the bit position cannot be pinned, fall back to a side table
-  `N42HeaderExt` (number → root) written beside `Headers`. That table cannot
-  follow headers into static files, which is why it is the fallback.
+  The test `no_alloy_compact_header_starts_with_the_marker` (`crates/n42/header/src/compact.rs`)
+  checks this bit position against reth-codecs 0.8.2. A side table was the
+  fallback, and it is not needed.
 
 Tests: an alloy `Compact` blob from before the change decodes to
 `N42Header { root: None }`. `Some` round-trips. `arbitrary` round-trips.
@@ -481,8 +479,8 @@ a provider it must refuse to build, as gov5 does.
 
 | Step | Files and crates | Estimate |
 | --- | --- | --- |
-| 1. `N42Header`: type, flat RLP (8.2), `Sealable`, accessors, serde, `InMemorySize`; tests byte-exact against the gov5 fixtures | new `crates/n42/header`; `Cargo.toml` workspace member; tests reading `crates/n42/h2-consensus/testdata/header_field_parity/` | 500-700 lines, 1-2 days |
-| 2. `Compact` / `Compress` / `Decompress` / bincode (8.3), with old-blob compatibility tests | `crates/n42/header` | 200-300 lines, 1 day |
+| 1. `N42Header`: type, flat RLP (8.2), `Sealable`, accessors, serde, `InMemorySize`; tests byte-exact against the gov5 fixtures | new `crates/n42/header`; `Cargo.toml` workspace member; tests reading `crates/n42/h2-consensus/testdata/header_field_parity/` | **done** on `feat/n42-header-field-24` (`cbdfbfd8a`, about 500 lines) |
+| 2. `Compact` (8.3), with old-blob compatibility tests; then `Compress` / `Decompress` / bincode | `crates/n42/header` | `Compact` **done** (same branch); `Compress`/`Decompress` need `reth-db-api` (a git dependency), and bincode follows; about 100 lines left |
 | 3. Chainspec: `type Header = N42Header` (`crates/chainspec/src/api.rs:85`) and the genesis header builder; `glamsterdamTime` / `mobileAnchorTime` predicates (`reth_chainspec::qmdb`-style, read from the genesis JSON) | vendored `crates/chainspec` (additive) | 150-250 lines, 1 day |
 | 4. Primitives switch: `N42Primitives::BlockHeader = N42Header`, `Block = alloy_consensus::Block<N42TxEnvelope, N42Header>`; follow the cascade | `crates/n42/tx-types/src/primitives.rs`, then `engine-types` (consensus bounds `EthChainSpec<Header = Header>` at `hotstuff_consensus.rs:294,409`, payload builder, `N42EvmConfig` block assembler: reth's `EthBlockAssembler` builds an alloy header, so a thin N42 assembler wraps it and sets the root), `N42NetworkBuilder` (`NetworkPrimitives::BlockHeader`), `N42RpcTypes`/`crates/n42/reth-rpc` (RPC header with `mobileRegistryRoot`), `qmdb-reth`; about 52 files reference `alloy_consensus::Header` and 44 touch `SealedHeader`, most of which keep the inner alloy header | 1,200-2,000 lines, 1-1.5 weeks |
 | 5. Engine API carrier (8.4) | `crates/n42/alloy-rpc-types-engine`, `h2-execution/src/raw_engine.rs`, `h2-el-rpc/src/engine.rs`, `h2-consensus/src/header_profile.rs` | 300-500 lines, 2 days |

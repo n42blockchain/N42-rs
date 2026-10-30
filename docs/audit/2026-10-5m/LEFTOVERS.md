@@ -1,6 +1,6 @@
 # 2026-10 5M 审计:遗留问题清单与分工
 
-更新日期:2026-10-30。**10-30:除 R3-E1/E3(Linux)外的全部遗留由 Windows 认领,按 G4 → E2 → R2-R2 → P5 → P7 → R2-X4 → P2/P3/P4 → N4 → R2-C9 → P6 的顺序推进;Linux 若要接手某项,改负责列并推送即可。**两个会话不在同一会话列表里,通过本文件协调:**认领一项时把"负责"改成自己并推送,
+更新日期:2026-10-30。**10-30:除 R3-E1/E3/E2(Linux,同一组文件)外的全部遗留由 Windows 认领,按 G4 → R2-R2 → P5 → P7 → R2-X4 → P2/P3/P4 → N4 → R2-C9 → P6 的顺序推进;Linux 若要接手某项,改负责列并推送即可。**两个会话不在同一会话列表里,通过本文件协调:**认领一项时把"负责"改成自己并推送,
 完成后在"状态"写提交号**,同时照常在 `ROUND2.md` / `ROUND3.md` 状态表追加一行。每项仍先写失败测试再修。
 
 - **Windows 会话**:Windows 主机上的 Claude Code(WSL2 编译,无 bench)。
@@ -62,8 +62,8 @@ Rust 现状:
 | R3-E1 | ROUND3 | builder 与 follower 的可纳入性规则对齐(先与 gov5 对齐规则) | Linux(10-30 认领) | 实现中:builder 串行循环在延迟执行下改按 Σgas_limit 预算 + 每 sender 最坏花费账本(与 follower `check_senders` 同一规则,严格化只在 builder 侧,跨客户端安全);R3-E3 一并;合入前 X22 配对 |
 | R3-P2/P3/P4 | ROUND3 | tx-queue 有界 lane、加价替换、`Lagged` 补齐,与帧索引一起设计 | Windows(10-30 认领),热路径项合入前由 Linux A/B | 待做 |
 | R3-N4 | ROUND3 | gossip `validate_messages()` + 回报 Accept/Reject/Ignore | Windows(10-30 认领),热路径项合入前由 Linux A/B | 待做 |
-| R3-G4 | ROUND3 | leader 首次导入的多余 payload 克隆 | Windows(10-30 认领),热路径项合入前由 Linux A/B | 低优先 |
-| R3-E2 | ROUND3 | 零手续费块 beneficiary 触碰:先用 gov5 夹具确认根 | Windows(10-30 认领),热路径项合入前由 Linux A/B | 待做 |
+| R3-G4 | ROUND3 | leader 首次导入的多余 payload 克隆 | Windows(10-30 认领),热路径项合入前由 Linux A/B | 已修(见 `git log --grep R3-G4`) |
+| R3-E2 | ROUND3 | 零手续费块 beneficiary 触碰:先用 gov5 夹具确认根 | Linux(与 R3-E1 同改 `payload.rs` / `parallel_transfer.rs`,Windows 不动) | 待做 |
 | 热路径 A/B | ROUND2/3 | R2-X1、R2-I1、R2-R4/Q4、R2-C7、R2-I6、R2-R3、R3-N2、R3-N3、R3-G2、R3-C3 | Linux | 已由 X22 配对整体闭合(5ab8fffea);此后的热路径改动(R3-N5 余项、R3-P9、R3-C2)待下一次配对,建议一次 X22 覆盖三者 |
 
 ## D. 需协议/跨仓库决定(先记录,不动手)

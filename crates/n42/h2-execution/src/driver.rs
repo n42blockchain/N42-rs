@@ -914,11 +914,14 @@ pub fn compact_body() -> bool {
 pub async fn import_own<E: ExecutionLayer + ?Sized>(
     el: &E,
     header: Option<&alloy_consensus::Header>,
-    payload: ExecutionData,
+    payload: &ExecutionData,
     elided: Option<usize>,
 ) -> Result<alloy_rpc_types_engine::PayloadStatus, ElError> {
+    // Borrowed: an elided block reaches the layer by its header and needs no
+    // copy of the payload, which every attempt used to make first (audit
+    // 2026-10 round 3, R3-G4).
     let Some(tx_count) = elided else {
-        return el.import_own_block(header, payload).await;
+        return el.import_own_block(header, payload.clone()).await;
     };
     let header = header.ok_or_else(|| ElError::new("an elided own block without its sealed header"))?;
     if let Some(status) = el.import_own_block_by_header(header).await {
@@ -928,7 +931,7 @@ pub async fn import_own<E: ExecutionLayer + ?Sized>(
         .own_block_body(header)
         .await?
         .ok_or_else(|| ElError::new(format!("the execution layer no longer holds own block {}", header.number)))?;
-    let whole = crate::el::fill_elided(&payload, &block, tx_count)?;
+    let whole = crate::el::fill_elided(payload, &block, tx_count)?;
     el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, whole).await
 }
 
@@ -1880,7 +1883,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // SYNCING waits for this report (`own_block_imported`). Given up
             // on, the leader stayed on its own block until a restart (audit
             // 2026-10 round 2, R2-I4).
-            let mut outcome = import_own(el.as_ref(), header.as_ref(), payload.clone(), elided).await;
+            let mut outcome = import_own(el.as_ref(), header.as_ref(), &payload, elided).await;
             for (attempt, pause) in backoff.iter().enumerate() {
                 let verdict = matches!(&outcome, Ok(status) if status.status.is_valid() || status.status.is_invalid());
                 if verdict {
@@ -1888,7 +1891,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
                 debug!(target: "n42.h2.el", block = ?hash, attempt = attempt + 1, ?pause, "own import ended without a verdict; trying again");
                 tokio::time::sleep(*pause).await;
-                outcome = import_own(el.as_ref(), header.as_ref(), payload.clone(), elided).await;
+                outcome = import_own(el.as_ref(), header.as_ref(), &payload, elided).await;
             }
             match outcome {
                 Ok(status) => {
@@ -2848,7 +2851,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {
         let started = std::time::Instant::now();
         let status = if built.elided {
-            import_own(self.el.as_ref(), built.header.as_ref(), built.execution_data.clone(), Some(built.tx_count))
+            import_own(self.el.as_ref(), built.header.as_ref(), &built.execution_data, Some(built.tx_count))
                 .await?
         } else {
             self.el

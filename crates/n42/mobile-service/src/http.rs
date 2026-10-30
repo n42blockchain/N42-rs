@@ -67,18 +67,21 @@ pub fn serve(
     service: Arc<Mutex<MobileService>>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if let Err(error) = handle(stream, &service) {
-                    // One bad connection is not a reason to stop serving.
-                    debug!(target: "n42.mobile.http", %error, "connection ended");
-                }
-            }
-            Err(error) => warn!(target: "n42.mobile.http", %error, "accept failed"),
-        }
+    serve_on(&listener, &service)
+}
+
+/// Connections served at once. One at a time, a single slow client held
+/// every phone for up to [`REQUEST_DEADLINE`] (audit 2026-10 round 3,
+/// R3-P7); past this many, a connection is answered 503 and closed.
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+
+/// Gives a connection's slot back when its thread ends, however it ends.
+struct Slot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
-    Ok(())
 }
 
 /// The address a listener bound to, for a caller that asked for port 0.
@@ -91,11 +94,27 @@ pub fn serve_on(
     listener: &TcpListener,
     service: &Arc<Mutex<MobileService>>,
 ) -> std::io::Result<()> {
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
-                if let Err(error) = handle(stream, service) {
-                    debug!(target: "n42.mobile.http", %error, "connection ended");
+            Ok(mut stream) => {
+                if active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= MAX_CONCURRENT_CONNECTIONS {
+                    active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
+                    let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                let slot = Slot(Arc::clone(&active));
+                let service = Arc::clone(service);
+                let spawned = std::thread::Builder::new().name("mobile-http".into()).spawn(move || {
+                    let _slot = slot;
+                    if let Err(error) = handle(stream, &service) {
+                        // One bad connection is not a reason to stop serving.
+                        debug!(target: "n42.mobile.http", %error, "connection ended");
+                    }
+                });
+                if let Err(error) = spawned {
+                    warn!(target: "n42.mobile.http", %error, "could not start a connection thread");
                 }
             }
             Err(error) => warn!(target: "n42.mobile.http", %error, "accept failed"),

@@ -8527,18 +8527,17 @@ mod tests {
         }
         let envs = txs
             .iter()
-            .map(|(s, nonce)| {
-                let mut env = TxEnv::default();
-                env.caller = addr(*s);
-                env.kind = TxKind::Call(addr(1_000_000 + s * 1_000 + nonce));
-                env.value = U256::from(1);
-                env.gas_limit = 21_000;
-                env.gas_price = 10_000_000_000;
-                env.gas_priority_fee = Some(1_000_000_000);
-                env.nonce = *nonce;
-                env.tx_type = 2;
-                env.chain_id = Some(1);
-                env
+            .map(|(s, nonce)| TxEnv {
+                caller: addr(*s),
+                kind: TxKind::Call(addr(1_000_000 + s * 1_000 + nonce)),
+                value: U256::from(1),
+                gas_limit: 21_000,
+                gas_price: 10_000_000_000,
+                gas_priority_fee: Some(1_000_000_000),
+                nonce: *nonce,
+                tx_type: 2,
+                chain_id: Some(1),
+                ..Default::default()
             })
             .collect();
         let header = Header {

@@ -893,13 +893,33 @@ fn main() {
                     .then(|| n42::queue_prune::spawn_thread(queue.clone()))
                     .flatten();
                 let prune_feed_lean = pruner.is_some() && n42::queue_prune::feed_lean();
+                let backfill_provider = node.provider.clone();
                 tokio::spawn(async move {
+                    // Heights a lagged receiver skipped are read back and
+                    // pruned ahead of the notification that shows them
+                    // (R3-P4).
+                    let mut watch = n42::queue_prune::GapWatch::default();
                     loop {
                         match canonical.recv().await {
                             Ok(notification) => {
                                 let behind = canonical.len();
                                 if behind > 8 {
                                     warn!(target: "reth::cli", behind, "canonical subscriber lag: queue pruner");
+                                }
+                                if let Some(gap) = watch.before(&notification) {
+                                    let provider = backfill_provider.clone();
+                                    let read = tokio::task::spawn_blocking(move || {
+                                        n42::queue_prune::backfill(gap, |range| {
+                                            reth_provider::BlockReader::recovered_block_range(&provider, range)
+                                        })
+                                    })
+                                    .await
+                                    .unwrap_or_default();
+                                    if !read.is_empty() {
+                                        n42::queue_prune::forward(&mut pruner, n42::queue_prune::PruneFeed::Lean(read), |feed| {
+                                            n42::queue_prune::prune_feed_inline(&queue, &feed)
+                                        });
+                                    }
                                 }
                                 match pruner {
                                     Some(_) => {
@@ -934,8 +954,11 @@ fn main() {
                                         loop {
                                             match canonical.try_recv() {
                                                 Ok(next) => batch.push(next),
+                                                // Ends the fold: the stretch is read
+                                                // back at the next notification.
                                                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                                                     warn!(target: "n42.tx_queue", skipped, "queue pruning fell behind canonical notifications");
+                                                    break;
                                                 }
                                                 Err(_) => break,
                                             }
@@ -957,10 +980,14 @@ fn main() {
                                                     Ok(Ok(next)) => batch.push(next),
                                                     Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                                                         warn!(target: "n42.tx_queue", skipped, "queue pruning fell behind canonical notifications");
+                                                        break;
                                                     }
                                                     Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => break,
                                                 }
                                             }
+                                        }
+                                        for later in &batch[1..] {
+                                            let _ = watch.before(later);
                                         }
                                         let notifications: Vec<_> = batch.iter().collect();
                                         n42::queue_prune::prune_notifications_lean(&queue, &notifications, first_at.elapsed());

@@ -177,10 +177,40 @@ QMDB-counter log to put it in (the read view's lag line is about the view, not t
 | stage | change | verification |
 | --- | --- | --- |
 | 0 | metrics of 3.7 (done in 301f82916) | unit tests; one fleet leg shows the growth rates in the table of section 1 |
-| 1 | read view resolves slots through atomic `Offsets` (3.3), no relocation yet | existing read-view and proof tests; an X22 control pair (the hot read path changes: expect noise) |
+| 1 | read view resolves slots through atomic `Offsets` (3.3), no relocation yet (atomic `Offsets` landed on `design/qmdb-compact-stage1`, 7e379dc62; the slot-resolving view on `design/qmdb-compact-stage1-view`; differences from 3.3 below the table) | existing read-view and proof tests; an X22 control pair (the hot read path changes: expect noise) |
 | 2 | `entries.relocated`, tagged records, `open_existing` from two files, `Offsets` top bit, checkpoint fields; compaction runs but never punches (landed on `design/qmdb-compact-stage2`: d0f98a5d6 refactor, 721c9e744 file and records, 7f96f529c `compact_twigs`, 4b07c285d checkpoint v2 and forest, be7b4e93a export refusal and gauge; differences from this design below the table) | tests: compact, restart, same root and same proofs; same portable snapshot bytes before and after; undo across a compacted boundary refused by construction (3.4a) and tested |
 | 3 | scheduler on the pruner thread, epoch-deferred punching, `punched` in the checkpoint | tests with a fake epoch; a fleet leg reads `entry_bytes_per_live_slot` falling to a plateau; `roll --kill` under load restarts on a punched file |
 | 4 | per-twig `base + u32` offsets for compacted twigs | heap growth per slot halves on the metric; control pair |
+
+Stage 1 as landed (`design/qmdb-compact-stage1-view`, after stage 2), where it differs from or
+adds to 3.3:
+
+- **Index and journals.** `QmdbReadView`'s `SharedOffsetIndex` holds key -> slot; the journals
+  hold each key's prior slot, and the view's floors (`floor`, `head_floor`, `floor_before`) are
+  slot counts. `TruncationGuard::before_truncate` is told the slot count the tree cuts to, not a
+  byte length. `QmdbCompatTree::live_entry_slots` / `QmdbForest::live_entry_slots` and
+  `QmdbForest::entry_offsets_reader` feed `QmdbReadView::build(path, offsets, head, live)`;
+  `BlockChangesParts` carries the block's first slot and count (`max_slot`), so the leased
+  compute no longer collects a per-slot offset list.
+- **Resolution.** `twig_core::entry_view::SlotFileView` resolves a slot with
+  `OffsetsReader::location` (the directory entry and one acquire load of the cell; the length,
+  written at every append, is not read: the view's guards keep it below it) and reads the record
+  from `entries.log` or, bit 63 set, from `entries.relocated`, which it maps the first time a
+  slot points into it (a group is synced before any slot is retargeted at it). No lock is added
+  to the read path.
+- **No 1 TiB limit.** `EntryFileView` maps each file in segments of `VIEW_MAP_BYTES` (1 TiB), each
+  mapping overlapping the next by the longest record, made the first time a read reaches them,
+  up to 1,024 segments (1 PiB). Tests use 64 KiB segments (`build_with_segment_bits`).
+- **The stage-2 copy is retired.** A relocated twig no longer keeps its 2048 old main-file
+  offsets; `QmdbCompatTree::entry_offset` answers `None` for a relocated slot.
+- **Hash-only slots.** A journal can name a slot that died in the block it covers; once
+  compacted such a slot has no payload. A read that meets one, or a location past the view's
+  reach, is declined (a miss flag on the index's key comparisons), never answered from a wrong
+  key; `advance` and a step back invalidate the view on it. Stage 3's horizon must stay at or
+  below `QmdbReadView::journal_floor()` (the oldest journal's slot floor) so this never fires.
+- **Stage 3 hooks, not behaviour.** The reader epoch is the publish to every reader slot (a
+  writer holding each slot's write lock has waited out every read that loaded a location before
+  it); the `punch_after` queue is a TODO in `read_view.rs`'s module documentation.
 
 Stage 2 as landed, where it differs from or adds to the text above:
 
@@ -194,10 +224,10 @@ Stage 2 as landed, where it differs from or adds to the text above:
   to the oldest cursor its own undo records can rewind to. Every group's leaves are hashed from
   its own bytes and checked against the twig's leaf root before it is written. The scan starts
   at twig 0 every call (no cursor yet: stage 3).
-- **Read view offsets (3.3, order note).** `entry_offset(slot)` keeps answering in
+- **Read view offsets (3.3, order note).** `entry_offset(slot)` kept answering in
   `entries.log` for a relocated slot, from a copy of the twig's main-file offsets kept per
-  relocated twig (16 KiB a compacted twig). That is what keeps the view unchanged in this stage;
-  stage 1 (slot-resolving view) or stage 3 (punching) retires the copy.
+  relocated twig (16 KiB a compacted twig). That is what kept the view unchanged in this stage;
+  stage 1 (slot-resolving view, above) retired the copy.
 - **Open (3.6).** The walk of `entries.relocated` stops at the first group that is torn, fails
   its CRC, is malformed, or names a twig not wholly inside the kept slots (a shorter historical
   prefix, or a main file cut back by an archive restore), and a writable open cuts it there. In

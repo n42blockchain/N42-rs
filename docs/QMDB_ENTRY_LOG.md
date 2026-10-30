@@ -176,6 +176,13 @@ Open walks `entries.log` as before, then `entries.relocated` group by group, poi
 complete group's slots at it (a later group of the same twig wins). The walk stops at the first
 group that is torn, fails its CRC, is malformed, or names a twig not wholly inside the kept
 slots, and a writable open cuts the file there. In stage 2 a lost group loses nothing. The
-file-mode checkpoint (`ForestCheckpoint` version 2) records `relocated_len`. The read view still
-reads byte offsets in `entries.log` (`QmdbCompatTree::entry_offset` answers there for a relocated
-slot too). `FileEntries::create` removes a stale `entries.relocated`.
+file-mode checkpoint (`ForestCheckpoint` version 2) records `relocated_len`. Since compaction
+stage 1 the read view indexes keys by slot and resolves each slot through the tree's shared
+offsets (`OffsetsReader::location`, one acquire load), so a relocated slot is read from
+`entries.relocated` (`entry_view::SlotFileView`, which maps that file the first time a slot
+points into it); `QmdbCompatTree::entry_offset` answers `None` for a relocated slot, and the
+per-twig copy of the old main-file offsets that stage 2 kept for the view is gone. The view maps
+each file in 1 TiB segments, each overlapping the next by the longest record, up to 1,024
+segments (1 PiB), and its index names 2^40 slots, the tree's own limit: the old invalidation of
+the view once `entries.log` passed 1 TiB is gone. `FileEntries::create` removes a stale
+`entries.relocated`.

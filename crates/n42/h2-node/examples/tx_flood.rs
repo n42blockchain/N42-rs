@@ -1029,6 +1029,95 @@ fn submit(
     }
 }
 
+/// How many times a refused funding transaction is sent again, and the pause
+/// before each try. Funding is one nonce sequence from the faucet: a single
+/// refusal leaves a nonce hole, nothing after it is mined, and the round dies
+/// in "funding did not mine" (loop351 SMPABAb, LWa, LZ2, VXa: one valid-looking
+/// transfer refused as "expected a valid hex string").
+const FUNDING_RETRIES: usize = 3;
+const FUNDING_RETRY_PAUSE: Duration = Duration::from_millis(200);
+
+/// What a refusal of one funding transaction means for the nonce sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FundingRefusal {
+    /// The node already has it, or has mined it: the nonce is not a hole.
+    Settled,
+    /// Anything else: send the same bytes (the same nonce) again.
+    Retry,
+}
+
+/// Reads one `eth_sendRawTransaction` error object.
+fn funding_refusal(error: &Value) -> FundingRefusal {
+    let message = error.get("message").and_then(Value::as_str).unwrap_or_default().to_ascii_lowercase();
+    if message.contains("already known") || message.contains("nonce too low") || message.contains("already imported") {
+        FundingRefusal::Settled
+    } else {
+        FundingRefusal::Retry
+    }
+}
+
+/// [`submit`] for the faucet's funding batch, whose transactions are one
+/// nonce sequence starting at `first_nonce`: every refused one is logged with
+/// its nonce and the node's words, and sent again by itself up to
+/// [`FUNDING_RETRIES`] times. What is still refused after that is counted as
+/// rejected; a refusal that means the node has it already counts as sent.
+fn submit_funding(
+    client: &reqwest::blocking::Client,
+    rpc: &str,
+    batch: &[String],
+    first_nonce: u64,
+    sent: &AtomicU64,
+    rejected: &AtomicU64,
+) {
+    let send = |raws: &[(usize, &String)]| -> Result<Vec<(usize, Value)>, String> {
+        let body: Vec<Value> = raws
+            .iter()
+            .map(|(id, raw)| json!({"jsonrpc": "2.0", "id": id, "method": "eth_sendRawTransaction", "params": [raw]}))
+            .collect();
+        match client.post(rpc).json(&body).send().and_then(reqwest::blocking::Response::json::<Value>) {
+            Ok(Value::Array(results)) => Ok(results
+                .iter()
+                .filter_map(|r| Some((usize::try_from(r.get("id")?.as_u64()?).ok()?, r.get("error")?.clone())))
+                .collect()),
+            Ok(other) => Err(format!("batch refused: {other}")),
+            Err(err) => Err(format!("submit failed: {err}")),
+        }
+    };
+    let mut pending: Vec<(usize, &String)> = batch.iter().enumerate().collect();
+    for attempt in 0..=FUNDING_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(FUNDING_RETRY_PAUSE);
+        }
+        let refused = match send(&pending) {
+            Ok(refused) => refused,
+            Err(err) => {
+                eprintln!("funding      : attempt {attempt}: {err}");
+                continue;
+            }
+        };
+        let mut again = Vec::new();
+        for (id, error) in &refused {
+            let nonce = first_nonce + *id as u64;
+            let verdict = funding_refusal(error);
+            eprintln!("funding      : nonce {nonce} refused (attempt {attempt}, {verdict:?}): {error}");
+            if verdict == FundingRefusal::Retry {
+                if let Some(raw) = batch.get(*id) {
+                    again.push((*id, raw));
+                }
+            }
+        }
+        sent.fetch_add((pending.len() - again.len()) as u64, Ordering::Relaxed);
+        pending = again;
+        if pending.is_empty() {
+            return;
+        }
+    }
+    for (id, raw) in &pending {
+        eprintln!("funding      : nonce {} still refused after {FUNDING_RETRIES} retries: {raw}", first_nonce + *id as u64);
+    }
+    rejected.fetch_add(pending.len() as u64, Ordering::Relaxed);
+}
+
 /// The same funding batch to every other node's RPC. Without transaction
 /// gossip (`F7_NO_TX_GOSSIP=1`) a pool holds only what was sent to it, and a
 /// leader tenure longer than the funding wait never mines funding sent to
@@ -1106,13 +1195,13 @@ fn fund(
         if batch.len() >= args.rpc_batch {
             // Funding is one nonce sequence from the faucet and it either goes
             // in or the round is over; the prefix count is for the flood.
-            let _ = submit(client, rpc, &batch, &sent, &rejected);
+            submit_funding(client, rpc, &batch, nonce - batch.len() as u64, &sent, &rejected);
             fund_others(client, args, &batch);
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        let _ = submit(client, rpc, &batch, &sent, &rejected);
+        submit_funding(client, rpc, &batch, nonce - batch.len() as u64, &sent, &rejected);
         fund_others(client, args, &batch);
     }
     println!(
@@ -2464,5 +2553,19 @@ mod tests {
             elapsed >= Duration::from_millis(400) && elapsed < Duration::from_millis(700),
             "expected ~500ms to refill 500 tokens at 1000/s, got {elapsed:?}"
         );
+    }
+
+    /// A refusal that means the node holds or mined the transaction leaves no
+    /// nonce hole; anything else (the loop351 "expected a valid hex string",
+    /// a full pool) is sent again.
+    #[test]
+    fn only_a_refusal_that_leaves_a_nonce_hole_is_retried() {
+        let error = |message: &str| json!({"code": -32000, "message": message});
+        assert_eq!(funding_refusal(&error("already known")), FundingRefusal::Settled);
+        assert_eq!(funding_refusal(&error("nonce too low: next nonce 200, tx nonce 0")), FundingRefusal::Settled);
+        assert_eq!(funding_refusal(&error("txpool is full")), FundingRefusal::Retry);
+        let hex = json!({"code": -32602, "data": "invalid value: string \"0x02\", expected a valid hex string", "message": "Invalid params"});
+        assert_eq!(funding_refusal(&hex), FundingRefusal::Retry);
+        assert_eq!(funding_refusal(&json!({})), FundingRefusal::Retry);
     }
 }

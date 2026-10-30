@@ -144,14 +144,17 @@ mod tests {
 
     #[test]
     fn a_note_survives_until_it_is_replaced_or_crowded_out() {
-        let built = B256::repeat_byte(0xa1);
-        remember(built, B256::repeat_byte(0xb1));
-        assert_eq!(filed_under(built), Some(B256::repeat_byte(0xb1)));
+        // The notes are one table for the whole process, so this test's
+        // hashes are bytes no other test of the crate files anything under
+        // (`fields_at_seal` renames 0xc1 to 0xc2 beside it).
+        let built = B256::repeat_byte(0x3c);
+        remember(built, B256::repeat_byte(0x3d));
+        assert_eq!(filed_under(built), Some(B256::repeat_byte(0x3d)));
         // The real seal replaces the chain's guess.
-        remember(built, B256::repeat_byte(0xb2));
-        assert_eq!(filed_under(built), Some(B256::repeat_byte(0xb2)));
+        remember(built, B256::repeat_byte(0x3e));
+        assert_eq!(filed_under(built), Some(B256::repeat_byte(0x3e)));
         // A rename to the same hash is not a move and leaves no note.
-        let same = B256::repeat_byte(0xc1);
+        let same = B256::repeat_byte(0x4d);
         remember(same, same);
         assert_eq!(filed_under(same), None);
         // Bounded.

@@ -39,7 +39,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{Hash, NULL_HASH, TWIG_SIZE, hash_leaf};
+use crate::{
+    Hash, NULL_HASH, TWIG_SIZE, hash_leaf,
+    offsets::{Offsets, OffsetsReader},
+};
 
 /// Fault injection for the entry file's appends (feature `failpoints`, for
 /// tests of callers that must survive a failed write): an armed path's next
@@ -301,88 +304,6 @@ fn populate_off_lock(map: &std::sync::Arc<memmap2::Mmap>) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = map;
-}
-
-/// Where each slot's record starts, in segments of
-/// [`crate::prefault::OFFSET_SEGMENT_SLOTS`] slots instead of one `Vec`: a
-/// `Vec` of a hundred million offsets grows by doubling, a copy of up to a
-/// gigabyte into fresh pages inside one block's apply, under the tree's lock
-/// (BREAKTHROUGH_DESIGN 10.42). A segment is 8 MiB, taken already faulted in
-/// from the prefault thread.
-#[derive(Clone, Default)]
-struct Offsets {
-    segments: Vec<Box<[u64]>>,
-    len: usize,
-}
-
-impl Offsets {
-    const BITS: u32 = crate::prefault::OFFSET_SEGMENT_BITS;
-    const MASK: usize = crate::prefault::OFFSET_SEGMENT_SLOTS - 1;
-
-    fn from_vec(offsets: Vec<u64>) -> Self {
-        let mut out = Self::default();
-        for offset in offsets {
-            out.push(offset);
-        }
-        out
-    }
-
-    const fn len(&self) -> usize {
-        self.len
-    }
-
-    fn get(&self, slot: usize) -> Option<u64> {
-        (slot < self.len).then(|| self.segments[slot >> Self::BITS][slot & Self::MASK])
-    }
-
-    /// Replaces `slot`'s offset (a compaction retargeting the slot).
-    fn set(&mut self, slot: usize, offset: u64) {
-        assert!(slot < self.len, "offset {slot} past {} slots", self.len);
-        self.segments[slot >> Self::BITS][slot & Self::MASK] = offset;
-    }
-
-    fn push(&mut self, offset: u64) {
-        let slot = self.len;
-        if slot >> Self::BITS == self.segments.len() {
-            self.segments.push(crate::prefault::take_offset_segment());
-        }
-        self.segments[slot >> Self::BITS][slot & Self::MASK] = offset;
-        self.len += 1;
-    }
-
-    /// Appends `offsets` in order: what one [`Self::push`] each leaves, a
-    /// segment's run at a time.
-    #[cfg(feature = "rayon")]
-    fn extend_from_slice(&mut self, mut offsets: &[u64]) {
-        while !offsets.is_empty() {
-            let slot = self.len;
-            if slot >> Self::BITS == self.segments.len() {
-                self.segments.push(crate::prefault::take_offset_segment());
-            }
-            let at = slot & Self::MASK;
-            let run = (crate::prefault::OFFSET_SEGMENT_SLOTS - at).min(offsets.len());
-            self.segments[slot >> Self::BITS][at..at + run].copy_from_slice(&offsets[..run]);
-            self.len += run;
-            offsets = &offsets[run..];
-        }
-    }
-
-    fn truncate(&mut self, len: usize) {
-        if len >= self.len {
-            return;
-        }
-        self.len = len;
-        self.segments.truncate(len.div_ceil(crate::prefault::OFFSET_SEGMENT_SLOTS));
-    }
-}
-
-impl std::ops::Index<usize> for Offsets {
-    type Output = u64;
-
-    fn index(&self, slot: usize) -> &u64 {
-        assert!(slot < self.len, "offset {slot} past {} slots", self.len);
-        &self.segments[slot >> Self::BITS][slot & Self::MASK]
-    }
 }
 
 /// One append-only file of the entry store, mapped for reads: the sealed
@@ -803,7 +724,7 @@ impl FileEntries {
             main,
             relocated,
             twigs,
-            offsets: Offsets::from_vec(offsets),
+            offsets: Offsets::from_vec(offsets)?,
             active: vec![0u64; (kept as usize).div_ceil(64)],
         };
         for (word, bits) in store.active.iter_mut().zip(active) {
@@ -824,7 +745,7 @@ impl FileEntries {
             total_slots: self.offsets.len() as u64,
             live_slots: live as u64,
             file_bytes: self.main.len_bytes,
-            offsets_bytes: (self.offsets.segments.len() * crate::prefault::OFFSET_SEGMENT_SLOTS * 8) as u64,
+            offsets_bytes: (self.offsets.allocated_segments() * crate::prefault::OFFSET_SEGMENT_SLOTS * 8) as u64,
             index_bytes: 0,
             chunks: self.main.chunks.len() as u64,
             relocated_bytes: self.relocated_len(),
@@ -850,7 +771,7 @@ impl FileEntries {
     /// its own length field, not from the next slot's offset, which may
     /// point into the other file.
     pub(crate) fn read(&self, slot: usize) -> SlotRef<'_> {
-        let raw = self.offsets[slot];
+        let raw = self.offsets.at(slot);
         if raw & RELOCATED_BIT == 0 {
             return payload_at(self.main.bytes_from(raw));
         }
@@ -871,6 +792,11 @@ impl FileEntries {
         self.offsets.len()
     }
 
+    /// A lock-free reader of the slots' offsets (`crate::offsets`).
+    pub(crate) fn offsets_reader(&self) -> OffsetsReader {
+        self.offsets.reader()
+    }
+
     /// Where `slot`'s record starts in `entries.log`: the main file keeps
     /// every slot's record in this stage, a compacted one included, so the
     /// read view's byte offsets stay valid.
@@ -886,7 +812,7 @@ impl FileEntries {
     /// confirmation read, so a record in the main file -- every slot but a
     /// compacted one -- is read without its length.
     fn key(&self, slot: usize) -> Option<&Hash> {
-        let raw = self.offsets[slot];
+        let raw = self.offsets.at(slot);
         if raw & RELOCATED_BIT == 0 {
             return Some(as_hash(&self.main.bytes_from(raw)[..KEY_LEN]));
         }
@@ -950,6 +876,9 @@ impl FileEntries {
     pub(crate) fn push(&mut self, key: &Hash, value: &[u8]) -> io::Result<()> {
         self.main.writable()?;
         let slot = self.offsets.len();
+        // Room for the offset before the record, so a refusal leaves both as
+        // they were.
+        self.offsets.reserve(slot + 1)?;
         let record_len = KEY_LEN + LEN_LEN + value.len();
         // Sealed before the record that would not fit rather than after the
         // one that overflowed: the tail never outgrows `CHUNK_BYTES`, so its
@@ -968,7 +897,7 @@ impl FileEntries {
         main.tail.extend_from_slice(key);
         main.tail.extend_from_slice(&(value.len() as u32).to_le_bytes());
         main.tail.extend_from_slice(value);
-        self.offsets.push(main.len_bytes);
+        self.offsets.push(main.len_bytes)?;
         main.len_bytes += record_len as u64;
         if self.active.len() * 64 <= slot {
             self.active.push(0);
@@ -997,6 +926,12 @@ impl FileEntries {
         let main = &mut self.main;
         for (key, value) in records.clone() {
             let record_len = KEY_LEN + LEN_LEN + value.len();
+            // The offset's room first: a refusal stops here like a failed
+            // seal, keeping the records copied before it.
+            if let Err(error) = self.offsets.reserve(first_slot + copied + 1) {
+                sealed = Err(error);
+                break;
+            }
             if !main.tail.is_empty()
                 && main.tail.len() + record_len > CHUNK_BYTES
                 && let Err(error) = main.seal_tail()
@@ -1020,7 +955,8 @@ impl FileEntries {
         faults.entries += entries_done.saturating_sub(at);
         let mut offset = first_byte;
         for (_, value) in records.take(copied) {
-            self.offsets.push(offset);
+            // Reserved in the copy loop; cannot refuse.
+            self.offsets.push(offset)?;
             offset += (KEY_LEN + LEN_LEN + value.len()) as u64;
         }
         let offsets_done = crate::prefault::thread_faults();
@@ -1063,6 +999,7 @@ impl FileEntries {
                 main.seal_tail()?;
                 continue;
             }
+            self.offsets.reserve(self.offsets.len() + (to - from))?;
             if main.tail.capacity() < CHUNK_BYTES {
                 main.tail.reserve_exact(CHUNK_BYTES.max(main.tail.len() + bytes) - main.tail.len());
             }
@@ -1118,7 +1055,7 @@ impl FileEntries {
                 *start += first_byte;
             }
             main.len_bytes += bytes as u64;
-            self.offsets.extend_from_slice(&starts);
+            self.offsets.extend_from_slice(&starts)?;
             self.set_active_run(first_slot, first_slot + (to - from));
             from = to;
         }
@@ -1173,7 +1110,7 @@ impl FileEntries {
                 self.main.path.display()
             )));
         }
-        let new_len_bytes = self.offsets[len];
+        let new_len_bytes = self.offsets.at(len);
         self.offsets.truncate(len);
         for slot in len..self.active.len() * 64 {
             self.set_active(slot, false);
@@ -1262,8 +1199,8 @@ impl FileEntries {
         let reclaimable = match self.twigs.get(&twig) {
             Some(relocated) => relocated.group_len,
             None => {
-                let first = self.offsets[base];
-                let last = self.offsets[base + TWIG_SIZE - 1];
+                let first = self.offsets.at(base);
+                let last = self.offsets.at(base + TWIG_SIZE - 1);
                 debug_assert_eq!((first | last) & RELOCATED_BIT, 0);
                 let SlotRef::Payload(_, value) = payload_at(self.main.bytes_from(last)) else { unreachable!() };
                 last + (KEY_LEN + LEN_LEN + value.len()) as u64 - first
@@ -1280,7 +1217,7 @@ impl FileEntries {
         file.sync()?;
         let main: Box<[u64]> = match self.twigs.remove(&twig) {
             Some(relocated) => relocated.main,
-            None => (base..base + TWIG_SIZE).map(|slot| self.offsets[slot]).collect(),
+            None => (base..base + TWIG_SIZE).map(|slot| self.offsets.at(slot)).collect(),
         };
         for (local, at) in group.starts.iter().enumerate() {
             self.offsets.set(base + local, (start + u64::from(*at)) | RELOCATED_BIT);
@@ -1772,6 +1709,14 @@ impl Entries {
         match self {
             Self::Heap(_) => None,
             Self::File(file) => Some(file.path()),
+        }
+    }
+
+    /// A lock-free reader of the file's slot offsets; `None` in the heap.
+    pub(crate) fn offsets_reader(&self) -> Option<OffsetsReader> {
+        match self {
+            Self::Heap(_) => None,
+            Self::File(file) => Some(file.offsets_reader()),
         }
     }
 }

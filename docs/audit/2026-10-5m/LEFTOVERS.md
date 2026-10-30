@@ -77,7 +77,7 @@ Rust 现状:
 | R2-C1 余项 | ROUND2 | 入站 `high_tc` 采纳:**Windows 已修(见 `git log --grep R2-C1`)**;只在 TC 能让本节点前进时验证,无需缓存。Linux devnet gov5 五形态(含 absent/late)10-30 覆盖,通过 |
 | R2-R2 | ROUND2 | 按 view leader 校验头部封印。**Windows 已修(见 `git log --grep R2-R2`)** |
 | R2-C9 余项 | ROUND2 | ~~gov5 header vote / deferred vote 未移植~~ **已修**(Windows,aab6c13b1 / 47afc33ee;deferred vote 已由 `BlockChecked` 覆盖)。Linux 10-30 与 gov5 两阶段 fleet 混跑通过:devnet 基因副本 `twoPhaseVoteGate: true`(Rust 验证者打印 `vote gate : two-phase`,gov5 链库 chainspec 同值),gov5late2p 160 块 / gov5now2p 133 块两客户端同哈希、gov5 error 0、Rust 超时数与普通形态相同 |
-| R2-X4 余项 | ROUND2 | 声明不按声明者分键(EL 不知道 peer)。**Windows 评估后暂缓:需 h2-node 与 EL 两端协议改动,见 ROUND3 状态行** |
+| R2-X4 余项 | ROUND2 | 声明不按声明者分键(EL 不知道 peer)。**已修(待 A/B)**(Linux,分支 `fix/r2-x4-claims-by-source`,未合 main):h2-node 带来源转发至多 4 份不同 layout,EL 每 root 每来源一槽;见 ROUND2 状态行。A/B:只在整块回退路径(本节点无自己的 layout)生效,常见情形(一份 body)不变 |
 
 ## E. 需要用户操作
 

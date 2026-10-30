@@ -19,7 +19,7 @@ Windows 合入的改动由 Linux 在下一次整体验证时一并覆盖。
 
 | 项 | 来源 | 内容 | 负责 | 状态 |
 |---|---|---|---|---|
-| R3-N5 余项 | ROUND3 | Timeout 先查重再验签(当前先验签,重复的 Timeout 每条都付一次 BLS 验证) | Windows | 待做 |
+| R3-N5 余项 | ROUND3 | Timeout 先查重再验签(当前先验签,重复的 Timeout 每条都付一次 BLS 验证) | Windows | 已修(见 `git log --grep R3-N5`) |
 | R3-N3 余项 | ROUND3 | by-hash 回复先核头哈希再解 body | Windows | 待做 |
 | R3-P9 | ROUND3 | EL 响应体按字节上限读取(`h2-el-rpc` transport) | Windows | 待做 |
 | R3-P8 余项 | ROUND3 | APoS 验证队列入队前校验成员与块哈希 | Windows | 待做 |

@@ -342,6 +342,18 @@ impl ConsensusEngine {
             return Ok(());
         }
 
+        // A sender already counted for this view: every further copy (two
+        // gossip topics, direct streams, relays) is dropped before its BLS
+        // verification, as the future path above does (audit 2026-10 round 3,
+        // R3-N5). The collector keeps the first verified copy either way.
+        if self
+            .timeout_collector
+            .as_ref()
+            .is_some_and(|collector| collector.view() == view && collector.has_timeout_from(timeout.sender))
+        {
+            return Ok(());
+        }
+
         // Current-view timeout processing.
         let view_set = self.validator_set_for_view(view);
         let pk = view_set.get_public_key(timeout.sender)?;

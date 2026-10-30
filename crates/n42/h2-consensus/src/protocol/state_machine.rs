@@ -4772,6 +4772,41 @@ mod tests {
         }
     }
 
+    /// Audit 2026-10 round 3 (R3-N5): a current-view timeout was verified
+    /// before the collector was asked whether its sender was counted, so
+    /// every copy (two gossip topics, direct streams, relays) paid a BLS
+    /// verification. A counted sender's copy is now dropped unverified.
+    #[test]
+    fn test_a_counted_senders_timeout_copy_is_not_verified_again() {
+        use crate::protocol::quorum::timeout_signing_message;
+        use n42_h2_primitives::consensus::TimeoutMessage;
+
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let view = 1u64;
+        engine.on_timeout().expect("timeout should succeed");
+        while rx.try_recv().is_ok() {}
+
+        let counted = TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 2,
+            signature: sks[2].sign(&timeout_signing_message(view)),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(counted)))
+            .expect("the first copy is counted");
+        // A copy whose signature would not verify shows whether it was checked.
+        let copy = TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 2,
+            signature: sks[2].sign(&timeout_signing_message(999)),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(copy)))
+            .expect("a counted sender's copy is dropped before verification");
+    }
+
     #[test]
     fn test_consensus_succeeds_despite_invalid_votes() {
         use crate::protocol::quorum::{commit_signing_message, signing_message};

@@ -904,37 +904,55 @@ impl TransportCore {
             let event = self.swarm.select_next_some().await;
             match event {
                 SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                    propagation_source,
+                    message_id,
                     message,
-                    ..
                 })) => {
-                    if message.topic == self.block_topic.hash() {
-                        return Some(TransportEvent::Block {
-                            from: message.source,
-                            data: message.data,
-                        });
-                    }
-                    if message.topic == self.tx_topic.hash() {
-                        return Some(TransportEvent::Transactions {
-                            from: message.source,
-                            data: message.data,
-                        });
-                    }
-                    if message.topic == self.native_topic.hash() {
-                        return Some(match decode_gov5_gossip_message(&message.data) {
+                    // Forwarded only once decoded (R3-N4): a consensus
+                    // message that does not decode is rejected and goes no
+                    // further, a body or a transaction batch (decoded above
+                    // the transport) is accepted, another topic ignored. A
+                    // refusal names the peer that delivered it, as an
+                    // anonymous message carries no author.
+                    let event = if message.topic == self.block_topic.hash() {
+                        Some(TransportEvent::Block { from: message.source, data: message.data })
+                    } else if message.topic == self.tx_topic.hash() {
+                        Some(TransportEvent::Transactions { from: message.source, data: message.data })
+                    } else if message.topic == self.native_topic.hash() {
+                        Some(match decode_gov5_gossip_message(&message.data) {
                             Ok(decoded) => TransportEvent::Native {
                                 from: message.source,
                                 message: Box::new(decoded),
                             },
                             Err(err) => TransportEvent::Rejected {
-                                from: message.source,
+                                from: Some(propagation_source),
                                 reason: format!("native message: {err}"),
                             },
-                        });
+                        })
+                    } else if message.topic == self.topic.hash() {
+                        Some(match self.decode_payload(message.source, &message.data) {
+                            TransportEvent::Rejected { reason, .. } => {
+                                TransportEvent::Rejected { from: Some(propagation_source), reason }
+                            }
+                            decoded => decoded,
+                        })
+                    } else {
+                        None
+                    };
+                    let verdict = match &event {
+                        None => gossipsub::MessageAcceptance::Ignore,
+                        Some(TransportEvent::Rejected { .. }) => gossipsub::MessageAcceptance::Reject,
+                        Some(_) => gossipsub::MessageAcceptance::Accept,
+                    };
+                    let _ = self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        verdict,
+                    );
+                    match event {
+                        Some(event) => return Some(event),
+                        None => continue,
                     }
-                    if message.topic != self.topic.hash() {
-                        continue;
-                    }
-                    return Some(self.decode_payload(message.source, &message.data));
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(
                     gossipsub::Event::Subscribed { peer_id, topic },

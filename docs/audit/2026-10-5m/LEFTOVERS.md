@@ -26,7 +26,7 @@ Windows 合入的改动由 Linux 在下一次整体验证时一并覆盖。
 | R3-E3 | ROUND3 | 并行执行器单笔 gas_limit ≤ 剩余 gas 的加固检查(当前不可达) | Linux(随 E1,同在装块热路径) | 待做 |
 | R3-N1 余项 | ROUND3 | 每 peer 入站 RPC 连接上限 | Windows | 已修(见 `git log --grep R3-N1`) |
 | R2-X2 余项 | ROUND2 | tx-ingest 帧间空闲超时(端口默认只绑回环) | Windows | 不修(帧体已有期限,见 ROUND3) |
-| R3-C2 | ROUND3 | 头部 QC 共用检查(实时路径投票闸门),方案见下 | 待认领(落在投票热路径,需 A/B 与 devnet gov5) | 方案已出 |
+| R3-C2 | ROUND3 | 头部 QC 共用检查(实时路径投票闸门),方案见下 | Windows 写(10-30 认领),Linux 验 A/B 与 devnet gov5 | 实现中 |
 
 ### R3-C2 实现方案(Windows 会话 10-30 读码结论)
 

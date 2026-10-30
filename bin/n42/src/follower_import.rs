@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
-use reth_consensus::{Consensus, FullConsensus, HeaderValidator};
+use reth_consensus::{FullConsensus};
 use n42_tx_types::{Block, N42Primitives as EthPrimitives, N42TxEnvelope as TransactionSigned};
 use reth_primitives_traits::transaction::TxHashRef as _;
 use reth_evm::{execute::Executor, ConfigureEvm};
@@ -63,6 +63,7 @@ pub static HANDOFF_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub const HANDOFF_STAGES: [&str; 8] = ["idle", "lookup", "handoff", "payload", "new-payload", "-", "-", "-"];
 
 /// Sets [`HANDOFF_STAGE`] while alive, clears it on drop.
+#[derive(Debug)]
 pub struct HandoffStage(pub u64);
 
 impl HandoffStage {
@@ -768,7 +769,7 @@ fn two_roads<T>(
     };
     let (voted, executed, exec_ms) = std::thread::scope(|scope| {
         let run_vote = &run_vote;
-        match std::thread::Builder::new().name("vote-road".into()).spawn_scoped(scope, move || run_vote()) {
+        match std::thread::Builder::new().name("vote-road".into()).spawn_scoped(scope, run_vote) {
             Ok(voted) => {
                 let executed = execute();
                 let exec_ms = roads_at.elapsed().as_millis() as u64;
@@ -905,7 +906,7 @@ where
 }
 
 /// The includability of a block's transactions on its parent's post-state
-/// (docs/PHASE_D_DEFERRED_EXECUTION.md, section 8.4): what a follower's
+/// (`docs/PHASE_D_DEFERRED_EXECUTION.md`, section 8.4): what a follower's
 /// vote attests under deferred execution, since the block's execution is
 /// checked only by the next header. Per sender, one account read: the
 /// nonces contiguous from the account's, the balance covering every
@@ -1324,7 +1325,7 @@ fn fold_runs(scans: Vec<ChunkScan>) -> Vec<(Address, SenderTotal)> {
 /// check chunked the block by frame instead of by a plain 32nd (a different
 /// chunking folds the senders into the map in a different order). Both paths
 /// call this, so both settle on the same sender.
-fn fault_order(fault: &Fault) -> (usize, &str) {
+const fn fault_order(fault: &Fault) -> (usize, &str) {
     (fault.index, fault.message.as_str())
 }
 
@@ -2566,9 +2567,7 @@ where
     let mut roads_at = None;
     // `N42_FOLLOWER_EXEC_EARLY=1` took this block: the check runs on the vote road.
     let mut early_check = false;
-    if !deferred {
-        against_parent()?;
-    } else {
+    if deferred {
         // What the vote attests: the header's execution fields are this
         // node's result for the parent, and every transaction is includable
         // on the parent's post-state.
@@ -2682,6 +2681,8 @@ where
                 );
             }
         }
+    } else {
+        against_parent()?;
     }
 
     // The parent in the engine, for a block whose execution reads it there.
@@ -3720,7 +3721,7 @@ fn carry_async() -> bool {
 /// Whether the QMDB root and the hashed post-state run together on the worker
 /// pool (default; `N42_ROOT_HASHED_PARALLEL=0` runs them one after the other).
 /// They read the same bundle and neither needs the other: the pair measured
-/// 94 -> 81 ms and was adopted (docs/FLEET7_STATUS.md), but the default had
+/// 94 -> 81 ms and was adopted (`docs/FLEET7_STATUS.md`), but the default had
 /// stayed off and no launcher set it. In parallel the pair is reported as
 /// `root_ms` with `hashed_ms` zero.
 fn root_hashed_parallel() -> bool {

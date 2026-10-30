@@ -14,8 +14,10 @@ use tree_hash::TreeHash;
 
 pub use reth_chainspec::{DEVNET_DEPOSIT_CONTRACT_ADDRESS, TESTNET_DEPOSIT_CONTRACT_ADDRESS};
 
+/// Address of the EIP-7002 withdrawal request contract.
 pub const EIP7002_CONTRACT_ADDRESS: &str = "0x00000961Ef480Eb55e80D19ad83579A64c007002";
 
+/// Builds the unsigned transaction that deposits to the deposit contract for a validator key.
 pub fn create_deposit_unsigned_tx(
     deposit_contract_address: &str,
     validator_private_key: &str,
@@ -24,7 +26,7 @@ pub fn create_deposit_unsigned_tx(
 ) -> eyre::Result<TransactionRequest> {
     let addr_hex = withdrawal_address
         .strip_prefix("0x")
-        .unwrap_or(&withdrawal_address);
+        .unwrap_or(withdrawal_address);
     let addr_bytes =
         hex::decode(addr_hex).map_err(|e| eyre::eyre!("invalid withdrawal_address: {}", e))?;
     if addr_bytes.len() != 20 {
@@ -36,11 +38,11 @@ pub fn create_deposit_unsigned_tx(
     let addr = Address::from_slice(&addr_bytes);
 
     let creds = withdrawal_credentials(&addr);
-    debug!("withdrawal_credentials: 0x{}", hex::encode(&creds));
+    debug!("withdrawal_credentials: 0x{}", hex::encode(creds));
 
     let validator_private_key = validator_private_key
         .strip_prefix("0x")
-        .unwrap_or(&validator_private_key);
+        .unwrap_or(validator_private_key);
     let sk = SecretKey::from_bytes(&Vec::from_hex(validator_private_key)?)
         .map_err(|e| eyre::eyre!("SecretKey::from_bytes() error {e:?}"))?;
     let pk = sk.sk_to_pk();
@@ -88,7 +90,7 @@ pub fn create_deposit_unsigned_tx(
     let tx = TransactionRequest {
         to: Some(NameOrAddress::Address(contract_address)),
         data: Some(calldata.into()),
-        value: Some(deposit_value_in_wei.clone()),
+        value: Some(*deposit_value_in_wei),
         // Use a safe fixed gas value for validator deposit tx;
         // this works for validator numbers up to at least 1M+ validators(ethereum mainnet)
         gas: Some(300_000u64.into()),
@@ -107,6 +109,7 @@ fn withdrawal_credentials(withdrawal_address: &alloy_primitives::Address) -> B25
     B256::from(credentials)
 }
 
+/// Builds the unsigned call that reads the current EIP-7002 exit fee.
 pub fn create_get_exit_fee_unsigned_tx() -> eyre::Result<TransactionRequest> {
     let contract_address: ethers::types::Address = EIP7002_CONTRACT_ADDRESS.parse()?;
     let tx = TransactionRequest {
@@ -120,6 +123,7 @@ pub fn create_get_exit_fee_unsigned_tx() -> eyre::Result<TransactionRequest> {
     Ok(tx)
 }
 
+/// Builds the unsigned EIP-7002 transaction that requests the exit of a validator.
 pub fn create_exit_unsigned_tx(
     validator_public_key: &str,
     fee: &Option<U256>,

@@ -1031,6 +1031,7 @@ impl TransportCore {
                 )) => {
                     self.block_guards.remove(&request_id);
                 }
+                #[allow(unreachable_patterns)] // event kinds are handled elsewhere; the arm documents them
                 SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Pushes(
                     request_response::Event::Message { peer, message, .. },
@@ -1112,6 +1113,7 @@ impl TransportCore {
                 )) => {
                     self.range_guards.remove(&request_id);
                 }
+                #[allow(unreachable_patterns)] // event kinds are handled elsewhere; the arm documents them
                 SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(
                     request_response::Event::Message { peer, message, .. },
@@ -1146,6 +1148,7 @@ impl TransportCore {
                 )) => {
                     self.txns_guards.remove(&request_id);
                 }
+                #[allow(unreachable_patterns)] // event kinds are handled elsewhere; the arm documents them
                 SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Votes(
                     request_response::Event::Message { peer, message, .. },

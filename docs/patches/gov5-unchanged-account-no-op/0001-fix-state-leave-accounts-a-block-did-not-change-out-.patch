@@ -1,0 +1,314 @@
+From bc048ef1ad484c7bbf0c7e373ef139ab7f5b85fd Mon Sep 17 00:00:00 2001
+From: MiraWells <1020080523@qq.com>
+Date: Fri, 30 Oct 2026 10:05:19 -0400
+Subject: [PATCH] fix(state): leave accounts a block did not change out of the
+ state root
+
+Gated by a new chain-config time, unchangedAccountNoOpTime (nil = never, the
+old rule). From a block at or past it, computeRootViaComputer gives the root
+computer no leaf for a live account that ends the block as it was read:
+same nonce, balance and code hash as its original, no storage or code
+written, no wiped storage, not created. Deleted and self-destructed accounts
+and the system address (the Prague system calls write it as a live empty
+account every block) are unaffected.
+
+Before it, whether an unchanged account was written depended on the path:
+the serial IntraBlockState writes one whose first access in the block was an
+AddBalance, a zero amount included (the balanceInc path dirties it: a zero
+tip to the coinbase, a zero-value transfer to an account not yet loaded),
+and nothing for the same account loaded earlier in the block
+(stateObject.AddBalance of zero on a live non-empty object journals
+nothing). QMDB's Tree.Set re-appends an unchanged value to a new slot, so
+the root moved with it. The parallel commit (parallel_commit.go Apply and
+parallel_apply_ibs.go) skips a zero CoinbaseDelta; ApplyBlockCommitToIBS
+replays every account it writes through SetBalance, which dirties it, and
+then roots through computeRootViaComputer, so under the rule it agrees with
+the serial path: an unchanged account is left out on both. n42-rs (revm's
+bundle keeps an account only when its transition has a revert) writes no
+leaf for an unchanged account on any path, so on a zero-tip block every
+n42-rs leader's block was rejected by gov5 with a state root mismatch
+(n42-rs audit R3-E2, mixed devnet with devBlockReward 0); with the rule at
+genesis the two clients agree. The Ethereum state root is blind to an
+unchanged account by construction; this makes the QMDB root the same
+function of the block's state change.
+
+HotStuff's Finalize sets the rule from the header's time before the root
+(build and verify path alike). replay-v2 sets it from the rebuilt block's
+time: a base rebuilt for the rule carries unchangedAccountNoOpTime at or
+before its first block in the chain config it is rebuilt under, and the
+operator sets the same time in the genesis the fleet then runs.
+---
+ internal/consensus/hotstuff/adapter.go       |   1 +
+ internal/replay/engine_v2.go                 |   3 +
+ modules/state/intra_block_state.go           |  45 ++++++++
+ modules/state/unchanged_account_noop_test.go | 109 +++++++++++++++++++
+ params/config.go                             |  16 +++
+ params/config_rules.go                       |   6 +
+ 6 files changed, 180 insertions(+)
+ create mode 100644 modules/state/unchanged_account_noop_test.go
+
+diff --git a/internal/consensus/hotstuff/adapter.go b/internal/consensus/hotstuff/adapter.go
+index 9aae0857..0dea519b 100644
+--- a/internal/consensus/hotstuff/adapter.go
++++ b/internal/consensus/hotstuff/adapter.go
+@@ -759,6 +759,7 @@ func (h *HotStuff) Finalize(chain consensus.ChainHeaderReader, iHeader block.IHe
+ 			"coinbase", header.Coinbase, "coinbaseBal", ibs.GetBalance(header.Coinbase).String(),
+ 			"faucetBal", ibs.GetBalance(fa).String(), "txs", len(txs), "dirtyAccts", accts, "dirtySlots", stor)
+ 	}
++	ibs.SetSkipUnchangedAccounts(h.chainConfig.IsUnchangedAccountNoOp(header.Time))
+ 	localRoot := ibs.IntermediateRoot()
+ 	if finalizeTrace {
+ 		log.Warn("finalize trace root", "number", header.Number.Uint64(), "verify", header.Root != (types.Hash{}),
+diff --git a/internal/replay/engine_v2.go b/internal/replay/engine_v2.go
+index 8cda291d..84ebef2f 100644
+--- a/internal/replay/engine_v2.go
++++ b/internal/replay/engine_v2.go
+@@ -944,6 +944,9 @@ func (e *EngineV2) processBatchV2(ctx context.Context, from, to uint64) error {
+ 				// Compute state roots.
+ 				var stateRoot types.Hash
+ 				if e.cfg.EnableJMT || useTrie {
++					// The rebuilt chain's own UnchangedAccountNoOpTime: a base
++					// rebuilt for the rule sets it at or before its first block.
++					ibs.SetSkipUnchangedAccounts(e.cfg.ChainConfig.IsUnchangedAccountNoOp(srcTime))
+ 					stateRoot = ibs.IntermediateRoot()
+ 
+ 					if (useMPT || useTrie) && e.cfg.VerifyMPT {
+diff --git a/modules/state/intra_block_state.go b/modules/state/intra_block_state.go
+index b0bbaeb8..1d212462 100644
+--- a/modules/state/intra_block_state.go
++++ b/modules/state/intra_block_state.go
+@@ -161,6 +161,9 @@ type IntraBlockState struct {
+ 	trace          bool
+ 	accessList     *accessList
+ 	balanceInc     map[types.Address]*BalanceIncrease // Map of balance increases (without first reading the account)
++	// skipUnchanged: the block is past UnchangedAccountNoOpTime, so the root
++	// leaves out touched but unchanged accounts (SetSkipUnchangedAccounts).
++	skipUnchanged bool
+ 
+ 	// balanceReadHook, when non-nil, observes every EXPLICIT balance read
+ 	// (GetBalance — the entry point of the BALANCE/SELFBALANCE opcodes and
+@@ -339,6 +342,13 @@ func (sdb *IntraBlockState) SetRootComputer(rc RootComputer) {
+ 	sdb.rootComputer = rc
+ }
+ 
++// SetSkipUnchangedAccounts sets whether the state root leaves out an account
++// the block touched but did not change (ChainConfig.IsUnchangedAccountNoOp at
++// the block's time); see computeRootViaComputer.
++func (sdb *IntraBlockState) SetSkipUnchangedAccounts(on bool) {
++	sdb.skipUnchanged = on
++}
++
+ func (sdb *IntraBlockState) HasRootComputer() bool {
+ 	return sdb.rootComputer != nil
+ }
+@@ -1709,6 +1719,18 @@ func (s *IntraBlockState) computeRootViaComputer() types.Hash {
+ 			}
+ 			continue
+ 		}
++		// UnchangedAccountNoOpTime: an account touched but left as it was read
++		// writes no leaf. Without the rule it is written whenever its first
++		// access in the block was an AddBalance (a zero tip to the coinbase,
++		// a zero-value transfer to an account not yet loaded: the balanceInc
++		// path dirties it for any amount), which re-appends an unchanged QMDB
++		// leaf and moves the positional root; the parallel commit already
++		// skips a zero CoinbaseDelta and writes only what changed. The system
++		// address is not subject to it: the Prague system calls write it as a
++		// live empty account on every block, and n42-rs does the same.
++		if s.skipUnchanged && s.unchangedThisBlock(addr, obj) {
++			continue
++		}
+ 		acct := new(account.StateAccount)
+ 		acct.Copy(&obj.data)
+ 		accounts[addr] = acct
+@@ -1789,6 +1811,29 @@ func (s *IntraBlockState) computeRootViaComputer() types.Hash {
+ 	return root
+ }
+ 
++// unchangedThisBlock reports whether a live object ends the block as it was
++// read at its start: not created or recreated, no code or storage written,
++// no wiped storage, and the same nonce, balance and code hash as its
++// original (a zero code hash read as the empty-code hash, as newObject
++// normalises the live copy).
++func (s *IntraBlockState) unchangedThisBlock(addr types.Address, obj *stateObject) bool {
++	if addr == SystemAddress || obj.created || obj.dirtyCode || len(obj.dirtyKeys) != 0 || len(s.activeWipedSlots(addr)) != 0 {
++		return false
++	}
++	if !obj.original.Initialised {
++		return false // did not exist before the block
++	}
++	codeHash := func(h types.Hash) types.Hash {
++		if h == (types.Hash{}) {
++			return emptyCodeHashH
++		}
++		return h
++	}
++	return obj.data.Nonce == obj.original.Nonce &&
++		obj.data.Balance.Eq(&obj.original.Balance) &&
++		codeHash(obj.data.CodeHash) == codeHash(obj.original.CodeHash)
++}
++
+ // LastRootDirtySet returns the account/storage dirty set the most recent
+ // computeRootViaComputer call fed to the root computer (nil before any call).
+ // Used to replay the leader's sealed block onto the live tree byte-exactly.
+diff --git a/modules/state/unchanged_account_noop_test.go b/modules/state/unchanged_account_noop_test.go
+new file mode 100644
+index 00000000..bc4328a7
+--- /dev/null
++++ b/modules/state/unchanged_account_noop_test.go
+@@ -0,0 +1,109 @@
++// Copyright 2022-2026 The N42 Authors
++// This file is part of the N42 library.
++
++package state
++
++import (
++	"testing"
++
++	"github.com/holiman/uint256"
++
++	"github.com/n42blockchain/N42/common/account"
++	"github.com/n42blockchain/N42/common/types"
++	"github.com/n42blockchain/N42/params"
++)
++
++// unchangedReader serves a fixed set of existing accounts.
++type unchangedReader struct {
++	accounts map[types.Address]account.StateAccount
++}
++
++func (r unchangedReader) ReadAccountData(addr types.Address) (*account.StateAccount, error) {
++	a, ok := r.accounts[addr]
++	if !ok {
++		return nil, nil
++	}
++	return &a, nil
++}
++func (unchangedReader) ReadAccountStorage(types.Address, *types.Hash) ([]byte, error) {
++	return nil, nil
++}
++func (unchangedReader) ReadAccountCode(types.Address, types.Hash) ([]byte, error)  { return nil, nil }
++func (unchangedReader) ReadAccountCodeSize(types.Address, types.Hash) (int, error) { return 0, nil }
++
++// capturingRootComputer records the accounts a root was computed from.
++type capturingRootComputer struct {
++	accounts map[types.Address]*account.StateAccount
++}
++
++func (c *capturingRootComputer) ComputeRoot(accounts map[types.Address]*account.StateAccount, _ map[types.Address]map[types.Hash]*uint256.Int) (types.Hash, error) {
++	c.accounts = accounts
++	return types.Hash{}, nil
++}
++
++// TestUnchangedAccountNoOp pins UnchangedAccountNoOpTime (audit R3-E2): a
++// zero credit to an account not yet loaded (the coinbase's zero tip, the
++// recipient of a zero-value transfer) dirties it through the balanceInc
++// path, and without the rule its unchanged leaf goes to the root computer;
++// with it, only accounts that changed do. An account loaded before its zero
++// credit is left out either way (stateObject.AddBalance of zero on a live
++// non-empty object journals nothing): the path dependence the rule removes.
++func TestUnchangedAccountNoOp(t *testing.T) {
++	funded := func(balance uint64, nonce uint64) account.StateAccount {
++		a := account.NewAccount()
++		a.Initialised = true // as a stored account decodes
++		a.Balance.SetUint64(balance)
++		a.Nonce = nonce
++		return a
++	}
++	coinbase := types.HexToAddress("0xc0")
++	recipient := types.HexToAddress("0xc1")
++	loaded := types.HexToAddress("0xc2")
++	payer := types.HexToAddress("0xc3")
++	payee := types.HexToAddress("0xc4")
++	reader := unchangedReader{accounts: map[types.Address]account.StateAccount{
++		coinbase:  funded(7, 0),
++		recipient: funded(9, 1),
++		loaded:    funded(3, 0),
++		payer:     funded(100, 2),
++		payee:     funded(1, 0),
++	}}
++	rules := &params.Rules{IsSpuriousDragon: true}
++	for _, skip := range []bool{false, true} {
++		ibs := New(reader)
++		rc := &capturingRootComputer{}
++		ibs.SetRootComputer(rc)
++		ibs.SetSkipUnchangedAccounts(skip)
++		_ = ibs.GetBalance(loaded) // read before its zero credit
++		ibs.AddBalance(recipient, uint256.NewInt(0))
++		ibs.AddBalance(loaded, uint256.NewInt(0))
++		ibs.SubBalance(payer, uint256.NewInt(5))
++		ibs.SetNonce(payer, 3)
++		ibs.AddBalance(payee, uint256.NewInt(5))
++		ibs.AddBalance(coinbase, uint256.NewInt(0))
++		if err := ibs.FinalizeTx(rules, NewNoopWriter()); err != nil {
++			t.Fatal(err)
++		}
++		ibs.IntermediateRoot()
++		for addr, want := range map[types.Address]bool{coinbase: !skip, recipient: !skip, loaded: false, payer: true, payee: true} {
++			if _, got := rc.accounts[addr]; got != want {
++				t.Errorf("skip=%v: %x in the root's accounts = %v, want %v", skip, addr, got, want)
++			}
++		}
++		if got := rc.accounts[payee]; got != nil && got.Balance.Uint64() != 6 {
++			t.Errorf("skip=%v: payee balance %d, want 6", skip, got.Balance.Uint64())
++		}
++	}
++}
++
++// TestIsUnchangedAccountNoOp: unset is the old rule, a time activates it.
++func TestIsUnchangedAccountNoOp(t *testing.T) {
++	c := &params.ChainConfig{}
++	if c.IsUnchangedAccountNoOp(1 << 40) {
++		t.Fatal("unset activates")
++	}
++	c.UnchangedAccountNoOpTime = uint256.NewInt(100).ToBig()
++	if c.IsUnchangedAccountNoOp(99) || !c.IsUnchangedAccountNoOp(100) {
++		t.Fatal("activation time")
++	}
++}
+diff --git a/params/config.go b/params/config.go
+index 6076097a..784ead6d 100644
+--- a/params/config.go
++++ b/params/config.go
+@@ -346,6 +346,22 @@ type ChainConfig struct {
+ 	// transactions are includable against that post-state. Nil = never.
+ 	DeferredExecutionTime *big.Int `json:"deferredExecutionTime,omitempty"`
+ 
++	// UnchangedAccountNoOpTime activates the unchanged-account rule for the
++	// state root: from a block whose timestamp is at or past it, an account
++	// the block touched but left as it was read -- same nonce, balance and
++	// code hash, no storage write, not created, not destroyed -- writes no
++	// leaf. Before it, such an account was written whenever its first access
++	// in the block was an AddBalance (the coinbase credited a zero tip, the
++	// recipient of a zero-value transfer not yet loaded), which re-appends an
++	// unchanged QMDB leaf and moves the positional root, while the parallel
++	// commit (zero CoinbaseDelta skipped) and an account loaded earlier in the
++	// block wrote nothing: one block could commit to two roots by path. With
++	// it the root is the function of the state change the Ethereum root
++	// already is, and the one n42-rs computes (audit R3-E2). N42 extension;
++	// a rebuilt base (replay-v2) carries the time it was rebuilt under.
++	// Nil = never.
++	UnchangedAccountNoOpTime *big.Int `json:"unchangedAccountNoOpTime,omitempty"`
++
+ 	// StateScheme determines the state commitment algorithm for Header.Root.
+ 	// Set at genesis, immutable thereafter. Nodes MUST refuse to start if the
+ 	// configured scheme does not match the database.
+diff --git a/params/config_rules.go b/params/config_rules.go
+index af73958a..5899dd10 100644
+--- a/params/config_rules.go
++++ b/params/config_rules.go
+@@ -461,6 +461,12 @@ func (c *ChainConfig) IsDeferredExecution(time uint64) bool {
+ 	return isForked(c.DeferredExecutionTime, time)
+ }
+ 
++// IsUnchangedAccountNoOp returns whether a block at time leaves an account it
++// touched but did not change out of the state root (UnchangedAccountNoOpTime).
++func (c *ChainConfig) IsUnchangedAccountNoOp(time uint64) bool {
++	return isForked(c.UnchangedAccountNoOpTime, time)
++}
++
+ // IsEip1559FeeCollector returns whether num has reached the EIP-1559 fee collector transition.
+ func (c *ChainConfig) IsEip1559FeeCollector(num uint64) bool {
+ 	return c.Eip1559FeeCollector != nil && isForked(c.Eip1559FeeCollectorTransition, num)
+-- 
+2.53.0
+

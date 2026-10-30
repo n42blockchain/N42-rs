@@ -351,7 +351,7 @@ pub(crate) fn road_stuck_legacy() -> bool {
 /// senders' lanes, in nonce order, up to the block's gas -- instead of
 /// taking nothing until a stuck flush invalidates the road. Each such flush
 /// brought the same untakeable debt back with the whole road behind it, a
-/// flush loop at the cool-down's period (loop351 leg LR1b: 97 stuck
+/// flush loop at the cool-down's period (loop351 leg `LR1b`: 97 stuck
 /// flushes, ~147k-transaction blocks).
 fn road_debt_sweep_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1028,6 +1028,7 @@ impl<T: PoolTransaction> Road<T> {
     /// put in the lanes (still counted as queued on the road: the caller
     /// lowers the count with [`Self::sub_len`] once the lanes count them).
     /// Counted as a flush.
+    #[allow(dead_code)] // road reset kept for the frame road; not used today
     pub(crate) fn invalidate(&self) -> Vec<RoadFrame<T>> {
         self.invalidate_keeping(false).0
     }

@@ -1329,6 +1329,7 @@ async fn check_ahead_unheld_hands_a_far_ahead_block_to_the_driver_up_to_the_queu
                 profile: n42_h2_consensus::N42HeaderProfile::Ethereum,
                 rlp: rlp.into(),
                 compact: false,
+                source: None,
             });
             parent = built.hash;
             hashes.push(built.hash);

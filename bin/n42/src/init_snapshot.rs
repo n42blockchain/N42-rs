@@ -190,7 +190,7 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
         if last == 0 && number > 0 {
             // A snapshot head carries no registry root: its header file is decoded as
             // Ethereum's header (see the decode above).
-            setup_without_evm(&provider_rw, SealedHeader::new(n42_header::N42Header::from(header.clone()), hash), |n| {
+            setup_without_evm(&provider_rw, SealedHeader::new(n42_header::N42Header::from(header), hash), |n| {
                 n42_header::N42Header::from(Header { number: n, ..Default::default() })
             })?;
             provider_factory.static_file_provider().commit()?;
@@ -329,7 +329,7 @@ impl<'a> DumpCheck<'a> {
 /// Writes the accounts of a state dump at `block`, as reth 2.5 stores them:
 /// hashed accounts and storage in MDBX, one changeset entry per account and
 /// slot ("created at `block`") in the static files, the history indices in
-/// RocksDB, bytecodes once. Chunked commits keep memory flat. `check` sees
+/// `RocksDB`, bytecodes once. Chunked commits keep memory flat. `check` sees
 /// each account before it is written.
 fn write_state_v2<PF>(
     provider_factory: &PF,

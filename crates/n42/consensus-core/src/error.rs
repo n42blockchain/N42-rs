@@ -3,7 +3,7 @@
 
 //! Consensus core error types
 
-use alloy_primitives::{BlockHash, BlockNumber, B256};
+use alloy_primitives::{BlockHash, B256};
 use n42_consensus_traits::AposError;
 use thiserror::Error;
 
@@ -36,20 +36,32 @@ pub enum ConsensusError {
 
     /// Invalid slot
     #[error("invalid slot: expected >= {expected}, got {actual}")]
-    InvalidSlot { expected: u64, actual: u64 },
+    InvalidSlot {
+        /// Lowest slot that would have been accepted.
+        expected: u64,
+        /// Slot found in the header.
+        actual: u64,
+    },
 
     /// Invalid state root
     #[error("invalid state root: expected {expected}, got {actual}")]
-    InvalidStateRoot { expected: B256, actual: B256 },
+    InvalidStateRoot {
+        /// State root the block should carry.
+        expected: B256,
+        /// State root found in the header.
+        actual: B256,
+    },
 
     /// Invalid parent hash
     #[error("invalid parent hash: expected {expected}, got {actual}")]
     InvalidParentHash {
+        /// Hash of the parent the chain expects.
         expected: BlockHash,
+        /// Parent hash found in the header.
         actual: BlockHash,
     },
 
-    /// APoS error
+    /// `APoS` error
     #[error("apos error: {0}")]
     AposError(AposError),
 
@@ -65,12 +77,12 @@ impl ConsensusError {
     }
 
     /// Check if this is a recoverable error
-    pub fn is_recoverable(&self) -> bool {
+    pub const fn is_recoverable(&self) -> bool {
         matches!(self, Self::ParentStateNotFound(_) | Self::BlockNotFound(_))
     }
 
     /// Check if this is a validation error
-    pub fn is_validation_error(&self) -> bool {
+    pub const fn is_validation_error(&self) -> bool {
         matches!(
             self,
             Self::InvalidBlock(_)

@@ -6,7 +6,7 @@
 //! This module provides validation functions for beacon blocks and headers.
 
 use crate::{ConsensusError, ConsensusResult};
-use alloy_primitives::{BlockHash, B256};
+use alloy_primitives::BlockHash;
 use n42_primitives::{Attestation, BeaconBlock, BeaconState, SLOTS_PER_EPOCH};
 
 /// Validate a beacon block against the current state
@@ -80,6 +80,7 @@ pub fn validate_parent_hash(expected: BlockHash, actual: BlockHash) -> Consensus
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::B256;
     use n42_primitives::AttestationData;
 
     #[test]

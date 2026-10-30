@@ -186,6 +186,7 @@ pub fn recover_poisoned<G>(store: &'static str, poisoned: std::sync::PoisonError
 }
 
 fn store() -> &'static (Mutex<VecDeque<(B256, Entry)>>, Condvar) {
+    #[allow(clippy::type_complexity)] // hot-path static; its type is kept inline
     static STORE: OnceLock<(Mutex<VecDeque<(B256, Entry)>>, Condvar)> = OnceLock::new();
     STORE.get_or_init(|| (Mutex::new(VecDeque::with_capacity(keep())), Condvar::new()))
 }
@@ -242,6 +243,7 @@ fn free_off_path(evicted: Vec<Entry>) {
 /// 5-16 ms of the own-block hand-off's `clone_ms` when it ran there (loop351
 /// af, `moved_body=true` blocks).
 pub(crate) fn free_boxed_off_path(evicted: Box<dyn Send>) {
+    #[allow(clippy::type_complexity)] // hot-path static; its type is kept inline
     static FREE: OnceLock<Option<Mutex<std::sync::mpsc::SyncSender<Box<dyn Send>>>>> = OnceLock::new();
     let sender = FREE.get_or_init(|| {
         let (send, receive) = std::sync::mpsc::sync_channel::<Box<dyn Send>>(2);
@@ -862,6 +864,7 @@ fn sealed_store() -> &'static Mutex<VecDeque<(B256, SealedKept)>> {
 /// A sealed block in the store: its own copy, or the executed block handed
 /// to the engine, shared (`N42_HANDOFF_NO_CLONE`).
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // hot-path layout kept; boxing would add an allocation
 enum SealedKept {
     Owned(SealedBlock<Block>),
     Shared(Arc<RecoveredBlock<Block>>),

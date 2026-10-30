@@ -7,7 +7,6 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 */
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![allow(clippy::useless_let_if_seq)]
 
@@ -25,7 +24,7 @@ use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome},
     ConfigureEvm, Evm, NextBlockEnvAttributes,
 };
-use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig};
+use reth_evm_ethereum::EthBlockAssembler;
 use crate::engine_types::N42BuiltPayload as EthBuiltPayload;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
@@ -54,17 +53,14 @@ use reth_chain_state::CanonStateSubscriptions;
 use n42_consensus_traits::SignerManager;
 use n42_qmdb_reth::{changes_from_execution, QmdbNodeState};
 use reth_trie::updates::TrieUpdates;
-use reth_consensus::{ConsensusError, FullConsensus};
+use reth_consensus::FullConsensus;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use reth_node_api::PayloadBuilderFor;
-use reth_node_api::PrimitivesTy;
 use reth_node_builder::{
-    components::{ConsensusBuilder, PayloadBuilderBuilder, PayloadServiceBuilder},
+    components::{ConsensusBuilder, PayloadServiceBuilder},
     node::{FullNodeTypes, NodeTypes},
     BuilderContext,
 };
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
-use std::future::Future;
 
 // Historical catch-up never enters the payload builder. Until a qualified
 // live PEVM builder exists, every invocation here is the live sequential path.
@@ -84,10 +80,12 @@ use reth_node_builder::{PayloadBuilderConfig, PayloadTypes};
 /// Note: In v1.5.0, consensus is built separately and shared via NodeComponents.
 /// The actual consensus instance will be passed through the N42PayloadServiceBuilder.
 #[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // wrapper kept for the stock payload builder; not constructed today
 pub struct EthereumPayloadBuilderWrapper;
 
 impl EthereumPayloadBuilderWrapper {
     /// Create a new wrapper.
+    #[allow(dead_code)] // constructor of the wrapper above; not used today
     pub fn new() -> Self {
         Self
     }
@@ -95,7 +93,6 @@ impl EthereumPayloadBuilderWrapper {
 // wrapper
 
 // reth/crates/ethereum/payload/src/config.rs
-use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M;
 use reth_primitives_traits::constants::GAS_LIMIT_BOUND_DIVISOR;
 
 /*
@@ -146,6 +143,7 @@ impl EthereumBuilderConfig {
 
 /// Calculate the gas limit for the next block based on parent and desired gas limits.
 /// Ref: <https://github.com/ethereum/go-ethereum/blob/88cbfab332c96edfbe99d161d9df6a40721bd786/core/block_validator.go#L166>
+#[allow(dead_code)] // gas-limit helper kept for the stock builder; not used today
 pub fn calculate_block_gas_limit(parent_gas_limit: u64, desired_gas_limit: u64) -> u64 {
     let delta = (parent_gas_limit / GAS_LIMIT_BOUND_DIVISOR).saturating_sub(1);
     let min_gas_limit = parent_gas_limit - delta;
@@ -1388,9 +1386,9 @@ fn after_parallel_step(
     AfterParallelStep::Serial
 }
 
-/// Thread-local: how long this thread's build waited in its selector for the
-/// parent's queue hand-off (`BuildOnOwnRequest::before_pull`), microseconds;
-/// reset at the build's selection and reported as `start_handoff_ms`.
+// Thread-local: how long this thread's build waited in its selector for the
+// parent's queue hand-off (`BuildOnOwnRequest::before_pull`), microseconds;
+// reset at the build's selection and reported as `start_handoff_ms`.
 thread_local! {
     static HANDOFF_WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -1469,6 +1467,7 @@ fn say_once_a_second(last: &std::sync::atomic::AtomicU64) -> bool {
 /// and configuration, this function creates a transaction payload. Returns
 /// a result indicating success with the payload or an error in case of failure.
 #[inline]
+#[allow(clippy::too_many_arguments)] // hot-path builder entry; the argument list is kept
 pub fn default_n42_payload<EvmConfig, Client, Pool, F, Cons>(
     evm_config: EvmConfig,
     client: Client,
@@ -1753,7 +1752,7 @@ where
         crate::frame_blocks::note_beneficiary(group_env.block_env.beneficiary);
         install_plan_ahead_body(&queue);
     }
-    let mut best_txs = best_txs(BestTransactionsAttributes::new(
+    let best_txs = best_txs(BestTransactionsAttributes::new(
         base_fee,
         builder
             .evm_mut()
@@ -3339,8 +3338,8 @@ where
                     par_graft_build_us = graft.sharded_build_us;
                     par_graft_merge_us = graft.sharded_merge_us;
                     let db = builder.executor.evm_mut().db_mut();
-                    if !keep_cache {
-                        if let Some(withdrawals) = attributes.withdrawals.as_ref() {
+                    if !keep_cache
+                        && let Some(withdrawals) = attributes.withdrawals.as_ref() {
                             for withdrawal in withdrawals {
                                 let grafted = db
                                     .bundle_state
@@ -3368,7 +3367,6 @@ where
                                 }
                             }
                         }
-                    }
                     let fees = graft.beneficiary_delta;
                     par_committed = graft.committed;
                     par_reverts = graft.reverts;
@@ -5182,11 +5180,10 @@ where
                         if !cached.accounts.contains_key(&sender) {
                             wanted.push(sender);
                         }
-                        if let Some(to) = pool_tx.to() {
-                            if !cached.accounts.contains_key(&to) {
+                        if let Some(to) = pool_tx.to()
+                            && !cached.accounts.contains_key(&to) {
                                 wanted.push(to);
                             }
-                        }
                     }
                     wanted.sort_unstable();
                     wanted.dedup();
@@ -5252,14 +5249,12 @@ where
         // ~0 stale transactions a block, the executor refuses a stale one
         // anyway, and the read cost ~1 us on every transaction (round 36).
         // Kept behind N42_BUILDER_STALE_CHECK=1 for the bookend.
-        if stale_check() {
-            if let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender()) {
-                if pool_tx.nonce() < account.nonce {
+        if stale_check()
+            && let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender())
+                && pool_tx.nonce() < account.nonce {
                     stale_txs += 1;
                     continue;
                 }
-            }
-        }
 
         // convert tx to a signed transaction
         let tx = pool_tx.to_consensus();

@@ -128,7 +128,45 @@ pub mod request {
     /// road, in its slot. Between a validator and its own execution layer
     /// only; nothing on the peer wire changes.
     pub const CHECK_ONLY: u8 = 10;
+    /// [`FOREIGN_BODY`]'s frame ([`super::encode_foreign_body_from`]) with a
+    /// *compact frame description* in it and, as a rule, its sender's
+    /// [`super::ClaimSource`]: a description of a block whose first compact
+    /// body is already with the execution layer, sent by another peer with a
+    /// different frame layout. Only the claim is taken -- the block's root
+    /// and layout, filed under the source (audit 2026-10 round 2, R2-X4), for
+    /// the whole-body fallback to try -- nothing is assembled, checked or
+    /// imported. One frame back: [`super::reply::VALUE`] with no bytes when
+    /// the claim was filed, [`super::reply::ERROR`] with the reason when not.
+    /// Between a validator and its own execution layer only; nothing on the
+    /// peer wire changes.
+    pub const CLAIM_LAYOUT: u8 = 11;
 }
+
+/// Who sent a compact body, as the validator names the peer to its
+/// execution layer: the first eight bytes of the keccak of the peer's libp2p
+/// id ([`claim_source_of`]). The execution layer keys the frame layouts
+/// descriptions claim by it, one per source per root.
+/// [`OWN_CLAIM_SOURCE`] is reserved for the node's own validator.
+pub type ClaimSource = [u8; 8];
+
+/// The reserved [`ClaimSource`] of the node's own claims (never evicted by a
+/// foreign one). The same value as `n42_engine_types::frame_blocks`'s.
+pub const OWN_CLAIM_SOURCE: ClaimSource = [0; 8];
+
+/// The [`ClaimSource`] of a peer, from its id's bytes: never
+/// [`OWN_CLAIM_SOURCE`].
+pub fn claim_source_of(peer_id_bytes: &[u8]) -> ClaimSource {
+    let digest = alloy_primitives::keccak256(peer_id_bytes);
+    let mut source = [0u8; 8];
+    source.copy_from_slice(&digest[..8]);
+    if source == OWN_CLAIM_SOURCE {
+        source[7] = 1;
+    }
+    source
+}
+
+/// The tag of the optional [`ClaimSource`] tail of a foreign-body frame.
+const SOURCE_TAG: u8 = 1;
 
 /// The byte a caller sends for a held block ([`request::HOLD_EXECUTION`])
 /// once it has received the block's CHECKED frame.
@@ -590,11 +628,28 @@ const fn profile_byte(profile: N42HeaderProfile) -> u8 {
 /// it is re-encoded: the whole point is that these bytes are parsed once, on
 /// the other side.
 pub fn encode_foreign_body(block_hash: B256, profile: N42HeaderProfile, body: &[u8]) -> Vec<u8> {
+    encode_foreign_body_from(block_hash, profile, body, None)
+}
+
+/// [`encode_foreign_body`], with who sent the body: a [`ClaimSource`] tail
+/// (a tag byte and eight bytes) after it when `source` is set, nothing more
+/// otherwise -- the frame without one is [`encode_foreign_body`]'s byte for
+/// byte.
+pub fn encode_foreign_body_from(
+    block_hash: B256,
+    profile: N42HeaderProfile,
+    body: &[u8],
+    source: Option<ClaimSource>,
+) -> Vec<u8> {
     let mut w = Writer(Vec::with_capacity(body.len() + 64));
     w.u8(VERSION);
     w.fixed(block_hash.as_slice());
     w.u8(profile_byte(profile));
     w.bytes(body);
+    if let Some(source) = source {
+        w.u8(SOURCE_TAG);
+        w.fixed(&source);
+    }
     w.0
 }
 
@@ -605,6 +660,13 @@ pub fn encode_foreign_body(block_hash: B256, profile: N42HeaderProfile, body: &[
 /// outlives nothing it hands on -- see `convert_body_to_block`, which copies
 /// what it keeps.
 pub fn decode_foreign_body(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8]), String> {
+    decode_foreign_body_from(buf).map(|(hash, profile, body, _)| (hash, profile, body))
+}
+
+/// [`decode_foreign_body`], with the sender's [`ClaimSource`] when the frame
+/// carries one ([`encode_foreign_body_from`]).
+#[allow(clippy::type_complexity)] // hot-path decoder; the return tuple is kept inline
+pub fn decode_foreign_body_from(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8], Option<ClaimSource>), String> {
     let mut r = Reader { rest: buf, shared: None };
     if r.u8()? != VERSION {
         return Err("unknown raw engine version".into());
@@ -617,10 +679,16 @@ pub fn decode_foreign_body(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8])
     };
     let len = r.u32()? as usize;
     let body = r.take(len)?;
-    if !r.rest.is_empty() {
-        return Err(format!("foreign body frame has {} trailing bytes", r.rest.len()));
-    }
-    Ok((block_hash, profile, body))
+    let source = match r.rest {
+        [] => None,
+        [SOURCE_TAG, source @ ..] if source.len() == 8 => {
+            let mut out = [0u8; 8];
+            out.copy_from_slice(source);
+            Some(out)
+        }
+        rest => return Err(format!("foreign body frame has {} trailing bytes", rest.len())),
+    };
+    Ok((block_hash, profile, body, source))
 }
 
 /// What a caller adds to a build-on-own request when the height after the
@@ -1034,6 +1102,22 @@ mod tests {
             let start = back_body.as_ptr() as usize - frame.as_ptr() as usize;
             assert!(start + back_body.len() <= frame.len());
         }
+    }
+
+    #[test]
+    fn a_foreign_body_carries_its_source_as_an_optional_tail() {
+        let body = vec![0xcd; 64];
+        let hash = B256::repeat_byte(0x5b);
+        let source = claim_source_of(b"peer");
+        let frame = encode_foreign_body_from(hash, N42HeaderProfile::Gov5H2, &body, Some(source));
+        let plain = encode_foreign_body(hash, N42HeaderProfile::Gov5H2, &body);
+        assert_eq!(&frame[..plain.len()], &plain[..], "the source only appends");
+        assert_eq!(decode_foreign_body_from(&frame).expect("decodes"), (hash, N42HeaderProfile::Gov5H2, &body[..], Some(source)));
+        assert_eq!(decode_foreign_body(&frame).expect("an old reader").2, &body[..]);
+        assert_eq!(decode_foreign_body_from(&plain).expect("no source").3, None);
+        assert!(decode_foreign_body_from(&frame[..frame.len() - 1]).is_err(), "a cut source");
+        assert_ne!(claim_source_of(b"peer"), OWN_CLAIM_SOURCE);
+        assert_ne!(claim_source_of(b"peer"), claim_source_of(b"other"));
     }
 
     #[test]

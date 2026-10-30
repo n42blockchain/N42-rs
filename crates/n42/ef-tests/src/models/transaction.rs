@@ -1,7 +1,7 @@
 //! Transaction model for EF tests
 
 use super::{
-    deserialize_b256, deserialize_b256_opt, deserialize_bytes, deserialize_bytes_opt,
+    deserialize_b256, deserialize_bytes,
     deserialize_bytes_vec, deserialize_u256, deserialize_u256_opt, deserialize_u256_vec,
     deserialize_u64, deserialize_u64_opt, deserialize_u64_vec,
 };
@@ -256,7 +256,7 @@ where
 
 impl Transaction {
     /// Get the transaction type based on fields present
-    pub fn tx_type(&self) -> u8 {
+    pub const fn tx_type(&self) -> u8 {
         if self.blob_versioned_hashes.is_some() {
             3 // EIP-4844
         } else if self.max_fee_per_gas.is_some() {
@@ -273,11 +273,10 @@ impl Transaction {
     /// otherwise falls back to `accessList` for backward compatibility
     pub fn get_access_list(&self, index: usize) -> Option<&Vec<AccessListItem>> {
         // First try accessLists array (new format)
-        if let Some(ref lists) = self.access_lists {
-            if index < lists.len() {
+        if let Some(ref lists) = self.access_lists
+            && index < lists.len() {
                 return Some(&lists[index]);
             }
-        }
         // Fall back to single accessList (legacy format)
         self.access_list.as_ref()
     }
@@ -290,16 +289,16 @@ impl BlockTransaction {
     }
 
     /// Check if this is a contract creation transaction
-    pub fn is_create(&self) -> bool {
+    pub const fn is_create(&self) -> bool {
         self.to.is_none()
     }
 
     /// Get the sender address (already included in the JSON)
-    pub fn sender(&self) -> crate::error::EfTestResult<Address> {
+    pub const fn sender(&self) -> crate::error::EfTestResult<Address> {
         Ok(self.sender)
     }
 
-    /// Get the gas price (uses gas_price or max_fee_per_gas for EIP-1559)
+    /// Get the gas price (uses `gas_price` or `max_fee_per_gas` for EIP-1559)
     pub fn effective_gas_price(&self) -> U256 {
         self.gas_price
             .or(self.max_fee_per_gas)

@@ -1,5 +1,5 @@
 //! Read-only canonical block export for validated recovery into a separate EL.
-//! Usage: export_recovery_prefix DATADIR GENESIS LAST_BLOCK NEW_OUTPUT_DIRECTORY
+//! Usage: `export_recovery_prefix` DATADIR GENESIS `LAST_BLOCK` `NEW_OUTPUT_DIRECTORY`
 //! Export is not execution validation and never changes QMDB or vote watermarks.
 
 use alloy_consensus::proofs::calculate_transaction_root;

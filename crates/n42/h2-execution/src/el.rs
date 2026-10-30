@@ -279,6 +279,11 @@ pub struct ForeignBody {
     /// a refusal means asking peers for the whole body rather than falling
     /// back to `NEW_PAYLOAD`.
     pub compact: bool,
+    /// Who sent a compact body ([`crate::raw_engine::claim_source_of`] of
+    /// the peer), when known: the execution layer files the frame layout a
+    /// description claims under it (audit 2026-10 round 2, R2-X4). `None`
+    /// for a full body or a sender not known.
+    pub source: Option<crate::raw_engine::ClaimSource>,
 }
 
 /// Whether a check-only answer ([`ExecutionLayer::check_only`]) vouches for
@@ -574,6 +579,18 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// default vouches for nothing.
     async fn check_only(&self, block_hash: B256, header_rlp: alloy_primitives::Bytes) -> bool {
         let _ = (block_hash, header_rlp);
+        false
+    }
+
+    /// A claim and nothing else ([`crate::raw_engine::request::CLAIM_LAYOUT`]):
+    /// `body` is another peer's compact frame description of a block whose
+    /// first compact body this layer already has, with its sender in
+    /// [`ForeignBody::source`]. The layer files the frame layout it claims
+    /// under that source for the whole-body fallback to try (audit 2026-10
+    /// round 2, R2-X4); nothing is imported. `true` when it was filed. The
+    /// default files nothing.
+    async fn claim_layout(&self, body: ForeignBody) -> bool {
+        let _ = body;
         false
     }
 

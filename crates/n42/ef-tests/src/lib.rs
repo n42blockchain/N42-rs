@@ -19,7 +19,8 @@
 //! ```
 
 #![warn(missing_docs)]
-#![warn(unused_crate_dependencies)]
+// Dependencies are shared with this package's tests, bins and examples, so the lib alone does not use all.
+#![allow(unused_crate_dependencies)]
 
 pub mod error;
 pub mod executor;

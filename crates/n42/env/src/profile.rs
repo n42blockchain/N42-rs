@@ -386,7 +386,8 @@ pub unsafe fn reconcile(features: ChainFeatures) -> Option<Withdrawn> {
 /// feature, each ending with how many of the profile's knobs remain in force.
 fn withdrawal_lines(binary: &str, withdrawn: &Withdrawn) -> Vec<String> {
     let mut lines = Vec::new();
-    for requirement in [Requires::FrameBlocks] {
+    {
+        let requirement = Requires::FrameBlocks;
         let names: Vec<&str> =
             withdrawn.knobs.iter().filter(|knob| knob.requires == Some(requirement)).map(|knob| knob.name).collect();
         if !names.is_empty() {

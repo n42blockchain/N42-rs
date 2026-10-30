@@ -308,7 +308,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The chain's period is the pacing unless a benchmark overrides it, which
     // gov5 spells the same way. Warn rather than merely document: a fleet whose
     // timestamps have left the wall clock is not one to leave running.
-    let period_ms = block_interval_ms.unwrap_or(period_secs.saturating_mul(1000)).max(1);
+    let period_ms = block_interval_ms.unwrap_or_else(|| period_secs.saturating_mul(1000)).max(1);
     if period_ms < period_secs.saturating_mul(1000) {
         eprintln!(
             "note: --block-interval-ms {period_ms} paces faster than the chain's {period_secs}s \
@@ -757,6 +757,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// block — it produces a chain whose own clock advances twelve times faster
 /// than the wall clock. gov5 does exactly this when they benchmark, and their
 /// verification never compares a timestamp to the local clock.
+#[allow(clippy::too_many_arguments)] // example helper; the argument list is kept
 fn block_attributes(
     fee_recipient: Address,
     withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,

@@ -1,41 +1,32 @@
 use crate::beacon::Beacon;
-use alloy_eips::eip2718::{Decodable2718, Encodable2718};
-use alloy_primitives::{BlockNumber, Bytes, Sealable};
+use alloy_primitives::Sealable;
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types::Block;
-use alloy_rpc_types::BlockTransactionsKind;
 use alloy_rpc_types::Transaction as RpcTransaction;
-use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
+use alloy_rpc_types_engine::{CancunPayloadFields, ForkchoiceState};
 use eyre::OptionExt;
 use n42_engine_primitives::PayloadAttributesBuilderExt;
-use n42_primitives::{
-    agg_sig_to_fixed, fixed_to_agg_sig, parse_deposit_log, Attestation, AttestationData, BLSPubkey,
-    BeaconBlock, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, RelativeEpoch,
-    VoluntaryExitWithSig, SLOTS_PER_EPOCH,
-};
+use n42_primitives::BeaconState;
 use reth_chainspec::EthChainSpec;
 use reth_chainspec::EthereumHardforks;
 use reth_engine_primitives::ConsensusEngineHandle;
-use reth_engine_primitives::EngineTypes;
-use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
+use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{
-    BuiltPayload, EngineApiMessageVersion, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
+    BuiltPayload, PayloadKind, PayloadTypes,
 };
 use n42_tx_types::N42TxEnvelope as TransactionSigned;
-use reth_primitives_traits::Recovered;
 // reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
 type SealedBlock<B = n42_tx_types::Block> = reth_primitives_traits::SealedBlock<B>;
-use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives, SignedTransaction};
+use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives, SignedTransaction};
 use reth_provider::{
     BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,
 };
-use reth_transaction_pool::EthPooledTransaction;
 use reth_transaction_pool::PoolTransaction;
-use reth_transaction_pool::{TransactionOrigin, TransactionPool};
-use sled::{Db, IVec};
-use tokio::time::{interval_at, sleep, Instant, Interval};
+use reth_transaction_pool::TransactionPool;
+use sled::Db;
+use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+/// Task that replays old chain data (from a database or an RPC endpoint) through the engine to migrate it.
 pub struct N42Migrate<T: PayloadTypes, Provider, B, Pool: TransactionPool> {
     provider: Provider,
     /// The payload attribute builder for the engine
@@ -48,6 +39,17 @@ pub struct N42Migrate<T: PayloadTypes, Provider, B, Pool: TransactionPool> {
     beacon: Beacon<Provider>,
     migrate_from_db_path: Option<String>,
     migrate_from_rpc: Option<String>,
+}
+
+impl<T: PayloadTypes, Provider, B, Pool: TransactionPool> std::fmt::Debug
+    for N42Migrate<T, Provider, B, Pool>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("N42Migrate")
+            .field("migrate_from_db_path", &self.migrate_from_db_path)
+            .field("migrate_from_rpc", &self.migrate_from_rpc)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T, Provider, B, Pool> N42Migrate<T, Provider, B, Pool>
@@ -65,6 +67,7 @@ where
     B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
+    /// Spawns the migration task and returns immediately.
     pub fn spawn_new(
         provider: Provider,
         payload_attributes_builder: B,
@@ -88,7 +91,7 @@ where
         tokio::spawn(migrate.run());
     }
 
-    async fn run(mut self) -> eyre::Result<()> {
+    async fn run(self) -> eyre::Result<()> {
         match self.run_inner().await {
             Ok(v) => {
                 info!(target: "consensus-client", ?v, "run ok");
@@ -100,6 +103,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::unnecessary_fallible_conversions)] // the conversion is kept fallible so a malformed RPC transaction is skipped, not fatal
     async fn run_inner(mut self) -> eyre::Result<()> {
         self.provider.save_beacon_block_hash_by_eth1_hash(
             &self.provider.chain_spec().genesis_hash(),
@@ -111,7 +115,7 @@ where
         )?;
 
         let db: Option<Db> = if self.migrate_from_db_path.is_some() {
-            Some(sled::open(&self.migrate_from_db_path.clone().unwrap())?)
+            Some(sled::open(self.migrate_from_db_path.clone().unwrap())?)
         } else {
             None
         };
@@ -138,21 +142,19 @@ where
             }
             block_number += 1;
             debug!(target: "consensus-client", ?block_number, "before reading from database");
-            let mut block = if db.is_some() {
-                let value = db.as_ref().unwrap().get(block_number.to_be_bytes())?;
-                if value.is_some() {
-                    Some(serde_json::from_slice(&value.unwrap())?)
+            let mut block = if let Some(db) = db.as_ref() {
+                let value = db.get(block_number.to_be_bytes())?;
+                if let Some(value) = value {
+                    Some(serde_json::from_slice(&value)?)
                 } else {
                     None
                 }
             } else {
                 None
             };
-            if rpc_provider.is_some() {
+            if let Some(rpc_provider) = rpc_provider.as_ref() {
                 while block.is_none() {
                     match rpc_provider
-                        .as_ref()
-                        .unwrap()
                         .get_block(block_number.into())
                         .full()
                         .await?
@@ -296,7 +298,7 @@ where
                 //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
                 self.provider
                     .get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
-                    .ok_or(eyre::eyre!(
+                    .ok_or_else(|| eyre::eyre!(
                         "get_beacon_block_hash_by_eth1_hash failed, hash={:?}",
                         block.header().parent_hash
                     ))?
@@ -306,7 +308,7 @@ where
                 parent_beacon_block_hash,
                 &Default::default(),
                 &Default::default(),
-                &block,
+                block,
             )?;
             let beacon_block_hash = beacon_block.hash_slow();
             self.provider
@@ -317,6 +319,7 @@ where
         }
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // signature kept; callers hold the migrator mutably
     async fn new_payload(
         &mut self,
         block: &SealedBlock<
@@ -325,7 +328,7 @@ where
     ) -> eyre::Result<()> {
         debug!(target: "consensus-client", "new_block hash {:?}", block.header().hash_slow());
 
-        let cancun_fields = self
+        let _cancun_fields = self
             .provider
             .chain_spec()
             .is_cancun_active_at_timestamp(block.timestamp())

@@ -331,7 +331,7 @@ fn same_message_batch_with_suite(
     }
     let mut scalars = vec![0u8; 8 * n];
     getrandom::fill(&mut scalars).map_err(|_| BlsError::RandomGenerationFailed)?;
-    for chunk in scalars.chunks_exact_mut(8) {
+    for chunk in scalars.as_chunks_mut::<8>().0 {
         if chunk.iter().all(|b| *b == 0) {
             chunk[0] = 1;
         }

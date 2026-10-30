@@ -1170,3 +1170,103 @@ async fn a_member_behind_its_peer_pulls_the_gap_and_finishes_level() {
     assert!(a.svc.catch_up.is_none());
     assert_eq!(a.svc.failed_peer, None);
 }
+
+// ---------------------------------------------------------------------------
+// Layout claims of compact frame descriptions (audit 2026-10 R2-X4)
+// ---------------------------------------------------------------------------
+
+/// A frame description of one block (the same header every call) under
+/// `layout`.
+fn frame_description(layout: &[(B256, u32)]) -> (B256, alloy_primitives::Bytes) {
+    let (hash, header, _) = block(2, B256::repeat_byte(1));
+    let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
+    let frame = n42_h2_consensus::encode_compact_frame_body(&rlp, layout, HeaderProfile::Ethereum).expect("frames");
+    (hash, alloy_primitives::Bytes::from(frame))
+}
+
+fn layout(k: u8) -> Vec<(B256, u32)> {
+    vec![(B256::repeat_byte(0x30 + k), 2), (B256::repeat_byte(0x60 + k), 1)]
+}
+
+/// The claims the execution layer was handed, once `want` of them are in
+/// (and every task spawned before them has run).
+async fn claims_seen(rig: &Rig, want: usize) -> Vec<(B256, Option<n42_h2_execution::raw_engine::ClaimSource>)> {
+    let seen = || {
+        rig.el
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                ElCall::ClaimLayout(hash, source) => Some((hash, source)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    within(async {
+        while seen().len() < want {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    seen()
+}
+
+fn source_of(peer: &PeerId) -> Option<n42_h2_execution::raw_engine::ClaimSource> {
+    Some(n42_h2_execution::raw_engine::claim_source_of(&peer.to_bytes()))
+}
+
+/// A second peer's frame description of a block already taken compact,
+/// with another layout, reaches the execution layer as a claim under that
+/// peer's source; the block is not imported a second time. One body alone
+/// costs nothing: no claim, no bookkeeping.
+#[tokio::test]
+async fn distinct_frame_layouts_from_two_peers_both_reach_the_execution_layer_with_their_sources() {
+    let mut rig = node(1, 0, None).await;
+    let (first, second) = (PeerId::random(), PeerId::random());
+    let (hash, body) = frame_description(&layout(0));
+    let (_, _, fresh) = rig.svc.accept_compact_body(body, Some(first)).expect("first");
+    assert!(fresh);
+    assert!(rig.svc.compact_claims.is_empty(), "one body: the fast path keeps no claims");
+    assert!(claims_seen(&rig, 0).await.is_empty());
+
+    let (_, other) = frame_description(&layout(1));
+    let (_, _, fresh) = rig.svc.accept_compact_body(other, Some(second)).expect("second");
+    assert!(!fresh, "not imported again");
+    assert_eq!(claims_seen(&rig, 1).await, vec![(hash, source_of(&second))]);
+    let sources: Vec<_> = rig.svc.compact_claims[&hash].iter().map(|(source, _)| *source).collect();
+    assert_eq!(sources, vec![source_of(&first), source_of(&second)], "the frame of record's sender first");
+}
+
+/// At most [`CLAIMS_PER_BLOCK`] layouts per block reach the execution
+/// layer, one per peer, each distinct: a peer's second layout, a layout
+/// already seen and a fifth peer's layout are dropped.
+#[tokio::test]
+async fn layout_claims_per_block_are_one_per_peer_distinct_and_bounded() {
+    let mut rig = node(1, 0, None).await;
+    let peers: Vec<PeerId> = (0..6).map(|_| PeerId::random()).collect();
+    let (hash, body) = frame_description(&layout(0));
+    rig.svc.accept_compact_body(body, Some(peers[0])).expect("first");
+    let mut send = |k: u8, peer: PeerId| {
+        let (_, body) = frame_description(&layout(k));
+        rig.svc.accept_compact_body(body, Some(peer)).expect("compact");
+    };
+    send(1, peers[1]);
+    send(2, peers[1]); // the same peer again: dropped
+    send(0, peers[2]); // the frame of record's layout: dropped
+    send(2, peers[2]);
+    send(3, peers[3]);
+    send(4, peers[4]); // a fifth layout: over the bound, dropped
+    send(5, peers[5]);
+    let mut seen = claims_seen(&rig, CLAIMS_PER_BLOCK - 1).await;
+    seen.sort();
+    let mut want: Vec<_> = peers[1..4].iter().map(|peer| (hash, source_of(peer))).collect();
+    want.sort();
+    assert_eq!(seen, want);
+    assert_eq!(rig.svc.compact_claims[&hash].len(), CLAIMS_PER_BLOCK);
+
+    // Bounded with the compact bodies: the claims go with the frame.
+    rig.svc.forget_compact_body(hash);
+    assert!(!rig.svc.compact_claims.contains_key(&hash));
+}

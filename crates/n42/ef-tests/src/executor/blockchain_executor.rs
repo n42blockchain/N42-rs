@@ -32,10 +32,10 @@ use tracing::{debug, trace};
 /// Minimum gas price for a data blob (EIP-4844)
 const MIN_BLOB_GASPRICE: u64 = 1;
 
-/// Safe version of fake_exponential that handles overflow gracefully.
+/// Safe version of `fake_exponential` that handles overflow gracefully.
 /// Approximates `factor * e ** (numerator / denominator)` using Taylor expansion.
-/// Returns u128::MAX on overflow instead of panicking.
-fn safe_fake_exponential(factor: u64, numerator: u64, denominator: u64) -> u128 {
+/// Returns `u128::MAX` on overflow instead of panicking.
+const fn safe_fake_exponential(factor: u64, numerator: u64, denominator: u64) -> u128 {
     if denominator == 0 {
         return u128::MAX;
     }
@@ -81,8 +81,8 @@ fn safe_fake_exponential(factor: u64, numerator: u64, denominator: u64) -> u128 
 }
 
 /// Safe calculation of blob gas price that handles overflow gracefully.
-/// Uses the EIP-4844 fake_exponential formula but with overflow protection.
-fn safe_calc_blob_gasprice(excess_blob_gas: u64, blob_base_fee_update_fraction: u64) -> u128 {
+/// Uses the EIP-4844 `fake_exponential` formula but with overflow protection.
+const fn safe_calc_blob_gasprice(excess_blob_gas: u64, blob_base_fee_update_fraction: u64) -> u128 {
     safe_fake_exponential(MIN_BLOB_GASPRICE, excess_blob_gas, blob_base_fee_update_fraction)
 }
 
@@ -90,6 +90,7 @@ fn safe_calc_blob_gasprice(excess_blob_gas: u64, blob_base_fee_update_fraction: 
 #[derive(Debug, Clone)]
 pub struct BlockchainTestExecutor {
     /// Chain specification
+    #[allow(dead_code)] // kept for the executor's configuration; not read today
     chain_spec: Arc<ChainSpec>,
     /// EVM configuration
     evm_config: EthEvmConfig,
@@ -110,6 +111,8 @@ impl BlockchainTestExecutor {
     }
 
     /// Execute a blockchain test
+    #[allow(deprecated)] // spec-test harness stays on the API the fixtures were validated with
+    #[allow(unused_assignments)] // value is kept for the debug output of the loop
     pub fn execute(&self, test: &BlockchainTest, test_name: &str) -> EfTestResult<TestResult> {
         let start = Instant::now();
         let fork = test.fork();
@@ -191,8 +194,8 @@ impl BlockchainTestExecutor {
             };
 
             // Apply pre-execution system calls for Cancun+ (EIP-4788 beacon roots)
-            if spec_id >= SpecId::CANCUN {
-                if let Some(parent_beacon_block_root) = header.parent_beacon_block_root {
+            if spec_id >= SpecId::CANCUN
+                && let Some(parent_beacon_block_root) = header.parent_beacon_block_root {
                     // Skip genesis block (block number 0)
                     if header.number > 0 {
                         // EIP-4788: Store beacon root
@@ -253,7 +256,6 @@ impl BlockchainTestExecutor {
                         }
                     }
                 }
-            }
 
             // Apply pre-execution system calls for Prague+ (EIP-2935 block hashes history)
             if spec_id >= SpecId::PRAGUE {
@@ -579,7 +581,7 @@ impl BlockchainTestExecutor {
         Ok(blocks)
     }
 
-    /// Convert ExecutionPayload to Header
+    /// Convert `ExecutionPayload` to Header
     fn execution_payload_to_header(
         &self,
         payload: &crate::models::ExecutionPayload,
@@ -799,9 +801,10 @@ impl BlockchainTestExecutor {
                     ),
                 }
             }
+            #[allow(unreachable_patterns)] // defensive arm for transaction types the decoder may add
             _ => {
                 return Err(EfTestError::InvalidTestData(
-                    format!("Unsupported transaction type in engine payload")
+                    "Unsupported transaction type in engine payload".to_string()
                 ))
             }
         };
@@ -809,7 +812,7 @@ impl BlockchainTestExecutor {
         Ok(block_tx)
     }
 
-    /// Build a CacheDB with the pre-state accounts
+    /// Build a `CacheDB` with the pre-state accounts
     fn build_pre_state_db(&self, pre: &HashMap<Address, Account>) -> EfTestResult<CacheDB<EmptyDB>> {
         let mut db = CacheDB::new(EmptyDB::default());
 
@@ -878,6 +881,7 @@ impl BlockchainTestExecutor {
     }
 
     /// Build transaction environment from block transaction
+    #[allow(clippy::field_reassign_with_default)] // fields are filled step by step from the fixture
     fn build_tx_env_from_block_tx(
         &self,
         tx: &crate::models::transaction::BlockTransaction,
@@ -1006,15 +1010,14 @@ impl BlockchainTestExecutor {
                 // so we should NOT merge with pre_state storage
                 let storage_was_destroyed = matches!(cached_account.status, DbAccountStatus::DestroyedChanged);
 
-                if !storage_was_destroyed {
-                    if let Some(pre_account) = pre_state.get(address) {
+                if !storage_was_destroyed
+                    && let Some(pre_account) = pre_state.get(address) {
                         for (k, v) in &pre_account.storage {
                             if !v.is_zero() {
                                 merged_storage.insert(B256::from(*k), *v);
                             }
                         }
                     }
-                }
 
                 for (k, v) in &account.storage {
                     if v.is_zero() {
@@ -1027,7 +1030,7 @@ impl BlockchainTestExecutor {
                 if merged_storage.is_empty() {
                     alloy_trie::EMPTY_ROOT_HASH
                 } else {
-                    storage_root_unhashed(merged_storage.into_iter())
+                    storage_root_unhashed(merged_storage)
                 }
             };
 
@@ -1044,10 +1047,10 @@ impl BlockchainTestExecutor {
 
         // Handle coinbase account specially - it may have been created during execution
         // and should be included in the state root if it has balance
-        if let Some(coinbase_addr) = coinbase {
-            if !included_addresses.contains(&coinbase_addr) {
-                if let Some(cached_coinbase) = state.cache.accounts.get(&coinbase_addr) {
-                    if !cached_coinbase.status.was_destroyed() {
+        if let Some(coinbase_addr) = coinbase
+            && !included_addresses.contains(&coinbase_addr)
+                && let Some(cached_coinbase) = state.cache.accounts.get(&coinbase_addr)
+                    && !cached_coinbase.status.was_destroyed() {
                         if let Some(cb_account) = &cached_coinbase.account {
                             let cb_info = &cb_account.info;
                             // Include coinbase if it has balance or if we're pre-Spurious Dragon
@@ -1075,7 +1078,7 @@ impl BlockchainTestExecutor {
                                     if merged_storage.is_empty() {
                                         alloy_trie::EMPTY_ROOT_HASH
                                     } else {
-                                        storage_root_unhashed(merged_storage.into_iter())
+                                        storage_root_unhashed(merged_storage)
                                     }
                                 };
                                 let reth_account = RethAccount {
@@ -1099,18 +1102,14 @@ impl BlockchainTestExecutor {
                             included_addresses.insert(coinbase_addr);
                         }
                     }
-                }
-            }
-        }
 
         // Include untouched accounts from pre_state
         for (address, account) in pre_state {
             if !included_addresses.contains(address) {
-                if let Some(cached) = state.cache.accounts.get(address) {
-                    if cached.status.was_destroyed() {
+                if let Some(cached) = state.cache.accounts.get(address)
+                    && cached.status.was_destroyed() {
                         continue;
                     }
-                }
 
                 if !include_empty && account.balance.is_zero() && account.nonce == 0 && account.code.is_empty() {
                     continue;
@@ -1137,10 +1136,10 @@ impl BlockchainTestExecutor {
             }
         }
 
-        Ok(state_root_unhashed(accounts.into_iter()))
+        Ok(state_root_unhashed(accounts))
     }
 
-    /// Calculate expected state root from post_state
+    /// Calculate expected state root from `post_state`
     fn calculate_expected_state_root(&self, post_state: &HashMap<Address, Account>) -> EfTestResult<B256> {
         let mut accounts: Vec<(Address, alloy_trie::TrieAccount)> = Vec::new();
         let include_empty = self.get_spec_id() < SpecId::SPURIOUS_DRAGON;
@@ -1170,11 +1169,11 @@ impl BlockchainTestExecutor {
             accounts.push((*address, trie_account));
         }
 
-        Ok(state_root_unhashed(accounts.into_iter()))
+        Ok(state_root_unhashed(accounts))
     }
 
     /// Get the spec ID for the current fork
-    pub fn get_spec_id(&self) -> SpecId {
+    pub const fn get_spec_id(&self) -> SpecId {
         match self.fork {
             ForkSpec::Frontier => SpecId::FRONTIER,
             ForkSpec::Homestead | ForkSpec::DaoFork => SpecId::HOMESTEAD,

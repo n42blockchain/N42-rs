@@ -704,14 +704,12 @@ impl ConsensusEngine {
         }
 
         // The commit vote the two-phase gate held for this block.
-        if self.held_prepare_qc.as_ref().is_some_and(|held| held.block_hash == block_hash) {
-            if let Some(held) = self.held_prepare_qc.take() {
-                if held.view == self.round_state.current_view() {
+        if self.held_prepare_qc.as_ref().is_some_and(|held| held.block_hash == block_hash)
+            && let Some(held) = self.held_prepare_qc.take()
+                && held.view == self.round_state.current_view() {
                     tracing::info!(target: "n42::interop::h2v4", view = held.view, %block_hash, "two-phase vote: block imported, casting the held commit vote");
                     self.process_prepare_qc(held)?;
                 }
-            }
-        }
 
         // edition-2021: N42-26 writes this as a let-chain. Resolving the
         // pending view first also ends the borrow of `self` before `send_vote`.

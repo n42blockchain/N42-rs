@@ -43,6 +43,7 @@ static RUNTIME: Lazy<Runtime> =
     Lazy::new(|| Runtime::new().expect("Failed to create Tokio runtime"));
 
 #[unsafe(no_mangle)]
+/// JNI entry point: builds the unsigned deposit transaction and returns it as JSON.
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
     mut env: jni::JNIEnv<'_>,
     _class: jni::objects::JClass<'_>,
@@ -115,6 +116,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
 }
 
 #[unsafe(no_mangle)]
+/// JNI entry point: generates a BLS12-381 key pair and returns it as JSON.
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_generateBls12381Keypair(
     mut env: jni::JNIEnv<'_>,
     _class: jni::objects::JClass<'_>,
@@ -143,6 +145,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_generateBls12381Keypair(
 }
 
 #[unsafe(no_mangle)]
+/// JNI entry point: builds the unsigned call that reads the exit fee and returns it as JSON.
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_createGetExitFeeUnsignedTx(
     mut env: jni::JNIEnv<'_>,
     _class: jni::objects::JClass<'_>,
@@ -171,6 +174,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createGetExitFeeUnsignedTx(
 }
 
 #[unsafe(no_mangle)]
+/// JNI entry point: builds the unsigned exit transaction and returns it as JSON.
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
     mut env: jni::JNIEnv<'_>,
     _class: jni::objects::JClass<'_>,
@@ -182,7 +186,9 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
-    let fee = if !exit_fee_in_wei_in_hex.is_null() {
+    let fee = if exit_fee_in_wei_in_hex.is_null() {
+        None
+    } else {
         let exit_fee_in_wei_in_hex = match env.get_string(&exit_fee_in_wei_in_hex) {
             Ok(s) => String::from(s),
             Err(_) => {
@@ -204,8 +210,6 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
         };
 
         Some(exit_fee_in_wei)
-    } else {
-        None
     };
 
     let transaction_request = match create_exit_unsigned_tx(&validator_public_key, &fee) {
@@ -232,6 +236,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
 }
 
 #[unsafe(no_mangle)]
+/// JNI entry point: runs the validator client until it stops and returns its result.
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
     mut env: jni::JNIEnv<'_>,
     _class: jni::objects::JClass<'_>,
@@ -334,7 +339,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
                     &global_cf,
                     "completeExceptionally",
                     "(Ljava/lang/Throwable;)Z",
-                    &[(&JObject::from(ex_obj)).into()],
+                    &[(&ex_obj).into()],
                 );
             }
         }

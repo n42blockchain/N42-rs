@@ -61,8 +61,7 @@ use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_net::{
     compress_block_rlp, decode_block_rlp_raw, decode_tx_batch, decompress_block_gossip,
-    encode_block_rlp, encode_tx_batch,
-    encode_block_rlp_parts, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
+    encode_block_rlp, encode_tx_batch, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
     TransportEvent, MAX_RANGE_BLOCKS,
 };
 use n42_h2_consensus::withdrawals_to_rewards;
@@ -409,6 +408,13 @@ pub struct H2Service<E> {
     /// The order [`Self::compact_bodies`] was filled in, so the oldest is
     /// what the bound drops.
     compact_order: std::collections::VecDeque<B256>,
+    /// The layout claims handed to the execution layer for a block taken as
+    /// a compact body: (sender's claim source, digest of the claimed frame
+    /// layout), the frame of record's first, [`CLAIMS_PER_BLOCK`] at most
+    /// (audit 2026-10 round 2, R2-X4). Only made once a second, different
+    /// frame description of the block arrives; bounded with
+    /// [`Self::compact_bodies`], whose entries it shadows.
+    compact_claims: std::collections::HashMap<B256, Vec<(Option<n42_h2_execution::raw_engine::ClaimSource>, B256)>>,
     /// Who pushed a block's body, when the sender named itself on the
     /// channel: the member that built it, and so the one member certain to
     /// hold every transaction of it. Asked first for a fill.
@@ -793,6 +799,7 @@ impl Drop for ServeSlot {
 }
 
 /// How many slots of `slots` are taken.
+#[allow(dead_code)] // helper kept for serve-slot accounting; not used today
 fn slots_taken(slots: &SharedServeSlots) -> usize {
     slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).total
 }
@@ -1115,6 +1122,7 @@ impl LoopSpend {
     /// The proposal for `view` is being made: closes the window the commit
     /// for `view - 1` opened and hands back what it cost, when that is worth
     /// a line.
+    #[allow(clippy::type_complexity)] // hot-path return type kept as is
     fn close(&mut self, view: u64) -> Option<(u64, Vec<(&'static str, u32, u64)>)> {
         let (opened, at) = self.since.take()?;
         if opened + 1 != view {
@@ -1278,6 +1286,13 @@ fn named_txns<T: AsRef<[u8]>>(txs: &[T], request: &n42_h2_net::BlockTxnsRequest)
 /// because each is ~5 MB: enough for a fill's round trip and for the gossip
 /// copy of a block already imported, not a history.
 const REMEMBERED_COMPACT_BODIES: usize = 8;
+
+/// Distinct frame layouts handed to the execution layer per block hash, one
+/// per peer: the first compact body's and up to three other peers' (audit
+/// 2026-10 round 2, R2-X4). The execution layer keeps as many per root, one
+/// per source (`n42_engine_types::frame_blocks::CLAIMS_PER_ROOT`), so a peer
+/// sending wrong layouts after the right one cannot push it out there.
+pub(crate) const CLAIMS_PER_BLOCK: usize = 4;
 
 const REMEMBERED_TIMESTAMPS: usize = 256;
 
@@ -1562,6 +1577,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             last_body_age_out: None,
             compact_bodies: std::collections::HashMap::new(),
             compact_order: std::collections::VecDeque::new(),
+            compact_claims: std::collections::HashMap::new(),
             body_from: std::collections::HashMap::new(),
             fill_peers: std::collections::HashMap::new(),
             fill_asked: std::collections::HashMap::new(),
@@ -1632,7 +1648,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// stops this node's voting and proposing (default from
     /// `N42_HALT_ON_COMMIT_INVALID`, on).
     #[must_use]
-    pub fn with_halt_on_commit_invalid(mut self, on: bool) -> Self {
+    pub const fn with_halt_on_commit_invalid(mut self, on: bool) -> Self {
         self.halt_on_commit_invalid = on;
         self
     }
@@ -1758,6 +1774,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// domain to canonicalize a catching-up node from a header. The view-0
     /// genesis sentinel embeds nothing, as gov5's `buildHeaderExtra(view,
     /// nil)`. A certificate that does not encode keeps the previous bytes.
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     fn refresh_header_qc(&mut self) {
         let qc = self.engine.last_committed_qc();
         let mut held = self.header_qc.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2246,6 +2263,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Bounded because the transport can always have more: an unbounded drain
     /// under sustained gossip would never return to the engine, which is the
     /// same starvation this fixes, pointed the other way.
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     async fn drain_transport(&mut self, events: &mut Vec<ServiceEvent>) -> Result<usize, ServiceError> {
         let mut drained = 0;
         // The phase's time, split: polling the swarm (which runs libp2p's
@@ -2643,6 +2661,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                             profile: self.header_profile,
                             rlp: filled,
                             compact: true,
+                            // The frame of record's sender, who claimed its layout.
+                            source: self
+                                .body_from
+                                .get(&request.hash)
+                                .map(|from| n42_h2_execution::raw_engine::claim_source_of(&from.to_bytes())),
                         });
                         self.import_eagerly(request.hash);
                     }
@@ -3249,6 +3272,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self
     }
 
+    /// Enables or disables building the next payload before this node is the leader (off by default).
     pub const fn with_build_ahead(mut self, enabled: bool) -> Self {
         self.prepare_ahead = enabled;
         self
@@ -4557,7 +4581,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 catch_up.target = catch_up.next + MAX_RANGE_BLOCKS - 1;
                 self.request_next_range();
-            } else if catch_up.probing && catch_up.next - 1 >= catch_up.probe_height {
+            } else if catch_up.probing && catch_up.next > catch_up.probe_height {
                 // Short, and at the height the peer was known at when the
                 // probe began: the rest is what the fleet made since, which
                 // gossip carries.
@@ -4689,6 +4713,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// starts above the commit. `None` on a fresh consensus state (a node
     /// started on a snapshot has nothing to measure from) or when the layer
     /// is not ahead.
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     async fn unproven_after_restart(&mut self) -> Option<u64> {
         let qc = self.engine.last_committed_qc();
         if qc.view == 0 {
@@ -5076,6 +5101,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.compact_bodies.remove(&block_hash).is_some() {
             self.compact_order.retain(|hash| hash != &block_hash);
         }
+        self.compact_claims.remove(&block_hash);
         self.driver.forget_payload(block_hash);
     }
 
@@ -5215,6 +5241,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             profile: self.header_profile,
             rlp: rlp.clone(),
             compact: false,
+            source: None,
         });
         self.remember_body(block_hash, rlp);
         Ok((block_hash, header, true))
@@ -5331,6 +5358,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.compact_order.retain(|hash| hash != &block_hash);
             self.driver.forget_payload(block_hash);
         }
+        self.compact_claims.remove(&block_hash);
         if self.body_request_due(block_hash) {
             self.await_body(block_hash);
             // One peer, not every peer: a whole body is 26 MB, and six of
@@ -5367,6 +5395,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // A second copy must not replace the frame of record: that one may
         // carry fills this one does not (defect 18).
         if self.body_store.contains_key(&block_hash) || self.compact_bodies.contains_key(&block_hash) {
+            self.forward_other_claim(block_hash, &header, bytes, from);
             return Ok((block_hash, header, false));
         }
         self.compact_bodies.insert(block_hash, bytes.clone());
@@ -5381,6 +5410,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         while self.compact_order.len() > REMEMBERED_COMPACT_BODIES {
             if let Some(oldest) = self.compact_order.pop_front() {
                 self.compact_bodies.remove(&oldest);
+                self.compact_claims.remove(&oldest);
                 self.body_from.remove(&oldest);
                 self.fill_peers.remove(&oldest);
                 self.fill_asked.remove(&oldest);
@@ -5395,8 +5425,68 @@ impl<E: ExecutionLayer> H2Service<E> {
             profile: self.header_profile,
             rlp: bytes,
             compact: true,
+            source: from.map(|peer| n42_h2_execution::raw_engine::claim_source_of(&peer.to_bytes())),
         });
         Ok((block_hash, header, true))
+    }
+
+    /// A second compact body of a block whose first is the frame of record:
+    /// when it is a frame description from a peer not yet heard on the block
+    /// with a layout not yet seen, its claim goes to the execution layer
+    /// under that peer's source (audit 2026-10 round 2, R2-X4) -- the layout
+    /// is not in the header, and the first body's may be wrong while this
+    /// one's is right. [`CLAIMS_PER_BLOCK`] layouts at most per block, one per
+    /// peer; the rest are dropped. Nothing is imported or stored, and a block
+    /// that only ever arrives once costs nothing here.
+    fn forward_other_claim(
+        &mut self,
+        block_hash: B256,
+        header: &Header,
+        bytes: alloy_primitives::Bytes,
+        from: Option<PeerId>,
+    ) {
+        use n42_h2_execution::raw_engine::claim_source_of;
+        let (Some(peer), Some(first)) = (from, self.compact_bodies.get(&block_hash)) else { return };
+        if !n42_h2_consensus::is_compact_frame_body(&bytes) {
+            return;
+        }
+        let profile = self.header_profile;
+        let digest = |body: &[u8]| -> Option<B256> {
+            let frames = n42_h2_consensus::decode_compact_body(body, profile).ok()?.frames?;
+            let mut flat = Vec::with_capacity(frames.len() * 36);
+            for (id, count) in &frames {
+                flat.extend_from_slice(id.as_slice());
+                flat.extend_from_slice(&count.to_le_bytes());
+            }
+            Some(keccak256(&flat))
+        };
+        let source = claim_source_of(&peer.to_bytes());
+        if !self.compact_claims.contains_key(&block_hash) {
+            // The frame of record's claim, made lazily: the first body's
+            // path stays as it was.
+            let first_source = self.body_from.get(&block_hash).map(|from| claim_source_of(&from.to_bytes()));
+            let first_digest = digest(first).unwrap_or(B256::ZERO);
+            self.compact_claims.insert(block_hash, vec![(first_source, first_digest)]);
+        }
+        let Some(claims) = self.compact_claims.get_mut(&block_hash) else { return };
+        if claims.len() >= CLAIMS_PER_BLOCK || claims.iter().any(|(known, _)| *known == Some(source)) {
+            return;
+        }
+        let Some(layout) = digest(&bytes) else { return };
+        if claims.iter().any(|(_, known)| *known == layout) {
+            return;
+        }
+        claims.push((Some(source), layout));
+        debug!(target: "n42.h2.node", ?block_hash, %peer, claims = claims.len(), "another peer's frame layout for a compact block; forwarding its claim");
+        self.driver.forward_claim(n42_h2_execution::ForeignBody {
+            block_hash,
+            number: header.number,
+            timestamp: header.timestamp,
+            profile,
+            rlp: bytes,
+            compact: true,
+            source: Some(source),
+        });
     }
 
     fn remember_block(&mut self, block_hash: B256, header: &Header) {
@@ -5582,6 +5672,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     /// Publishes a block body, queueing it if the mesh is not ready.
+    #[allow(unused_assignments)] // initial value documents the loop state
     fn publish_body(
         &mut self,
         execution: &alloy_rpc_types_engine::ExecutionData,
@@ -5710,6 +5801,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.send_body(data, block_hash);
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     fn remember_topic_skipped(&mut self, block_hash: B256) {
         debug!(target: "n42.h2.node", ?block_hash, "body pushed to every member; topic not used");
     }
@@ -6115,7 +6207,7 @@ fn trace_messages() -> bool {
     *ON.get_or_init(|| std::env::var("N42_H2_TRACE_MSGS").is_ok_and(|v| v == "1"))
 }
 
-fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'static str {
+const fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'static str {
     use n42_h2_primitives::consensus::ConsensusMessage as M;
     match message {
         M::Proposal(_) => "proposal",
@@ -6128,7 +6220,7 @@ fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'s
     }
 }
 
-fn transport_event_kind(event: &TransportEvent) -> &'static str {
+const fn transport_event_kind(event: &TransportEvent) -> &'static str {
     match event {
         TransportEvent::Envelope { .. } => "envelope",
         TransportEvent::Native { .. } => "native",

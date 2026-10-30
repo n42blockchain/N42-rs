@@ -134,15 +134,14 @@ pub fn transactions_root_by_rule<T: Encodable2718 + Sync>(
     frame_layout: Option<&[usize]>,
     transactions: &[T],
 ) -> B256 {
-    if frame_blocks {
-        if let Some(layout) = frame_layout {
+    if frame_blocks
+        && let Some(layout) = frame_layout {
             use rayon::prelude::*;
             let hashes: Vec<B256> = transactions.par_iter().map(|tx| tx.trie_hash()).collect();
             if let Some(root) = n42_tx_types::frame_tree_root_of(&hashes, layout) {
                 return root;
             }
         }
-    }
     parallel_transaction_root(transactions)
 }
 

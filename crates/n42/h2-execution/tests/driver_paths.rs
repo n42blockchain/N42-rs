@@ -60,6 +60,7 @@ fn body_for(hash: B256, number: u64, compact: bool) -> ForeignBody {
         profile: n42_h2_consensus::N42HeaderProfile::Ethereum,
         rlp: alloy_primitives::Bytes::from_static(&[0xc0]),
         compact,
+        source: None,
     }
 }
 

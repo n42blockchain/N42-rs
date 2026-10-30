@@ -4,10 +4,15 @@
 //! Sends signed value transfers to a node's JSON-RPC, for watching them
 //! travel a mixed fleet: submitted to one client, sealed by the other.
 //!
-//!   send_tx --rpc http://127.0.0.1:18545 --key <hex> --to <address> --count 3 [--chain-id 1143]
+//!   `send_tx` --rpc <http://127.0.0.1:18545> --key <hex> --to <address> --count 3 [--chain-id 1143]
 //!
 //! Prints each transaction's hash; `eth_getTransactionReceipt` on any member
 //! then says which block, and whose, sealed it.
+//!
+//! `--tip <wei>` sets the priority fee (1 gwei by default; 0 makes a block
+//! whose beneficiary earns nothing from it), `--value <wei>` the amount sent
+//! (0.001 ETH by default; 0 makes a transfer that touches the recipient
+//! without changing it).
 //!
 //! `--rate <tx/s>` paces the sending instead of bursting, and `--seconds <n>`
 //! runs for a duration rather than a count — a fleet measured only on empty
@@ -35,6 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seconds: Option<u64> = None;
     let mut quiet = false;
     let mut alg = "secp256k1".to_string();
+    let mut tip = 1_000_000_000u128;
+    let mut value = U256::from(1_000_000_000_000_000u64);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -48,6 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A sustained run prints one line per transaction otherwise, which
             // at any useful rate is its own kind of load.
             "--quiet" => quiet = true,
+            "--tip" => tip = args.next().ok_or("--tip needs a number of wei")?.parse()?,
+            "--value" => value = args.next().ok_or("--value needs a number of wei")?.parse()?,
             "--alg" => alg = args.next().ok_or("--alg needs secp256k1 or ed25519")?,
             other => return Err(format!("unknown argument {other}").into()),
         }
@@ -113,9 +122,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             nonce,
             gas_limit: 21_000,
             max_fee_per_gas: 5_000_000_000,
-            max_priority_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: tip,
             to: TxKind::Call(to),
-            value: U256::from(1_000_000_000_000_000u64),
+            value,
             ..Default::default()
         };
         let raw = match (&ed25519, &pubkey) {

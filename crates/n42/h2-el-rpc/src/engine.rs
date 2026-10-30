@@ -1614,6 +1614,13 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         self.check_only_over_channel(block_hash, &header_rlp).await
     }
 
+    async fn claim_layout(&self, body: n42_h2_execution::ForeignBody) -> bool {
+        if !body.compact {
+            return false;
+        }
+        self.claim_layout_over_channel(&body).await
+    }
+
     async fn fork_choice_updated(
         &self,
         state: ForkchoiceState,
@@ -2113,10 +2120,11 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             (addr, channel.stream.take())
         };
         let started = std::time::Instant::now();
-        let frame = n42_h2_execution::raw_engine::encode_foreign_body(
+        let frame = n42_h2_execution::raw_engine::encode_foreign_body_from(
             body.block_hash,
             body.profile,
             &body.rlp,
+            body.source,
         );
         let mut checked = Some(checked);
         let held = release.is_some();
@@ -2345,6 +2353,59 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             "check-only answer"
         );
         vouched
+    }
+
+    /// A layout claim over the raw channel (`request::CLAIM_LAYOUT`, audit
+    /// 2026-10 round 2, R2-X4): one request, one frame back. `true` only for
+    /// a VALUE frame; an ERROR frame, no channel or a failed connection are
+    /// `false`, and the claim is simply not filed.
+    async fn claim_layout_over_channel(&self, body: &n42_h2_execution::ForeignBody) -> bool {
+        use n42_h2_execution::raw_engine::{reply, request};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (addr, taken) = {
+            let mut channel = self.raw_import.lock().await;
+            let Some(addr) = self.raw_endpoint(&mut channel).await else { return false };
+            (addr, channel.stream.take())
+        };
+        let frame =
+            n42_h2_execution::raw_engine::encode_foreign_body_from(body.block_hash, body.profile, &body.rlp, body.source);
+        let attempt: std::io::Result<(u8, tokio::net::TcpStream)> = within_raw_deadline(async {
+            let mut conn = match taken {
+                Some(stream) => stream,
+                None => {
+                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                    stream.set_nodelay(true)?;
+                    stream
+                }
+            };
+            let len = u32::try_from(frame.len())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "claim too large"))?;
+            let mut out = Vec::with_capacity(frame.len() + 5);
+            out.push(request::CLAIM_LAYOUT);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&frame);
+            conn.write_all(&out).await?;
+            let kind = conn.read_u8().await?;
+            let len = read_bounded_u32(&mut conn, 1 << 20).await?;
+            let mut buf = vec![0u8; len];
+            conn.read_exact(&mut buf).await?;
+            Ok((kind, conn))
+        })
+        .await;
+        let (kind, conn) = match attempt {
+            Ok(answer) => answer,
+            Err(err) => {
+                debug!(target: "n42.h2.el", block = ?body.block_hash, %err, "layout claim request failed");
+                return false;
+            }
+        };
+        {
+            let mut channel = self.raw_import.lock().await;
+            if channel.stream.is_none() {
+                channel.stream = Some(conn);
+            }
+        }
+        kind == reply::VALUE
     }
 
     async fn new_payload_over_channel(&self, payload: &ExecutionData) -> Option<PayloadStatus> {

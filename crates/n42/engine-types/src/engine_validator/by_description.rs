@@ -212,6 +212,22 @@ where
         queue: &n42_tx_queue::TxQueue<crate::N42PooledTransaction>,
         miss_wait: std::time::Duration,
     ) -> Result<DescribedBlock, CompactBodyError> {
+        self.describe_compact_body_from(announced, profile, compact, queue, miss_wait, None)
+    }
+
+    /// [`Self::describe_compact_body`], with who sent the body: a frame
+    /// description's layout claim is filed under `source`
+    /// ([`crate::frame_blocks::remember_claimed_from`], audit 2026-10 round 2,
+    /// R2-X4).
+    pub fn describe_compact_body_from(
+        &self,
+        announced: B256,
+        profile: N42HeaderProfile,
+        compact: &[u8],
+        queue: &n42_tx_queue::TxQueue<crate::N42PooledTransaction>,
+        miss_wait: std::time::Duration,
+        source: Option<crate::frame_blocks::ClaimSource>,
+    ) -> Result<DescribedBlock, CompactBodyError> {
         use rayon::prelude::*;
         let other = |message: String| CompactBodyError::Invalid(NewPayloadError::Other(message.into()));
         if profile != self.profile {
@@ -230,7 +246,7 @@ where
         let supplied = super::supplied_from_fill(&body)?;
         let fill_us = filled_at.elapsed().as_micros() as u64;
         if body.frames.is_some() {
-            return self.describe_frames(body, queue, miss_wait, started, supplied, fill_us);
+            return self.describe_frames(body, queue, miss_wait, started, supplied, fill_us, source);
         }
         // Under `N42_FRAME_BLOCKS=1` a block described by hashes is one whose
         // body is not a run of frames: it carries the MPT root, checked below
@@ -405,6 +421,39 @@ where
         })
     }
 
+    /// Files the frame layout another peer's compact frame description
+    /// claims, under `source`, and nothing else (`request::CLAIM_LAYOUT`,
+    /// audit 2026-10 round 2, R2-X4): the block's first compact body went
+    /// down [`Self::describe_compact_body_from`]; this one is a second
+    /// opinion on its layout, tried by the whole-body fallback
+    /// ([`crate::frame_blocks::root_for_body`]) only where it reproduces the
+    /// header's root over the body's own hashes. Refused: another header
+    /// profile, a body that is not the announced block, or not a frame
+    /// description.
+    pub fn claim_compact_body(
+        &self,
+        announced: B256,
+        profile: N42HeaderProfile,
+        compact: &[u8],
+        source: Option<crate::frame_blocks::ClaimSource>,
+    ) -> Result<(), String> {
+        if profile != self.profile {
+            return Err(format!("claim read under the {profile:?} header profile, this chain is {:?}", self.profile));
+        }
+        if !crate::frame_blocks::active() {
+            return Err("a layout claim on a node without N42_FRAME_BLOCKS=1".to_owned());
+        }
+        let body = n42_h2_consensus::decode_compact_body(compact, profile).map_err(|err| err.to_string())?;
+        if body.block_hash != announced {
+            return Err(format!("claim is block {} and not the announced {announced}", body.block_hash));
+        }
+        let Some(frames) = body.frames.as_deref() else {
+            return Err("not a frame description: no layout to claim".to_owned());
+        };
+        crate::frame_blocks::remember_claimed_from(body.block_hash, body.header.transactions_root, frames, source);
+        Ok(())
+    }
+
     /// [`Self::describe_compact_body`] for a frame description
     /// (`N42_FRAME_BLOCKS=1`): the block assembled by reference from the
     /// frames this node's queue indexed, one look-up per frame
@@ -434,6 +483,7 @@ where
         started: std::time::Instant,
         supplied: Vec<(usize, Address, TransactionSigned)>,
         fill_us: u64,
+        source: Option<crate::frame_blocks::ClaimSource>,
     ) -> Result<DescribedBlock, CompactBodyError> {
         use rayon::prelude::*;
         let other = |message: String| CompactBodyError::Invalid(NewPayloadError::Other(message.into()));
@@ -443,10 +493,11 @@ where
         // Before any refusal below: a body this node cannot fill here is
         // fetched whole, and that payload's conversion roots it by this claim
         // (checked there against the body's own hashes).
-        crate::frame_blocks::remember_claimed(
+        crate::frame_blocks::remember_claimed_from(
             body.block_hash,
             body.header.transactions_root,
             body.frames.as_deref().unwrap_or_default(),
+            source,
         );
         let frames: Vec<(B256, usize)> =
             body.frames.as_deref().unwrap_or_default().iter().map(|(id, count)| (*id, *count as usize)).collect();

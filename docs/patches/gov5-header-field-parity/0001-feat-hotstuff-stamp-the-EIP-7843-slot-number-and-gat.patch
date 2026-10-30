@@ -1,0 +1,295 @@
+From d070b88dafdf15a02c54d3cb77c4b4663f00ea50 Mon Sep 17 00:00:00 2001
+From: MiraWells <1020080523@qq.com>
+Date: Fri, 30 Oct 2026 02:54:37 -0400
+Subject: [PATCH 1/3] feat(hotstuff): stamp the EIP-7843 slot number and gate
+ MobileRegistryRoot behind it
+
+Ethereum's Amsterdam header has slot_number at RLP element 23, so
+MobileRegistryRoot is element 24 (65f2c63f). The layout is now purely
+fork-gated: from Glamsterdam, gov5's Amsterdam fork, a native-chain header
+carries SlotNumber at 23, and MobileRegistryRoot at 24 when MobileAnchor is
+also active (params.IsMobileRegistryRootInHeader). A MobileAnchor time
+earlier than Glamsterdam takes effect at Glamsterdam; a header never carries
+the root without the slot.
+
+The slot is the block number: a HotStuff chain has views, not slots, the
+view is not visible to an Ethereum client outside Extra, and the number is
+what the Rust client already writes into its V4 payloads and sealed headers.
+FinalizeAndAssemble stamps it; verifyHeader requires it from Glamsterdam,
+equal to the number, and refuses it before. The miner and verifyHeader gate
+the root on both forks.
+
+Headers chain 94 sealed since mobileAnchorTime (root at element 23, no slot)
+are not readable under this layout; that history is rebuilt with replay-v2
+under the new fork schedule.
+---
+ internal/consensus/hotstuff/adapter.go        | 43 ++++++++++++-
+ internal/consensus/hotstuff/adapter_test.go   | 27 +++++++--
+ .../consensus/hotstuff/slot_number_test.go    | 60 +++++++++++++++++++
+ internal/miner/worker.go                      |  9 +--
+ internal/mobileanchor_test.go                 |  4 +-
+ params/config_rules.go                        | 12 ++++
+ 6 files changed, 142 insertions(+), 13 deletions(-)
+ create mode 100644 internal/consensus/hotstuff/slot_number_test.go
+
+diff --git a/internal/consensus/hotstuff/adapter.go b/internal/consensus/hotstuff/adapter.go
+index 9aae0857..f70c856a 100644
+--- a/internal/consensus/hotstuff/adapter.go
++++ b/internal/consensus/hotstuff/adapter.go
+@@ -477,13 +477,18 @@ func (h *HotStuff) verifyHeaderWithBatch(chain consensus.ChainHeaderReader, iHea
+ 	// Enforce the RLP shape on both sides of the boundary so a validator started
+ 	// without the mobile pipeline cannot silently produce nil-root blocks after
+ 	// activation, and a pre-fork producer cannot change historical wire form.
++	// The root is RLP element 24, behind the EIP-7843 slot number, so it is
++	// gated on both forks (params.IsMobileRegistryRootInHeader).
+ 	if cfg := chain.Config(); cfg != nil {
+-		active := cfg.IsMobileAnchor(header.Time)
++		active := cfg.IsMobileRegistryRootInHeader(header.Time)
+ 		switch {
+ 		case active && header.MobileRegistryRoot == nil:
+-			return fmt.Errorf("missing MobileRegistryRoot at block %s after MobileAnchor activation", header.Number)
++			return fmt.Errorf("missing MobileRegistryRoot at block %s after MobileAnchor and Glamsterdam activation", header.Number)
+ 		case !active && header.MobileRegistryRoot != nil:
+-			return fmt.Errorf("unexpected MobileRegistryRoot at block %s before MobileAnchor activation", header.Number)
++			return fmt.Errorf("unexpected MobileRegistryRoot at block %s before MobileAnchor and Glamsterdam activation", header.Number)
++		}
++		if err := verifySlotNumber(cfg, header); err != nil {
++			return err
+ 		}
+ 	}
+ 
+@@ -839,6 +844,11 @@ func (h *HotStuff) FinalizeAndAssemble(chain consensus.ChainHeaderReader, iHeade
+ 			rq := hash.EmptyRootHash // keccak256(RLP([])): no EIP-7685 requests
+ 			header.RequestsHash = &rq
+ 		}
++		if cfg.IsGlamsterdam(header.Time) && header.SlotNumber == nil {
++			// EIP-7843 header element 23; see NativeSlotNumber.
++			slot := NativeSlotNumber(header)
++			header.SlotNumber = &slot
++		}
+ 	}
+ 
+ 	// Assemble the block with computed TxHash and ReceiptHash.
+@@ -1116,3 +1126,30 @@ func sortedAddrs(m map[types.Address]*account.StateAccount) []types.Address {
+ 	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i][:], out[j][:]) < 0 })
+ 	return out
+ }
++
++// NativeSlotNumber is the EIP-7843 slot number of a native-chain block: its
++// block number. EIP-7843 takes the slot from the consensus layer; a HotStuff
++// chain has views, not slots, and a view is not recoverable from the header
++// alone by an Ethereum client (it sits inside Extra). The block number is the
++// one monotonic index every member derives from the header itself, and it is
++// what the Rust client puts in the Engine API payload and its sealed header
++// (n42-rs crates/n42/h2-el-rpc/src/engine.rs, h2-consensus header_profile.rs).
++func NativeSlotNumber(header *block.Header) uint64 {
++	return header.Number.Uint64()
++}
++
++// verifySlotNumber enforces the EIP-7843 header field on the native chain:
++// present from Glamsterdam (gov5's Amsterdam fork) on and equal to the block
++// number, absent before. The same fork moves MobileRegistryRoot to element 24.
++func verifySlotNumber(cfg *params.ChainConfig, header *block.Header) error {
++	active := cfg.IsGlamsterdam(header.Time)
++	switch {
++	case active && header.SlotNumber == nil:
++		return fmt.Errorf("missing SlotNumber at block %s after Glamsterdam activation", header.Number)
++	case active && *header.SlotNumber != NativeSlotNumber(header):
++		return fmt.Errorf("SlotNumber %d at block %s, want the block number", *header.SlotNumber, header.Number)
++	case !active && header.SlotNumber != nil:
++		return fmt.Errorf("unexpected SlotNumber %d at block %s before Glamsterdam activation", *header.SlotNumber, header.Number)
++	}
++	return nil
++}
+diff --git a/internal/consensus/hotstuff/adapter_test.go b/internal/consensus/hotstuff/adapter_test.go
+index 0276bf85..3c3159c3 100644
+--- a/internal/consensus/hotstuff/adapter_test.go
++++ b/internal/consensus/hotstuff/adapter_test.go
+@@ -309,30 +309,47 @@ func TestVerifyHeader_ValidQC(t *testing.T) {
+ func TestVerifyHeader_MobileAnchorForkShape(t *testing.T) {
+ 	h := New(&params.HotStuffConfig{}, nil)
+ 	chain := newMockChainReader()
+-	chain.config = &params.ChainConfig{MobileAnchorTime: big.NewInt(100)}
+-	parent := &block.Header{Number: uint256.NewInt(0), Time: 90}
++	// MobileAnchor at 50, Glamsterdam at 100: the root (element 24) appears
++	// only once the slot number (element 23) does.
++	chain.config = &params.ChainConfig{MobileAnchorTime: big.NewInt(50), GlamsterdamTime: big.NewInt(100)}
++	parent := &block.Header{Number: uint256.NewInt(0), Time: 40}
+ 	chain.headers[0] = parent
+ 
+ 	extra := make([]byte, extraMinLen)
+ 	copy(extra[:extraMagicLen], extraMagic[:])
++	slot := uint64(1)
++	root := types.Hash{0x42}
+ 	child := &block.Header{
+ 		Number:     uint256.NewInt(1),
+ 		ParentHash: parent.Hash(),
+ 		Time:       100,
+ 		Extra:      extra,
++		SlotNumber: &slot,
+ 	}
+ 	if err := h.VerifyHeader(chain, child, false); err == nil {
+ 		t.Fatal("post-fork header without MobileRegistryRoot was accepted")
+ 	}
+-	root := types.Hash{0x42}
+ 	child.MobileRegistryRoot = &root
+ 	if err := h.VerifyHeader(chain, child, false); err != nil {
+-		t.Fatalf("post-fork header with MobileRegistryRoot rejected: %v", err)
++		t.Fatalf("post-fork header with slot and MobileRegistryRoot rejected: %v", err)
++	}
++	child.SlotNumber = nil
++	if err := h.VerifyHeader(chain, child, false); err == nil {
++		t.Fatal("post-Glamsterdam header without SlotNumber was accepted")
+ 	}
+ 
++	// MobileAnchor active, Glamsterdam not: no root, no slot.
+ 	child.Time = 99
+ 	if err := h.VerifyHeader(chain, child, false); err == nil {
+-		t.Fatal("pre-fork header with MobileRegistryRoot was accepted")
++		t.Fatal("a MobileRegistryRoot without a slot number was accepted")
++	}
++	child.MobileRegistryRoot = nil
++	if err := h.VerifyHeader(chain, child, false); err != nil {
++		t.Fatalf("pre-Glamsterdam header without root and slot rejected: %v", err)
++	}
++	child.SlotNumber = &slot
++	if err := h.VerifyHeader(chain, child, false); err == nil {
++		t.Fatal("pre-Glamsterdam header with SlotNumber was accepted")
+ 	}
+ }
+ 
+diff --git a/internal/consensus/hotstuff/slot_number_test.go b/internal/consensus/hotstuff/slot_number_test.go
+new file mode 100644
+index 00000000..c931958e
+--- /dev/null
++++ b/internal/consensus/hotstuff/slot_number_test.go
+@@ -0,0 +1,60 @@
++// Copyright 2022-2026 The N42 Authors
++// This file is part of the N42 library.
++
++package hotstuff
++
++import (
++	"math/big"
++	"testing"
++
++	"github.com/holiman/uint256"
++
++	"github.com/n42blockchain/N42/common/block"
++	"github.com/n42blockchain/N42/params"
++)
++
++// EIP-7843 on the native chain: the slot number is the block number, present
++// from Glamsterdam on and absent before it.
++func TestVerifySlotNumberByFork(t *testing.T) {
++	cfg := &params.ChainConfig{GlamsterdamTime: big.NewInt(1000)}
++	slot := func(v uint64) *uint64 { return &v }
++	cases := []struct {
++		name string
++		time uint64
++		slot *uint64
++		ok   bool
++	}{
++		{"before the fork, no slot", 999, nil, true},
++		{"before the fork, a slot", 999, slot(7), false},
++		{"at the fork, no slot", 1000, nil, false},
++		{"at the fork, the block number", 1000, slot(7), true},
++		{"at the fork, another value", 1000, slot(8), false},
++	}
++	for _, c := range cases {
++		h := &block.Header{Number: uint256.NewInt(7), Time: c.time, SlotNumber: c.slot}
++		err := verifySlotNumber(cfg, h)
++		if (err == nil) != c.ok {
++			t.Errorf("%s: err = %v, want ok=%v", c.name, err, c.ok)
++		}
++	}
++	// A chain that never schedules Glamsterdam never carries the field.
++	if err := verifySlotNumber(&params.ChainConfig{}, &block.Header{Number: uint256.NewInt(7), Time: 1 << 40}); err != nil {
++		t.Errorf("no Glamsterdam: %v", err)
++	}
++}
++
++// The registry root is in the header only under both forks.
++func TestMobileRegistryRootNeedsGlamsterdam(t *testing.T) {
++	cfg := &params.ChainConfig{MobileAnchorTime: big.NewInt(50), GlamsterdamTime: big.NewInt(100)}
++	for _, c := range []struct {
++		time uint64
++		want bool
++	}{{49, false}, {50, false}, {99, false}, {100, true}} {
++		if got := cfg.IsMobileRegistryRootInHeader(c.time); got != c.want {
++			t.Errorf("time %d: %v, want %v", c.time, got, c.want)
++		}
++	}
++	if (&params.ChainConfig{GlamsterdamTime: big.NewInt(0)}).IsMobileRegistryRootInHeader(1) {
++		t.Error("root in the header without MobileAnchor")
++	}
++}
+diff --git a/internal/miner/worker.go b/internal/miner/worker.go
+index ece008ac..ad29a2cd 100644
+--- a/internal/miner/worker.go
++++ b/internal/miner/worker.go
+@@ -1791,10 +1791,11 @@ func (w *worker) commitWork(interrupt *atomic.Int32, noempty bool, timestamp int
+ 	// commitment only — like the CommitteePool's ParentBeaconRoot link, it binds
+ 	// the root into the block hash (RLP) with NO state-trie write, so it needs no
+ 	// system contract, no genesis alloc and no replay to activate. The full
+-	// history lives in the rawdb anchor log (phase 6b). Gated on IsMobileAnchor;
+-	// a nil provider or inactive fork leaves the header field nil (byte-identical
+-	// pre-fork / on eth-el).
+-	if w.mobileAnchorRoot != nil && w.chainConfig.IsMobileAnchor(current.header.Time) {
++	// history lives in the rawdb anchor log (phase 6b). Gated on
++	// IsMobileRegistryRootInHeader (MobileAnchor and Glamsterdam: the root is
++	// element 24, behind the EIP-7843 slot number); a nil provider or inactive
++	// fork leaves the header field nil (byte-identical pre-fork / on eth-el).
++	if w.mobileAnchorRoot != nil && w.chainConfig.IsMobileRegistryRootInHeader(current.header.Time) {
+ 		current.header.MobileRegistryRoot = w.mobileAnchorRoot()
+ 	}
+ 
+diff --git a/internal/mobileanchor_test.go b/internal/mobileanchor_test.go
+index 4c0ac8b9..c430e5a6 100644
+--- a/internal/mobileanchor_test.go
++++ b/internal/mobileanchor_test.go
+@@ -40,7 +40,9 @@ func mobileAnchorConfig(active bool) *params.ChainConfig {
+ 		CancunBlock:           big.NewInt(0),
+ 	}
+ 	if active {
++		// The root rides behind the EIP-7843 slot number, so it needs both forks.
+ 		cfg.MobileAnchorTime = big.NewInt(0)
++		cfg.GlamsterdamTime = big.NewInt(0)
+ 	}
+ 	return cfg
+ }
+@@ -91,7 +93,7 @@ func TestMobileAnchorHeaderIsPureCommitment(t *testing.T) {
+ // active. Kept in lockstep with the miner so the determinism validation
+ // exercises the real activation logic, not a stand-in.
+ func stampLikeMiner(cfg *params.ChainConfig, header *block.Header, root *types.Hash) {
+-	if root != nil && cfg.IsMobileAnchor(header.Time) {
++	if root != nil && cfg.IsMobileRegistryRootInHeader(header.Time) {
+ 		header.MobileRegistryRoot = root
+ 	}
+ }
+diff --git a/params/config_rules.go b/params/config_rules.go
+index af73958a..030988fa 100644
+--- a/params/config_rules.go
++++ b/params/config_rules.go
+@@ -443,6 +443,18 @@ func (c *ChainConfig) IsMobileAnchor(time uint64) bool {
+ 	return isForked(c.MobileAnchorTime, time)
+ }
+ 
++// IsMobileRegistryRootInHeader returns whether a header at time carries
++// Header.MobileRegistryRoot: the MobileAnchor fork AND the EIP-7843 slot
++// number (Glamsterdam). The root is RLP element 24, behind the slot at 23, so
++// it exists only on headers that carry a slot; a MobileAnchor time earlier
++// than Glamsterdam takes effect at Glamsterdam. Headers chain 94 stamped
++// before this rule (root at element 23, no slot) are not readable under it;
++// that history is rebuilt with replay-v2 (docs in n42-rs
++// docs/HEADER_FIELD_PARITY.md).
++func (c *ChainConfig) IsMobileRegistryRootInHeader(time uint64) bool {
++	return c.IsMobileAnchor(time) && c.IsGlamsterdam(time)
++}
++
+ // IsNativeAsset returns whether time is at or past the native asset module
+ // activation. N42 extension; nil on every Ethereum chainspec.
+ func (c *ChainConfig) IsNativeAsset(time uint64) bool {
+-- 
+2.53.0
+

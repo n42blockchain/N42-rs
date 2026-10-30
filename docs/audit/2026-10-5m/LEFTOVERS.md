@@ -64,7 +64,7 @@ Rust 现状:
 | R3-P2/P3/P4 | ROUND3 | tx-queue 有界 lane、加价替换、`Lagged` 补齐 | Windows 已修(4f6256c4d P4 / c1814476f P3 / ad3ece18d、c402f298a P2);Linux A/B 10-30 stage fw | 已修,A/B 闭合:win1/轮总量 -0.9%/-0.7%(噪声内);5M 负载下 `refused=0`、`refused_at_cap=0`、`frames_refused=0`,无 `Lagged` 读回 |
 | R3-N4 | ROUND3 | gossip `validate_messages()` + 回报 Accept/Reject/Ignore | Windows 已修(eb9146203);Linux A/B + gov5 混跑 10-30 | 已修,A/B 闭合(stage fw);gov5 混跑五形态(gov5late/late/absent + gov5late2p/gov5now2p)全部同哈希、gov5 error 0,网格评分无异常(gov5 全程封块/提交) |
 | R3-G4 | ROUND3 | leader 首次导入的多余 payload 克隆 | Windows(10-30 认领),Linux A/B | 已修(见 `git log --grep R3-G4`),A/B 闭合(stage fw) |
-| R3-E2 | ROUND3 | 零手续费块 beneficiary 触碰:先用 gov5 夹具确认根 | Linux(与 R3-E1 同改 `payload.rs` / `parallel_transfer.rs`,Windows 不动) | 待做 |
+| R3-E2 | ROUND3 | 零手续费块 beneficiary 触碰:先用 gov5 夹具确认根 | Linux(与 R3-E1 同改 `payload.rs` / `parallel_transfer.rs`,Windows 不动) | Rust unchanged, rule pinned by test (f163ff525); gov5 gated patch pending the user's decision (`R3_E2.md`) |
 | 热路径 A/B | ROUND2/3 | R2-X1、R2-I1、R2-R4/Q4、R2-C7、R2-I6、R2-R3、R3-N2、R3-N3、R3-G2、R3-C3 | Linux | 已由 X22 配对整体闭合(5ab8fffea);10-30 之后的热路径改动(R3-N5 余项、R3-P9、R3-C2、P2/P3/P4、N4、G4、R2-C9 余项、E1/E3)由 stage `fw` 一次闭合(HANDOFF.md "第二轮 Linux 结果") |
 
 ## D. 需协议/跨仓库决定(先记录,不动手)
@@ -77,7 +77,7 @@ Rust 现状:
 | R2-C1 余项 | ROUND2 | 入站 `high_tc` 采纳:**Windows 已修(见 `git log --grep R2-C1`)**;只在 TC 能让本节点前进时验证,无需缓存。Linux devnet gov5 五形态(含 absent/late)10-30 覆盖,通过 |
 | R2-R2 | ROUND2 | 按 view leader 校验头部封印。**Windows 已修(见 `git log --grep R2-R2`)** |
 | R2-C9 余项 | ROUND2 | ~~gov5 header vote / deferred vote 未移植~~ **已修**(Windows,aab6c13b1 / 47afc33ee;deferred vote 已由 `BlockChecked` 覆盖)。Linux 10-30 与 gov5 两阶段 fleet 混跑通过:devnet 基因副本 `twoPhaseVoteGate: true`(Rust 验证者打印 `vote gate : two-phase`,gov5 链库 chainspec 同值),gov5late2p 160 块 / gov5now2p 133 块两客户端同哈希、gov5 error 0、Rust 超时数与普通形态相同 |
-| R2-X4 余项 | ROUND2 | 声明不按声明者分键(EL 不知道 peer)。**Windows 评估后暂缓:需 h2-node 与 EL 两端协议改动,见 ROUND3 状态行** |
+| R2-X4 余项 | ROUND2 | 声明不按声明者分键(EL 不知道 peer)。**已合 main 766a89654(A/B 过:stage fx VX2,win1 4.993/4.980M 对 main 5.040/4.920M,轮总量 443.4/450.6M 对 452.1/443.2M,闸门干净)**:h2-node 带来源转发至多 4 份不同 layout,EL 每 root 每来源一槽;见 ROUND2 状态行。A/B:只在整块回退路径(本节点无自己的 layout)生效,常见情形(一份 body)不变 |
 
 ## E. 需要用户操作
 

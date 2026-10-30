@@ -5415,9 +5415,20 @@ mod tests {
     /// A block of `n` transfers among `senders` accounts, every sender
     /// paying a few recipients in turn, some of them fresh, some shared.
     fn fixture(senders: u64, per: u64) -> (RecoveredBlock<Block>, CacheDB<EmptyDB>) {
+        fixture_with(senders, per, 1_000_000_000, None)
+    }
+
+    /// [`fixture`] with every transfer's priority fee `tip` (at 0 the block
+    /// pays its beneficiary nothing: the base fee is burned) and, with
+    /// `zero_value_to`, the fresh recipient shared by the senders replaced by
+    /// that funded account, sent nothing.
+    fn fixture_with(senders: u64, per: u64, tip: u128, zero_value_to: Option<Address>) -> (RecoveredBlock<Block>, CacheDB<EmptyDB>) {
         let mut db = CacheDB::new(EmptyDB::default());
         let beneficiary = addr(1);
         db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
+        if let Some(to) = zero_value_to {
+            db.insert_account_info(to, AccountInfo { balance: U256::from(9), nonce: 1, ..Default::default() });
+        }
         let mut txs = Vec::new();
         let mut recovered = Vec::new();
         for s in 0..senders {
@@ -5426,19 +5437,20 @@ mod tests {
             for k in 0..per {
                 // Recipients: another sender (shared), a fresh account, and
                 // the same fresh account again from a different sender.
-                let to = match k % 3 {
-                    0 => addr(100 + (s + 1) % senders),
-                    1 => addr(10_000 + s * per + k),
-                    _ => addr(20_000 + k),
+                let (to, value) = match (k % 3, zero_value_to) {
+                    (0, _) => (addr(100 + (s + 1) % senders), 1_000 + k),
+                    (1, _) => (addr(10_000 + s * per + k), 1_000 + k),
+                    (_, Some(to)) => (to, 0),
+                    _ => (addr(20_000 + k), 1_000 + k),
                 };
                 let inner = TxEip1559 {
                     chain_id: 1,
                     nonce: 3 + k,
                     gas_limit: 21_000,
                     max_fee_per_gas: 10_000_000_000,
-                    max_priority_fee_per_gas: 1_000_000_000,
+                    max_priority_fee_per_gas: tip,
                     to: TxKind::Call(to),
-                    value: U256::from(1_000 + k),
+                    value: U256::from(value),
                     input: Bytes::new(),
                     ..Default::default()
                 };
@@ -5711,6 +5723,74 @@ mod tests {
         let hashed = crate::output_shards::hashed_post_state_of(&view);
         let theirs = reth_trie::HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(follower.state.state.iter());
         assert_eq!(hashed.accounts, theirs.accounts, "the hashed accounts");
+    }
+
+    /// R3-E2, the rule every Rust path follows: an account a block touches
+    /// but leaves unchanged writes no QMDB leaf. A block whose tips are all
+    /// zero credits its beneficiary nothing, and revm's bundle keeps an
+    /// account only when its transition has a revert
+    /// (`BundleState::apply_transitions_and_create_reverts`), so the touched
+    /// but unchanged beneficiary is absent from the serial executor's bundle;
+    /// the parallel paths, which commit the beneficiary only for a non-zero
+    /// credit, agree. The same holds for the recipient of a zero-value
+    /// transfer that exists and stays as it was. gov5's serial path writes
+    /// both (an `AddBalance` of zero to an account not yet loaded dirties it),
+    /// its parallel path does not; the cross-client fix is a gated gov5 rule
+    /// (docs/audit/2026-10-5m/R3_E2.md), not a change here.
+    #[test]
+    fn an_unchanged_account_writes_no_leaf_on_any_path() {
+        let unchanged = addr(30_000);
+        let (block, db) = fixture_with(8, 6, 0, Some(unchanged));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
+        let beneficiary = block.header().beneficiary;
+        let keys = [
+            n42_twig_core::qmdb_compat::gov5_account_key(&beneficiary.0 .0),
+            n42_twig_core::qmdb_compat::gov5_account_key(&unchanged.0 .0),
+        ];
+        let no_leaf = |ops: &n42_twig_core::qmdb_compat::QmdbOps, what: &str| {
+            let ops = ops.to_operations();
+            assert!(!ops.is_empty(), "{what}: the block writes leaves");
+            for key in &keys {
+                assert!(ops.iter().all(|op| op.key != *key), "{what}: a leaf for an unchanged account");
+            }
+        };
+        for address in [beneficiary, unchanged] {
+            assert!(!serial.state.state.contains_key(&address), "serial: {address} in the bundle");
+        }
+        let serial_ops = n42_qmdb_reth::sorted_operations_from_execution(&serial.state, true);
+        no_leaf(&serial_ops, "serial");
+        for (graft, sender_groups, ahead, merge_behind) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (false, true, false, false),
+            (true, false, true, true),
+            (true, true, true, false),
+            (false, false, false, true),
+        ] {
+            let what = format!("graft {graft}, sender groups {sender_groups}, ahead {ahead}, merge behind {merge_behind}");
+            let plan = ahead.then(|| plan_transfers(&evm_config, &block).expect("a plan"));
+            let (parallel, _) =
+                execute_transfers_with_plan(&evm_config, &block, db.clone(), &|| Some(db.clone()), graft, sender_groups, plan, merge_behind)
+                    .expect("no execution error")
+                    .expect("the block qualifies");
+            for address in [beneficiary, unchanged] {
+                assert!(!parallel.state.state.contains_key(&address), "{what}: {address} in the bundle");
+            }
+            assert_same_bundle(&parallel.state, &serial.state, &what);
+            let ops = n42_qmdb_reth::sorted_operations_from_execution(&parallel.state, true);
+            assert_eq!(ops, serial_ops, "{what}: the QMDB operations");
+        }
+        let (sharded, _) = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone()))
+            .expect("no execution error")
+            .expect("the block qualifies on the build path");
+        let overlaps = sharded.shards.overlaps(&sharded.residual);
+        let view = sharded.shards.view(&sharded.residual, &overlaps);
+        let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, true);
+        assert_eq!(ops, serial_ops, "the build path: the QMDB operations");
+        no_leaf(&ops, "the build path");
+        assert_same_bundle(&sharded.merged(), &serial.state, "the build path");
     }
 
     /// A block the build path cannot reproduce exactly is refused, never

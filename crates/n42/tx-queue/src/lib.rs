@@ -296,11 +296,15 @@ pub enum Dropped {
     HeldEvicted,
     /// An own block still held at a height the chain had already passed.
     HeldBehind,
+    /// A queued transaction another at its (sender, nonce) outbid by the
+    /// pool's price bump (audit 2026-10 round 3, R3-P3). Harmless: the
+    /// sender replaced it.
+    Outbid,
 }
 
 impl Dropped {
     /// Every reason, in report order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Duplicate,
         Self::Mined,
         Self::StaleArrival,
@@ -310,6 +314,7 @@ impl Dropped {
         Self::NoLane,
         Self::HeldEvicted,
         Self::HeldBehind,
+        Self::Outbid,
     ];
 
     /// The name this reason is reported under.
@@ -324,6 +329,7 @@ impl Dropped {
             Self::NoLane => "no_lane",
             Self::HeldEvicted => "held_evicted",
             Self::HeldBehind => "held_behind",
+            Self::Outbid => "outbid",
         }
     }
 
@@ -338,8 +344,33 @@ impl Dropped {
             Self::NoLane => 6,
             Self::HeldEvicted => 7,
             Self::HeldBehind => 8,
+            Self::Outbid => 9,
         }
     }
+
+    /// Whether this reason is ordinary traffic rather than a suspect: not
+    /// sampled, and no reason to report the drops.
+    const fn harmless(self) -> bool {
+        matches!(self, Self::Duplicate | Self::Mined | Self::Outbid)
+    }
+}
+
+/// The pool's price bump for a replacement, in percent (reth's
+/// `PriceBumpConfig` default).
+const REPLACE_PRICE_BUMP: u128 = 10;
+
+/// Whether `new` may take `held`'s place at its (sender, nonce): another
+/// transaction whose fee cap and tip both exceed the held one's by
+/// [`REPLACE_PRICE_BUMP`] percent, as the pool requires (R3-P3). The same
+/// transaction again (equal hashes) never does, so a re-sent frame's
+/// duplicates cost one hash comparison.
+fn outbids<T: PoolTransaction>(held: &ValidPoolTransaction<T>, new: &ValidPoolTransaction<T>) -> bool {
+    if held.hash() == new.hash() {
+        return false;
+    }
+    let bumped = |fee: u128| fee.saturating_mul(100 + REPLACE_PRICE_BUMP) / 100;
+    new.max_fee_per_gas() >= bumped(held.max_fee_per_gas())
+        && new.priority_fee_or_price() >= bumped(held.priority_fee_or_price())
 }
 
 /// The pool [`TxQueue::forget_mined_parallel`] runs on: eight threads of
@@ -814,7 +845,7 @@ fn fold_highest(mined: impl IntoIterator<Item = (Address, u64)>) -> AddressHashM
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DropReport {
     /// Counts in [`Dropped::ALL`] order.
-    pub counts: [u64; 9],
+    pub counts: [u64; 10],
     /// The first few, as (reason, sender, nonce): enough to take one sender
     /// to the generator's own log and see which nonce went missing.
     pub samples: Vec<(Dropped, Address, u64)>,
@@ -830,7 +861,7 @@ impl DropReport {
         self.counts
             .iter()
             .enumerate()
-            .any(|(i, n)| i != Dropped::Duplicate.index() && i != Dropped::Mined.index() && *n > 0)
+            .any(|(i, n)| !Dropped::ALL[i].harmless() && *n > 0)
     }
 
     /// The reasons that fired, as `name=count` pairs.
@@ -6411,8 +6442,16 @@ impl<T: PoolTransaction> Inner<T> {
                 let Some(Keyed { nonce, valid, .. }) = self.pending_drain.pop_front() else { break };
                 moved += 1;
                 match lane.by_nonce.entry(nonce) {
-                    std::collections::btree_map::Entry::Occupied(_) => {
-                        self.drops.counts[Dropped::Duplicate.index()] += 1;
+                    std::collections::btree_map::Entry::Occupied(mut held) => {
+                        // Outbid by the pool's bump: the new one takes the
+                        // slot (R3-P3); a frame holding the old one then
+                        // fails its by-pointer check and is not taken whole.
+                        if outbids(held.get(), &valid) {
+                            held.insert(valid);
+                            self.drops.counts[Dropped::Outbid.index()] += 1;
+                        } else {
+                            self.drops.counts[Dropped::Duplicate.index()] += 1;
+                        }
                     }
                     std::collections::btree_map::Entry::Vacant(slot) => {
                         if lane.mined.is_some_and(|mined| nonce <= mined) {
@@ -6469,8 +6508,14 @@ impl<T: PoolTransaction> Inner<T> {
             .lanes
             .entry(sender)
             .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None, chain_mined: None, parked: None, road: 0 });
-        if lane.by_nonce.contains_key(&nonce) {
-            self.dropped(Dropped::Duplicate, sender, nonce);
+        if let Some(held) = lane.by_nonce.get_mut(&nonce) {
+            // Outbid by the pool's bump: the new one takes the slot (R3-P3).
+            if outbids(held, &valid) {
+                *held = valid;
+                self.dropped(Dropped::Outbid, sender, nonce);
+            } else {
+                self.dropped(Dropped::Duplicate, sender, nonce);
+            }
             return;
         }
         if lane.is_stale(nonce) {
@@ -6655,7 +6700,7 @@ impl<T: PoolTransaction> Inner<T> {
     /// result is that of one [`Self::dropped`] call per item, in order.
     fn dropped_many(&mut self, reason: Dropped, items: impl ExactSizeIterator<Item = (Address, u64)>) {
         self.drops.counts[reason.index()] += items.len() as u64;
-        if reason == Dropped::Duplicate || reason == Dropped::Mined {
+        if reason.harmless() {
             return;
         }
         let room = DROP_SAMPLES.saturating_sub(self.drops.samples.len());
@@ -6665,10 +6710,7 @@ impl<T: PoolTransaction> Inner<T> {
     /// Records that a transaction left the queue, or never entered it.
     fn dropped(&mut self, reason: Dropped, sender: Address, nonce: u64) {
         self.drops.counts[reason.index()] += 1;
-        if self.drops.samples.len() < DROP_SAMPLES
-            && reason != Dropped::Duplicate
-            && reason != Dropped::Mined
-        {
+        if self.drops.samples.len() < DROP_SAMPLES && !reason.harmless() {
             self.drops.samples.push((reason, sender, nonce));
         }
     }
@@ -8153,6 +8195,51 @@ mod tests {
         assert_eq!(offered.first().copied(), Some(0), "a hole was left at the head of the lane");
         assert_eq!(offered, vec![0, 1, 2, 3]);
         let _ = sender;
+    }
+
+    /// Audit 2026-10 round 3 (R3-P3): a second transaction at a queued
+    /// (sender, nonce) was dropped as a duplicate whatever it paid, so a
+    /// sender could not speed up or cancel one the queue held. One that
+    /// outbids the held one by the pool's price bump (10% on both fees)
+    /// takes its place, through either drain and over a frame's member; a
+    /// lower or equal bid, or the same transaction again, is a duplicate.
+    #[test]
+    fn a_higher_fee_replaces_a_queued_transaction() {
+        use crate::test_support::{frame, sender, tx_priced};
+        for runs in [false, true] {
+            let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64).with_drain_runs(runs);
+            let who = sender(7);
+            queue.push(vec![tx_priced(who, 0, 100, 10), tx_priced(who, 1, 100, 10)]);
+            queue.drain_now();
+            let bump = tx_priced(who, 1, 110, 11);
+            let bumped = *bump.hash();
+            queue.push(vec![tx_priced(who, 1, 109, 20), tx_priced(who, 1, 200, 10), tx_priced(who, 1, 100, 10), bump]);
+            queue.drain_now();
+            assert_eq!(queue.len(), 2, "runs {runs}");
+            let mut best = queue.best_for_build(B256::repeat_byte(1));
+            let offered: Vec<(u64, B256)> = std::iter::from_fn(|| best.next()).map(|t| (t.nonce(), *t.hash())).collect();
+            drop(best);
+            assert_eq!(offered.len(), 2, "runs {runs}");
+            assert_eq!(offered[1], (1, bumped), "runs {runs}: the outbidding one is offered");
+            let named: alloy_primitives::map::HashMap<&str, u64> = queue.take_drops().named().into_iter().collect();
+            assert_eq!(named.get("duplicate"), Some(&3), "runs {runs}: {named:?}");
+            assert_eq!(named.get("outbid"), Some(&1), "runs {runs}: {named:?}");
+        }
+
+        // A frame's member outbid: the build offers the replacement, never both.
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64);
+        let who = sender(8);
+        frame(&queue, who, 0, 3);
+        queue.drain_now();
+        let bump = tx_priced(who, 1, 1_000, 100);
+        let bumped = *bump.hash();
+        queue.push(vec![bump]);
+        queue.drain_now();
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        let offered: Vec<(u64, B256)> = std::iter::from_fn(|| best.next()).map(|t| (t.nonce(), *t.hash())).collect();
+        drop(best);
+        assert_eq!(offered.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(offered[1].1, bumped);
     }
 
     /// Whatever the queue lets go of is counted and the first few are

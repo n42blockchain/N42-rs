@@ -16,7 +16,7 @@ use reth_basic_payload_builder::{
     is_better_payload, BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder,
     PayloadConfig,
 };
-use reth_chainspec::{ChainSpec, ChainSpecProvider, EthChainSpec, EthereumHardforks};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use n42_tx_types::{N42Primitives as EthPrimitives, N42TxEnvelope as TransactionSigned};
 use alloy_consensus::transaction::TxHashRef as _;
@@ -6507,7 +6507,7 @@ mod includability_tests {
     use n42_header::N42Header as Header;
     use alloy_primitives::{Address, Bytes, Signature, TxKind};
     use reth_basic_payload_builder::PayloadConfig;
-    use reth_chainspec::ChainSpecBuilder;
+    use reth_chainspec::{ChainSpec, ChainSpecBuilder};
     use reth_primitives_traits::{Recovered, RecoveredBlock, SealedHeader};
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_transaction_pool::{

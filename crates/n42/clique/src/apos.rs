@@ -737,7 +737,7 @@ where
     }
 }
 
-/// The node's header type: an APoS header never carries gov5's registry
+/// The node's header type: an `APoS` header never carries gov5's registry
 /// root, so its Ethereum view (same fields, same hash) is validated.
 impl<Provider, ChainSpec> HeaderValidator<n42_header::N42Header> for APos<Provider, ChainSpec>
 where
@@ -770,7 +770,7 @@ where
         )
     }
 
-    /// As the Ethereum header's: APoS checks headers one at a time.
+    /// As the Ethereum header's: `APoS` checks headers one at a time.
     fn validate_header_range(
         &self,
         _headers: &[SealedHeader<n42_header::N42Header>],

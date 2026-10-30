@@ -31,6 +31,9 @@ use reth_revm::cached::CachedReads;
 use reth_trie::updates::TrieUpdates;
 use std::sync::{Condvar, Mutex};
 
+/// A sealed header of the node's header type.
+type SealedN42Header = reth_primitives_traits::SealedHeader<n42_header::N42Header>;
+
 /// The read cache carried from one direct import to the next: the previous
 /// block's post-state (its senders above all -- every sender of the next
 /// block is one of the same 6,000 at the bench tier), keyed by the block it
@@ -339,7 +342,7 @@ type ParentOutput = Arc<reth_provider::BlockExecutionOutput<n42_tx_types::Receip
 /// The last blocks imported here, published as soon as their execution ends
 /// and before the engine takes them (`N42_CHECK_ON_PARENT_OUTPUT`,
 /// `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`).
-static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, reth_primitives_traits::SealedHeader<n42_header::N42Header>, ParentOutput)>> =
+static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, SealedN42Header, ParentOutput)>> =
     Mutex::new(std::collections::VecDeque::new());
 
 /// How many published outputs are kept: the check reads only the parent's.
@@ -441,7 +444,7 @@ fn publish_parent_outputs() -> bool {
 }
 
 /// Publishes a block's execution output for its child's check.
-fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::SealedHeader<n42_header::N42Header>, output: ParentOutput) {
+fn publish_parent_output(block_hash: B256, header: SealedN42Header, output: ParentOutput) {
     {
         let mut outputs = PARENT_OUTPUTS.lock().unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("PARENT_OUTPUTS", p));
         outputs.retain(|(hash, _, _)| *hash != block_hash);
@@ -465,7 +468,7 @@ fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::Seale
 ///
 /// [`ShardLayer`]: n42_engine_types::output_shards::ShardLayer
 type KeptShards =
-    (B256, reth_primitives_traits::SealedHeader<n42_header::N42Header>, Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput);
+    (B256, SealedN42Header, Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput);
 static FOLLOWER_SHARDS: Mutex<std::collections::VecDeque<KeptShards>> = Mutex::new(std::collections::VecDeque::new());
 
 /// How many blocks' shards are kept: the child reads its parent's, and under
@@ -492,7 +495,7 @@ fn check_on_shards() -> bool {
 /// and wakes a child waiting for them.
 fn keep_follower_shards(
     block_hash: B256,
-    header: reth_primitives_traits::SealedHeader<n42_header::N42Header>,
+    header: SealedN42Header,
     shards: Arc<n42_engine_types::output_shards::FrozenShards>,
     residual: ParentOutput,
 ) {
@@ -509,7 +512,7 @@ fn keep_follower_shards(
 
 /// The header, shards and residual kept for `block_hash`, if it was executed
 /// here on the build path and the shards are read ([`check_on_shards`]).
-fn follower_shards_of(block_hash: B256) -> Option<(reth_primitives_traits::SealedHeader<n42_header::N42Header>, ParentLayer)> {
+fn follower_shards_of(block_hash: B256) -> Option<(SealedN42Header, ParentLayer)> {
     if !check_on_shards() {
         return None;
     }
@@ -585,7 +588,7 @@ pub const fn parent_read_name(code: u64) -> &'static str {
 /// [`ShardLayer`]: n42_engine_types::output_shards::ShardLayer
 fn open_on_layers(
     historical: reth_provider::StateProviderBox,
-    layers: &[(reth_primitives_traits::SealedHeader<n42_header::N42Header>, ParentLayer)],
+    layers: &[(SealedN42Header, ParentLayer)],
 ) -> reth_provider::StateProviderBox {
     use n42_engine_types::direct_build::{executed_from_output, overlay_on_executed};
     let mut state = historical;
@@ -625,13 +628,13 @@ fn open_on_layers(
 fn wait_for_parent_layer(
     parent_hash: B256,
     parent_in: impl Fn() -> bool,
-) -> Option<(reth_primitives_traits::SealedHeader<n42_header::N42Header>, ParentLayer)> {
+) -> Option<(SealedN42Header, ParentLayer)> {
     wait_for_layer_within(parent_hash, parent_in, PARENT_WAIT, layer_of)
 }
 
 /// A block's layer for its descendant's check and execution: its shards when
 /// held, else its published output.
-fn layer_of(hash: B256) -> Option<(reth_primitives_traits::SealedHeader<n42_header::N42Header>, ParentLayer)> {
+fn layer_of(hash: B256) -> Option<(SealedN42Header, ParentLayer)> {
     follower_shards_of(hash).or_else(|| published_output(hash).map(|(header, output)| (header, ParentLayer::Merged(output))))
 }
 
@@ -641,7 +644,7 @@ fn wait_for_output_within(
     parent_hash: B256,
     parent_in: impl Fn() -> bool,
     wait: std::time::Duration,
-) -> Option<(reth_primitives_traits::SealedHeader<n42_header::N42Header>, ParentOutput)> {
+) -> Option<(SealedN42Header, ParentOutput)> {
     wait_for_layer_within(parent_hash, parent_in, wait, published_output)
 }
 
@@ -702,7 +705,7 @@ fn wait_for_parent_fields(parent_hash: B256) -> Result<(), String> {
 /// at every depth.
 fn wait_for_ancestor_fields(
     genesis: &alloy_genesis::Genesis,
-    parent: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
+    parent: &SealedN42Header,
     depth: u64,
 ) -> Result<(), String> {
     if depth <= 1 {
@@ -723,8 +726,8 @@ fn wait_for_ancestor_fields(
 /// closure because the vote road calls it from a thread of its own.
 fn validate_against_parent(
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
-    header: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
-    parent: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
+    header: &SealedN42Header,
+    parent: &SealedN42Header,
 ) -> Result<(), String> {
     consensus.validate_header_against_parent(header, parent).map_err(|err| format!("header against parent: {err}"))
 }
@@ -847,7 +850,7 @@ fn parent_in<Provider>(
     parent_hash: B256,
     genesis: &alloy_genesis::Genesis,
     deferred: bool,
-) -> Result<Option<reth_primitives_traits::SealedHeader<n42_header::N42Header>>, String>
+) -> Result<Option<SealedN42Header>, String>
 where
     Provider: HeaderProvider<Header = n42_header::N42Header>,
 {
@@ -872,7 +875,7 @@ fn wait_for_parent<Provider>(
     parent_hash: B256,
     genesis: &alloy_genesis::Genesis,
     deferred: bool,
-) -> Result<reth_primitives_traits::SealedHeader<n42_header::N42Header>, String>
+) -> Result<SealedN42Header, String>
 where
     Provider: HeaderProvider<Header = n42_header::N42Header>,
 {
@@ -1422,7 +1425,7 @@ fn decline_on_output(number: u64, why: &'static str) {
 }
 
 /// The published output of a block imported here, if it is still kept.
-fn published_output(hash: B256) -> Option<(reth_primitives_traits::SealedHeader<n42_header::N42Header>, ParentOutput)> {
+fn published_output(hash: B256) -> Option<(SealedN42Header, ParentOutput)> {
     PARENT_OUTPUTS
         .lock()
         .unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("PARENT_OUTPUTS", p))
@@ -1495,7 +1498,7 @@ struct Ancestry {
     ///
     /// Each is the block's shards under its residual when it was executed here
     /// on the build path and they are still kept, else its merged output.
-    outputs: Vec<(reth_primitives_traits::SealedHeader<n42_header::N42Header>, ParentLayer)>,
+    outputs: Vec<(SealedN42Header, ParentLayer)>,
     /// The nearest ancestor in the engine, whose state a read none of the
     /// bundles answers falls through to.
     anchor: B256,
@@ -1517,7 +1520,7 @@ impl Ancestry {
 /// and the wait is the honest answer.
 fn ancestry_of<Provider>(
     provider: &Provider,
-    parent: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
+    parent: &SealedN42Header,
     layer: &ParentLayer,
     genesis: &alloy_genesis::Genesis,
     deferred: bool,
@@ -1578,7 +1581,7 @@ where
 fn overlay_parent(
     ancestry: &Ancestry,
     number: u64,
-) -> Option<(B256, Vec<(reth_primitives_traits::SealedHeader<n42_header::N42Header>, ParentLayer)>)> {
+) -> Option<(B256, Vec<(SealedN42Header, ParentLayer)>)> {
     if hashed_state_enabled() {
         // A setting, not a property of this block, so it is said once: with
         // the pass on every block would otherwise print a refusal, and the
@@ -1715,7 +1718,7 @@ pub type MadeAside = Result<(RecoveredBlock<Block>, u64), String>;
 #[derive(Debug)]
 pub struct DescribedAside {
     /// The header, sealed by the hash the description checked it against.
-    pub header: reth_primitives_traits::SealedHeader<n42_header::N42Header>,
+    pub header: SealedN42Header,
     /// The withdrawals the body lists (`None` before Shanghai).
     pub withdrawals: Option<Vec<alloy_eips::eip4895::Withdrawal>>,
     /// The transactions, held by reference, in block order.
@@ -1979,7 +1982,7 @@ impl RoadPhases {
 /// includability, timed by part: (header us, includability us).
 #[allow(clippy::too_many_arguments)]
 fn timed_check<Provider>(
-    against: Option<(&(dyn FullConsensus<EthPrimitives> + Send + Sync), &reth_primitives_traits::SealedHeader<n42_header::N42Header>, &reth_primitives_traits::SealedHeader<n42_header::N42Header>)>,
+    against: Option<(&(dyn FullConsensus<EthPrimitives> + Send + Sync), &SealedN42Header, &SealedN42Header)>,
     provider: &Provider,
     parent_hash: B256,
     parent_output: Option<ParentBundles<'_>>,

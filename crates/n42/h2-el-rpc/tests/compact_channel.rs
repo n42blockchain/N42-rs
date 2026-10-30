@@ -118,6 +118,7 @@ fn body(compact: bool) -> ForeignBody {
         profile: N42HeaderProfile::Gov5H2,
         rlp: vec![0xc0, 1, 2, 3].into(),
         compact,
+        source: None,
     }
 }
 

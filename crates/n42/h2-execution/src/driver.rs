@@ -1282,6 +1282,20 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
     }
 
+    /// Hands the execution layer another peer's compact frame description of
+    /// a block whose first compact body is cached here
+    /// ([`ExecutionLayer::claim_layout`]): only its layout claim, filed under
+    /// its sender, for the whole-body fallback to try (audit 2026-10 round 2,
+    /// R2-X4). Nothing is cached or imported; the answer is not waited for.
+    pub fn forward_claim(&self, body: ForeignBody) {
+        let el = std::sync::Arc::clone(&self.el);
+        tokio::spawn(async move {
+            let block_hash = body.block_hash;
+            let filed = el.claim_layout(body).await;
+            debug!(target: "n42.h2.el", block = ?block_hash, filed, "another peer's layout claim forwarded");
+        });
+    }
+
     /// Installs the decoder the `NEW_PAYLOAD` fallback needs. See
     /// [`BodyDecoder`].
     pub fn set_body_decoder(&mut self, decoder: BodyDecoder) {

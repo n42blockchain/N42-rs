@@ -34,6 +34,7 @@ fn body_of(block: &BuiltBlock) -> ForeignBody {
         profile: n42_h2_consensus::N42HeaderProfile::Ethereum,
         rlp: rlp.into(),
         compact: false,
+        source: None,
     }
 }
 

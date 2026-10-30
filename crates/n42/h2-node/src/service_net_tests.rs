@@ -379,6 +379,49 @@ async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_n
     assert_eq!((catch_up.peer, catch_up.next), (other, 2));
 }
 
+/// Audit 2026-10 round 3 (R3-C2): a block that arrived live was voted for
+/// whatever its header carried, where gov5's `verifyHeaderWithBatch` refuses
+/// a header whose embedded QC does not decode, names a view past the
+/// header's own, or does not verify under a known set. A Rust quorum could
+/// then certify a block every gov5 member rejects. Such a block's import no
+/// longer reaches the engine, so no vote follows; a good QC still passes.
+#[tokio::test]
+async fn a_live_block_whose_header_qc_gov5_refuses_is_not_voted_for() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let quorum = [0, 1, 2];
+    let parent = B256::ZERO;
+    let refused = [
+        ("forged", header_qc(&rig.svc, &keys, &quorum, 3, parent, B256::repeat_byte(0x77))),
+        ("past the header's view", header_qc(&rig.svc, &keys, &quorum, 5, parent, parent)),
+        ("undecodable", vec![0xff; 10]),
+    ];
+    let mut events = Vec::new();
+    for (checked, (name, qc)) in [false, true].into_iter().flat_map(|c| refused.clone().map(|r| (c, r))) {
+        let (hash, header, _) = block_with_extra(if checked { 2 } else { 1 }, parent, 4, qc);
+        rig.svc.remember_block(hash, &header);
+        let event = if checked { ConsensusEvent::BlockChecked(hash) } else { ConsensusEvent::BlockImported(hash) };
+        rig.svc.apply_driver_action(DriverAction::Consensus(Box::new(event)), &mut events).expect("ok");
+        assert!(!rig.svc.engine.has_imported_block(&hash), "{name} (checked: {checked}) reached the engine");
+        assert!(!rig.svc.imported.contains(&hash), "{name} is not built on");
+    }
+
+    let good = header_qc(&rig.svc, &keys, &quorum, 3, parent, parent);
+    let (hash, header, _) = block_with_extra(1, parent, 4, good);
+    rig.svc.remember_block(hash, &header);
+    rig.svc
+        .apply_driver_action(DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(hash))), &mut events)
+        .expect("ok");
+    assert!(rig.svc.engine.has_imported_block(&hash), "a header QC that verifies passes");
+    // None at all: nothing to check, as gov5.
+    let (hash, header, _) = block_with_extra(1, parent, 5, Vec::new());
+    rig.svc.remember_block(hash, &header);
+    rig.svc
+        .apply_driver_action(DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(hash))), &mut events)
+        .expect("ok");
+    assert!(rig.svc.engine.has_imported_block(&hash), "a header without a QC passes");
+}
+
 /// Audit 2026-10 B-6: a step that returns early -- a range reply part
 /// imported, the rest left for the next step -- still checks for local
 /// faults: a vote-log halt ends it as it ends a step on the slow path.

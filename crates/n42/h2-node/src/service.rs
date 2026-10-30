@@ -561,6 +561,8 @@ pub struct H2Service<E> {
     /// ([`MAX_FILL_SERVE_BYTES`]), and each peer's share of them; their own
     /// budget, as `fill_slots` are.
     fill_bytes: FillBudget,
+    /// Header QCs that verified, so the vote path checks each once.
+    verified_header_qcs: std::cell::RefCell<VerifiedHeaderQcs>,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -1605,6 +1607,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             serve_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_SERVE_BYTES >> 10)),
             fill_slots: ServeSlots::shared(MAX_FILL_SERVES_PER_PEER, MAX_FILL_SERVES_IN_FLIGHT),
             fill_bytes: FillBudget::new(MAX_FILL_SERVE_BYTES >> 10),
+            verified_header_qcs: std::cell::RefCell::default(),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -3083,6 +3086,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             // The parent first, as for every import: a block the pull brought
             // in never told the engine, and an unknown parent withholds the
             // vote (audit 2026-10 round 2, R2-R1).
+            if let Some(reason) = self.header_qc_refusal(block_hash) {
+                warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no vote");
+                return Ok(());
+            }
             if let Some(header) = self.block_headers.get(block_hash) {
                 self.engine.remember_parent(*block_hash, header.parent_hash);
             }
@@ -3949,6 +3956,15 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(), ServiceError> {
         match action {
             DriverAction::Consensus(event) => {
+                // A block gov5 refuses for its header QC is not voted for,
+                // nor built on (audit 2026-10 round 3, R3-C2).
+                if let ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) =
+                    event.as_ref()
+                    && let Some(reason) = self.header_qc_refusal(block_hash)
+                {
+                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no vote");
+                    return Ok(());
+                }
                 // The engine's extends rule reads the parent of an imported
                 // block; every block imported here came with its header.
                 if let ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) =
@@ -4575,6 +4591,24 @@ impl<E: ExecutionLayer> H2Service<E> {
         {
             return Err(format!("parent {} is not the block pulled before it, {prev}", header.parent_hash));
         }
+        let Some(qc) = self.check_header_qc(header)? else {
+            return Ok(None);
+        };
+        if qc.view == 0 {
+            return Ok(None);
+        }
+        self.certified_is_an_ancestor(header, qc.block_hash)
+    }
+
+    /// The committed QC a header embeds, checked as gov5's
+    /// `verifyHeaderWithBatch` does: extra data that does not decode (QC
+    /// then seal, or the legacy QC alone) is refused, as is a QC whose view
+    /// is past the header's own or that does not verify against the set for
+    /// its exact view. No QC, or no set known for its view, is `Ok(None)`:
+    /// gov5 checks nothing more either. A QC that verified once is not
+    /// verified again ([`VerifiedHeaderQcs`]): the live path asks for every
+    /// block it votes on.
+    fn check_header_qc(&self, header: &Header) -> Result<Option<QuorumCertificate>, String> {
         let extra = match n42_h2_consensus::HeaderExtra::decode(&header.extra_data) {
             Ok(extra) => extra,
             Err(err) if self.header_profile == HeaderProfile::Gov5H2 => return Err(err.to_string()),
@@ -4593,19 +4627,30 @@ impl<E: ExecutionLayer> H2Service<E> {
         if wire.view > extra.view {
             return Err(format!("header QC view {} is past the header's view {}", wire.view, extra.view));
         }
+        let key = alloy_primitives::keccak256(&extra.qc);
+        if let Some(qc) = self.verified_header_qcs.borrow().get(&key) {
+            return Ok(Some(qc));
+        }
         let Some(qc) = self.engine.verify_header_qc(&wire).map_err(|err| err.to_string())? else {
             debug!(
                 target: "n42.h2.node",
                 qc_view = wire.view,
                 number = header.number,
-                "validator set for the certificate's view is not known; only the parent link is checked"
+                "validator set for the certificate's view is not known; the header QC is unchecked"
             );
             return Ok(None);
         };
-        if qc.view == 0 {
-            return Ok(None);
-        }
-        self.certified_is_an_ancestor(header, qc.block_hash)
+        self.verified_header_qcs.borrow_mut().insert(key, qc.clone());
+        Ok(Some(qc))
+    }
+
+    /// Why a block's import must not reach the engine, when its header --
+    /// held since its body arrived -- carries a QC gov5 refuses (audit
+    /// 2026-10 round 3, R3-C2). A block whose header this node does not hold
+    /// passes, as before.
+    fn header_qc_refusal(&self, block_hash: &B256) -> Option<String> {
+        let header = self.block_headers.get(block_hash)?;
+        self.check_header_qc(header).err()
     }
 
     /// After a restart: the height past which the execution layer holds
@@ -5917,6 +5962,36 @@ impl FillBudget {
     /// Drops a peer's share; replies still held keep theirs until sent.
     fn forget(&mut self, peer: &PeerId) {
         self.per_peer.remove(peer);
+    }
+}
+
+/// Header QCs that verified, keyed by the hash of their bytes, oldest
+/// dropped first. Consecutive headers mostly embed the same committed QC,
+/// and the live path checks the header of every block it votes on: without
+/// it that is a BLS aggregate verification per block (R3-C2).
+#[derive(Debug, Default)]
+struct VerifiedHeaderQcs {
+    by_bytes: std::collections::HashMap<B256, QuorumCertificate>,
+    order: std::collections::VecDeque<B256>,
+}
+
+impl VerifiedHeaderQcs {
+    /// QCs kept: a few epochs' worth of commits a lagging header may name.
+    const CAPACITY: usize = 64;
+
+    fn get(&self, key: &B256) -> Option<QuorumCertificate> {
+        self.by_bytes.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: B256, qc: QuorumCertificate) {
+        if self.by_bytes.insert(key, qc).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > Self::CAPACITY
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.by_bytes.remove(&oldest);
+            }
+        }
     }
 }
 

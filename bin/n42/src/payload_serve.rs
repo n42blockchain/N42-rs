@@ -2821,6 +2821,20 @@ fn check_only_answer(
     Err("not checked here".to_owned())
 }
 
+/// The answer to a layout claim (`request::CLAIM_LAYOUT`, audit 2026-10
+/// round 2, R2-X4): another peer's frame description of a block, filed under
+/// its sender's source for the whole-body fallback to try. Nothing is
+/// assembled or imported.
+fn claim_layout_answer(
+    frame: &[u8],
+    validator: Option<&n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec>>,
+) -> Result<(), String> {
+    let (announced, profile, body, source) =
+        raw_engine::decode_foreign_body_from(frame).map_err(|err| format!("layout claim frame: {err}"))?;
+    let validator = validator.ok_or_else(|| "no direct import; no claims kept".to_owned())?;
+    validator.claim_compact_body(announced, profile, body, source)
+}
+
 /// Answers a held request (`request::HOLD_EXECUTION`) under `N42_IMPORT_ONCE`
 /// with an error: a held execution is released by one validator and cannot be
 /// shared between keys (`import_once::check_startup` refuses the switch
@@ -3134,6 +3148,36 @@ where
             );
             continue;
         }
+        if kind == request::CLAIM_LAYOUT {
+            let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
+            if len > MAX_SMALL_FRAME {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "layout claim frame too large"));
+            }
+            let mut buf = vec![0u8; len];
+            within_frame_deadline(stream.read_exact(&mut buf)).await?;
+            let answer = claim_layout_answer(&buf, reuse.as_ref().map(|reuse| &*reuse.validator));
+            out.clear();
+            match &answer {
+                Ok(()) => {
+                    out.push(raw_engine::reply::VALUE);
+                    out.extend_from_slice(&frame_len(0)?);
+                }
+                Err(message) => {
+                    out.push(raw_engine::reply::ERROR);
+                    out.extend_from_slice(&frame_len(message.len())?);
+                    out.extend_from_slice(message.as_bytes());
+                }
+            }
+            stream.write_all(&out).await?;
+            debug!(
+                target: "n42.payload_serve",
+                filed = answer.is_ok(),
+                reason = answer.as_ref().err().map_or("", String::as_str),
+                answered_us = started_at.elapsed().as_micros() as u64,
+                "layout claim request"
+            );
+            continue;
+        }
         if kind == request::OWN_BLOCK {
             let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
             if len > MAX_SMALL_FRAME {
@@ -3385,7 +3429,7 @@ where
             // this borrows the connection's frame buffer and is tens of
             // milliseconds of rayon work a runtime worker must not sit on.
             let assembled = tokio::task::block_in_place(|| {
-                let (announced, profile, body) = raw_engine::decode_foreign_body(&frame)
+                let (announced, profile, body, source) = raw_engine::decode_foreign_body_from(&frame)
                     .map_err(|err| CompactRefusal::Said(format!("compact body frame: {err}")))?;
                 let validator = validator.ok_or_else(|| {
                     CompactRefusal::Said("no direct import; send the payload".to_owned())
@@ -3404,7 +3448,7 @@ where
                 // header with the queue's transactions held by reference,
                 // then the one copy reth's block type forces.
                 let mut described = validator
-                    .describe_compact_body(announced, profile, body, &queue, miss_wait())
+                    .describe_compact_body_from(announced, profile, body, &queue, miss_wait(), source)
                     .map_err(CompactRefusal::Refused)?;
                 let make_at = std::time::Instant::now();
                 // The payload travels with an empty list until the import

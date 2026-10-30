@@ -39,6 +39,9 @@ pub enum ElCall {
     BodyDropped(B256),
     /// A check-only request ([`ExecutionLayer::check_only`]).
     CheckOnly(B256),
+    /// A layout claim ([`ExecutionLayer::claim_layout`]): the block and its
+    /// sender's source.
+    ClaimLayout(B256, Option<crate::raw_engine::ClaimSource>),
 }
 
 /// Behaviour a test wants from the execution layer.
@@ -316,6 +319,11 @@ impl ExecutionLayer for MockExecutionLayer {
 
     fn checks_only(&self) -> bool {
         self.behaviour.lock().expect("mock behaviour lock").check_only.is_some()
+    }
+
+    async fn claim_layout(&self, body: crate::ForeignBody) -> bool {
+        self.record(ElCall::ClaimLayout(body.block_hash, body.source));
+        true
     }
 
     async fn check_only(&self, block_hash: B256, _header_rlp: alloy_primitives::Bytes) -> bool {

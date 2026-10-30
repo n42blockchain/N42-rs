@@ -548,7 +548,7 @@ pub struct H2Service<E> {
     pending_imports: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>,
     /// Block requests the store could not answer, for the execution layer
     /// on the next drain.
-    pending_block_requests: Vec<(String, B256, n42_h2_net::BlockRequestChannel)>,
+    pending_block_requests: Vec<(PeerId, B256, n42_h2_net::BlockRequestChannel)>,
     /// Range requests being served off the loop; see [`ServeSlots`].
     serve_slots: SharedServeSlots,
     /// The bytes range replies may hold at once, in KiB, for every peer
@@ -557,9 +557,10 @@ pub struct H2Service<E> {
     /// Fills and block-by-hash requests being served off the loop: their
     /// own share, so range pulls never refuse a vote-path fill.
     fill_slots: SharedServeSlots,
-    /// The bytes fill and block-by-hash replies may hold at once, in KiB
-    /// ([`MAX_FILL_SERVE_BYTES`]); their own budget, as `fill_slots` are.
-    fill_bytes: Arc<tokio::sync::Semaphore>,
+    /// The bytes fill and block-by-hash replies may hold at once
+    /// ([`MAX_FILL_SERVE_BYTES`]), and each peer's share of them; their own
+    /// budget, as `fill_slots` are.
+    fill_bytes: FillBudget,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -1603,7 +1604,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             serve_slots: ServeSlots::shared(MAX_SERVES_PER_PEER, MAX_SERVES_IN_FLIGHT),
             serve_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_SERVE_BYTES >> 10)),
             fill_slots: ServeSlots::shared(MAX_FILL_SERVES_PER_PEER, MAX_FILL_SERVES_IN_FLIGHT),
-            fill_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_FILL_SERVE_BYTES >> 10)),
+            fill_bytes: FillBudget::new(MAX_FILL_SERVE_BYTES >> 10),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -2668,7 +2669,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 match self.body_store.get(&hash).map(|body| body.to_shared()) {
                     Some(body) => {
                         debug!(target: "n42.h2.node", %peer, ?hash, "peer asked for a block; served from the store");
-                        self.respond_block_within_budget(channel, Some(body));
+                        self.respond_block_within_budget(peer, channel, Some(body));
                     }
                     // A block this node took elided is fetched by its header
                     // on the next drain (it needs this loop's state).
@@ -2680,7 +2681,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                             debug!(target: "n42.h2.node", %peer, ?hash, "block request queue full; refused");
                             self.transport.respond_block(channel, None);
                         } else {
-                            self.pending_block_requests.push((peer.to_string(), hash, channel));
+                            self.pending_block_requests.push((peer, hash, channel));
                         }
                     }
                     // Any other is looked up off the loop, within the
@@ -2852,6 +2853,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.direct_votes.forget_peer(&peer);
                 // A height is only worth what the peer can still serve.
                 self.peer_heights.remove(&peer);
+                self.fill_bytes.forget(&peer);
             }
             TransportEvent::VoteHello { peer, index, signature } => {
                 if !self.direct_votes.hello_worth_verifying(index, peer) {
@@ -2952,8 +2954,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         // "not here" without a second, whole-block lookup on this loop.
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
             let body = self.queued_body(hash).await;
-            debug!(target: "n42.h2.node", peer, ?hash, found = body.is_some(), "peer asked for a block taken elided");
-            self.respond_block_within_budget(channel, body);
+            debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block taken elided");
+            self.respond_block_within_budget(peer, channel, body);
         }
         while let Ok(served) = self.served_txns.1.try_recv() {
             self.respond_served(served);
@@ -5128,7 +5130,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             Served::Txns(served) => self.respond_served_txns(served),
             Served::Block { peer, hash, channel, body } => {
                 debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
-                self.respond_block_within_budget(channel, body);
+                self.respond_block_within_budget(peer, channel, body);
             }
             Served::Range { peer, request, channel, mut range, slot } => {
                 debug!(target: "n42.h2.node", %peer, ?request, served = range.rlps.len(), short_of_budget = range.short_of_budget, "peer asked for a range");
@@ -5159,7 +5161,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         };
         let bytes = txns.iter().map(|tx| tx.len()).sum();
-        match reply_permit(&self.fill_bytes, bytes) {
+        match self.fill_bytes.permit(peer, bytes) {
             Some(permit) => {
                 self.transport.respond_block_txns_holding(channel, Ok(txns), n42_h2_net::ServeGuard::new(permit));
             }
@@ -5176,6 +5178,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// peer (audit 2026-10 R2-I6).
     fn respond_block_within_budget(
         &mut self,
+        peer: PeerId,
         channel: n42_h2_net::BlockRequestChannel,
         body: Option<alloy_primitives::Bytes>,
     ) {
@@ -5183,12 +5186,12 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.transport.respond_block(channel, None);
             return;
         };
-        match reply_permit(&self.fill_bytes, body.len()) {
+        match self.fill_bytes.permit(peer, body.len()) {
             Some(permit) => {
                 self.transport.respond_block_holding(channel, Some(body), n42_h2_net::ServeGuard::new(permit));
             }
             None => {
-                debug!(target: "n42.h2.node", bytes = body.len(), "fill byte budget spent; block request refused");
+                debug!(target: "n42.h2.node", %peer, bytes = body.len(), "fill byte budget spent; block request refused");
                 self.transport.respond_block(channel, None);
             }
         }
@@ -5852,10 +5855,69 @@ struct ServedRange {
 
 /// A share of `budget` (KiB permits) for a reply of `bytes`, or none while
 /// the budget cannot cover it. A reply larger than the whole budget asks
-/// for all of it rather than never being served.
+/// for all of it rather than never being served. Fills now go through
+/// [`FillBudget`]; the R2-I6 budget tests still use it.
+#[cfg(test)]
 fn reply_permit(budget: &Arc<tokio::sync::Semaphore>, bytes: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
     let kib = bytes.div_ceil(1024).clamp(1, MAX_FILL_SERVE_BYTES >> 10);
     Arc::clone(budget).try_acquire_many_owned(u32::try_from(kib).unwrap_or(u32::MAX)).ok()
+}
+
+/// The shares of the fill budget one peer may hold: 64 MiB of 512, still
+/// two of the largest bodies a 5M-tier block has carried.
+const FILL_PEER_SHARES: usize = 8;
+
+/// Peers with a share kept before the idle ones are dropped: one connected
+/// again after its disconnect was seen would otherwise stay for good.
+const MAX_FILL_PEERS: usize = 1024;
+
+/// The fill and block-by-hash byte budget (KiB permits), and each peer's
+/// share of it: one peer asking for large bodies faster than libp2p sends
+/// them holds its share, not every reply's (audit 2026-10 round 3, R3-G2).
+#[derive(Debug)]
+struct FillBudget {
+    total: Arc<tokio::sync::Semaphore>,
+    per_peer: std::collections::HashMap<PeerId, Arc<tokio::sync::Semaphore>>,
+    total_kib: usize,
+    peer_kib: usize,
+}
+
+impl FillBudget {
+    fn new(total_kib: usize) -> Self {
+        Self {
+            total: Arc::new(tokio::sync::Semaphore::new(total_kib)),
+            per_peer: std::collections::HashMap::new(),
+            total_kib,
+            peer_kib: (total_kib / FILL_PEER_SHARES).max(1),
+        }
+    }
+
+    /// A reply of `bytes` to `peer`, held against both its share and the
+    /// whole, or none while either cannot cover it. A reply larger than a
+    /// share asks for all of it rather than never being served.
+    fn permit(
+        &mut self,
+        peer: PeerId,
+        bytes: usize,
+    ) -> Option<(tokio::sync::OwnedSemaphorePermit, tokio::sync::OwnedSemaphorePermit)> {
+        if self.per_peer.len() >= MAX_FILL_PEERS && !self.per_peer.contains_key(&peer) {
+            let whole = self.peer_kib;
+            self.per_peer.retain(|_, share| share.available_permits() < whole);
+        }
+        let peer_kib = self.peer_kib;
+        let share = self.per_peer.entry(peer).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(peer_kib)));
+        let kib = bytes.div_ceil(1024).max(1);
+        let take = |budget: &Arc<tokio::sync::Semaphore>, cap: usize| {
+            Arc::clone(budget).try_acquire_many_owned(u32::try_from(kib.min(cap)).unwrap_or(u32::MAX)).ok()
+        };
+        let own = take(share, peer_kib)?;
+        Some((own, take(&self.total, self.total_kib)?))
+    }
+
+    /// Drops a peer's share; replies still held keep theirs until sent.
+    fn forget(&mut self, peer: &PeerId) {
+        self.per_peer.remove(peer);
+    }
 }
 
 /// Whether a range reply holding `blocks` blocks of `bytes` takes one more

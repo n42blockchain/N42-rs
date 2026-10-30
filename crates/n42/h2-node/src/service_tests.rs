@@ -1418,6 +1418,24 @@ fn fill_and_block_replies_draw_on_a_byte_budget_held_until_dropped() {
     assert!(reply_permit(&whole, usize::MAX).is_some(), "a reply larger than the budget takes all of it, once");
 }
 
+/// Audit 2026-10 round 3 (R3-G2): the fill budget was one pool, so a single
+/// peer asking for large bodies faster than libp2p sent them held all of it
+/// and every other peer's fill was refused. Each peer draws on a share.
+#[test]
+fn one_peer_cannot_hold_the_whole_fill_budget() {
+    let mut budget = FillBudget::new(64 << 10);
+    let (greedy, other) = (PeerId::random(), PeerId::random());
+    let first = budget.permit(greedy, 6 << 20).expect("one body within the peer's share");
+    assert!(budget.permit(greedy, 6 << 20).is_none(), "a second passes the share, though the pool has room");
+    let served = budget.permit(other, 6 << 20).expect("another peer is still served");
+    drop(first);
+    assert!(budget.permit(greedy, 6 << 20).is_some(), "given back with the reply");
+    drop(served);
+    assert!(budget.permit(other, usize::MAX).is_some(), "a reply larger than a share takes all of it, once");
+    budget.forget(&greedy);
+    assert!(!budget.per_peer.contains_key(&greedy), "a gone peer's share is dropped");
+}
+
 /// Audit 2026-10 round 2 (R2-R5): while pulled blocks wait for a proof
 /// (`unproven_from`), the height last read from the execution layer still
 /// answers "is any peer past what is held": no peer is past the unproven

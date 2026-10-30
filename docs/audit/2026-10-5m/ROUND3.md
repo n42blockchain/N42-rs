@@ -69,3 +69,4 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | R3-P9 | 未修(信任边界内):两条路径都是本节点自己的执行层(Engine API 带 JWT;`--el-rpc` 由运维指定),响应体上限防的是本机进程,优先级低 |
 | R3-N4 | 未修(热路径,gov5 交互):开启 `validate_messages()` 后每条 gossip 需显式回报 Accept/Reject/Ignore,遗漏即不转发;转发时机变化影响出块关键路径与 gov5 网格评分,需单独设计与 A/B |
 | R2-C1(high_tc) | 未修:复核结论为无永久停滞,只有延迟(TC 由任一节点形成并推进);最小移植方案已记录,留待 C2 一并做跨客户端一致性 |
+| R3-G2 | 已修:fill/by-hash 回复预算按 peer 分份(`FillBudget`,每 peer 至多总量 1/8 = 64 MiB,超过一份的回复取整份),断开时 `forget` 释放,peer 表至多 1,024 项、满时丢弃空闲项;测试 `one_peer_cannot_hold_the_whole_fill_budget` 修复前编译失败(无按 peer 预算)。热路径:每个 fill/by-hash 回复多一次 HashMap 查找与一个 semaphore permit,需同机 A/B |

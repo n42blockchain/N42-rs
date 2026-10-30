@@ -626,7 +626,17 @@ impl TreeLease {
         // 3.3): the appended slots follow from the cursor, nothing per slot
         // is collected.
         let appended = tree.entry_file().is_some().then(|| tree.next_slot().saturating_sub(undo.prev_next_slot));
-        let delta = delta_of_applied(tree, &undo);
+        // On the pool as one job, as before the offsets list went: the leasing
+        // thread is a plain thread outside the rayon pool (`qmdb-root` in the
+        // assembler, the payload builder's scoped root thread), so a bare call
+        // queues each of the delta's `par_iter` stages on the pool separately,
+        // each waiting behind the next block's execution. That stretched the
+        // lease (stage fx VS: 11.3 / 12.1 ms a block against 10.0-10.9).
+        let delta = if n42_twig_core::qmdb_compat::parallel_apply() {
+            rayon::join(|| delta_of_applied(tree, &undo), || ()).0
+        } else {
+            delta_of_applied(tree, &undo)
+        };
         let delta_us = delta_at.elapsed().as_micros() as u64;
         Ok(LeasedRoot { root: B256::from(root), ops, undo, delta, appended, phases, apply_us, delta_us })
     }

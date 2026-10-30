@@ -78,3 +78,4 @@ RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测�
 | R3-N3 余项 | 不修:by-hash 回复只对本节点发出的请求生效,每个请求至多一次解码,无放大;先核头哈希只省掉一次错误回复的 body 解码 |
 | R3-P8 余项 | 暂缓:矿工已逐条核块哈希、成员、重复与签名;剩下的是公开调用灌满队列使诚实签名得到 "retry"。在 RPC 层过滤需矿工导出当前待定块并提供成员查询;这是 APoS 旧路径(HotStuff 链不启动矿工),价值低 |
 | R2-X2 余项 | 不修:帧体读取已有期限(`FRAME_READ_TIMEOUT`);剩下的帧间空闲只占一个连接名额(256 个,每个 1 MiB 读缓冲,合计有界),空闲超时会断开长期空闲的合法客户端(本节点 relay、flood 工具) |
+| R3-C2 | 已修(实时路径):拉取路径的检查抽成 `check_header_qc`(gov5 `decodeHeaderExtra` 两种布局、`qc.view > header view` 即拒、已知集合下必须验签通过,未知集合或无 QC 放行);实时路径在 `BlockImported`/`BlockChecked` 交给 engine 之前(`apply_driver_action` 与已导入块的 `ExecuteBlock` 分支)检查本节点持有的头部,被拒则不投票、不在其上建块。已验证 QC 按字节哈希缓存 64 个。测试 `a_live_block_whose_header_qc_gov5_refuses_is_not_voted_for` 修复前失败(伪造 QC 的块到达 engine)。热路径:每次投票一次 keccak(QC 字节)与缓存查询,缓存未命中一次 BLS 聚合验签;需 Linux X22 A/B 与 devnet gov5 三形态。未改:h2-wire 位图严格解码(集合未知时比 gov5 严,诚实 gov5 不产生) |

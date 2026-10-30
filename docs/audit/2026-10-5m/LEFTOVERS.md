@@ -26,7 +26,7 @@ Windows 合入的改动由 Linux 在下一次整体验证时一并覆盖。
 | R3-E3 | ROUND3 | 并行执行器单笔 gas_limit ≤ 剩余 gas 的加固检查(当前不可达) | Linux(随 E1,同在装块热路径) | 待做 |
 | R3-N1 余项 | ROUND3 | 每 peer 入站 RPC 连接上限 | Windows | 已修(见 `git log --grep R3-N1`) |
 | R2-X2 余项 | ROUND2 | tx-ingest 帧间空闲超时(端口默认只绑回环) | Windows | 不修(帧体已有期限,见 ROUND3) |
-| R3-C2 | ROUND3 | 头部 QC 共用检查(实时路径投票闸门),方案见下 | Windows 写(10-30 认领),Linux 验 A/B 与 devnet gov5 | 实现中 |
+| R3-C2 | ROUND3 | 头部 QC 共用检查(实时路径投票闸门),方案见下 | Windows 写(10-30 认领),Linux 验 A/B 与 devnet gov5 | 已实现(见 `git log --grep R3-C2`),**待 Linux:X22 A/B + devnet gov5 三形态**,通过后改为已修 |
 
 ### R3-C2 实现方案(Windows 会话 10-30 读码结论)
 
@@ -64,7 +64,7 @@ Rust 现状:
 | R3-N4 | ROUND3 | gossip `validate_messages()` + 回报 Accept/Reject/Ignore | Linux | 待做 |
 | R3-G4 | ROUND3 | leader 首次导入的多余 payload 克隆 | Linux | 低优先 |
 | R3-E2 | ROUND3 | 零手续费块 beneficiary 触碰:先用 gov5 夹具确认根 | Linux | 待做 |
-| 热路径 A/B | ROUND2/3 | R2-X1、R2-I1、R2-R4/Q4、R2-C7、R2-I6、R2-R3、R3-N2、R3-N3、R3-G2、R3-C3 | Linux | 已由 X22 配对整体闭合(5ab8fffea);此后的热路径改动(R3-N5 余项、R3-P9)待下一次配对 |
+| 热路径 A/B | ROUND2/3 | R2-X1、R2-I1、R2-R4/Q4、R2-C7、R2-I6、R2-R3、R3-N2、R3-N3、R3-G2、R3-C3 | Linux | 已由 X22 配对整体闭合(5ab8fffea);此后的热路径改动(R3-N5 余项、R3-P9、R3-C2)待下一次配对,建议一次 X22 覆盖三者 |
 
 ## D. 需协议/跨仓库决定(先记录,不动手)
 

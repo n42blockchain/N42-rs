@@ -267,6 +267,19 @@ pub fn tc_to_wire(tc: &TimeoutCertificate) -> Result<H2TimeoutCertificate, Bridg
     })
 }
 
+/// The TC a vote, commit vote or timeout carries as gov5's `SyncInfo`
+/// `high_tc`, if any, with its view: the view is enough to decide whether it
+/// is worth translating (see [`ConsensusEngine::adopt_embedded_tc`]).
+///
+/// [`ConsensusEngine::adopt_embedded_tc`]: crate::ConsensusEngine::adopt_embedded_tc
+pub const fn embedded_tc(envelope: &H2V4Envelope) -> Option<&H2TimeoutCertificate> {
+    match &envelope.message {
+        H2Message::Vote(v) | H2Message::CommitVote(v) => v.high_tc.as_ref(),
+        H2Message::Timeout(t) => t.high_tc.as_ref(),
+        _ => None,
+    }
+}
+
 /// Translates an envelope received from the fleet into what the engine consumes.
 ///
 /// `validator_count` is the size of the set the certificates in this message are
@@ -297,8 +310,8 @@ pub fn to_engine(
             // correct instruction on a chain that has no reconfiguration.
             validator_changes: None,
         }),
-        // `high_tc` is dropped here — see the module docs. It is a recovery
-        // accelerator, and this engine recovers without it.
+        // `high_tc` is not part of the engine's message: the node hands it
+        // to `ConsensusEngine::adopt_embedded_tc` first ([`embedded_tc`]).
         H2Message::Vote(v) => ConsensusMessage::Vote(Vote {
             view: v.view,
             block_hash: v.block_hash,

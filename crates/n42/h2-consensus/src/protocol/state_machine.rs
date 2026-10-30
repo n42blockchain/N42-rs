@@ -2059,6 +2059,14 @@ impl ConsensusEngine {
     /// reached): the certificate is unchecked, not refused, as gov5's
     /// `verifyHeaderWithBatch` skips a QC whose set it cannot resolve. Every
     /// other failure is an error.
+    /// The key of the leader for `view`, when the set authorized for that
+    /// exact view is known: what a block's header seal is checked against.
+    pub fn leader_public_key_for_view(&self, view: ViewNumber) -> Option<n42_h2_primitives::BlsPublicKey> {
+        let set = self.epoch_manager.known_validator_set_for_view(view)?;
+        let leader = LeaderSelector::leader_for_view_with_tenure(view, self.leader_tenure, set);
+        set.get_public_key(leader).ok().cloned()
+    }
+
     /// Whether an import (or, under deferred execution, a check) of
     /// `block_hash` has reached this engine: what its vote waits for.
     pub fn has_imported_block(&self, block_hash: &B256) -> bool {

@@ -70,9 +70,29 @@ impl VerificationReceipt {
         let pubkey = BlsPublicKey::from_bytes(&self.verifier_pubkey)
             .map_err(|_| ReceiptError::InvalidPublicKey)?;
         pubkey
-            .verify(&self.signing_message(), &self.signature)
+            .verify_with_dst(&self.signing_message(), &self.signature, RECEIPT_DST)
             .map_err(|_| ReceiptError::InvalidSignature)
     }
+}
+
+/// The domain receipts are signed in: their own, so a receipt signature is
+/// never a consensus one or the reverse (audit 2026-10 round 3, R3-P6).
+pub const RECEIPT_DST: &[u8] = b"N42_MOBILE_RECEIPT_V1_BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+/// The domain a verifier's proof of possession is signed in.
+pub const POP_DST: &[u8] = b"N42_MOBILE_V1_BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+/// A verifier's proof that it holds the key it registers: its public key
+/// signed in [`POP_DST`]. Receipts from many keys are aggregated over one
+/// message, which is forgeable with a key derived from others' (a rogue
+/// key) unless every key came with this proof (R3-P6).
+pub fn proof_of_possession(signing_key: &BlsSecretKey) -> BlsSignature {
+    signing_key.sign_with_dst(&signing_key.public_key().to_bytes(), POP_DST)
+}
+
+/// Whether `proof` is [`proof_of_possession`] for `pubkey`.
+pub fn verify_proof_of_possession(pubkey: &[u8; 48], proof: &BlsSignature) -> bool {
+    BlsPublicKey::from_bytes(pubkey).is_ok_and(|key| key.verify_with_dst(pubkey, proof, POP_DST).is_ok())
 }
 
 /// Creates a signed verification receipt after executing a block.
@@ -85,7 +105,7 @@ pub fn sign_receipt(
 ) -> VerificationReceipt {
     let verifier_pubkey = signing_key.public_key().to_bytes();
     let msg = build_signing_message(&block_hash, block_number, &computed_receipts_root);
-    let signature = signing_key.sign(&msg);
+    let signature = signing_key.sign_with_dst(&msg, RECEIPT_DST);
 
     VerificationReceipt {
         block_hash,
@@ -182,6 +202,19 @@ pub enum ReceiptError {
 
 #[cfg(test)]
 mod tests {
+    /// Audit 2026-10 round 3 (R3-P6): receipts were signed in the native
+    /// consensus domain (the same DST its votes use). A receipt carries its
+    /// own; a signature over the same bytes in the consensus domain is not a
+    /// receipt.
+    #[test]
+    fn a_receipt_is_signed_in_its_own_domain() {
+        let key = n42_h2_primitives::BlsSecretKey::key_gen(&[7u8; 32]).expect("key");
+        let mut receipt = super::sign_receipt(alloy_primitives::B256::repeat_byte(1), 3, alloy_primitives::B256::repeat_byte(2), 0, &key);
+        receipt.verify_signature().expect("signed in its own domain");
+        receipt.signature = key.sign(&receipt.signing_message());
+        assert!(receipt.verify_signature().is_err(), "the consensus domain does not verify as a receipt");
+    }
+
     use super::*;
     use n42_h2_primitives::BlsSecretKey;
 

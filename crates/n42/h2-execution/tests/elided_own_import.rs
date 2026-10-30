@@ -86,7 +86,7 @@ fn transactions(n: usize) -> Vec<Bytes> {
 async fn an_elided_own_block_imports_by_its_header_without_fetching_the_body() {
     let (built, header) = elided(3);
     let el = Recording { by_header: true, ..Default::default() };
-    let status = import_own(&el, built.header.as_ref(), built.execution_data.clone(), Some(built.tx_count))
+    let status = import_own(&el, built.header.as_ref(), &built.execution_data, Some(built.tx_count))
         .await
         .expect("imports");
     assert!(status.status.is_valid());
@@ -103,7 +103,7 @@ async fn a_refused_header_fetches_the_body_and_sends_the_whole_payload() {
         body: Some(ChainBlock { header: header.clone(), transactions: transactions(3), withdrawals: None }),
         ..Default::default()
     };
-    import_own(&el, built.header.as_ref(), built.execution_data.clone(), Some(built.tx_count))
+    import_own(&el, built.header.as_ref(), &built.execution_data, Some(built.tx_count))
         .await
         .expect("imports");
     assert_eq!(*el.bodies_asked.lock().unwrap(), 1, "fetched on demand, once");
@@ -118,7 +118,7 @@ async fn an_elided_payload_is_never_sent_without_its_body() {
     // No longer held: an error, not an empty block.
     let (built, _) = elided(3);
     let el = Recording { by_header: false, body: None, ..Default::default() };
-    assert!(import_own(&el, built.header.as_ref(), built.execution_data.clone(), Some(3)).await.is_err());
+    assert!(import_own(&el, built.header.as_ref(), &built.execution_data, Some(3)).await.is_err());
     assert!(el.payloads.lock().unwrap().is_empty());
 
     // A body of the wrong length is not this block either.
@@ -128,13 +128,13 @@ async fn an_elided_payload_is_never_sent_without_its_body() {
         body: Some(ChainBlock { header, transactions: transactions(2), withdrawals: None }),
         ..Default::default()
     };
-    assert!(import_own(&el, built.header.as_ref(), built.execution_data.clone(), Some(3)).await.is_err());
+    assert!(import_own(&el, built.header.as_ref(), &built.execution_data, Some(3)).await.is_err());
     assert!(el.payloads.lock().unwrap().is_empty());
 
     // And without the sealed header there is nothing to ask by.
     let (built, _) = elided(3);
     let el = Recording { by_header: true, ..Default::default() };
-    assert!(import_own(&el, None, built.execution_data.clone(), Some(3)).await.is_err());
+    assert!(import_own(&el, None, &built.execution_data, Some(3)).await.is_err());
 }
 
 #[tokio::test]
@@ -143,7 +143,7 @@ async fn a_whole_own_block_is_imported_exactly_as_before() {
     // and nothing fetched.
     let built = MockExecutionLayer::built_block(7);
     let el = Recording { by_header: true, ..Default::default() };
-    import_own(&el, None, built.execution_data.clone(), None).await.expect("imports");
+    import_own(&el, None, &built.execution_data, None).await.expect("imports");
     assert!(el.headers.lock().unwrap().is_empty(), "the default import_own_block sends the payload");
     assert_eq!(*el.bodies_asked.lock().unwrap(), 0);
     assert_eq!(el.payloads.lock().unwrap().len(), 1);

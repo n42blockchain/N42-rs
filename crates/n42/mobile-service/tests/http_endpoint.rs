@@ -95,7 +95,10 @@ fn a_phone_can_complete_the_round_trip_over_http() {
     let registered = call(
         port,
         "mobile_registerVerifier",
-        json!([format!("0x{}", hex::encode(key.public_key().to_bytes()))]),
+        json!([
+            format!("0x{}", hex::encode(key.public_key().to_bytes())),
+            format!("0x{}", hex::encode(n42_mobile_verify::proof_of_possession(&key).to_bytes())),
+        ]),
     );
     assert_eq!(registered["result"], json!(0));
 
@@ -185,6 +188,22 @@ fn an_idle_connection_does_not_hold_the_endpoint() {
         let _ = tx.send(call(port, "mobile_finality", json!([])));
     });
     let answer = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("served after the idle one's deadline");
+    assert_eq!(answer["result"]["block_hash"], json!(BLOCK.to_string()));
+}
+
+/// Audit 2026-10 round 3 (R3-P7, the remainder): connections were served
+/// one at a time, so one slow client held every phone for up to its 10 s
+/// deadline. Several are served at once; a request beside idle ones is
+/// answered at once.
+#[test]
+fn a_request_is_served_beside_idle_connections() {
+    let (port, _) = start();
+    let _idle: Vec<_> = (0..3).map(|_| TcpStream::connect(("127.0.0.1", port)).expect("connect")).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(call(port, "mobile_finality", json!([])));
+    });
+    let answer = rx.recv_timeout(std::time::Duration::from_secs(3)).expect("served beside the idle ones");
     assert_eq!(answer["result"]["block_hash"], json!(BLOCK.to_string()));
 }
 

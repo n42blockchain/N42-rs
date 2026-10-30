@@ -71,6 +71,12 @@ impl BlsSecretKey {
         BlsSignature(self.0.sign(message, DST, &[]))
     }
 
+    /// Signs `message` under a caller-chosen domain separation tag, for a
+    /// protocol whose signatures must not verify as consensus ones.
+    pub fn sign_with_dst(&self, message: &[u8], dst: &[u8]) -> BlsSignature {
+        BlsSignature(self.0.sign(message, dst, &[]))
+    }
+
     /// Signs an H2-v4 cross-client message using the ciphersuite deployed by gov5.
     pub fn sign_h2_v4(&self, message: &[u8]) -> BlsSignature {
         BlsSignature(self.0.sign(message, H2_V4_DST, &[]))
@@ -131,6 +137,16 @@ impl BlsPublicKey {
     /// untrusted RPC inputs).
     pub fn verify(&self, message: &[u8], signature: &BlsSignature) -> Result<(), BlsError> {
         let result = signature.0.verify(true, message, DST, &[], &self.0, true);
+        if result != BLST_ERROR::BLST_SUCCESS {
+            return Err(BlsError::VerificationFailed(result));
+        }
+        Ok(())
+    }
+
+    /// [`Self::verify`] under a caller-chosen domain separation tag (see
+    /// [`BlsSecretKey::sign_with_dst`]), with full key validation.
+    pub fn verify_with_dst(&self, message: &[u8], signature: &BlsSignature, dst: &[u8]) -> Result<(), BlsError> {
+        let result = signature.0.verify(true, message, dst, &[], &self.0, true);
         if result != BLST_ERROR::BLST_SUCCESS {
             return Err(BlsError::VerificationFailed(result));
         }

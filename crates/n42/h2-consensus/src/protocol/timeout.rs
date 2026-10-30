@@ -511,6 +511,41 @@ impl ConsensusEngine {
         })
     }
 
+    /// gov5's `processEmbeddedTC` (the `SyncInfo` rule): a TC piggybacked on a
+    /// vote, commit vote or timeout is the fleet's proof that its view ended,
+    /// so a node behind it locks on the TC's high QC and moves to the view
+    /// after it without waiting for a NewView it may have missed (audit
+    /// 2026-10 round 2, R2-C1). Only a TC that would move this node is
+    /// verified -- against the set for its exact view, with its high QC --
+    /// and one that does not verify is ignored, not an error: the message
+    /// carrying it is judged on its own. `Ok(true)` when the node moved.
+    pub fn adopt_embedded_tc(&mut self, tc: &TimeoutCertificate) -> ConsensusResult<bool> {
+        let current_view = self.round_state.current_view();
+        let target_view = tc.view.saturating_add(1);
+        if tc.view == 0 || target_view <= current_view {
+            return Ok(false);
+        }
+        let Some(tc_set) = self.epoch_manager.known_validator_set_for_view(tc.view) else {
+            tracing::debug!(target: "n42::cl::timeout", tc_view = tc.view, "piggybacked TC for a view with no known set; ignored");
+            return Ok(false);
+        };
+        if let Err(err) = super::quorum::verify_tc_with_profile(tc, tc_set, self.signing_profile) {
+            tracing::debug!(target: "n42::cl::timeout", tc_view = tc.view, %err, "piggybacked TC does not verify; ignored");
+            return Ok(false);
+        }
+        if let Err(err) = self.verify_embedded_qc(&tc.high_qc) {
+            tracing::debug!(target: "n42::cl::timeout", tc_view = tc.view, %err, "piggybacked TC's high QC does not verify; ignored");
+            return Ok(false);
+        }
+        tracing::info!(target: "n42::cl::timeout", current_view, target_view, "piggybacked TC: catching up to the fleet");
+        self.round_state.update_locked_qc(&tc.high_qc);
+        self.round_state.reset_consecutive_timeouts();
+        self.advance_to_view(target_view)?;
+        let actual_view = self.round_state.current_view();
+        self.emit(EngineOutput::ViewChanged { new_view: actual_view })?;
+        Ok(true)
+    }
+
     /// Builds a TC from the current timeout_collector and broadcasts NewView.
     ///
     /// Centralises TC-formation logic so the actual-view ViewChanged fix is applied

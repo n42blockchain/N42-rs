@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! N42 APoS consensus trait definitions
+//! N42 `APoS` consensus trait definitions
 
 use crate::AposResult;
 use alloy_consensus::Header;
@@ -11,21 +11,21 @@ use n42_primitives::Snapshot;
 use reth_primitives_traits::SealedHeader;
 use std::time::Duration;
 
-/// APoS (Authority Proof of Stake) consensus extension trait.
+/// `APoS` (Authority Proof of Stake) consensus extension trait.
 ///
 /// This trait extends the base reth `Consensus` trait with N42-specific
-/// functionality for the APoS consensus mechanism.
+/// functionality for the `APoS` consensus mechanism.
 ///
 /// # Implementors
 ///
 /// This trait should be implemented by consensus engines that support
-/// the N42 APoS protocol, such as `APos` in `n42-clique`.
+/// the N42 `APoS` protocol, such as `APos` in `n42-clique`.
 #[auto_impl::auto_impl(&, Arc, Box)]
 pub trait AposConsensus: Send + Sync {
     /// Prepare a new block header based on the parent header.
     ///
     /// This method is called before block production to initialize
-    /// the header fields according to APoS rules.
+    /// the header fields according to `APoS` rules.
     ///
     /// # Arguments
     /// * `parent_header` - The sealed parent block header
@@ -36,14 +36,14 @@ pub trait AposConsensus: Send + Sync {
 
     /// Seal a block header with the signer's signature.
     ///
-    /// This method adds the signature to the header's extra_data field,
+    /// This method adds the signature to the header's `extra_data` field,
     /// completing the block sealing process.
     ///
     /// # Arguments
     /// * `header` - The header to seal (modified in place)
     fn seal(&self, header: &mut Header) -> AposResult<()>;
 
-    /// Validate a block header according to APoS rules.
+    /// Validate a block header according to `APoS` rules.
     ///
     /// This performs APoS-specific validation beyond the standard
     /// Ethereum header validation.
@@ -54,7 +54,7 @@ pub trait AposConsensus: Send + Sync {
     fn validate_header(&self, header: &Header, parent: &Header) -> AposResult<()>;
 }
 
-/// Snapshot management for APoS consensus.
+/// Snapshot management for `APoS` consensus.
 ///
 /// Snapshots capture the state of the signer set at specific block heights,
 /// enabling efficient validation and fork choice.
@@ -80,7 +80,7 @@ pub trait SnapshotManager: Send + Sync {
     fn has_snapshot(&self, number: u64, hash: B256) -> bool;
 }
 
-/// Signer key management for APoS.
+/// Signer key management for `APoS`.
 ///
 /// Manages the private key used for signing blocks.
 #[auto_impl::auto_impl(&, Arc, Box)]
@@ -108,7 +108,7 @@ pub trait SignerManager: Send + Sync {
     }
 }
 
-/// Voting and proposal management for APoS.
+/// Voting and proposal management for `APoS`.
 ///
 /// Handles validator voting for adding/removing signers.
 #[auto_impl::auto_impl(&, Arc, Box)]
@@ -140,7 +140,7 @@ pub trait VotingManager: Send + Sync {
     }
 }
 
-/// Difficulty and timing calculations for APoS.
+/// Difficulty and timing calculations for `APoS`.
 #[auto_impl::auto_impl(&, Arc, Box)]
 pub trait DifficultyCalculator: Send + Sync {
     /// Get the total difficulty at a block.
@@ -171,9 +171,9 @@ pub trait DifficultyCalculator: Send + Sync {
     fn calculate_difficulty(&self, signer: Address, snapshot: &Snapshot) -> u64;
 }
 
-/// Combined trait for full APoS consensus functionality.
+/// Combined trait for full `APoS` consensus functionality.
 ///
-/// Implementors provide complete APoS consensus support.
+/// Implementors provide complete `APoS` consensus support.
 pub trait FullAposConsensus:
     AposConsensus + SnapshotManager + SignerManager + VotingManager + DifficultyCalculator
 {

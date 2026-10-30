@@ -1891,6 +1891,9 @@ mod tests {
         let senders: Vec<Address> = (0..transactions.len()).map(|i| Address::with_last_byte((i % 250) as u8)).collect();
         let raw: Vec<Bytes> = transactions.iter().map(|tx| Bytes::from(tx.encoded_2718())).collect();
         let mut header = gov5_header(B256::ZERO, U256::ZERO);
+        // Room for 2,600 transfers: a body carrying more than its gas limit
+        // pays for is refused (audit 2026-10 round 3, R3-N3).
+        header.gas_limit = 60_000_000;
         header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&transactions);
         header.withdrawals_root = Some(n42_h2_consensus::gov5_rewards_root(Vec::new()));
         let mut payload =

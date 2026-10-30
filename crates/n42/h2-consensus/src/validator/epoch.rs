@@ -267,11 +267,10 @@ impl EpochManager {
 
         // edition-2021: N42-26 writes this as a let-chain. A `None` next_set
         // still falls through to the historical lookup below, as before.
-        if epoch == self.current_epoch + 1 {
-            if let Some(next_set) = self.next_set.as_ref() {
+        if epoch == self.current_epoch + 1
+            && let Some(next_set) = self.next_set.as_ref() {
                 return next_set;
             }
-        }
 
         // Look up historical set
         if let Some(set) = self.historical_sets.get(&epoch) {
@@ -697,11 +696,10 @@ impl EpochManager {
         let mut overlap = 0usize;
         for i in 0..self.current_set.len() {
             // edition-2021: N42-26 writes this as a let-chain.
-            if let Ok(addr) = self.current_set.get_address(i) {
-                if new_addrs.contains(addr) {
+            if let Ok(addr) = self.current_set.get_address(i)
+                && new_addrs.contains(addr) {
                     overlap += 1;
                 }
-            }
         }
         let required = self.current_set.quorum_size(); // n-f of the active set
         if overlap < required {

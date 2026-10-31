@@ -2297,12 +2297,17 @@ where
         Some(sealed) => {
             // Falcon never inherits trust from compact-body sender claims or
             // queue indexes. Verify its key and signature on every import road.
-            for tx in sealed.body().transactions() {
+            for (at, tx) in sealed.body().transactions().enumerate() {
                 if let TransactionSigned::Falcon(falcon) = tx {
                     if !n42_tx_types::pq_tx_enabled() {
                         return Err("Falcon transactions disabled by genesis".to_string());
                     }
-                    falcon.verify().map_err(|err| format!("Falcon sender: {err}"))?;
+                    let sender = falcon.verify().map_err(|err| format!("Falcon sender: {err}"))?;
+                    if let Some(claimed) = given_senders.as_ref().or(given_claims.as_ref())
+                        && claimed.get(at) != Some(&sender)
+                    {
+                        return Err(format!("Falcon sender claim mismatch at {at}"));
+                    }
                 }
             }
             let recovered = match given_senders {
@@ -2332,6 +2337,14 @@ where
                         Some(claims) => claims.into_iter().map(Some).collect(),
                         None => queue_for_senders().map_or_else(Vec::new, |queue| senders_in_queue(&queue, &txs)),
                     };
+                    for (at, tx) in txs.iter().enumerate() {
+                        if let TransactionSigned::Falcon(falcon) = tx
+                            && let Some(Some(claimed)) = indexed.get(at)
+                            && falcon.verify().map_err(|err| err.to_string())? != *claimed
+                        {
+                            return Err(format!("Falcon queue sender mismatch at {at}"));
+                        }
+                    }
                     let from_index = indexed.iter().flatten().count();
                     // Under `N42_INGEST_VERIFY=leader` the queue holds the frame's
                     // word for a sender, not this node's recovery of it, so what the

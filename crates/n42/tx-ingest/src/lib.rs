@@ -306,6 +306,7 @@ fn recovery_nice() -> i32 {
 /// Lowers the calling thread's priority to [`recovery_nice`], once per
 /// thread; blocking-pool threads are reused, so this is a few syscalls a
 /// frame at most.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::missing_const_for_fn))]
 fn apply_recovery_nice() {
     #[cfg(target_os = "linux")]
     apply_recovery_nice_linux();
@@ -385,6 +386,7 @@ fn physical_cores() -> &'static [usize] {
 
 /// Pins the calling thread to its core (see [`recovery_pin`]), once per
 /// thread.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::missing_const_for_fn))]
 fn apply_recovery_affinity() {
     #[cfg(target_os = "linux")]
     apply_recovery_affinity_linux();
@@ -2196,11 +2198,9 @@ where
         // Falcon is always cryptographically verified locally. Sender claims,
         // Ed25519 batches and frame attestations do not bypass this verifier.
         if let N42PooledTxEnvelope::Falcon(falcon) = &tx {
-            if n42_tx_types::pq_tx_enabled() {
-                if let Ok(sender) = falcon.verify() {
-                    recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
-                    verified_here += 1;
-                }
+            if n42_tx_types::pq_tx_enabled() && let Ok(sender) = falcon.verify() {
+                recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
+                verified_here += 1;
             }
             continue;
         }
@@ -2431,6 +2431,35 @@ mod shard_tests {
         .sign_ed25519(&key)
     }
 
+    #[test]
+    fn falcon_gate_and_signature_cannot_be_bypassed_by_attestations_or_claims() {
+        use alloy_eips::eip2718::Decodable2718;
+        let _lock = crate::coverage_tests::counter_lock();
+        let previous = n42_tx_types::pq_tx_enabled();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tx-types/tests/testdata/falcon512_wallet_v1.json")).unwrap();
+        let raw: Bytes = fixture["rawTransaction"].as_str().unwrap().parse().unwrap();
+        let valid = n42_tx_types::FalconTx::decode_2718_exact(&raw).unwrap();
+        let bogus = Address::repeat_byte(0xdd);
+        for enabled in [false, true] {
+            n42_tx_types::set_pq_tx_enabled(enabled);
+            for attested in [false, true] {
+                for shard in [None, Some((0, 2))] {
+                    for broken in [false, true] {
+                        let mut sig = valid.signature().to_vec();
+                        if broken { *sig.last_mut().unwrap() ^= 1; }
+                        let tx = n42_tx_types::FalconTx::new(valid.tx().clone(), sig.into());
+                        let out = recover_decoded_in::<NoopTransactionPool<N42PooledTransaction>>(
+                            vec![N42PooledTxEnvelope::Falcon(tx)], vec![bogus], None, shard, attested);
+                        assert_eq!(out.len(), usize::from(enabled && !broken));
+                        if let Some(tx) = out.first() { assert_eq!(tx.sender(), valid.sender()); }
+                    }
+                }
+            }
+        }
+        n42_tx_types::set_pq_tx_enabled(previous);
+    }
+
     /// A frame the ingest kept whole is described in frame order, whatever
     /// order the recovery returned it in; one it dropped from is unaligned.
     #[test]
@@ -2622,6 +2651,7 @@ mod shard_tests {
             .iter()
             .map(|tx| match tx {
                 N42PooledTxEnvelope::AltSig(tx) => tx.sender(),
+                N42PooledTxEnvelope::Falcon(tx) => tx.sender(),
                 N42PooledTxEnvelope::Eth(_) => Address::ZERO,
             })
             .collect();

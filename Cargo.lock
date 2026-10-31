@@ -7970,6 +7970,7 @@ dependencies = [
  "reth-primitives-traits 0.8.2",
  "reth-transaction-pool",
  "secp256k1 0.30.0",
+ "serde_json",
  "tokio",
  "tracing",
 ]

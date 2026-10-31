@@ -84,8 +84,8 @@ pub fn dump_all(each: std::time::Duration) -> usize {
 
 /// Stack signalling requires Linux thread IDs and `/proc`; no handler is installed elsewhere.
 #[cfg(not(target_os = "linux"))]
-pub fn install() {}
+pub const fn install() {}
 
 /// No threads are signalled on platforms without the Linux diagnostic backend.
 #[cfg(not(target_os = "linux"))]
-pub fn dump_all(_each: std::time::Duration) -> usize { 0 }
+pub const fn dump_all(_each: std::time::Duration) -> usize { 0 }

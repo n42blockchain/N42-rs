@@ -97,7 +97,7 @@ fn current_nice() -> i32 {
 
 /// Per-thread nice values are only queried on Linux.
 #[cfg(not(target_os = "linux"))]
-fn current_nice() -> i32 {
+const fn current_nice() -> i32 {
     0
 }
 

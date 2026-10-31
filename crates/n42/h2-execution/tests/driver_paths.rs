@@ -528,7 +528,7 @@ async fn a_prepared_build_that_failed_is_reported_and_replaced_by_a_build_now() 
 async fn a_build_on_the_sealed_block_the_layer_refuses_falls_back_to_the_ordinary_build() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
-    let header = alloy_consensus::Header::default();
+    let header = n42_h2_consensus::N42Header::default();
     driver.prepare_build_on_sealed(GENESIS, header.clone(), attrs(), None).await.expect("requested");
     // The mock offers no direct build: the task marks the request refused.
     for _ in 0..16 {
@@ -547,7 +547,7 @@ async fn a_build_on_the_sealed_block_the_layer_refuses_falls_back_to_the_ordinar
 async fn the_first_build_of_a_tenure_keeps_a_build_already_prepared_on_the_parent() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
-    let header = alloy_consensus::Header::default();
+    let header = n42_h2_consensus::N42Header::default();
     assert_eq!(
         driver.prepare_first_build_on_output(GENESIS, header.clone(), attrs(), None).await.expect("ok"),
         "requested"

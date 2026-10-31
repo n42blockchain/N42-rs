@@ -22,7 +22,8 @@
 //! which header shapes are accepted, and a mixed fleet needs the builder to
 //! adopt gov5's.
 
-use alloy_consensus::{proofs::calculate_transaction_root, Block, Header, TxEnvelope};
+use alloy_consensus::{proofs::calculate_transaction_root, Block, TxEnvelope};
+use n42_h2_consensus::N42Header as Header;
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_eips::eip4895::{Withdrawal, Withdrawals};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
@@ -332,12 +333,13 @@ pub fn decode_block_rlp_shared(
 fn reconstruct_block_raw(
     execution: &ExecutionData,
     profile: HeaderProfile,
-) -> Result<Block<Bytes>, BlockGossipError> {
+) -> Result<Block<Bytes, Header>, BlockGossipError> {
     let expected_hash = execution.block_hash();
     let direct = execution
         .clone()
         .into_block_raw()
         .map_err(|error| BlockGossipError::PayloadReconstruction(error.to_string()))?;
+    let direct = n42_h2_consensus::header_engine::block_with_payload_root(direct, &execution.payload);
     match profile {
         HeaderProfile::Ethereum => {
             validate_header(&direct.header, profile)?;
@@ -419,7 +421,7 @@ mod tests {
     use alloy_primitives::{Address, U256};
 
     fn header(extra: Bytes) -> Header {
-        Header {
+        Header::from(alloy_consensus::Header {
             parent_hash: B256::repeat_byte(1),
             ommers_hash: alloy_consensus::EMPTY_OMMER_ROOT_HASH,
             beneficiary: Address::ZERO,
@@ -437,7 +439,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::ZERO),
             requests_hash: Some(EMPTY_REQUESTS_HASH),
             ..Default::default()
-        }
+        })
     }
 
     fn execution_data(header: Header) -> ExecutionData {
@@ -571,7 +573,7 @@ mod bal_roundtrip {
     /// as `Unsupported fork` three hops away.
     #[test]
     fn an_access_list_survives_encode_and_decode() {
-        let header = Header { number: 5, ..Default::default() };
+        let header = Header::from(alloy_consensus::Header { number: 5, ..Default::default() });
         let bal = Bytes::from_static(&[0xc4, 0x83, 0x01, 0x02, 0x03]);
         let encoded = encode_block_rlp_raw(&header, &[], &[], Some(&bal));
         let decoded = decode_block_rlp(&encoded, HeaderProfile::Ethereum)
@@ -591,13 +593,13 @@ mod bal_roundtrip {
             TxEnvelope::Legacy(Signed::new_unchecked(TxLegacy { chain_id: Some(1), nonce: 2, gas_price: 10, gas_limit: 21_000, to: TxKind::Call(Address::repeat_byte(3)), value: U256::from(1), ..Default::default() }, Signature::test_signature(), Default::default())),
         ];
         let rewards = vec![(Address::repeat_byte(0x42), U256::from(5_000_000_000u64))];
-        let header = Header {
+        let header = Header::from(alloy_consensus::Header {
             number: 7, gas_limit: 30_000_000, base_fee_per_gas: Some(7), blob_gas_used: Some(0), excess_blob_gas: Some(0),
             parent_beacon_block_root: Some(B256::repeat_byte(9)),
             withdrawals_root: Some(n42_h2_consensus::gov5_rewards_root(rewards.iter().copied())),
             transactions_root: alloy_consensus::proofs::calculate_transaction_root(&txs),
             ..Default::default()
-        };
+        });
         let encoded = encode_block_rlp_parts(&header, &txs, &rewards);
         let typed = decode_block_rlp(&encoded, HeaderProfile::Ethereum).expect("typed decodes");
         let raw = decode_block_rlp_raw(&encoded, HeaderProfile::Ethereum).expect("raw decodes");
@@ -612,7 +614,7 @@ mod bal_roundtrip {
     /// before the field existed.
     #[test]
     fn no_access_list_is_the_old_encoding() {
-        let header = Header { number: 5, ..Default::default() };
+        let header = Header::from(alloy_consensus::Header { number: 5, ..Default::default() });
         assert_eq!(
             encode_block_rlp_raw(&header, &[], &[], None),
             encode_block_rlp_raw(&header, &[], &[], None),

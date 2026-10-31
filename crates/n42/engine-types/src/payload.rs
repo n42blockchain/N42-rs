@@ -16,7 +16,7 @@ use reth_basic_payload_builder::{
     is_better_payload, BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder,
     PayloadConfig,
 };
-use reth_chainspec::{ChainSpec, ChainSpecProvider, EthChainSpec, EthereumHardforks};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use n42_tx_types::{N42Primitives as EthPrimitives, N42TxEnvelope as TransactionSigned};
 use alloy_consensus::transaction::TxHashRef as _;
@@ -175,7 +175,7 @@ pub fn gas_limit_over_carried(computed: u64, parent_gas_limit: u64, carried_gas_
 /// entry when this node built it (`note_built`).
 fn carried_fields_for_seal(
     genesis: &alloy_genesis::Genesis,
-    parent: &reth_primitives_traits::SealedHeader,
+    parent: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
     parent_built: Option<B256>,
     depth: u64,
 ) -> Option<crate::executed_fields::ExecutedFields> {
@@ -191,7 +191,7 @@ fn carried_fields_for_seal(
 /// "no_built" when there was no builder hash to wait under.
 fn carried_fields_for_seal_traced(
     genesis: &alloy_genesis::Genesis,
-    parent: &reth_primitives_traits::SealedHeader,
+    parent: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
     parent_built: Option<B256>,
     depth: u64,
 ) -> (Option<crate::executed_fields::ExecutedFields>, &'static str) {
@@ -209,7 +209,7 @@ fn carried_fields_for_seal_traced(
 
 fn carried_fields_for_seal_untraced(
     genesis: &alloy_genesis::Genesis,
-    parent: &reth_primitives_traits::SealedHeader,
+    parent: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
     parent_built: Option<B256>,
     depth: u64,
 ) -> Option<crate::executed_fields::ExecutedFields> {
@@ -291,7 +291,7 @@ where
     EvmConfig: ConfigureEvm<
         Primitives = EthPrimitives,
         NextBlockEnvCtx = NextBlockEnvAttributes,
-        BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
+        BlockAssembler = crate::assembler::N42HeaderAssembler<Client::ChainSpec>,
         BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
     >,
     Client: StateProviderFactory
@@ -371,7 +371,7 @@ where
 
     fn build_empty_payload(
         &self,
-        config: PayloadConfig<Self::Attributes>,
+        config: PayloadConfig<Self::Attributes, n42_header::N42Header>,
     ) -> Result<EthBuiltPayload, PayloadBuilderError> {
         // upstream added execution_cache and state_root_handle; this path shares
         // neither with the engine, so both are None.
@@ -437,7 +437,7 @@ where
     EvmConfig: ConfigureEvm<
             Primitives = EthPrimitives,
             NextBlockEnvCtx = NextBlockEnvAttributes,
-            BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
+            BlockAssembler = crate::assembler::N42HeaderAssembler<Client::ChainSpec>,
             BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
         > + Send
         + Sync
@@ -1488,7 +1488,7 @@ where
     EvmConfig: ConfigureEvm<
         Primitives = EthPrimitives,
         NextBlockEnvCtx = NextBlockEnvAttributes,
-        BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
+        BlockAssembler = crate::assembler::N42HeaderAssembler<Client::ChainSpec>,
         BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
     >,
     Client: StateProviderFactory
@@ -1905,7 +1905,7 @@ where
 
     let start_prepare_at = std::time::Instant::now();
     let mut header = cons
-        .prepare(&parent_header)
+        .prepare(&n42_header::seal_to_alloy(&parent_header))
         .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
     if hotstuff {
         header.beneficiary = coinbase;
@@ -2339,7 +2339,7 @@ where
             seal_header_ms = (seal_at.elapsed().as_millis() as u64).saturating_sub(root_ms + fields_ms);
             let step_at = std::time::Instant::now();
             let body = alloy_consensus::BlockBody { transactions, ommers: Vec::new(), withdrawals };
-            let sealed_block = SealedBlock::seal_parts(header.clone(), body);
+            let sealed_block = SealedBlock::seal_parts(n42_header::N42Header::from(header.clone()), body);
             let block_hash = SealedBlock::hash(&sealed_block);
             let recovered: Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>> =
                 Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(sealed_block, senders));
@@ -5622,7 +5622,7 @@ where
     // Keep the recovered senders: EthBuiltPayload now takes a RecoveredBlock, and
     // re-recovering them from signatures here would be pure waste.
     let senders = block.senders().to_vec();
-    let sealed_block = SealedBlock::seal_parts(header, block.into_block().body);
+    let sealed_block = SealedBlock::seal_parts(n42_header::N42Header::from(header), block.into_block().body);
     let block_hash = SealedBlock::hash(&sealed_block);
     // Under the sealed hash, for the next header: the child's header is
     // assembled from and checked against exactly this.
@@ -5815,7 +5815,7 @@ impl<CB> N42PayloadServiceBuilder<CB> {
 impl<Node, Pool, EvmConfig, CB> PayloadServiceBuilder<Node, Pool, EvmConfig>
     for N42PayloadServiceBuilder<CB>
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = n42_header::N42ChainSpec, Primitives = EthPrimitives>>,
     <Node::Types as NodeTypes>::Payload: PayloadTypes<
         BuiltPayload = EthBuiltPayload,
         PayloadAttributes = EthPayloadAttributes,
@@ -6313,14 +6313,14 @@ mod plan_body_tests {
             assert!(made.slots.iter().all(|slot| slot.get().is_none()), "empty slots");
 
             // Executed on the prepared partition and slots, and fresh.
-            let header = alloy_consensus::Header {
+            let header = n42_header::N42Header::from(alloy_consensus::Header {
                 number: 20_000_000,
                 beneficiary,
                 gas_limit: 5_000_000_000,
                 base_fee_per_gas: Some(base_fee),
                 timestamp: 1_800_000_000,
                 ..Default::default()
-            };
+            });
             let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(
                 reth_chainspec::MAINNET.clone(),
                 crate::fast_transfer::N42EvmFactory::with_fast_transfers(true),
@@ -6362,7 +6362,7 @@ mod plan_body_tests {
 mod depth_two_tests {
     use super::*;
     use reth_primitives_traits::SealedHeader;
-    use alloy_consensus::Header;
+    use n42_header::N42Header as Header;
 
     /// T9 of docs/DEFERRED_DEPTH_2_DESIGN.md: the limit step never goes below
     /// the carried `gasUsed`, and never further than the parent allows.
@@ -6414,11 +6414,11 @@ mod depth_two_tests {
         crate::executed_fields::remember(gp_built, fields(0xd4));
         // The parent was built on the grandparent's sealed hash.
         let parent = SealedHeader::new(
-            Header { number: 12, timestamp: 12, parent_hash: gp_sealed, ..Default::default() },
+            n42_header::N42Header::from(alloy_consensus::Header { number: 12, timestamp: 12, parent_hash: gp_sealed, ..Default::default() }),
             alloy_primitives::keccak256(b"depth-two-tests-0xd5"),
         );
         let no_alias = SealedHeader::new(
-            Header { number: 12, timestamp: 12, parent_hash: alloy_primitives::keccak256(b"depth-two-tests-0xd6"), ..Default::default() },
+            n42_header::N42Header::from(alloy_consensus::Header { number: 12, timestamp: 12, parent_hash: alloy_primitives::keccak256(b"depth-two-tests-0xd6"), ..Default::default() }),
             alloy_primitives::keccak256(b"depth-two-tests-0xd7"),
         );
         // With nothing under the sealed hash the build waits, then fails.
@@ -6438,13 +6438,13 @@ mod depth_two_tests {
         // other tests left running may have pushed the entry out meanwhile.
         crate::executed_fields::remember(gp_built, fields(0xd4));
         let on_resealed = SealedHeader::new(
-            Header { number: 12, timestamp: 13, parent_hash: gp_resealed, ..Default::default() },
+            n42_header::N42Header::from(alloy_consensus::Header { number: 12, timestamp: 13, parent_hash: gp_resealed, ..Default::default() }),
             alloy_primitives::keccak256(b"depth-two-tests-0xd8"),
         );
         assert_eq!(carried_fields_for_seal(&genesis, &on_resealed, Some(on_resealed.hash()), 2), Some(fields(0xd4)));
         // At the chain start (parent 1) the genesis result is the parent's own header.
         let block1 = SealedHeader::new(
-            Header { number: 1, timestamp: 1, state_root: alloy_primitives::keccak256(b"depth-two-tests-0xd9"), ..Default::default() },
+            n42_header::N42Header::from(alloy_consensus::Header { number: 1, timestamp: 1, state_root: alloy_primitives::keccak256(b"depth-two-tests-0xd9"), ..Default::default() }),
             alloy_primitives::keccak256(b"depth-two-tests-0xda"),
         );
         assert_eq!(
@@ -6457,7 +6457,7 @@ mod depth_two_tests {
 #[cfg(test)]
 mod hand_out_early_tests {
     use super::{hand_out_early, EthBuiltPayload};
-    use alloy_consensus::Header;
+    use n42_header::N42Header as Header;
     use alloy_primitives::{Address, U256};
     use reth_primitives_traits::{RecoveredBlock, SealedBlock};
     use std::sync::Arc;
@@ -6468,7 +6468,7 @@ mod hand_out_early_tests {
             alloy_primitives::Signature::test_signature(),
         ));
         let block = n42_tx_types::Block {
-            header: Header { number: 7, extra_data: b"sealed".as_slice().into(), ..Default::default() },
+            header: n42_header::N42Header::from(alloy_consensus::Header { number: 7, extra_data: b"sealed".as_slice().into(), ..Default::default() }),
             body: alloy_consensus::BlockBody { transactions: vec![tx], ommers: Vec::new(), withdrawals: None },
         };
         Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::with_last_byte(1)]))
@@ -6503,10 +6503,11 @@ mod hand_out_early_tests {
 #[cfg(test)]
 mod includability_tests {
     use super::*;
-    use alloy_consensus::{Header, Signed, TxEip1559};
+    use alloy_consensus::{Signed, TxEip1559};
+    use n42_header::N42Header as Header;
     use alloy_primitives::{Address, Bytes, Signature, TxKind};
     use reth_basic_payload_builder::PayloadConfig;
-    use reth_chainspec::ChainSpecBuilder;
+    use reth_chainspec::{ChainSpec, ChainSpecBuilder};
     use reth_primitives_traits::{Recovered, RecoveredBlock, SealedHeader};
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_transaction_pool::{
@@ -6607,7 +6608,7 @@ mod includability_tests {
         // Far above any height another test marks decided (the process-wide
         // `canonical_head`, which would decline the build), and before the
         // fork, so the header carries the parent's own fields.
-        let parent = Header {
+        let parent = n42_header::N42Header::from(alloy_consensus::Header {
             number: 1_000_000_000,
             gas_limit: GAS_LIMIT,
             gas_used: GAS_LIMIT / 2,
@@ -6619,7 +6620,7 @@ mod includability_tests {
             excess_blob_gas: Some(0),
             requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
-        };
+        });
         let attributes = EthPayloadAttributes {
             timestamp: TIMESTAMP,
             prev_randao: B256::ZERO,
@@ -6648,7 +6649,7 @@ mod includability_tests {
             EthereumBuilderConfig::new().with_gas_limit(GAS_LIMIT),
             args,
             move |_| Box::new(listed) as BestTransactionsIter<NoopTransactionPool<Pooled>>,
-            Arc::new(crate::hotstuff_consensus::HotStuffConsensus::new(spec)),
+            Arc::new(crate::hotstuff_consensus::HotStuffConsensus::new(Arc::new(n42_header::N42ChainSpec::from(spec)))),
             None,
             None,
             None,

@@ -27,11 +27,12 @@
 //! [`prepare`]: reth_consensus::Consensus::prepare
 //! [`seal`]: reth_consensus::Consensus::seal
 
-use alloy_consensus::{BlockHeader as _, Header, TxReceipt};
+use alloy_consensus::{BlockHeader as _, Header as AlloyHeader, TxReceipt};
+use n42_header::N42Header as Header;
 use alloy_primitives::{logs_bloom, Address, B256, U256};
 use n42_consensus_traits::{AposError, AposResult, SignerManager};
 use n42_h2_consensus::{
-    gov5_receipts_root, gov5_rewards_root, is_empty_requests_hash, validate_gov5_h2_header,
+    gov5_receipts_root, gov5_rewards_root, is_empty_requests_hash, validate_gov5_h2_header, validate_gov5_header_tail, HeaderTailRules,
     withdrawals_to_rewards,
     HeaderExtra, ReceiptView, SimulatedCommitteePool, GOV5_EMPTY_REQUESTS_HASH,
 };
@@ -140,7 +141,7 @@ pub enum DeferredExecutionError {
 /// The execution result a header past the fork must carry for `parent`:
 /// the parent's own header if the parent is before the fork (its header
 /// carries its own execution), the registry otherwise.
-pub fn parent_executed_fields(genesis: &alloy_genesis::Genesis, parent: &SealedHeader) -> Option<crate::executed_fields::ExecutedFields> {
+pub fn parent_executed_fields(genesis: &alloy_genesis::Genesis, parent: &SealedHeader<Header>) -> Option<crate::executed_fields::ExecutedFields> {
     ancestor_executed_fields(genesis, parent, 1)
 }
 
@@ -148,7 +149,7 @@ pub fn parent_executed_fields(genesis: &alloy_genesis::Genesis, parent: &SealedH
 /// at `depth` (`docs/DEFERRED_DEPTH_2_DESIGN.md` section 1.1): the parent at
 /// depth 1, the parent's parent at depth 2. By hash on the child's own chain,
 /// never by number.
-pub fn ancestor_hash(parent: &SealedHeader, depth: u64) -> B256 {
+pub fn ancestor_hash(parent: &SealedHeader<Header>, depth: u64) -> B256 {
     if depth <= 1 {
         parent.hash()
     } else {
@@ -164,7 +165,7 @@ pub fn ancestor_hash(parent: &SealedHeader, depth: u64) -> B256 {
 /// fork or at genesis, the registry under the parent's hash otherwise.
 pub fn ancestor_executed_fields(
     genesis: &alloy_genesis::Genesis,
-    parent: &SealedHeader,
+    parent: &SealedHeader<Header>,
     depth: u64,
 ) -> Option<crate::executed_fields::ExecutedFields> {
     if depth != 1 {
@@ -189,7 +190,7 @@ pub fn ancestor_executed_fields(
 }
 
 /// What the depth rule needs of a parent header.
-pub fn parent_link(parent: &SealedHeader) -> n42_h2_consensus::deferred_depth::ParentLink {
+pub fn parent_link(parent: &SealedHeader<Header>) -> n42_h2_consensus::deferred_depth::ParentLink {
     n42_h2_consensus::deferred_depth::ParentLink {
         number: parent.number,
         hash: parent.hash(),
@@ -201,7 +202,7 @@ pub fn parent_link(parent: &SealedHeader) -> n42_h2_consensus::deferred_depth::P
 /// registry (as opposed to the parent's own header at the chain start or
 /// before the fork): what a caller that waits for the ancestor's result asks
 /// first.
-pub fn ancestor_result_is_recorded(genesis: &alloy_genesis::Genesis, parent: &SealedHeader, depth: u64) -> bool {
+pub fn ancestor_result_is_recorded(genesis: &alloy_genesis::Genesis, parent: &SealedHeader<Header>, depth: u64) -> bool {
     if depth <= 1 {
         return parent.number > 0 && reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp);
     }
@@ -237,7 +238,7 @@ pub const PARENT_FIELDS_WAIT: std::time::Duration = std::time::Duration::from_se
 /// caller on that parent needs no fallback.
 pub fn parent_executed_fields_or_built(
     genesis: &alloy_genesis::Genesis,
-    parent: &SealedHeader,
+    parent: &SealedHeader<Header>,
     parent_built: Option<B256>,
     timeout: std::time::Duration,
 ) -> Option<crate::executed_fields::ExecutedFields> {
@@ -250,7 +251,7 @@ pub fn parent_executed_fields_or_built(
 /// [`parent_executed_fields_or_built`].
 pub fn ancestor_executed_fields_or_built(
     genesis: &alloy_genesis::Genesis,
-    parent: &SealedHeader,
+    parent: &SealedHeader<Header>,
     ancestor_built: Option<B256>,
     depth: u64,
     timeout: std::time::Duration,
@@ -274,13 +275,22 @@ pub fn gov5_receipt_root_bloom(receipts: &[Receipt]) -> ReceiptRootBloom {
     (root, bloom)
 }
 
+/// Which trailing header fields the chain's schedule asks for at `timestamp`:
+/// gov5's Glamsterdam and MobileAnchor gates, read from the genesis.
+pub fn header_tail_rules(genesis: &alloy_genesis::Genesis, timestamp: u64) -> HeaderTailRules {
+    HeaderTailRules {
+        slot_number: reth_chainspec::qmdb::glamsterdam_active_at(genesis, timestamp),
+        mobile_registry_root: reth_chainspec::qmdb::mobile_registry_root_in_header_at(genesis, timestamp),
+    }
+}
+
 /// The header a leader's block starts from, before the builder fills in
 /// execution outputs: HotStuff's fixed fields, and a view-0 extra layout the
 /// validator process overwrites with the real view and seal.
-pub fn prepare_hotstuff_header(parent: &SealedHeader) -> Header {
-    Header {
+pub fn prepare_hotstuff_header<H: alloy_consensus::BlockHeader + alloy_primitives::Sealable>(parent: &SealedHeader<H>) -> AlloyHeader {
+    AlloyHeader {
         parent_hash: parent.hash(),
-        number: parent.number + 1,
+        number: parent.number() + 1,
         ommers_hash: B256::ZERO,
         difficulty: U256::ZERO,
         nonce: Default::default(),
@@ -289,17 +299,22 @@ pub fn prepare_hotstuff_header(parent: &SealedHeader) -> Header {
     }
 }
 
-impl<ChainSpec> HeaderValidator for HotStuffConsensus<ChainSpec>
+impl<ChainSpec> HeaderValidator<Header> for HotStuffConsensus<ChainSpec>
 where
     ChainSpec: EthChainSpec<Header = Header> + EthereumHardforks + core::fmt::Debug + Send + Sync,
 {
-    fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
+    fn validate_header(&self, header: &SealedHeader<Header>) -> Result<(), ConsensusError> {
         let header = header.header();
         if header.number == 0 {
             // Genesis carries no consensus fields, in gov5 as here.
             return Ok(());
         }
         validate_gov5_h2_header(header).map_err(|err| ConsensusError::Other(Arc::new(err)))?;
+        // The slot number and `mobileRegistryRoot`, present exactly when the
+        // genesis schedule says so; the root's value is not checked
+        // (`validate_gov5_header_tail`).
+        validate_gov5_header_tail(header, header_tail_rules(self.chain_spec.genesis(), header.timestamp))
+            .map_err(|err| ConsensusError::Other(Arc::new(err)))?;
 
         if reth_chainspec::qmdb::deferred_execution_active_at(self.chain_spec.genesis(), header.timestamp) {
             // The header's gas used is an ancestor's execution, bounded by
@@ -351,8 +366,8 @@ where
 
     fn validate_header_against_parent(
         &self,
-        header: &SealedHeader,
-        parent: &SealedHeader,
+        header: &SealedHeader<Header>,
+        parent: &SealedHeader<Header>,
     ) -> Result<(), ConsensusError> {
         // Hash and number linkage, timestamp strictly after the parent, gas
         // limit ramp, base fee, blob gas: gov5 checks the first two and
@@ -411,7 +426,7 @@ where
     fn validate_body_against_header(
         &self,
         body: &EthBlockBody,
-        header: &SealedHeader,
+        header: &SealedHeader<Header>,
     ) -> Result<(), ConsensusError> {
         // gov5's producer leaves the ommers hash zero; its genesis, and this
         // node's Ethereum-profile history, carry the empty-list hash. A body
@@ -512,11 +527,11 @@ where
         result
     }
 
-    fn prepare(&self, parent_header: &SealedHeader) -> Result<Header, ConsensusError> {
+    fn prepare(&self, parent_header: &SealedHeader) -> Result<AlloyHeader, ConsensusError> {
         Ok(prepare_hotstuff_header(parent_header))
     }
 
-    fn seal(&self, _header: &mut Header) -> Result<(), ConsensusError> {
+    fn seal(&self, _header: &mut AlloyHeader) -> Result<(), ConsensusError> {
         // The validator process stamps the view and signs the seal; the
         // execution layer has neither.
         Ok(())
@@ -689,6 +704,17 @@ impl<ChainSpec: Send + Sync> SignerManager for HotStuffConsensus<ChainSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The tests write Ethereum headers; the node's header wraps them.
+    use alloy_consensus::Header;
+    type N42Sealed = SealedHeader<n42_header::N42Header>;
+
+    fn n42_sealed(header: Header, hash: B256) -> N42Sealed {
+        SealedHeader::new(header.into(), hash)
+    }
+
+    fn n42_seal_slow(header: Header) -> N42Sealed {
+        SealedHeader::seal_slow(header.into())
+    }
     use alloy_consensus::EMPTY_OMMER_ROOT_HASH;
     use alloy_primitives::Log;
     use n42_h2_consensus::GOV5_NIL_HASH;
@@ -727,7 +753,7 @@ mod tests {
         let genesis = deferred_genesis();
         // Distinct per test: the registry is process-wide.
         let built_hash = B256::repeat_byte(0x71);
-        let sealed = SealedHeader::new(
+        let sealed = n42_sealed(
             Header { number: 41, timestamp: 1_700_000_000, ..Default::default() },
             B256::repeat_byte(0x72),
         );
@@ -754,7 +780,7 @@ mod tests {
         assert_eq!(parent_executed_fields(&genesis, &sealed), Some(fields(0xA0)));
 
         // Without a builder hash there is nothing to fall back to.
-        let other = SealedHeader::new(
+        let other = n42_sealed(
             Header { number: 42, timestamp: 1_700_000_001, ..Default::default() },
             B256::repeat_byte(0x73),
         );
@@ -771,17 +797,17 @@ mod tests {
             reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(),
             serde_json::json!(1_000u64),
         );
-        let recorded = SealedHeader::new(
+        let recorded = n42_sealed(
             Header { number: 7, timestamp: 2_000, parent_hash: B256::repeat_byte(0x5e), ..Default::default() },
             B256::repeat_byte(0x5f),
         );
         crate::executed_fields::remember(recorded.hash(), fields(0x50));
         let carried = Header { state_root: B256::repeat_byte(0x52), gas_used: 9, ..Default::default() };
         let parents = [
-            SealedHeader::new(Header { number: 0, ..carried.clone() }, B256::repeat_byte(0x53)),
-            SealedHeader::new(Header { number: 3, timestamp: 10, ..carried.clone() }, B256::repeat_byte(0x54)),
+            n42_sealed(Header { number: 0, ..carried.clone() }, B256::repeat_byte(0x53)),
+            n42_sealed(Header { number: 3, timestamp: 10, ..carried.clone() }, B256::repeat_byte(0x54)),
             recorded,
-            SealedHeader::new(Header { number: 8, timestamp: 2_001, ..carried }, B256::repeat_byte(0x55)),
+            n42_sealed(Header { number: 8, timestamp: 2_001, ..carried }, B256::repeat_byte(0x55)),
         ];
         for genesis in [deferred_genesis(), late_fork] {
             for parent in &parents {
@@ -822,9 +848,9 @@ mod tests {
         let genesis = depth_two_genesis();
         assert_eq!(reth_chainspec::qmdb::deferred_execution_depth_at(&genesis, 1), 2);
         let genesis_fields = fields(0x80);
-        let block0 = SealedHeader::new(carrying(Header::default(), genesis_fields), alloy_primitives::keccak256(b"depth-two-consensus-0x81"));
+        let block0 = n42_sealed(carrying(Header::default(), genesis_fields), alloy_primitives::keccak256(b"depth-two-consensus-0x81"));
         // Block 1 carries the genesis result; so would block 2 (its parent is 1).
-        let block1 = SealedHeader::new(
+        let block1 = n42_sealed(
             carrying(Header { number: 1, timestamp: 1, parent_hash: block0.hash(), ..Default::default() }, genesis_fields),
             alloy_primitives::keccak256(b"depth-two-consensus-0x82"),
         );
@@ -832,7 +858,7 @@ mod tests {
         assert_eq!(ancestor_executed_fields(&genesis, &block1, 2), Some(genesis_fields), "block 2");
         assert!(!ancestor_result_is_recorded(&genesis, &block1, 2));
         // Block 3 (parent 2, grandparent 1): result(1), from the registry.
-        let block2 = SealedHeader::new(
+        let block2 = n42_sealed(
             carrying(Header { number: 2, timestamp: 2, parent_hash: block1.hash(), ..Default::default() }, genesis_fields),
             alloy_primitives::keccak256(b"depth-two-consensus-0x83"),
         );
@@ -843,13 +869,13 @@ mod tests {
         crate::executed_fields::remember(block2.hash(), fields(0x86));
         assert_eq!(ancestor_executed_fields(&genesis, &block2, 2), Some(fields(0x84)), "block 3 carries result(1)");
         // Two siblings at height 2 on block 1: their children expect the same.
-        let sibling = SealedHeader::new(
+        let sibling = n42_sealed(
             Header { number: 2, timestamp: 3, parent_hash: block1.hash(), ..Default::default() },
             alloy_primitives::keccak256(b"depth-two-consensus-0x87"),
         );
         assert_eq!(ancestor_executed_fields(&genesis, &sibling, 2), ancestor_executed_fields(&genesis, &block2, 2));
         // A parent on another grandparent expects that one's result.
-        let other = SealedHeader::new(
+        let other = n42_sealed(
             Header { number: 3, timestamp: 4, parent_hash: block2.hash(), ..Default::default() },
             alloy_primitives::keccak256(b"depth-two-consensus-0x88"),
         );
@@ -858,7 +884,7 @@ mod tests {
         assert_eq!(ancestor_executed_fields(&genesis, &block2, 1), Some(fields(0x86)));
         // The builder's fallback at depth 2: the grandparent filed under its
         // builder hash only is found and filed under the sealed hash.
-        let unknown = SealedHeader::new(
+        let unknown = n42_sealed(
             Header { number: 9, timestamp: 9, parent_hash: alloy_primitives::keccak256(b"depth-two-consensus-0x89"), ..Default::default() },
             alloy_primitives::keccak256(b"depth-two-consensus-0x8a"),
         );
@@ -879,7 +905,7 @@ mod tests {
     /// the same headers the other way -- the mixed-fleet refusal, at unit level.
     #[test]
     fn each_depth_refuses_the_other_depths_header() {
-        let d2 = HotStuffConsensus::new(Arc::new(ChainSpecBuilder::mainnet().genesis(depth_two_genesis()).build()));
+        let d2 = HotStuffConsensus::new(Arc::new(n42_header::N42ChainSpec::from(Arc::new(ChainSpecBuilder::mainnet().genesis(depth_two_genesis()).build()))));
         let d1 = deferred_consensus();
         let grandparent = alloy_primitives::keccak256(b"depth-two-consensus-0x90");
         crate::executed_fields::remember(grandparent, fields(0x92)); // result(N-2)
@@ -935,7 +961,7 @@ mod tests {
             gas_used: 42_000,
             ..Default::default()
         };
-        let sealed = SealedHeader::new(header, B256::repeat_byte(0xC9));
+        let sealed = n42_sealed(header, B256::repeat_byte(0xC9));
         let found = parent_executed_fields_or_built(&genesis, &sealed, None, std::time::Duration::ZERO)
             .expect("its own header is the answer");
         assert_eq!(found.state_root, B256::repeat_byte(0xC1));
@@ -968,7 +994,7 @@ mod tests {
 
     #[test]
     fn a_prepared_header_is_a_gov5_header_for_view_zero() {
-        let parent = SealedHeader::seal_slow(Header {
+        let parent = n42_seal_slow(Header {
             number: 4,
             ..Default::default()
         });
@@ -992,8 +1018,8 @@ mod tests {
     const TS_CANCUN: u64 = 1_720_000_000;
     const TS_PRAGUE: u64 = 1_800_000_000;
 
-    fn consensus() -> HotStuffConsensus<ChainSpec> {
-        HotStuffConsensus::new(MAINNET.clone())
+    fn consensus() -> HotStuffConsensus<n42_header::N42ChainSpec> {
+        HotStuffConsensus::new(Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())))
     }
 
     /// A header the profile and Ethereum's standalone rules accept at `ts`.
@@ -1023,8 +1049,8 @@ mod tests {
         header
     }
 
-    fn sealed(header: Header) -> SealedHeader {
-        SealedHeader::seal_slow(header)
+    fn sealed(header: Header) -> N42Sealed {
+        n42_seal_slow(header)
     }
 
     fn other_err<T: std::error::Error + 'static>(err: &ConsensusError) -> Option<&T> {
@@ -1032,6 +1058,48 @@ mod tests {
             ConsensusError::Other(inner) => inner.downcast_ref::<T>(),
             _ => None,
         }
+    }
+
+    /// gov5's presence rules, read from the genesis schedule: no slot and no
+    /// root before Glamsterdam, the slot (equal to the number) from it, and
+    /// the registry root as well once MobileAnchor is also active. The root's
+    /// value is not checked.
+    #[test]
+    fn the_slot_number_and_registry_root_follow_the_genesis_schedule() {
+        use n42_h2_consensus::HeaderProfileError as E;
+        let mut genesis = alloy_genesis::Genesis::default();
+        genesis.config.extra_fields.insert(
+            reth_chainspec::qmdb::GLAMSTERDAM_TIME_KEY.to_owned(),
+            serde_json::json!(TS_PRAGUE + 10),
+        );
+        genesis.config.extra_fields.insert(
+            reth_chainspec::qmdb::MOBILE_ANCHOR_TIME_KEY.to_owned(),
+            serde_json::json!(TS_PRAGUE + 20),
+        );
+        let c = HotStuffConsensus::new(Arc::new(n42_header::N42ChainSpec::from(
+            ChainSpecBuilder::mainnet().genesis(genesis).build(),
+        )));
+        let with = |header: Header, slot: Option<u64>, root: Option<B256>| {
+            SealedHeader::seal_slow(n42_header::N42Header::new(Header { slot_number: slot, ..header }, root))
+        };
+        let refused = |header: &N42Sealed| c.validate_header(header).map_err(|err| other_err::<E>(&err).map(ToString::to_string));
+        let root = Some(B256::repeat_byte(0x24));
+
+        let before = good_header(9, TS_PRAGUE);
+        assert!(c.validate_header(&with(before.clone(), None, None)).is_ok());
+        assert!(matches!(refused(&with(before.clone(), Some(9), None)), Err(Some(_))));
+        assert!(matches!(refused(&with(before, None, root)), Err(Some(_))));
+
+        let glamsterdam = good_header(9, TS_PRAGUE + 10);
+        assert!(c.validate_header(&with(glamsterdam.clone(), Some(9), None)).is_ok());
+        assert!(matches!(refused(&with(glamsterdam.clone(), None, None)), Err(Some(_))));
+        assert!(matches!(refused(&with(glamsterdam.clone(), Some(10), None)), Err(Some(_))));
+        assert!(matches!(refused(&with(glamsterdam, Some(9), root)), Err(Some(_))));
+
+        let anchored = good_header(9, TS_PRAGUE + 20);
+        assert!(c.validate_header(&with(anchored.clone(), Some(9), root)).is_ok());
+        assert!(c.validate_header(&with(anchored.clone(), Some(9), Some(B256::ZERO))).is_ok());
+        assert!(matches!(refused(&with(anchored, Some(9), None)), Err(Some(_))));
     }
 
     #[test]
@@ -1136,7 +1204,7 @@ mod tests {
         assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::RequestsHashUnexpected)));
     }
 
-    fn parent_and_child() -> (SealedHeader, Header) {
+    fn parent_and_child() -> (N42Sealed, Header) {
         let parent = sealed(good_header(5, TS_SHANGHAI));
         let mut child = good_header(6, TS_SHANGHAI + 3);
         child.parent_hash = parent.hash();
@@ -1181,8 +1249,8 @@ mod tests {
         ));
     }
 
-    fn deferred_consensus() -> HotStuffConsensus<ChainSpec> {
-        HotStuffConsensus::new(Arc::new(ChainSpecBuilder::mainnet().genesis(deferred_genesis()).build()))
+    fn deferred_consensus() -> HotStuffConsensus<n42_header::N42ChainSpec> {
+        HotStuffConsensus::new(Arc::new(n42_header::N42ChainSpec::from(Arc::new(ChainSpecBuilder::mainnet().genesis(deferred_genesis()).build()))))
     }
 
     #[test]
@@ -1239,7 +1307,7 @@ mod tests {
         assert!(c.validate_header_against_parent(&sealed(child.clone()), &parent).is_ok());
 
         // Past the parent's own limit is still refused.
-        let mut over = parent.header().clone();
+        let mut over = parent.header().inner.clone();
         over.number = 602;
         let over_parent = sealed(over);
         let past = crate::executed_fields::ExecutedFields { gas_used: over_parent.gas_limit + 1, ..fields(0x61) };
@@ -1286,7 +1354,7 @@ mod tests {
     fn a_committee_chain_links_the_parent_beacon_root_to_the_parents_evidence() {
         let genesis: alloy_genesis::Genesis =
             serde_json::from_str(include_str!("../../../chainspec/res/genesis/n42_devnet.json")).unwrap();
-        let c = HotStuffConsensus::new(Arc::new(ChainSpec::from(genesis)));
+        let c = HotStuffConsensus::new(Arc::new(n42_header::N42ChainSpec::from(Arc::new(ChainSpec::from(genesis)))));
         let pool = c.committee_pool().expect("the devnet genesis names a committee pool");
 
         let mut parent_header = good_header(7, 1_000);
@@ -1318,7 +1386,7 @@ mod tests {
     }
 
     fn block_of(header: Header, body: EthBlockBody) -> SealedBlock<EthBlock> {
-        SealedBlock::seal_slow(EthBlock { header, body })
+        SealedBlock::seal_slow(EthBlock { header: header.into(), body })
     }
 
     fn empty_body() -> EthBlockBody {
@@ -1342,7 +1410,7 @@ mod tests {
         ));
         // A body that brings ommers under a zero hash is lying.
         header.ommers_hash = B256::ZERO;
-        let with_ommers = EthBlockBody { ommers: vec![Header::default()], ..empty_body() };
+        let with_ommers = EthBlockBody { ommers: vec![Default::default()], ..empty_body() };
         assert!(matches!(
             c.validate_body_against_header(&with_ommers, &sealed(header)),
             Err(ConsensusError::BodyOmmersHashDiff(_))
@@ -1448,7 +1516,7 @@ mod tests {
     fn prepare_and_seal_leave_the_view_and_seal_to_the_validator() {
         let c = consensus();
         let parent = sealed(good_header(9, TS_SHANGHAI));
-        let mut header = c.prepare(&parent).unwrap();
+        let mut header = c.prepare(&n42_header::seal_to_alloy(&parent)).unwrap();
         assert_eq!(header.number, 10);
         let before = header.clone();
         c.seal(&mut header).unwrap();
@@ -1487,7 +1555,7 @@ mod tests {
     use alloy_eips::eip7685::Requests;
 
     fn recovered(header: Header) -> RecoveredBlock<EthBlock> {
-        RecoveredBlock::new_unhashed(EthBlock { header, body: empty_body() }, vec![])
+        RecoveredBlock::new_unhashed(EthBlock { header: header.into(), body: empty_body() }, vec![])
     }
 
     fn result_of(receipts: Vec<Receipt>, gas_used: u64) -> BlockExecutionResult<Receipt> {

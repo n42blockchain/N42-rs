@@ -948,7 +948,7 @@ async fn the_block_after_a_recovered_own_commit_imports_from_its_body() {
 async fn a_refused_first_build_on_output_falls_back_to_the_forkchoice_build() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
-    let header = alloy_consensus::Header::default();
+    let header = n42_h2_consensus::N42Header::default();
     let what = driver
         .prepare_first_build_on_output(GENESIS, header, attrs(), None)
         .await
@@ -974,7 +974,7 @@ async fn a_finished_build_ahead_is_kept_for_the_first_build_of_a_tenure() {
         tokio::task::yield_now().await;
     }
     let what = driver
-        .prepare_first_build_on_output(GENESIS, alloy_consensus::Header::default(), attrs(), None)
+        .prepare_first_build_on_output(GENESIS, n42_h2_consensus::N42Header::default(), attrs(), None)
         .await
         .expect("nothing to start");
     assert_eq!(what, "a forkchoice build ahead on this parent has already finished");

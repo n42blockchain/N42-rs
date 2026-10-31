@@ -211,6 +211,7 @@ fn an_amsterdam_payload_goes_to_v5_with_its_access_list() {
             payload_inner: payload_v3(),
             block_access_list: Bytes::from_static(&[0xc0]),
             slot_number: 7,
+            mobile_registry_root: None,
         }),
         ExecutionPayloadSidecar::v3(cancun),
     );
@@ -504,7 +505,7 @@ async fn chain_lookups_come_back_as_consensus_types() {
 
     let served = client.block_by_number(7).await.unwrap().expect("served");
     let (by_number, txs) = (served.header, served.transactions);
-    assert_eq!(by_number, header);
+    assert_eq!(by_number, n42_header::N42Header::from(header.clone()));
     assert!(txs.is_empty());
     let by_hash = client.block_by_hash(hash).await.unwrap().expect("served").header;
     assert_eq!(by_hash.hash_slow(), hash);

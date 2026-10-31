@@ -1572,6 +1572,15 @@ pub struct ExecutionPayloadV4 {
     /// [EIP-7843]: https://eips.ethereum.org/EIPS/eip-7843
     #[cfg_attr(feature = "serde", serde(with = "alloy_serde::quantity"))]
     pub slot_number: u64,
+    /// N42: gov5's `MobileRegistryRoot`, header element 24 (absent on every
+    /// chain without gov5's MobileAnchor and Glamsterdam forks). It is part of
+    /// the block hash, so a payload that dropped it could not reproduce the
+    /// block. Not in the SSZ form, which N42's engine path does not use.
+    #[cfg_attr(
+        feature = "serde",
+        serde(rename = "mobileRegistryRoot", default, skip_serializing_if = "Option::is_none")
+    )]
+    pub mobile_registry_root: Option<B256>,
 }
 
 #[cfg(feature = "serde")]
@@ -1615,6 +1624,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadV4 {
             block_access_list: Bytes,
             #[serde(with = "alloy_serde::quantity")]
             slot_number: u64,
+            #[serde(rename = "mobileRegistryRoot", default)]
+            mobile_registry_root: Option<B256>,
         }
 
         let helper = Helper::deserialize(deserializer)?;
@@ -1646,6 +1657,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadV4 {
             },
             block_access_list: helper.block_access_list,
             slot_number: helper.slot_number,
+            mobile_registry_root: helper.mobile_registry_root,
         })
     }
 }
@@ -1709,6 +1721,7 @@ impl ssz::Decode for ExecutionPayloadV4 {
             },
             block_access_list: decoder.decode_next()?,
             slot_number: decoder.decode_next()?,
+            mobile_registry_root: None,
         })
     }
 }
@@ -1803,6 +1816,7 @@ impl ExecutionPayloadV4 {
                 |hash| Bytes::copy_from_slice(hash.as_slice()),
             ),
             slot_number: block.header.slot_number().unwrap_or_default(),
+            mobile_registry_root: None,
         }
     }
 
@@ -1826,12 +1840,23 @@ impl ExecutionPayloadV4 {
             payload_inner: ExecutionPayloadV3::from_block_unchecked(block_hash, block),
             block_access_list,
             slot_number: block.header.slot_number().unwrap_or_default(),
+            mobile_registry_root: None,
         }
     }
 
     /// Returns the timestamp for the execution payload.
     pub const fn timestamp(&self) -> u64 {
         self.payload_inner.timestamp()
+    }
+
+    /// The header's `block_access_list_hash`: keccak of the list.
+    ///
+    /// N42: an empty `block_access_list` (not an RLP list, so no real access
+    /// list encodes to it) stands for a header without the hash, gov5's empty
+    /// element 22 before a slot number or registry root
+    /// (`docs/HEADER_FIELD_PARITY.md` gap 2).
+    pub fn block_access_list_hash(&self) -> Option<B256> {
+        (!self.block_access_list.is_empty()).then(|| keccak256(&self.block_access_list))
     }
 
     /// Converts [`ExecutionPayloadV4`] to [`Block`].
@@ -1864,10 +1889,10 @@ impl ExecutionPayloadV4 {
     /// This is similar to [`Self::try_into_block_with`] but returns the transactions as raw bytes
     /// without any conversion.
     pub fn into_block_raw(self) -> Result<Block<Bytes>, PayloadError> {
+        let block_access_list_hash = self.block_access_list_hash();
         let mut base_block = self.payload_inner.into_block_raw()?;
 
-        let block_access_list_hash = alloy_primitives::keccak256(&self.block_access_list);
-        base_block.header.block_access_list_hash = Some(block_access_list_hash);
+        base_block.header.block_access_list_hash = block_access_list_hash;
         base_block.header.slot_number = Some(self.slot_number);
 
         Ok(base_block)
@@ -1892,10 +1917,11 @@ impl ExecutionPayloadV4 {
         self,
         transactions_root: Option<B256>,
     ) -> Result<Block<Bytes>, PayloadError> {
+        let block_access_list_hash = self.block_access_list_hash();
         let mut base_block =
             self.payload_inner.into_block_raw_with_transactions_root_opt(transactions_root)?;
 
-        base_block.header.block_access_list_hash = Some(keccak256(self.block_access_list));
+        base_block.header.block_access_list_hash = block_access_list_hash;
         base_block.header.slot_number = Some(self.slot_number);
 
         Ok(base_block)
@@ -2826,7 +2852,7 @@ impl ExecutionPayload {
     ///
     /// Returns `None` for pre-Amsterdam payloads (V1, V2, V3).
     pub fn bal_hash(&self) -> Option<B256> {
-        self.as_v4().map(|payload| keccak256(&payload.block_access_list))
+        self.as_v4().and_then(ExecutionPayloadV4::block_access_list_hash)
     }
 
     /// Returns the slot number for the payload (EIP-7843).
@@ -3195,6 +3221,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     // N42
                     Difficulty,
                     Nonce,
+                    MobileRegistryRoot,
                 }
 
                 let mut parent_hash = None;
@@ -3218,6 +3245,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                 let mut excess_blob_gas = None;
                 let mut block_access_list = None;
                 let mut slot_number = None;
+                let mut mobile_registry_root: Option<B256> = None;
 
                 while let Some(key) = map.next_key()? {
                     match key {
@@ -3265,6 +3293,10 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                         Fields::SlotNumber => {
                             let raw = map.next_value::<U64>()?;
                             slot_number = Some(raw.to());
+                        }
+                        // N42: gov5's header element 24, a V4 field.
+                        Fields::MobileRegistryRoot => {
+                            mobile_registry_root = map.next_value()?;
                         }
                     }
                 }
@@ -3318,7 +3350,10 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                 };
 
                 let Some(withdrawals) = withdrawals else {
-                    return if blob_gas_used.is_none() && excess_blob_gas.is_none() {
+                    return if blob_gas_used.is_none()
+                        && excess_blob_gas.is_none()
+                        && mobile_registry_root.is_none()
+                    {
                         Ok(ExecutionPayload::V1(v1))
                     } else {
                         Err(serde::de::Error::custom("invalid enum variant"))
@@ -3341,10 +3376,14 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                                 payload_inner: v3,
                                 block_access_list,
                                 slot_number,
+                                mobile_registry_root,
                             }))
                         }
-                        // reject incomplete V4 payloads
-                        (None, None) => Ok(ExecutionPayload::V3(v3)),
+                        // reject incomplete V4 payloads; N42: a registry
+                        // root is a V4 field, never dropped from a V3 one
+                        (None, None) if mobile_registry_root.is_none() => {
+                            Ok(ExecutionPayload::V3(v3))
+                        }
                         _ => Err(serde::de::Error::custom("invalid enum variant")),
                     };
                 }
@@ -3355,7 +3394,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                 }
 
                 // reject V4 fields without V3 fields
-                if block_access_list.is_some() || slot_number.is_some() {
+                if block_access_list.is_some() || slot_number.is_some() || mobile_registry_root.is_some() {
                     return Err(serde::de::Error::custom("invalid enum variant"));
                 }
 
@@ -4496,6 +4535,7 @@ mod tests {
             payload_inner: ssz_payload_v3(),
             block_access_list: Bytes::from(vec![18, 19]),
             slot_number: 20,
+            mobile_registry_root: None,
         }
     }
 
@@ -5891,6 +5931,7 @@ mod tests {
             },
             block_access_list: Bytes::from(vec![0xaa, 0xbb]),
             slot_number: 0,
+            mobile_registry_root: None,
         };
 
         let serialized = serde_json::to_string(&payload).unwrap();
@@ -6022,6 +6063,7 @@ mod tests {
             },
             block_access_list: block_access_list.clone(),
             slot_number: 7,
+            mobile_registry_root: None,
         });
 
         assert_eq!(payload.slot_number(), Some(7));

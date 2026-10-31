@@ -18,6 +18,7 @@ use n42_clique::APos;
 use n42_consensus_traits::{AposResult, SignerManager};
 use n42_primitives::Snapshot;
 use n42_qmdb_reth::HotStuffGenesisConfig;
+use n42_header::{N42ChainSpec, N42Header};
 use reth_chainspec::ChainSpec;
 use reth_consensus::{
     Consensus, ConsensusError, FullConsensus, HeaderConsensusError, HeaderValidator,
@@ -44,11 +45,11 @@ impl<T> N42FullConsensus for T where T: FullConsensus<EthPrimitives> + SignerMan
 /// The bounds APoS puts on its provider; the enum carries them so it can
 /// hold an [`APos`] at all.
 pub trait ConsensusProvider:
-    HeaderProvider<Header = Header> + BlockIdReader + BlockReaderIdExt + Clone + Unpin + 'static
+    HeaderProvider<Header: Into<Header>> + BlockIdReader + BlockReaderIdExt + Clone + Unpin + 'static
 {
 }
 impl<T> ConsensusProvider for T where
-    T: HeaderProvider<Header = Header> + BlockIdReader + BlockReaderIdExt + Clone + Unpin + 'static
+    T: HeaderProvider<Header: Into<Header>> + BlockIdReader + BlockReaderIdExt + Clone + Unpin + 'static
 {
 }
 
@@ -60,7 +61,7 @@ pub enum N42Consensus<Provider: ConsensusProvider> {
     Apos(Box<APos<Provider, ChainSpec>>),
     /// A HotStuff-2 chain: a validator process drives this node over the
     /// Engine API, and blocks follow gov5's header profile.
-    HotStuff(HotStuffConsensus<ChainSpec>),
+    HotStuff(HotStuffConsensus<N42ChainSpec>),
 }
 
 impl<Provider: ConsensusProvider> std::fmt::Debug for N42Consensus<Provider> {
@@ -96,26 +97,26 @@ macro_rules! delegate {
     };
 }
 
-impl<Provider> HeaderValidator for N42Consensus<Provider>
+impl<Provider> HeaderValidator<N42Header> for N42Consensus<Provider>
 where
     Provider: ConsensusProvider,
 {
-    fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
+    fn validate_header(&self, header: &SealedHeader<N42Header>) -> Result<(), ConsensusError> {
         delegate!(self, c => c.validate_header(header))
     }
 
     fn validate_header_against_parent(
         &self,
-        header: &SealedHeader,
-        parent: &SealedHeader,
+        header: &SealedHeader<N42Header>,
+        parent: &SealedHeader<N42Header>,
     ) -> Result<(), ConsensusError> {
         delegate!(self, c => c.validate_header_against_parent(header, parent))
     }
 
     fn validate_header_range(
         &self,
-        headers: &[SealedHeader],
-    ) -> Result<(), HeaderConsensusError<Header>> {
+        headers: &[SealedHeader<N42Header>],
+    ) -> Result<(), HeaderConsensusError<N42Header>> {
         delegate!(self, c => c.validate_header_range(headers))
     }
 }
@@ -127,7 +128,7 @@ where
     fn validate_body_against_header(
         &self,
         body: &EthBlockBody,
-        header: &SealedHeader,
+        header: &SealedHeader<N42Header>,
     ) -> Result<(), ConsensusError> {
         delegate!(self, c => Consensus::<EthBlock>::validate_body_against_header(c, body, header))
     }
@@ -255,7 +256,7 @@ pub struct N42ConsensusBuilder;
 
 impl<Node> ConsensusBuilder<Node> for N42ConsensusBuilder
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = N42ChainSpec, Primitives = EthPrimitives>>,
 {
     type Consensus = Arc<N42Consensus<<Node as FullNodeTypes>::Provider>>;
 
@@ -271,7 +272,7 @@ where
         } else {
             N42Consensus::Apos(Box::new(APos::new(
                 ctx.provider().clone(),
-                chain_spec,
+                chain_spec.inner().clone(),
                 ctx.config().dev.consensus_signer_private_key.clone(),
             )))
         };

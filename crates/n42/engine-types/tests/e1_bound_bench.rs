@@ -331,7 +331,7 @@ fn e1_exec_bound() {
         ..Default::default()
     };
     let evm_config = N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
-    let evm_env = evm_config.evm_env(&header).expect("env");
+    let evm_env = evm_config.evm_env(&n42_header::N42Header::from(header.clone())).expect("env");
 
     // The three kept layers: each block executed on the stack below it.
     let mut layers: Vec<Arc<FrozenShards>> = Vec::new();
@@ -767,7 +767,7 @@ fn e1_overlap() {
         ..Default::default()
     };
     let evm_config = N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
-    let evm_env = evm_config.evm_env(&header).expect("env");
+    let evm_env = evm_config.evm_env(&n42_header::N42Header::from(header.clone())).expect("env");
     let mut layers: Vec<Arc<FrozenShards>> = Vec::new();
     for b in 0..LAYERS as u64 {
         let db = StackDb(Arc::new(Stack { layers: layers.clone(), memory: Vec::new(), view: Arc::clone(&view), head: 1 }));

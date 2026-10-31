@@ -17,7 +17,7 @@
 //! as — their root against the header is the execution layer's check, on the
 //! side that has to decode them anyway.
 
-use alloy_consensus::Header;
+use n42_header::N42Header as Header;
 use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader, RlpDecodable, RlpEncodable};

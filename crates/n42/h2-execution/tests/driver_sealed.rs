@@ -81,7 +81,7 @@ impl ExecutionLayer for DirectEl {
     }
     async fn build_on_own_block(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_h2_consensus::N42Header,
         _attrs: PayloadAttributes,
     ) -> Option<Result<BuiltBlock, ElError>> {
         Some(match self.mode {
@@ -103,8 +103,8 @@ fn driver(mode: Direct) -> ExecutionDriver<DirectEl> {
     ExecutionDriver::new(DirectEl { mock: MockExecutionLayer::new(), mode }, GENESIS)
 }
 
-fn sealed_parent() -> (alloy_consensus::Header, B256) {
-    let header = alloy_consensus::Header { number: 7, ..Default::default() };
+fn sealed_parent() -> (n42_h2_consensus::N42Header, B256) {
+    let header = n42_h2_consensus::N42Header::from(alloy_consensus::Header { number: 7, ..Default::default() });
     let hash = header.hash_slow();
     (header, hash)
 }
@@ -125,7 +125,7 @@ async fn a_build_sealed_ahead_for_the_right_view_is_taken_as_it_is_with_its_body
     let mut driver = driver(Direct::OnTheHeader);
     driver.set_payload_normalizer(move |payload, _header, view| {
         counter.fetch_add(1, Ordering::SeqCst);
-        Ok((stamp(payload, view), Some(alloy_consensus::Header { number: 8, ..Default::default() })))
+        Ok((stamp(payload, view), Some(n42_h2_consensus::N42Header::from(alloy_consensus::Header { number: 8, ..Default::default() }))))
     });
     driver.set_own_body_encoder(|execution, header| {
         assert_eq!(header.number, 8, "the encoder sees the finished header");
@@ -153,7 +153,7 @@ async fn a_build_sealed_for_another_view_is_sealed_again_at_the_proposal() {
     let mut driver = driver(Direct::OnTheHeader);
     driver.set_payload_normalizer(move |payload, _header, view| {
         counter.fetch_add(1, Ordering::SeqCst);
-        Ok((stamp(payload, view), Some(alloy_consensus::Header { number: 8, ..Default::default() })))
+        Ok((stamp(payload, view), Some(n42_h2_consensus::N42Header::from(alloy_consensus::Header { number: 8, ..Default::default() }))))
     });
     driver.set_own_body_encoder(|_, _| Some(alloy_primitives::Bytes::from_static(b"stale")));
     driver.prepare_build_on_sealed_for_view(parent, header, attrs(), None, Some(9)).await.expect("requested");

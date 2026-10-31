@@ -699,7 +699,8 @@ where
             // reth's own conversion is pinned to its Ethereum envelope; this is
             // the same decode over the node's, checked against the announced hash.
             let expected_hash = payload.block_hash();
-            let block = payload.try_into_block::<TransactionSigned>()?;
+            let root = n42_header::engine::payload_mobile_registry_root(&payload.payload);
+            let block = n42_header::engine::block_with_root(payload.try_into_block::<TransactionSigned>()?, root);
             let sealed = SealedBlock::seal_slow(block);
             if sealed.hash() != expected_hash {
                 return Err(PayloadError::BlockHash { execution: sealed.hash(), consensus: expected_hash }.into());
@@ -832,7 +833,7 @@ where
         // block already decoded.
         let checked = started.elapsed();
         let block = n42_h2_consensus::reconstruct_gov5_h2_block_from_or_tx_root(
-            ethereum_shaped.into_block(),
+            n42_header::engine::block_with_payload_root(ethereum_shaped.into_block(), &payload.payload),
             &payload,
             mpt_alternate,
         )
@@ -929,7 +930,8 @@ pub fn is_gov5_ommers_hash(hash: B256) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
+    use alloy_consensus::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
+    use n42_header::N42Header as Header;
     use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
     use alloy_primitives::{Bytes, U256};
     use n42_h2_consensus::{block_for_header, execution_data_for_block, HeaderExtra, GOV5_NIL_HASH};
@@ -937,7 +939,7 @@ mod tests {
     use crate::engine_types::N42EngineTypes as EthEngineTypes;
 
     fn gov5_header(ommers_hash: B256, difficulty: U256) -> Header {
-        Header {
+        n42_header::N42Header::from(alloy_consensus::Header {
             parent_hash: B256::repeat_byte(1),
             ommers_hash,
             state_root: B256::repeat_byte(2),
@@ -956,7 +958,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::ZERO),
             requests_hash: Some(EMPTY_REQUESTS_HASH),
             ..Default::default()
-        }
+        })
     }
 
     fn payload_for(header: Header) -> ExecutionData {

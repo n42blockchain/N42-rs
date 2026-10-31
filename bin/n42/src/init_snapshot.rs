@@ -74,10 +74,27 @@ enum Command {
     Export(ExportArgs),
 }
 
+/// [`N42ChainSpecParser`] over the node's header: the node type opened here
+/// stores `N42Header`, so its chain spec is [`n42_header::N42ChainSpec`].
+#[derive(Debug, Clone, Copy, Default)]
+struct SnapshotChainSpecParser;
+
+impl reth_cli::chainspec::ChainSpecParser for SnapshotChainSpecParser {
+    type ChainSpec = n42_header::N42ChainSpec;
+
+    const SUPPORTED_CHAINS: &'static [&'static str] =
+        <N42ChainSpecParser as reth_cli::chainspec::ChainSpecParser>::SUPPORTED_CHAINS;
+
+    fn parse(s: &str) -> eyre::Result<std::sync::Arc<Self::ChainSpec>> {
+        let spec = <N42ChainSpecParser as reth_cli::chainspec::ChainSpecParser>::parse(s)?;
+        Ok(std::sync::Arc::new(n42_header::N42ChainSpec::from(spec)))
+    }
+}
+
 #[derive(Debug, Parser)]
 struct InitArgs {
     #[command(flatten)]
-    env: EnvironmentArgs<N42ChainSpecParser>,
+    env: EnvironmentArgs<SnapshotChainSpecParser>,
     /// reth `init-state` JSONL: `{"root": ...}` then one account per line.
     #[arg(long, value_name = "STATE_JSONL")]
     state: PathBuf,
@@ -92,7 +109,7 @@ struct InitArgs {
 #[derive(Debug, Parser)]
 struct ExportArgs {
     #[command(flatten)]
-    env: EnvironmentArgs<N42ChainSpecParser>,
+    env: EnvironmentArgs<SnapshotChainSpecParser>,
     /// The state JSONL's path, for naming: the header goes to
     /// `<out>.header.rlp`. The JSONL itself comes from gov5's
     /// `n42-reth-state-dump` at the same block.
@@ -171,9 +188,10 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
         let provider_rw = provider_factory.database_provider_rw()?;
         let last = provider_rw.last_block_number()?;
         if last == 0 && number > 0 {
-            setup_without_evm(&provider_rw, SealedHeader::new(header, hash), |n| Header {
-                number: n,
-                ..Default::default()
+            // A snapshot head carries no registry root: its header file is decoded as
+            // Ethereum's header (see the decode above).
+            setup_without_evm(&provider_rw, SealedHeader::new(n42_header::N42Header::from(header), hash), |n| {
+                n42_header::N42Header::from(Header { number: n, ..Default::default() })
             })?;
             provider_factory.static_file_provider().commit()?;
         } else if last != number {
@@ -213,7 +231,7 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     println!("state: {accounts} accounts, {slots} slots, every one a leaf of the snapshot");
 
     // The forest, from the portable snapshot, checked against the header.
-    let qmdb = QmdbNodeState::new(chain.clone(), data_dir.data_dir().join("qmdb"));
+    let qmdb = QmdbNodeState::new(chain.inner().clone(), data_dir.data_dir().join("qmdb"));
     qmdb.initialize_from_portable(&portable, chain.chain().id(), chain.genesis_hash(), (number, hash), root)?;
     println!("QMDB forest restored at block {number}; the node can start");
     Ok(())
@@ -450,7 +468,7 @@ fn export(args: ExportArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     // same block.
     println!("header -> {}", header_path.display());
 
-    let qmdb = QmdbNodeState::new(chain.clone(), data_dir.data_dir().join("qmdb"));
+    let qmdb = QmdbNodeState::new(chain.inner().clone(), data_dir.data_dir().join("qmdb"));
     let portable = qmdb.portable_export(chain.chain().id(), chain.genesis_hash())?;
     fs::write(&args.qmdb_out, &portable)?;
     println!("QMDB snapshot: {} bytes -> {}", portable.len(), args.qmdb_out.display());

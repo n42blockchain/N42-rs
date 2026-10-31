@@ -36,7 +36,7 @@ fn main() -> Result<()> {
         "output must be outside the source datadir"
     );
     let genesis: Genesis = serde_json::from_slice(&fs::read(&genesis_path)?)?;
-    let chain = Arc::new(reth_chainspec::ChainSpec::from(genesis));
+    let chain = Arc::new(n42_header::N42ChainSpec::from(reth_chainspec::ChainSpec::from(genesis)));
     let factory = N42Node::provider_factory_builder().open_read_only(
         chain,
         datadir.clone(),

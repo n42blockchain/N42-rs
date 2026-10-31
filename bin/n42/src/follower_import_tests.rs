@@ -34,13 +34,13 @@ fn output_of(accounts: &[(Address, Option<AccountInfo>)]) -> ParentOutput {
 }
 
 /// A sealed header unique to `tag`.
-fn header(number: u64, parent: B256, tag: &str) -> reth_primitives_traits::SealedHeader {
-    reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+fn header(number: u64, parent: B256, tag: &str) -> reth_primitives_traits::SealedHeader<n42_header::N42Header> {
+    reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
         number,
         parent_hash: parent,
         extra_data: tag.as_bytes().to_vec().into(),
         ..Default::default()
-    })
+    }))
 }
 
 // --- ParentLayer ---------------------------------------------------------------
@@ -75,7 +75,7 @@ fn the_parent_read_names_follow_the_layer_codes() {
 
 // --- the kept stores -----------------------------------------------------------
 
-fn keep(number: u64, parent: B256, tag: &str) -> reth_primitives_traits::SealedHeader {
+fn keep(number: u64, parent: B256, tag: &str) -> reth_primitives_traits::SealedHeader<n42_header::N42Header> {
     let header = header(number, parent, tag);
     keep_follower_shards(
         header.hash(),
@@ -229,7 +229,7 @@ fn deferred_genesis(at: u64) -> alloy_genesis::Genesis {
 
 #[test]
 fn an_unknown_parent_is_not_in() {
-    let provider = MockEthProvider::default();
+    let provider = MockEthProvider::<n42_tx_types::N42Primitives>::new();
     let genesis = alloy_genesis::Genesis::default();
     assert!(parent_in(&provider, B256::repeat_byte(0xE0), &genesis, false).unwrap().is_none());
     assert!(parent_in(&provider, B256::repeat_byte(0xE0), &genesis, true).unwrap().is_none());
@@ -237,7 +237,7 @@ fn an_unknown_parent_is_not_in() {
 
 #[test]
 fn a_known_parent_is_in_unless_its_execution_is_owed_here() {
-    let provider = MockEthProvider::default();
+    let provider = MockEthProvider::<n42_tx_types::N42Primitives>::new();
     // Before the fork a header carries its own result.
     let before = header(5, B256::ZERO, "in-before-fork");
     provider.add_header(before.hash(), before.header().clone());
@@ -245,12 +245,12 @@ fn a_known_parent_is_in_unless_its_execution_is_owed_here() {
     assert_eq!(parent_in(&provider, before.hash(), &genesis, true).unwrap().map(|p| p.hash()), Some(before.hash()));
 
     // Past the fork, a parent counts once its fields are recorded here.
-    let past = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+    let past = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
         number: 6,
         timestamp: 2_000,
         extra_data: b"in-past-fork".to_vec().into(),
         ..Default::default()
-    });
+    }));
     provider.add_header(past.hash(), past.header().clone());
     assert!(parent_in(&provider, past.hash(), &genesis, true).unwrap().is_none(), "executed here is owed");
     assert!(parent_in(&provider, past.hash(), &genesis, false).unwrap().is_some(), "not deferred: the provider's word");
@@ -266,19 +266,19 @@ fn a_known_parent_is_in_unless_its_execution_is_owed_here() {
     assert!(parent_in(&provider, past.hash(), &genesis, true).unwrap().is_some());
 
     // The genesis block carries no deferred result of its own.
-    let genesis_block = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+    let genesis_block = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
         number: 0,
         timestamp: 3_000,
         extra_data: b"in-genesis".to_vec().into(),
         ..Default::default()
-    });
+    }));
     provider.add_header(genesis_block.hash(), genesis_block.header().clone());
     assert!(parent_in(&provider, genesis_block.hash(), &genesis, true).unwrap().is_some());
 }
 
 #[test]
 fn waiting_for_a_parent_returns_once_the_provider_learns_of_it() {
-    let provider = MockEthProvider::default();
+    let provider = MockEthProvider::<n42_tx_types::N42Primitives>::new();
     let parent = header(7, B256::ZERO, "late-parent");
     let genesis = alloy_genesis::Genesis::default();
     let found = std::thread::scope(|scope| {
@@ -296,7 +296,7 @@ fn waiting_for_a_parent_returns_once_the_provider_learns_of_it() {
 
 #[test]
 fn one_published_block_over_an_ancestor_in_the_engine_is_a_one_deep_ancestry() {
-    let provider = MockEthProvider::default();
+    let provider = MockEthProvider::<n42_tx_types::N42Primitives>::new();
     let anchor = header(10, B256::ZERO, "anc-anchor");
     provider.add_header(anchor.hash(), anchor.header().clone());
     let parent = header(11, anchor.hash(), "anc-parent");
@@ -310,7 +310,7 @@ fn one_published_block_over_an_ancestor_in_the_engine_is_a_one_deep_ancestry() {
 
 #[test]
 fn an_ancestry_is_refused_when_an_ancestor_is_neither_in_the_engine_nor_published() {
-    let provider = MockEthProvider::default();
+    let provider = MockEthProvider::<n42_tx_types::N42Primitives>::new();
     let parent = header(11, B256::repeat_byte(0xF1), "anc-lost");
     let genesis = alloy_genesis::Genesis::default();
     assert!(ancestry_of(&provider, &parent, &ParentLayer::Merged(output_of(&[])), &genesis, false, 12).is_none());
@@ -338,7 +338,7 @@ fn the_overlay_and_the_published_ancestry_follow_the_hashed_state_setting() {
 
 fn empty_sealed_block(number: u64) -> SealedBlock<Block> {
     SealedBlock::seal_slow(Block {
-        header: alloy_consensus::Header { number, ..Default::default() },
+        header: n42_header::N42Header::from(alloy_consensus::Header { number, ..Default::default() }),
         body: n42_tx_types::BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: None },
     })
 }
@@ -435,10 +435,10 @@ fn the_intrinsic_gas_spec_follows_the_latest_active_fork() {
 
 #[test]
 fn a_timed_check_of_an_empty_block_passes_with_and_without_the_header_comparison() {
-    let provider = MockEthProvider::default();
+    let provider = MockEthProvider::<n42_tx_types::N42Primitives>::new();
     let block = RecoveredBlock::new_sealed(
         SealedBlock::new_unhashed(Block {
-            header: alloy_consensus::Header { number: 2, gas_limit: 30_000_000, base_fee_per_gas: Some(7), ..Default::default() },
+            header: n42_header::N42Header::from(alloy_consensus::Header { number: 2, gas_limit: 30_000_000, base_fee_per_gas: Some(7), ..Default::default() }),
             body: n42_tx_types::BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: None },
         }),
         Vec::new(),
@@ -552,13 +552,13 @@ fn some_fields(byte: u8) -> n42_engine_types::executed_fields::ExecutedFields {
 fn at_depth_two_the_vote_waits_for_the_grandparents_result_not_the_parents() {
     let genesis = depth_two_genesis();
     let grandparent = B256::repeat_byte(0xA7);
-    let parent = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+    let parent = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
         number: 9,
         timestamp: 9,
         parent_hash: grandparent,
         extra_data: b"depth-two-parent".to_vec().into(),
         ..Default::default()
-    });
+    }));
     n42_engine_types::executed_fields::remember(grandparent, some_fields(0xA8));
     assert!(n42_engine_types::executed_fields::get(&parent.hash()).is_none(), "the parent's root is not computed");
     let at = std::time::Instant::now();
@@ -567,13 +567,13 @@ fn at_depth_two_the_vote_waits_for_the_grandparents_result_not_the_parents() {
 
     // The grandparent's result missing: the road waits for it.
     let late_grandparent = B256::repeat_byte(0xA9);
-    let parent2 = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+    let parent2 = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
         number: 9,
         timestamp: 9,
         parent_hash: late_grandparent,
         extra_data: b"depth-two-parent-2".to_vec().into(),
         ..Default::default()
-    });
+    }));
     let filer = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(80));
         n42_engine_types::executed_fields::remember(late_grandparent, some_fields(0xAA));
@@ -598,26 +598,26 @@ fn at_depth_two_the_vote_waits_for_the_grandparents_result_not_the_parents() {
 
     // The chain start: blocks 1 and 2 carry the genesis result, read off the
     // parent's own header -- nothing recorded, nothing waited for.
-    let block1 = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+    let block1 = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
         number: 1,
         timestamp: 1,
         parent_hash: B256::repeat_byte(0xAC),
         extra_data: b"depth-two-block-1".to_vec().into(),
         ..Default::default()
-    });
+    }));
     let at = std::time::Instant::now();
     wait_for_ancestor_fields(&genesis, &block1, 2).expect("no lookup at the chain start");
     assert!(at.elapsed() < std::time::Duration::from_millis(500));
 
     // `parent_in` is unchanged: the parent counts as in only once its own
     // result is recorded, whatever the depth.
-    let provider = MockEthProvider::default();
-    let unexecuted = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+    let provider = MockEthProvider::<n42_tx_types::N42Primitives>::new();
+    let unexecuted = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
         number: 10,
         timestamp: 10,
         extra_data: b"depth-two-parent-in".to_vec().into(),
         ..Default::default()
-    });
+    }));
     provider.add_header(unexecuted.hash(), unexecuted.header().clone());
     assert!(parent_in(&provider, unexecuted.hash(), &genesis, true).unwrap().is_none());
     n42_engine_types::executed_fields::remember(unexecuted.hash(), some_fields(0xAD));

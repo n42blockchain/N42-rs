@@ -29,6 +29,7 @@ members = [
     "crates/n42/h2-primitives",
     "crates/n42/h2-wire",
     "crates/n42/h2-consensus",
+    "crates/n42/header",
     "crates/n42/h2-net",
     "crates/n42/h2-execution",
     "crates/n42/h2-el-rpc",
@@ -240,6 +241,7 @@ n42-bmt-core = { path = "crates/n42/bmt-core" }
 n42-h2-primitives = { path = "crates/n42/h2-primitives" }
 n42-h2-wire = { path = "crates/n42/h2-wire" }
 n42-h2-consensus = { path = "crates/n42/h2-consensus" }
+n42-header = { path = "crates/n42/header" }
 n42-h2-net = { path = "crates/n42/h2-net" }
 n42-h2-execution = { path = "crates/n42/h2-execution" }
 n42-h2-el-rpc = { path = "crates/n42/h2-el-rpc" }

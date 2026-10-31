@@ -40,12 +40,12 @@ impl ExecutionLayer for Recording {
         Ok(valid())
     }
 
-    async fn own_block_body(&self, header: &alloy_consensus::Header) -> Result<Option<ChainBlock>, ElError> {
+    async fn own_block_body(&self, header: &n42_h2_consensus::N42Header) -> Result<Option<ChainBlock>, ElError> {
         *self.bodies_asked.lock().unwrap() += 1;
         Ok(self.body.clone().map(|body| ChainBlock { header: header.clone(), ..body }))
     }
 
-    async fn import_own_block_by_header(&self, header: &alloy_consensus::Header) -> Option<PayloadStatus> {
+    async fn import_own_block_by_header(&self, header: &n42_h2_consensus::N42Header) -> Option<PayloadStatus> {
         self.headers.lock().unwrap().push(header.hash_slow());
         self.by_header.then(valid)
     }
@@ -69,9 +69,9 @@ impl ExecutionLayer for Recording {
 
 /// A built block as an elided answer delivers it: its header, no
 /// transactions in the payload, the count beside it.
-fn elided(tx_count: usize) -> (BuiltBlock, alloy_consensus::Header) {
+fn elided(tx_count: usize) -> (BuiltBlock, n42_h2_consensus::N42Header) {
     let mut built = MockExecutionLayer::built_block(7);
-    let header = built.execution_data.clone().into_block_raw().expect("block").header;
+    let header = n42_h2_consensus::N42Header::from(built.execution_data.clone().into_block_raw().expect("block").header);
     built.header = Some(header.clone());
     built.tx_count = tx_count;
     built.elided = true;

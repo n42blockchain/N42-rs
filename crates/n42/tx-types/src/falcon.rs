@@ -1,21 +1,21 @@
-//! N42 0x05 full-key padded Falcon-512 transaction. See docs/spec/N42_TX_0x05.md.
+//! N42 0x05 full-key padded Falcon-512 transaction. See `docs/spec/N42_TX_0x05.md`.
 
 use alloc::vec::Vec;
 use alloy_consensus::{
+    InMemorySize, Transaction, Typed2718,
     crypto::RecoveryError,
     transaction::{SignerRecoverable, TxHashRef},
-    InMemorySize, Transaction, Typed2718,
 };
 use alloy_eips::{
     eip2718::{Decodable2718, Eip2718Error, Eip2718Result, Encodable2718},
     eip2930::AccessList,
     eip7702::SignedAuthorization,
 };
-use alloy_primitives::{keccak256, Address, Bytes, ChainId, Keccak256, TxKind, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, ChainId, Keccak256, TxKind, U256, keccak256};
 use alloy_rlp::{BufMut, Decodable, Encodable, Header};
-use serde::{Deserialize, Serialize};
 use pqcrypto_falcon::falconpadded512 as falcon;
-use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
+use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
+use serde::{Deserialize, Serialize};
 
 /// N42 extended transaction discriminator.
 pub const FALCON_TX_TYPE_ID: u8 = 0x05;
@@ -26,7 +26,9 @@ pub const ALG_FALCON512: u8 = 0;
 #[error("invalid Falcon-512 transaction signature or key")]
 pub struct FalconError;
 impl From<FalconError> for RecoveryError {
-    fn from(err: FalconError) -> Self { Self::from_source(err) }
+    fn from(err: FalconError) -> Self {
+        Self::from_source(err)
+    }
 }
 /// The unsigned fields of a 0x05 transaction.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -124,9 +126,20 @@ impl TxFalcon {
     /// `keccak256(0x05 || rlp([unsigned fields ..., alg_type, pubkey_mode, pubkey]))`.
     pub fn signing_hash(&self) -> B256 {
         let payload_length = self.fields_len();
-        let mut buf = Vec::with_capacity(1 + Header { list: true, payload_length }.length() + payload_length);
+        let mut buf = Vec::with_capacity(
+            1 + Header {
+                list: true,
+                payload_length,
+            }
+            .length()
+                + payload_length,
+        );
         buf.put_u8(FALCON_TX_TYPE_ID);
-        Header { list: true, payload_length }.encode(&mut buf);
+        Header {
+            list: true,
+            payload_length,
+        }
+        .encode(&mut buf);
         self.encode_fields(&mut buf);
         keccak256(&buf)
     }
@@ -156,7 +169,11 @@ pub struct FalconTx {
 impl FalconTx {
     /// Builds the signed transaction and computes its hash.
     pub fn new(tx: TxFalcon, signature: Bytes) -> Self {
-        let mut this = Self { tx, signature, hash: B256::ZERO };
+        let mut this = Self {
+            tx,
+            signature,
+            hash: B256::ZERO,
+        };
         this.hash = keccak256(this.encoded_2718());
         this
     }
@@ -194,9 +211,15 @@ impl FalconTx {
 
     /// Verify shape and the actual Falcon signature before deriving the sender.
     pub fn verify(&self) -> Result<Address, FalconError> {
-        if self.tx.alg_type != ALG_FALCON512 || self.tx.pubkey_mode != 0 || self.tx.chain_id == 0 ||
-            self.tx.max_priority_fee_per_gas > self.tx.max_fee_per_gas ||
-            self.tx.pubkey.len() != 897 || self.signature.len() != 666 { return Err(FalconError); }
+        if self.tx.alg_type != ALG_FALCON512
+            || self.tx.pubkey_mode != 0
+            || self.tx.chain_id == 0
+            || self.tx.max_priority_fee_per_gas > self.tx.max_fee_per_gas
+            || self.tx.pubkey.len() != 897
+            || self.signature.len() != 666
+        {
+            return Err(FalconError);
+        }
         let key = falcon::PublicKey::from_bytes(&self.tx.pubkey).map_err(|_| FalconError)?;
         let sig = falcon::DetachedSignature::from_bytes(&self.signature).map_err(|_| FalconError)?;
         falcon::verify_detached_signature(&sig, self.tx.signing_hash().as_slice(), &key).map_err(|_| FalconError)?;
@@ -207,7 +230,10 @@ impl FalconTx {
     }
 
     fn header(&self) -> Header {
-        Header { list: true, payload_length: self.signed_fields_len() }
+        Header {
+            list: true,
+            payload_length: self.signed_fields_len(),
+        }
     }
 
     /// Decodes the typed payload (after the 0x05 byte), returning the parts and
@@ -233,7 +259,11 @@ impl FalconTx {
         let mut hasher = Keccak256::new();
         hasher.update([FALCON_TX_TYPE_ID]);
         hasher.update(&original[..consumed]);
-        Ok(Self { tx, signature, hash: hasher.finalize() })
+        Ok(Self {
+            tx,
+            signature,
+            hash: hasher.finalize(),
+        })
     }
 }
 
@@ -416,9 +446,12 @@ impl SignerRecoverable for FalconTx {
     }
 }
 
-
 static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Process-wide admission flag initialized from this node's genesis.
-pub fn pq_tx_enabled() -> bool { ENABLED.load(core::sync::atomic::Ordering::Acquire) }
+pub fn pq_tx_enabled() -> bool {
+    ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
 /// Initialize only from the chain configuration, never from incoming traffic.
-pub fn set_pq_tx_enabled(value: bool) { ENABLED.store(value, core::sync::atomic::Ordering::Release); }
+pub fn set_pq_tx_enabled(value: bool) {
+    ENABLED.store(value, core::sync::atomic::Ordering::Release);
+}

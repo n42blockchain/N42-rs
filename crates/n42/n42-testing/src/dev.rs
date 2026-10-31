@@ -2624,16 +2624,12 @@ async fn test_falcon_transfer__is_mined_and_typed_0x05() -> eyre::Result<()> {
     let raw = alloy_eips::eip2718::Encodable2718::encoded_2718(&tx);
     let signed = <n42_tx_types::N42TxEnvelope as alloy_eips::eip2718::Decodable2718>::decode_2718_exact(&raw)?;
     assert_eq!(reth_primitives_traits::SignerRecoverable::recover_signer(&signed)?, ed_sender);
-    let encoded_len = alloy_eips::eip2718::Encodable2718::encode_2718_len(&signed);
-    let recovered = reth_primitives_traits::Recovered::new_unchecked(signed, ed_sender);
-    let pooled = n42_engine_types::N42PooledTransaction::new(recovered, encoded_len);
-    let outcome = reth_transaction_pool::TransactionPool::add_transaction(
-        &node.pool,
-        reth_transaction_pool::TransactionOrigin::Local,
-        pooled,
-    )
-    .await;
-    assert!(outcome.is_ok(), "the pool admits a 0x05 transaction on this chain: {outcome:?}");
+    let mut invalid = raw.clone();
+    *invalid.last_mut().unwrap() ^= 1;
+    assert!(reth_rpc_api::EthApiServer::send_raw_transaction(node.eth_api(), invalid.into()).await.is_err(),
+        "RPC must reject invalid Falcon signatures before pool admission");
+    let submitted = reth_rpc_api::EthApiServer::send_raw_transaction(node.eth_api(), raw.into()).await?;
+    assert_eq!(submitted, tx_hash, "RPC returns the canonical signed wire hash");
     let status = reth_transaction_pool::TransactionPool::pool_size(&node.pool);
     assert_eq!(status.pending, 1, "the transaction is pending, not queued: {status:?}");
 
@@ -2651,6 +2647,12 @@ async fn test_falcon_transfer__is_mined_and_typed_0x05() -> eyre::Result<()> {
     assert_eq!(receipts[0].tx_type, n42_tx_types::N42TxType::Falcon);
     assert!(receipts[0].success);
     qmdb.on_canonical(header.hash())?;
+    assert_eq!(reth_rpc_api::EthApiServer::balance(node.eth_api(), Address::with_last_byte(0x77), None).await?, U256::from(1_000u64));
+    assert_eq!(reth_rpc_api::EthApiServer::transaction_count(node.eth_api(), ed_sender, None).await?, U256::from(1u64));
+    let paid_gas = U256::from(21_000u64) * U256::from(header.base_fee_per_gas.unwrap() + 1_000_000_000);
+    let expected_balance = U256::from(10u128.pow(18)) - U256::from(1_000u64) - paid_gas;
+    assert_eq!(reth_rpc_api::EthApiServer::balance(node.eth_api(), ed_sender, None).await?, expected_balance);
+
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

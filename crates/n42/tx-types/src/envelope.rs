@@ -53,17 +53,15 @@ impl N42TxEnvelope {
     pub const fn as_eth(&self) -> Option<&TransactionSigned> {
         match self {
             Self::Eth(tx) => Some(tx),
-            Self::AltSig(_) => None,
-            Self::Falcon(_) => None,
+            Self::AltSig(_) | Self::Falcon(_) => None,
         }
     }
 
     /// The 0x50 transaction, if this is one.
     pub const fn as_alt_sig(&self) -> Option<&AltSigTx> {
         match self {
-            Self::Eth(_) => None,
             Self::AltSig(tx) => Some(tx),
-            Self::Falcon(_) => None,
+            Self::Eth(_) | Self::Falcon(_) => None,
         }
     }
 
@@ -105,8 +103,7 @@ impl N42TxEnvelope {
                 .try_into_pooled_eip4844(sidecar)
                 .map(N42PooledTxEnvelope::Eth)
                 .map_err(|err| err.map(Self::Eth)),
-            this @ Self::AltSig(_) => Err(ValueError::new_static(this, "Expected 4844 transaction")),
-            this @ Self::Falcon(_) => Err(ValueError::new_static(this, "Expected 4844 transaction")),
+            this @ (Self::AltSig(_) | Self::Falcon(_)) => Err(ValueError::new_static(this, "Expected 4844 transaction")),
         }
     }
 }
@@ -115,9 +112,8 @@ impl N42PooledTxEnvelope {
     /// The 0x50 transaction, if this is one.
     pub const fn as_alt_sig(&self) -> Option<&AltSigTx> {
         match self {
-            Self::Eth(_) => None,
             Self::AltSig(tx) => Some(tx),
-            Self::Falcon(_) => None,
+            Self::Eth(_) | Self::Falcon(_) => None,
         }
     }
 

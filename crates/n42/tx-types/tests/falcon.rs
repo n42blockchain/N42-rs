@@ -1,6 +1,6 @@
 //! Public vectors produced independently by the wallet (PQClean) and Go client.
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use n42_tx_types::{FalconTx, N42PooledTxEnvelope, N42TxEnvelope, N42TxType};
 use reth_codecs::Compact;
 use reth_primitives_traits::SignerRecoverable;
@@ -19,7 +19,10 @@ fn vector(json: &str) -> (FalconTx, Vec<u8>) {
 
 #[test]
 fn wallet_and_go_signatures_roundtrip_storage_pool_and_json() {
-    for json in [include_str!("testdata/falcon512_wallet_v1.json"), include_str!("testdata/falcon512_go_v1.json")] {
+    for json in [
+        include_str!("testdata/falcon512_wallet_v1.json"),
+        include_str!("testdata/falcon512_go_v1.json"),
+    ] {
         let (tx, raw) = vector(json);
         let env = N42TxEnvelope::decode_2718_exact(&raw).unwrap();
         assert!(matches!(env, N42TxEnvelope::Falcon(_)));
@@ -59,11 +62,43 @@ fn signature_binds_payment_and_rejects_other_modes() {
         }
         assert!(FalconTx::new(tx, valid.signature().clone()).verify().is_err());
     }
-    let mut trailing = raw.clone(); trailing.push(0);
+    let mut trailing = raw.clone();
+    trailing.push(0);
     assert!(FalconTx::decode_2718_exact(&trailing).is_err());
     for len in [0, 32, 665, 667, 690] {
-        assert!(FalconTx::new(valid.tx().clone(), Bytes::from(vec![0; len])).verify().is_err());
+        assert!(
+            FalconTx::new(valid.tx().clone(), Bytes::from(vec![0; len]))
+                .verify()
+                .is_err()
+        );
     }
-    let mut bad = raw; *bad.last_mut().unwrap() ^= 1;
+    let mut bad = raw;
+    *bad.last_mut().unwrap() ^= 1;
     assert!(FalconTx::decode_2718_exact(&bad).unwrap().verify().is_err());
+}
+
+#[test]
+fn evm_mapping_and_rpc_receipt_preserve_the_extended_type() {
+    use alloy_consensus::Typed2718;
+    use alloy_evm::FromRecoveredTx;
+    let (tx, _) = vector(include_str!("testdata/falcon512_wallet_v1.json"));
+    let env = N42TxEnvelope::from(tx.clone());
+    let evm = revm::context::TxEnv::from_recovered_tx(&env, tx.verify().unwrap());
+    assert_eq!(evm.tx_type, 2);
+    assert_eq!(evm.caller, tx.sender());
+    assert_eq!(evm.value, tx.tx().value);
+    assert_eq!(evm.chain_id, Some(tx.tx().chain_id));
+    let receipt = n42_tx_types::N42RpcReceipt::from_receipt(
+        N42TxType::Falcon,
+        alloy_consensus::Receipt {
+            status: true.into(),
+            cumulative_gas_used: 21000,
+            logs: Vec::new(),
+        },
+    );
+    assert_eq!(receipt.ty(), 5);
+    let json = serde_json::to_value(&receipt).unwrap();
+    assert_eq!(json["type"], "0x5");
+    let restored: n42_tx_types::N42RpcReceipt = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.ty(), 5);
 }

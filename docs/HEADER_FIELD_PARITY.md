@@ -321,9 +321,17 @@ gov5: `verifyHeaderWithBatch` and `FinalizeAndAssemble` (`internal/consensus/hot
    the field. A Rust leader on a MobileAnchor chain needs a root provider, the
    equivalent of gov5's `mobileAnchorRoot()` (`worker.go:377-381`).
 
-### 7.1 Rust status (branch `feat/n42-header-field-24`)
+### 7.1 Rust status (branch `feat/n42-header-field-24`, merged into main as b87fa2884 on 2026-10-30)
 
 Gaps 1-5 are closed on the Rust side; gap 6 is closed for followers only.
+
+Verification before the merge: 1,362 tests over the N42 crates and `scripts/clippy-n42.sh` clean on
+the branch carrying main f5d4be42b; the unchanged devnet with a gov5 member byte-identical at block
+133 (no Amsterdam or Glamsterdam time, so the gates-off path only; `audit-notes/ci/hdr-devnet.log`);
+the X22 pair VH (win1 4.973/4.973M against main's 5.033/5.047M, rounds 448.2/445.6M against
+451.8/454.4M, gates clean) inside the day's A/A spread (pair VC, two builds of main: 5.013/4.927M
+against 4.980/4.760M). The gates-on path (slot number and registry root on the wire) is untested
+until a fleet runs the patched gov5 of `docs/patches/gov5-header-field-parity/`.
 
 - **The node runs on `N42Header`.** `N42Primitives::BlockHeader` is
   `n42_header::N42Header`. reth's `ChainSpec` is not generic over its header,

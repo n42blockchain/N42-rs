@@ -1,0 +1,198 @@
+{
+  "_doc": "Read log codec (cmd/evmsdk/read_log.go). encoded = count u32 LE || entries. 0x00 = account not found. Account header: 0x01 exists | nonce length (0..7) << 1 | 0x40 when the nonce needs 8 bytes | 0x10 has balance (non-zero) | 0x20 contract (codeHash != keccak(empty)); then nonce big-endian with leading zeros stripped; then, with 0x10, len u8 || balance big-endian stripped; then codeHash32 with 0x20. Storage: 0x80 + len (0..32) || value big-endian stripped. Block hash: 0xC0 || hash32 (never produced by the Go recorder). Entries are positional, no keys. decoded: nonce as a decimal string, balance/value as 0x-hex quantities. invalid = inputs DecodeReadLog rejects. non_canonical_inputs = non-minimal encodings and whether gov5's decoder accepts them (a strict decoder would reject what a phone accepts).",
+  "encoded": "0f00000000011301080de0b6b3a764000015012c01010d0100000000001f8000000000000020ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff41800000000000000023019c1b4bfdd5bd0e9d8b1d7a5a9e7c6f3f7b2d5f8a1c3e5d7f9b1a3c5e7d9f1b3a312080000000000000000000000000000000000000000000000000000000000000009c1b4bfdd5bd0e9d8b1d7a5a9e7c6f3f7b2d5f8a1c3e5d7f9b1a3c5e7d9f1b3a808101820100a08000000000000000000000000000000000000000000000000000000000000000a0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc0abababababababababababababababababababababababababababababababab",
+  "entries": [
+    {
+      "desc": "account not found",
+      "entry_bytes": "00",
+      "decoded": {
+        "kind": "account_not_found"
+      }
+    },
+    {
+      "desc": "EOA nonce 0, no balance",
+      "entry_bytes": "01",
+      "decoded": {
+        "kind": "account",
+        "nonce": "0",
+        "balance": "0x0",
+        "code_hash": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+      }
+    },
+    {
+      "desc": "EOA nonce 1, balance 1 ether",
+      "entry_bytes": "1301080de0b6b3a7640000",
+      "decoded": {
+        "kind": "account",
+        "nonce": "1",
+        "balance": "0xde0b6b3a7640000",
+        "code_hash": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+      }
+    },
+    {
+      "desc": "EOA nonce 300, balance 1",
+      "entry_bytes": "15012c0101",
+      "decoded": {
+        "kind": "account",
+        "nonce": "300",
+        "balance": "0x1",
+        "code_hash": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+      }
+    },
+    {
+      "desc": "EOA nonce 2^40, no balance",
+      "entry_bytes": "0d010000000000",
+      "decoded": {
+        "kind": "account",
+        "nonce": "1099511627776",
+        "balance": "0x0",
+        "code_hash": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+      }
+    },
+    {
+      "desc": "EOA nonce 2^55 (7 bytes), balance max",
+      "entry_bytes": "1f8000000000000020ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "decoded": {
+        "kind": "account",
+        "nonce": "36028797018963968",
+        "balance": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "code_hash": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+      }
+    },
+    {
+      "desc": "EOA nonce 2^63 (8 bytes: bit 0x40)",
+      "entry_bytes": "418000000000000000",
+      "decoded": {
+        "kind": "account",
+        "nonce": "9223372036854775808",
+        "balance": "0x0",
+        "code_hash": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+      }
+    },
+    {
+      "desc": "contract nonce 1, no balance",
+      "entry_bytes": "23019c1b4bfdd5bd0e9d8b1d7a5a9e7c6f3f7b2d5f8a1c3e5d7f9b1a3c5e7d9f1b3a",
+      "decoded": {
+        "kind": "account",
+        "nonce": "1",
+        "balance": "0x0",
+        "code_hash": "9c1b4bfdd5bd0e9d8b1d7a5a9e7c6f3f7b2d5f8a1c3e5d7f9b1a3c5e7d9f1b3a"
+      }
+    },
+    {
+      "desc": "contract nonce 0, balance 2^255",
+      "entry_bytes": "312080000000000000000000000000000000000000000000000000000000000000009c1b4bfdd5bd0e9d8b1d7a5a9e7c6f3f7b2d5f8a1c3e5d7f9b1a3c5e7d9f1b3a",
+      "decoded": {
+        "kind": "account",
+        "nonce": "0",
+        "balance": "0x8000000000000000000000000000000000000000000000000000000000000000",
+        "code_hash": "9c1b4bfdd5bd0e9d8b1d7a5a9e7c6f3f7b2d5f8a1c3e5d7f9b1a3c5e7d9f1b3a"
+      }
+    },
+    {
+      "desc": "storage 0",
+      "entry_bytes": "80",
+      "decoded": {
+        "kind": "storage",
+        "value": "0x0"
+      }
+    },
+    {
+      "desc": "storage 1",
+      "entry_bytes": "8101",
+      "decoded": {
+        "kind": "storage",
+        "value": "0x1"
+      }
+    },
+    {
+      "desc": "storage 0x0100",
+      "entry_bytes": "820100",
+      "decoded": {
+        "kind": "storage",
+        "value": "0x100"
+      }
+    },
+    {
+      "desc": "storage 2^255",
+      "entry_bytes": "a08000000000000000000000000000000000000000000000000000000000000000",
+      "decoded": {
+        "kind": "storage",
+        "value": "0x8000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "desc": "storage max",
+      "entry_bytes": "a0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "decoded": {
+        "kind": "storage",
+        "value": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      }
+    },
+    {
+      "desc": "block hash",
+      "entry_bytes": "c0abababababababababababababababababababababababababababababababab",
+      "decoded": {
+        "kind": "block_hash",
+        "hash": "abababababababababababababababababababababababababababababababab"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "bytes": "0100000002",
+      "error": "read_log: invalid encoding: invalid account header 0x02 at offset 4"
+    },
+    {
+      "bytes": "0100000081",
+      "error": "read_log: invalid encoding: truncated at offset 5 (need 1, have 0)"
+    },
+    {
+      "bytes": "01000000c000",
+      "error": "read_log: invalid encoding: truncated at offset 5 (need 32, have 1)"
+    },
+    {
+      "bytes": "21a10700",
+      "error": "read_log: invalid encoding: entry count 500001 exceeds max 500000"
+    },
+    {
+      "bytes": "01000000112100",
+      "error": "read_log: invalid encoding: balance length 33 > 32"
+    },
+    {
+      "bytes": "01000000a1",
+      "error": "read_log: invalid encoding: unknown header byte 0xa1 at offset 4"
+    },
+    {
+      "bytes": "01000000c1",
+      "error": "read_log: invalid encoding: unknown header byte 0xc1 at offset 4"
+    }
+  ],
+  "non_canonical_inputs": [
+    {
+      "bytes": "01000000050001",
+      "accepted": true,
+      "reencoded": "010000000301"
+    },
+    {
+      "bytes": "01000000410000000000000001",
+      "accepted": true,
+      "reencoded": "010000000301"
+    },
+    {
+      "bytes": "01000000820001",
+      "accepted": true,
+      "reencoded": "010000008101"
+    },
+    {
+      "bytes": "010000001100",
+      "accepted": true,
+      "reencoded": "0100000001"
+    },
+    {
+      "bytes": "0100000021c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+      "accepted": true,
+      "reencoded": "0100000001"
+    }
+  ]
+}

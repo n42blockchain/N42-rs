@@ -20,6 +20,7 @@
 
 pub mod build_throttle;
 pub mod direct_votes;
+pub mod mobile;
 pub mod persistence;
 pub mod service;
 pub mod straggler;

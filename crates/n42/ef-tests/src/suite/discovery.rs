@@ -194,14 +194,13 @@ impl TestDiscovery {
 
         if let Ok(entries) = std::fs::read_dir(&self.base_path) {
             for entry in entries.filter_map(|e| e.ok()) {
-                if entry.path().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
+                if entry.path().is_dir()
+                    && let Some(name) = entry.file_name().to_str() {
                         // Skip hidden directories
                         if !name.starts_with('.') {
                             forks.push(name.to_string());
                         }
                     }
-                }
             }
         }
 
@@ -221,13 +220,11 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
         return name.contains(middle);
     }
 
-    if pattern.starts_with('*') {
-        let suffix = &pattern[1..];
+    if let Some(suffix) = pattern.strip_prefix('*') {
         return name.ends_with(suffix);
     }
 
-    if pattern.ends_with('*') {
-        let prefix = &pattern[..pattern.len() - 1];
+    if let Some(prefix) = pattern.strip_suffix('*') {
         return name.starts_with(prefix);
     }
 
@@ -236,7 +233,8 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
 
 /// Test case metadata extracted from a test file
 #[derive(Debug, Clone)]
-pub struct TestCaseInfo {
+#[allow(dead_code)] // discovery record kept for test listing; not constructed today
+pub(super) struct TestCaseInfo {
     /// Path to the test file
     pub file_path: PathBuf,
     /// Test name within the file
@@ -249,7 +247,8 @@ pub struct TestCaseInfo {
 
 impl TestCaseInfo {
     /// Create a unique identifier for this test case
-    pub fn id(&self) -> String {
+    #[allow(dead_code)] // identifier helper kept for test listing; not used today
+    pub(super) fn id(&self) -> String {
         format!(
             "{}::{}::{}",
             self.file_path.display(),

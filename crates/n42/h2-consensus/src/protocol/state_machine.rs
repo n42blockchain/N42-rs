@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use n42_h2_primitives::{
     BlsSecretKey,
-    consensus::{ConsensusMessage, H2V4ChainIdentity, QuorumCertificate, ViewNumber},
+    consensus::{ConsensusMessage, H2V4ChainIdentity, PrepareQC, QuorumCertificate, ViewNumber},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -309,6 +309,15 @@ pub(super) struct PendingProposal {
     pub(super) justify_block: B256,
 }
 
+/// Leader work a failed vote-log write left undone (audit 2026-10 R2-C7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VoteLogRetry {
+    /// The proposal of this node's own block, aborted before anything went out.
+    OwnBlock { view: ViewNumber, block_hash: B256, tx_root_hash: Option<B256> },
+    /// The leader's own commit vote for the PrepareQC it formed.
+    LeaderCommitVote { view: ViewNumber, block_hash: B256 },
+}
+
 /// The HotStuff-2 consensus engine.
 ///
 /// An event-driven state machine that processes consensus messages and produces
@@ -348,6 +357,13 @@ pub struct ConsensusEngine {
     /// what deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`) would
     /// give the cycle before any header changes.
     pub(super) vote_before_import: bool,
+    /// gov5's `hotstuff.twoPhaseVoteGate`: a PrepareQC no longer proves its
+    /// voters executed the block, so this node's commit vote waits for the
+    /// block's import (audit 2026-10 R2-C9). Round 1 stays import-gated
+    /// here, which is stricter than gov5's two-phase Round 1.
+    pub(super) two_phase_vote_gate: bool,
+    /// The PrepareQC whose commit vote the two-phase gate holds.
+    pub(super) held_prepare_qc: Option<PrepareQC>,
     /// Outputs `emit` could not put in a full output channel, in order. The
     /// channel's consumer is the task that runs this engine, so waiting for
     /// it to drain cannot work; nothing is dropped instead, and the consumer
@@ -362,6 +378,10 @@ pub struct ConsensusEngine {
     /// These may produce a TC only when the validator set for that view is
     /// known without epoch fallback and this node is the next-view leader.
     pub(super) future_timeout_collectors: HashMap<ViewNumber, TimeoutCollector>,
+    /// Each sender's highest verified future-view timeout: the weak
+    /// synchronizer joins the (f+1)-th highest of these views (gov5's
+    /// `futureTimeouts`). Keyed by validator index, so bounded by the set.
+    pub(super) future_timeout_views: HashMap<u32, ViewNumber>,
     /// QC formed from Round 1 votes (used to broadcast PrepareQC).
     pub(super) prepare_qc: Option<QuorumCertificate>,
     /// Saved PrepareQC piggybacked into the next Proposal (chained mode).
@@ -377,6 +397,10 @@ pub struct ConsensusEngine {
     /// Parent hash of every imported block still in `imported_blocks`, as the
     /// orchestrator reported it; what the extends rule reads.
     pub(super) imported_parents: HashMap<B256, B256>,
+    /// A signature or certificate in the message being processed that did
+    /// not verify where the message is dropped quietly; reported as
+    /// [`ConsensusError::Unauthenticated`] once the message is done.
+    pub(super) unauthenticated: Option<(ViewNumber, &'static str)>,
     /// Tracks which block hash each validator voted for (equivocation detection).
     /// Tracks R1 (Vote) per validator per view for equivocation detection.
     pub(super) equivocation_tracker: HashMap<u32, B256>,
@@ -386,6 +410,15 @@ pub struct ConsensusEngine {
     /// current view. The commitment includes validator changes, so reusing a
     /// block hash with a different reconfiguration payload is still detected.
     pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256)>,
+    /// The signed-message commitment of the proposal this view has taken;
+    /// a repeat of it (any peer can replay the leader's) is dropped.
+    pub(super) processed_proposal: Option<B256>,
+    /// Leader work a failed vote-log write left undone, retried before the
+    /// next event (audit 2026-10 R2-C7).
+    pub(super) vote_log_retry: Option<VoteLogRetry>,
+    /// Set while [`Self::retry_vote_log_work`] runs: its failures do not
+    /// lengthen the run that halts voting.
+    pub(super) vote_log_retrying: bool,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
     /// Which validators' Round 1 votes this node, as leader, has verified,
@@ -416,6 +449,9 @@ pub struct ConsensusEngine {
     pub(super) parked_votes: HashMap<ViewNumber, Vec<super::vote_batch::ParkedVote>>,
     /// Per-view timing for commit latency diagnosis.
     pub(super) view_timing: ViewTiming,
+    /// The Round 1 vote this node last sent, sent again with each repeated
+    /// timeout of its view (gov5 `timeout.go`; audit 2026-10 round 3, R3-C3).
+    pub(super) last_vote: Option<n42_h2_primitives::consensus::Vote>,
     /// Timing from the last committed view (preserved across advance_to_view).
     last_committed_timing: Option<ViewTiming>,
     /// Pending tx_root_hash values for Baby Raptr DA verification.
@@ -509,6 +545,8 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
+            two_phase_vote_gate: false,
+            held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
@@ -516,6 +554,7 @@ impl ConsensusEngine {
             commit_collector: None,
             timeout_collector: None,
             future_timeout_collectors: HashMap::new(),
+            future_timeout_views: HashMap::new(),
             prepare_qc: None,
             previous_prepare_qc: None,
             output_tx,
@@ -523,9 +562,13 @@ impl ConsensusEngine {
             imported_blocks: HashSet::new(),
             imported_block_fifo: VecDeque::new(),
             imported_parents: HashMap::new(),
+            unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
+            processed_proposal: None,
+            vote_log_retry: None,
+            vote_log_retrying: false,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
@@ -534,6 +577,7 @@ impl ConsensusEngine {
             vote_queue: Vec::new(),
             parked_votes: HashMap::new(),
             view_timing: ViewTiming::new(),
+            last_vote: None,
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
             pending_changes_hashes: BoundedFifoMap::new(64),
@@ -623,6 +667,8 @@ impl ConsensusEngine {
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
+            two_phase_vote_gate: false,
+            held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::from_snapshot(
                 recovered_view,
@@ -637,6 +683,7 @@ impl ConsensusEngine {
             commit_collector: None,
             timeout_collector: None,
             future_timeout_collectors: HashMap::new(),
+            future_timeout_views: HashMap::new(),
             prepare_qc: None,
             previous_prepare_qc: None,
             output_tx,
@@ -644,9 +691,13 @@ impl ConsensusEngine {
             imported_blocks: HashSet::new(),
             imported_block_fifo: VecDeque::new(),
             imported_parents: HashMap::new(),
+            unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
+            processed_proposal: None,
+            vote_log_retry: None,
+            vote_log_retrying: false,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
@@ -655,6 +706,7 @@ impl ConsensusEngine {
             vote_queue: Vec::new(),
             parked_votes: HashMap::new(),
             view_timing: ViewTiming::new(),
+            last_vote: None,
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
             pending_changes_hashes: BoundedFifoMap::new(64),
@@ -1055,8 +1107,14 @@ impl ConsensusEngine {
             self.vote_log_failures_in_a_row = 0;
             return Ok(());
         };
-        self.vote_log_failures_in_a_row = self.vote_log_failures_in_a_row.saturating_add(1);
         self.vote_log_failures_total = self.vote_log_failures_total.saturating_add(1);
+        if self.vote_log_retrying {
+            // A retry runs before every event; counted, a few milliseconds
+            // of disk trouble and two late votes halted voting (audit
+            // 2026-10 round 3, R3-G3). The run grows by first attempts.
+            return Err(err);
+        }
+        self.vote_log_failures_in_a_row = self.vote_log_failures_in_a_row.saturating_add(1);
         if self.vote_log_fatal_after != 0 && self.vote_log_failures_in_a_row >= self.vote_log_fatal_after {
             self.halt_voting("vote_log");
             return Err(ConsensusError::Fatal {
@@ -1093,6 +1151,11 @@ impl ConsensusEngine {
         self.vote_before_import = on;
     }
 
+    /// gov5's `hotstuff.twoPhaseVoteGate`; see the field.
+    pub fn set_two_phase_vote_gate(&mut self, on: bool) {
+        self.two_phase_vote_gate = on;
+    }
+
     /// Consecutive views one validator leads; see [`Self::set_leader_tenure`].
     pub const fn leader_tenure(&self) -> u64 {
         self.leader_tenure
@@ -1106,10 +1169,35 @@ impl ConsensusEngine {
 
     /// Records a block's parent ahead of its `BlockImported`, so the vote that
     /// import releases can check the proposal extends its justify QC's block.
-    /// Unknown parents are tolerated by that check, so this is advisory — but
-    /// without it the rule cannot refuse anything.
+    /// A block whose parent is unknown gets no vote from that check (audit
+    /// 2026-10 A-2), so the service records the parent before every
+    /// `BlockImported` / `BlockChecked`.
     pub fn remember_parent(&mut self, block_hash: B256, parent_hash: B256) {
         self.imported_parents.insert(block_hash, parent_hash);
+    }
+
+    /// A block's header is known here (its parent recorded as by
+    /// [`Self::remember_parent`]): under gov5's `twoPhaseVoteGate` this is
+    /// what releases Round 1 for the pending proposal (gov5's
+    /// `tryHeaderVote`, audit 2026-10 R2-C9); the commit vote still waits
+    /// for the import. The caller has checked whatever the header must pass
+    /// before this node votes for it.
+    pub fn header_known(&mut self, block_hash: B256, parent_hash: B256) -> ConsensusResult<()> {
+        self.remember_parent(block_hash, parent_hash);
+        if self.pending_proposal.as_ref().is_some_and(|pending| pending.block_hash == block_hash) {
+            self.try_header_vote()?;
+        }
+        Ok(())
+    }
+
+    /// Whether gov5's `twoPhaseVoteGate` is on; see the field.
+    pub const fn two_phase_vote_gate(&self) -> bool {
+        self.two_phase_vote_gate
+    }
+
+    /// Whether [`Self::remember_parent`] recorded `block_hash`'s parent.
+    pub fn knows_parent(&self, block_hash: &B256) -> bool {
+        self.imported_parents.contains_key(block_hash)
     }
 
     pub fn locked_qc(&self) -> &QuorumCertificate {
@@ -1134,8 +1222,44 @@ impl ConsensusEngine {
 
     // ── Event processing ──
 
+    /// Retries the leader work a failed vote-log write left undone, if it is
+    /// still this view's. Only a fatal error is returned: any other failure
+    /// is kept for the next event, and the event at hand is still handled.
+    fn retry_vote_log_work(&mut self) -> ConsensusResult<()> {
+        let Some(retry) = self.vote_log_retry.take() else {
+            return Ok(());
+        };
+        let current_view = self.round_state.current_view();
+        self.vote_log_retrying = true;
+        let retried = match retry {
+            VoteLogRetry::OwnBlock { view, block_hash, tx_root_hash } if view == current_view => {
+                self.on_block_ready(block_hash, tx_root_hash)
+            }
+            VoteLogRetry::LeaderCommitVote { view, block_hash }
+                if view == current_view
+                    && self.prepare_qc.as_ref().is_some_and(|qc| qc.block_hash == block_hash) =>
+            {
+                self.cast_leader_commit_vote(view, block_hash)
+                    .and_then(|_| self.try_form_commit_qc())
+            }
+            _ => Ok(()),
+        };
+        self.vote_log_retrying = false;
+        match retried {
+            Err(error) if error.fatal_reason().is_some() => Err(error),
+            Err(error) => {
+                tracing::warn!(target: "n42::cl::engine", view = current_view, %error, "vote-log retry failed; trying again on the next event");
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
     /// Processes a consensus event and generates outputs.
     pub fn process_event(&mut self, event: ConsensusEvent) -> ConsensusResult<()> {
+        if self.vote_log_retry.is_some() {
+            self.retry_vote_log_work()?;
+        }
         let kind = match &event {
             ConsensusEvent::Message(_) => "message",
             ConsensusEvent::BlockReady(..) => "block_ready",
@@ -1171,6 +1295,9 @@ impl ConsensusEngine {
         &mut self,
         authenticated: AuthenticatedConsensusMessage,
     ) -> ConsensusResult<()> {
+        if self.vote_log_retry.is_some() {
+            self.retry_vote_log_work()?;
+        }
         self.process_message_inner(authenticated.message, Some(authenticated.proof))
     }
 
@@ -1181,6 +1308,21 @@ impl ConsensusEngine {
     }
 
     fn process_message_inner(
+        &mut self,
+        msg: ConsensusMessage,
+        authenticated_proof: Option<AuthenticatedVoteProof>,
+    ) -> ConsensusResult<()> {
+        // The paths that drop a forged message keep doing so; the caller is
+        // told afterwards, so it can count the sender (audit 2026-10 A-8).
+        self.unauthenticated = None;
+        self.process_message_checked(msg, authenticated_proof)?;
+        match self.unauthenticated.take() {
+            Some((view, what)) => Err(ConsensusError::Unauthenticated { view, what }),
+            None => Ok(()),
+        }
+    }
+
+    fn process_message_checked(
         &mut self,
         msg: ConsensusMessage,
         authenticated_proof: Option<AuthenticatedVoteProof>,
@@ -1201,11 +1343,10 @@ impl ConsensusEngine {
             if view > current_view && !is_exempt {
                 if view <= current_view + FUTURE_VIEW_WINDOW {
                     // edition-2021: N42-26 writes this as a let-chain.
-                    if let ConsensusMessage::Timeout(ref timeout) = msg {
-                        if self.collect_future_timeout(timeout.clone())? {
+                    if let ConsensusMessage::Timeout(ref timeout) = msg
+                        && self.collect_future_timeout(timeout.clone())? {
                             return Ok(());
                         }
-                    }
                     // A future message inside the buffering window may still
                     // carry a quorum-authenticated QC. Use that proof to catch
                     // up to exactly qc.view+1 before buffering. This preserves
@@ -1220,6 +1361,11 @@ impl ConsensusEngine {
                         if view > new_current && view <= new_current + FUTURE_VIEW_WINDOW {
                             self.buffer_future_message(view, msg, authenticated_proof.is_some());
                         }
+                        return Ok(());
+                    }
+                    // The jump found the carried QC forged: the message
+                    // takes no buffer slot (audit 2026-10 R2-C2).
+                    if self.unauthenticated.is_some() {
                         return Ok(());
                     }
                     if self.buffer_future_message(view, msg, authenticated_proof.is_some()) {
@@ -1260,11 +1406,10 @@ impl ConsensusEngine {
         });
         if let Some(view) = stale_msg_view {
             // edition-2021: N42-26 writes this as a let-chain.
-            if let ConsensusMessage::Proposal(ref proposal) = msg {
-                if self.recover_late_committed_proposal(proposal)? {
+            if let ConsensusMessage::Proposal(ref proposal) = msg
+                && self.recover_late_committed_proposal(proposal)? {
                     return Ok(());
                 }
-            }
             // A late or progress vote for a view this node led: not for the
             // protocol, but for the voters ledger (the stragglers' grace).
             if let ConsensusMessage::Vote(ref vote) = msg {
@@ -1388,7 +1533,31 @@ impl ConsensusEngine {
                 ?sender,
                 "dropping future-view message: signature does not verify"
             );
+            self.unauthenticated = Some((view, "future-view message signature"));
             return false;
+        }
+
+        // A proposal's signature does not cover its justify QC: copies of
+        // the leader's genuine proposal carrying forged QCs would pass the
+        // check above and fill the leader's share, keeping the genuine one
+        // out (audit 2026-10 R2-C2). The QC gets the check the replay will
+        // give it; a set this node does not know is a gap in its history,
+        // not a forgery, and such a proposal is still buffered. Cost: one
+        // aggregate verification per buffered future proposal.
+        if let ConsensusMessage::Proposal(proposal) = &msg {
+            let qc = &proposal.justify_qc;
+            if qc.view > 0
+                && self.resolve_qc_validator_set(qc).is_ok()
+                && self.verify_qc_any_domain_or_known(qc).is_err()
+            {
+                tracing::debug!(target: "n42::cl::engine",
+                    msg_view = view,
+                    qc_view = qc.view,
+                    "dropping future-view proposal: its QC does not verify"
+                );
+                self.unauthenticated = Some((view, "future-view proposal QC"));
+                return false;
+            }
         }
 
         // Per-view cap: the messages of one view are equals, so a full view
@@ -1414,13 +1583,12 @@ impl ConsensusEngine {
                 *buffered_view == view && Self::future_message_unchecked(buffered)
             };
             let unchecked_in_view = self.future_msg_buffer.iter().filter(|&e| in_class(e)).count();
-            if unchecked_in_view >= class_cap {
-                if let Some(index) = self.future_msg_buffer.iter().position(in_class) {
+            if unchecked_in_view >= class_cap
+                && let Some(index) = self.future_msg_buffer.iter().position(in_class) {
                     // `remove`, not `swap_remove`: the buffer keeps arrival
                     // order, which is what FIFO and the replay rely on.
                     self.future_msg_buffer.remove(index);
                 }
-            }
         } else if let Some(sender) = sender {
             // Per-sender cap: evict the sender's highest view if the new
             // message is for a lower one.
@@ -1594,6 +1762,11 @@ impl ConsensusEngine {
                 %error,
                 "QC view jump failed: QC does not verify against its view's validator set"
             );
+            // Forged only when the set it names is known: an unknown set is
+            // a gap in this node's history, not the sender's fault.
+            if self.resolve_qc_validator_set(qc).is_ok() {
+                self.unauthenticated = Some((qc.view, "QC carried for a view jump"));
+            }
             return Ok(false);
         }
 
@@ -1725,14 +1898,13 @@ impl ConsensusEngine {
         self.prepare_qc = None;
         // A proposal this node has not voted for because its block was still
         // importing: remembered, so the import can still tell the leader.
-        if let Some(pending) = self.pending_proposal.take() {
-            if self.progress_votes && self.round_state.last_voted_view() < pending.view {
+        if let Some(pending) = self.pending_proposal.take()
+            && self.progress_votes && self.round_state.last_voted_view() < pending.view {
                 if self.withheld_votes.len() >= VOTERS_SEEN_WINDOW {
                     self.withheld_votes.pop_front();
                 }
                 self.withheld_votes.push_back(pending);
             }
-        }
         // Gov5 keeps successful import evidence across view changes: a new
         // leader commonly reproposes the same uncommitted block, and reth will
         // not emit a second import completion for it. Native optimistic voting
@@ -1740,10 +1912,15 @@ impl ConsensusEngine {
         if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
+            // The parents are kept beside the evidence and bounded by its
+            // FIFO; with the evidence gone they would only accumulate.
+            self.imported_parents.clear();
         }
         self.equivocation_tracker.clear();
         self.commit_equivocation_tracker.clear();
         self.proposal_equivocation_tracker.clear();
+        self.processed_proposal = None;
+        self.held_prepare_qc = None;
 
         // Defense-in-depth: re-derive my_index from the current set on every view
         // advance. The epoch-boundary branch above only fires for live consensus
@@ -1775,11 +1952,16 @@ impl ConsensusEngine {
             tracing::debug!(target: "n42::cl::engine", view = new_view, replaying = to_replay.len(), "replaying buffered future-view messages");
         }
 
+        // A forgery the replay drops was sent by whoever sent that buffered
+        // message, not by the sender of the message that moved the view
+        // (audit 2026-10 R2-C8): what the replay flags is not reported.
+        let triggering = self.unauthenticated.take();
         for msg in to_replay {
             if let Err(e) = self.dispatch_message(msg, None) {
                 tracing::debug!(target: "n42::cl::engine", view = new_view, error = %e, "buffered message replay failed");
             }
         }
+        self.unauthenticated = triggering;
 
         tracing::debug!(target: "n42::cl::engine", view = new_view, "advanced to new view");
         Ok(())
@@ -1892,6 +2074,20 @@ impl ConsensusEngine {
     /// reached): the certificate is unchecked, not refused, as gov5's
     /// `verifyHeaderWithBatch` skips a QC whose set it cannot resolve. Every
     /// other failure is an error.
+    /// The key of the leader for `view`, when the set authorized for that
+    /// exact view is known: what a block's header seal is checked against.
+    pub fn leader_public_key_for_view(&self, view: ViewNumber) -> Option<n42_h2_primitives::BlsPublicKey> {
+        let set = self.epoch_manager.known_validator_set_for_view(view)?;
+        let leader = LeaderSelector::leader_for_view_with_tenure(view, self.leader_tenure, set);
+        set.get_public_key(leader).ok().cloned()
+    }
+
+    /// Whether an import (or, under deferred execution, a check) of
+    /// `block_hash` has reached this engine: what its vote waits for.
+    pub fn has_imported_block(&self, block_hash: &B256) -> bool {
+        self.imported_blocks.contains(block_hash)
+    }
+
     pub fn verify_header_qc(
         &self,
         wire: &n42_h2_wire::h2_wire::H2QuorumCertificate,
@@ -3208,7 +3404,7 @@ mod tests {
         // leader proposes from a head that never imported `certified`.
         let genesis = B256::repeat_byte(0x42);
         let certified = B256::repeat_byte(0xA1);
-        let vote_after = |block: B256, parent: B256| {
+        let vote_after = |block: B256, parent: Option<B256>| {
             let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
             enable_test_h2(&mut engine);
             let mut proposal = signed_h2_test_proposal(&engine, 2, block, 2, &sks[2]);
@@ -3230,7 +3426,9 @@ mod tests {
                 )))
                 .expect("the proposal itself is valid");
             assert_eq!(engine.current_view(), 2, "the justify QC carries the engine to view 2");
-            engine.remember_parent(block, parent);
+            if let Some(parent) = parent {
+                engine.remember_parent(block, parent);
+            }
             engine
                 .process_event(ConsensusEvent::BlockImported(block))
                 .expect("import is reported");
@@ -3242,13 +3440,200 @@ mod tests {
             })
         };
         assert!(
-            !vote_after(B256::repeat_byte(0xB2), genesis),
+            !vote_after(B256::repeat_byte(0xB2), Some(genesis)),
             "a sibling of the certified block must not get a vote"
         );
         assert!(
-            vote_after(B256::repeat_byte(0xC3), certified),
+            vote_after(B256::repeat_byte(0xC3), Some(certified)),
             "a child of the certified block gets one"
         );
+        // Audit 2026-10 A-2: a block whose parent this node never learnt
+        // cannot be judged, so it gets no vote -- gov5 votes only on a known
+        // parent (`tryHeaderVote` needs its `importedParents` entry).
+        assert!(
+            !vote_after(B256::repeat_byte(0xD4), None),
+            "an unjudged parent is abstained on"
+        );
+    }
+
+    /// Audit 2026-10 A-3: a repeat of the proposal this view took, arriving
+    /// after this node timed out of the view -- any peer can replay the
+    /// leader's signed one -- changes nothing: it used to put the view back
+    /// into voting, so the next timeout counted as a first one again, and to
+    /// re-arm the pending vote. (A repeat before a vote went out is still
+    /// taken: that is how a vote whose log write failed is retried.)
+    #[test]
+    fn test_a_repeated_proposal_after_a_timeout_is_dropped() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let block_hash = B256::repeat_byte(0xE7);
+        let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal.clone())))
+            .expect("the proposal is accepted");
+        engine.on_timeout().expect("timed out");
+        let timeouts = engine.consecutive_timeouts();
+        let _: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("a repeat is not an error");
+        let again: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(again.is_empty(), "a repeat produces nothing: {again:?}");
+        engine.on_timeout().expect("still timed out");
+        assert_eq!(engine.consecutive_timeouts(), timeouts, "the repeat timeout is not a new one");
+    }
+
+    /// Audit 2026-10 R2-C4: A-3 for the leader's own proposal. A peer that
+    /// relays the leader's proposal back to it after the leader timed out of
+    /// the view must change nothing, as for any other repeat.
+    #[test]
+    fn a_leader_given_back_its_own_proposal_after_a_timeout_drops_it() {
+        let (probe, ..) = make_engine(4, 0);
+        let view = probe.current_view();
+        let me = probe.leader_index_for_view(view);
+        let (mut engine, _sks, _, mut rx) = make_engine(4, me);
+        engine
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xE8), None))
+            .expect("the leader proposes");
+        let proposal = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|output| match output {
+                EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(p)) => Some(p),
+                _ => None,
+            })
+            .expect("the proposal is broadcast");
+        engine.on_timeout().expect("timed out");
+        let timeouts = engine.consecutive_timeouts();
+        let _: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)));
+        let again: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(again.is_empty(), "its own proposal given back produces nothing: {again:?}");
+        assert_eq!(engine.current_phase(), Phase::TimedOut, "and the view stays timed out");
+        engine.on_timeout().expect("still timed out");
+        assert_eq!(engine.consecutive_timeouts(), timeouts, "the repeat timeout is not a new one");
+    }
+
+    /// Audit 2026-10 R2-C6: gov5's commit signatures do not cover the
+    /// changes hash, so a relay can put any value in a Decide's envelope and
+    /// its QC still verifies. gov5 chains carry no validator changes: a
+    /// nonzero hash is refused instead of sending this node into a resync
+    /// for changes that never existed.
+    #[test]
+    fn a_gov5_decide_naming_validator_changes_is_refused() {
+        use crate::protocol::quorum::VoteCollector;
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let view = engine.current_view();
+        let block_hash = B256::repeat_byte(0xD6);
+        let message = engine.signing_profile.commit_message(view, block_hash, B256::ZERO);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for i in 0..3u32 {
+            collector
+                .add_vote(i, engine.signing_profile.sign(&sks[i as usize], &message))
+                .unwrap();
+        }
+        let commit_qc = collector
+            .build_qc_with_profile_message(&vs, &message, engine.signing_profile)
+            .unwrap();
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+            view,
+            block_hash,
+            commit_qc,
+            validator_changes_hash: B256::repeat_byte(0x77),
+        })));
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !outputs.iter().any(|o| matches!(o, EngineOutput::SyncRequired { .. })),
+            "no resync for changes a gov5 chain cannot carry: {outputs:?}"
+        );
+        assert_eq!(engine.current_view(), view, "and nothing is committed on it");
+    }
+
+    /// Audit 2026-10 R2-C9: under gov5's `twoPhaseVoteGate` a PrepareQC no
+    /// longer proves that its voters executed the block (gov5 votes Round 1
+    /// before the import), so the commit vote is the execution attestation:
+    /// it is held until the block is imported here, as gov5 holds it.
+    #[test]
+    fn under_the_two_phase_gate_the_commit_vote_waits_for_the_import() {
+        use crate::protocol::quorum::VoteCollector;
+        let (probe, ..) = make_engine(4, 0);
+        let leader = probe.leader_index_for_view(1);
+        let (mut engine, sks, vs, mut rx) = make_engine(4, (leader + 1) % 4);
+        enable_test_h2(&mut engine);
+        engine.set_two_phase_vote_gate(true);
+        let view = engine.current_view();
+        let block_hash = B256::repeat_byte(0xC9);
+        let message = engine.signing_profile.vote_message(view, block_hash);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for i in (0..4u32).filter(|&i| i != engine.my_index).take(3) {
+            collector
+                .add_vote(i, engine.signing_profile.sign(&sks[i as usize], &message))
+                .unwrap();
+        }
+        let qc = collector
+            .build_qc_with_profile_message(&vs, &message, engine.signing_profile)
+            .unwrap();
+        let commit_votes = |rx: &mut mpsc::Receiver<EngineOutput>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::CommitVote(_))))
+                .count()
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+                n42_h2_primitives::consensus::PrepareQC { view, block_hash, qc },
+            )))
+            .expect("a valid PrepareQC");
+        assert_eq!(commit_votes(&mut rx), 0, "no commit vote before the block is imported here");
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("the import");
+        assert_eq!(commit_votes(&mut rx), 1, "the held commit vote goes out on the import");
+        assert_eq!(engine.last_commit_voted_view(), view);
+    }
+
+    /// Audit 2026-10 R2-C9 (the remainder): under gov5's `twoPhaseVoteGate`
+    /// gov5 casts Round 1 once the proposal's header is known and extends its
+    /// justify QC's block (`tryHeaderVote`), the commit vote being the
+    /// execution attestation; this node still waited for the import, a
+    /// block's execution later than every gov5 member. The header now
+    /// releases the vote under the gate (a zero parent is no parent), with
+    /// the header first or the proposal first; without the gate the vote
+    /// still waits for the import.
+    #[test]
+    fn under_the_two_phase_gate_the_vote_goes_out_on_the_header() {
+        let votes = |rx: &mut mpsc::Receiver<EngineOutput>, block_hash: B256| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(v)) if v.block_hash == block_hash))
+                .count()
+        };
+        let parent = B256::repeat_byte(0x11);
+        for gate in [false, true] {
+            let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+            enable_test_h2(&mut engine);
+            engine.set_two_phase_vote_gate(gate);
+            let block_hash = B256::repeat_byte(0xE2);
+            let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+                .expect("the proposal");
+            assert_eq!(votes(&mut rx, block_hash), 0, "gate {gate}: nothing known yet");
+            engine.header_known(block_hash, B256::ZERO).expect("a header");
+            assert_eq!(votes(&mut rx, block_hash), 0, "gate {gate}: a zero parent is no parent");
+            engine.header_known(block_hash, parent).expect("a header");
+            assert_eq!(votes(&mut rx, block_hash), usize::from(gate), "gate {gate}: the header");
+            engine.process_event(ConsensusEvent::BlockImported(block_hash)).expect("the import");
+            assert_eq!(votes(&mut rx, block_hash), usize::from(!gate), "gate {gate}: the import");
+        }
+        // The header before the proposal: the vote goes out with it.
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        engine.set_two_phase_vote_gate(true);
+        let block_hash = B256::repeat_byte(0xE3);
+        engine.header_known(block_hash, parent).expect("a header");
+        let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("the proposal");
+        assert_eq!(votes(&mut rx, block_hash), 1, "voted on the proposal");
     }
 
     #[test]
@@ -4179,6 +4564,255 @@ mod tests {
         }
     }
 
+    /// A view-0 QC naming an arbitrary block: the shape audit 2026-10 A-6
+    /// says must never pass for the genesis QC.
+    fn forged_view_zero_qc() -> QuorumCertificate {
+        QuorumCertificate {
+            block_hash: B256::repeat_byte(0xAB),
+            ..QuorumCertificate::genesis()
+        }
+    }
+
+    #[test]
+    fn test_proposal_justified_by_a_non_genesis_view_zero_qc_is_refused() {
+        let (probe, ..) = make_engine(4, 0);
+        let leader = probe.leader_index_for_view(1);
+        let (mut engine, sks, _vs, _rx) = make_engine(4, (leader + 1) % 4);
+        let mut proposal =
+            signed_test_proposal(1, B256::repeat_byte(0xC1), leader, &sks[leader as usize]);
+        proposal.justify_qc = forged_view_zero_qc();
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect_err("a view-0 QC that is not genesis justifies nothing");
+        assert!(matches!(err, crate::error::ConsensusError::InvalidQC { view: 0, .. }), "{err:?}");
+    }
+
+    /// Audit 2026-10 R2-C5: a validator whose highest QC is still genesis (a
+    /// fresh or restarted member) times out with the genesis QC as its high
+    /// QC. gov5 counts that timeout; refusing it once this node's lock moved
+    /// kept such members out of every TC. The lock only moves up, so the
+    /// genesis QC cannot lower it.
+    #[test]
+    fn a_timeout_with_the_genesis_high_qc_counts_after_the_lock_moved() {
+        use crate::protocol::quorum::timeout_signing_message;
+        use n42_h2_primitives::consensus::TimeoutMessage;
+
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        for view in 1..=2u64 {
+            let block_hash = B256::repeat_byte(0xB0 + view as u8);
+            let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                    view,
+                    block_hash,
+                    commit_qc,
+                    validator_changes_hash: B256::ZERO,
+                })))
+                .expect("valid Decide");
+        }
+        let lock = engine.round_state.locked_qc().clone();
+        assert!(lock.view > 0, "the lock moved past genesis");
+        let view = engine.current_view();
+        engine.on_timeout().expect("timed out");
+        while rx.try_recv().is_ok() {}
+        for sender in [1u32, 2] {
+            let timeout = TimeoutMessage {
+                view,
+                high_qc: QuorumCertificate::genesis(),
+                sender,
+                signature: sks[sender as usize].sign(&timeout_signing_message(view)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
+                .expect("a genesis high QC is a valid high QC");
+        }
+        assert_eq!(engine.current_view(), view + 1, "the three timeouts formed a TC");
+        assert_eq!(engine.round_state.locked_qc(), &lock, "and the lock did not move back");
+    }
+
+    #[test]
+    fn test_timeout_carrying_a_non_genesis_view_zero_qc_is_refused() {
+        use crate::protocol::quorum::timeout_signing_message;
+        use n42_h2_primitives::consensus::TimeoutMessage;
+
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let view = 1u64;
+        engine.on_timeout().expect("timeout should succeed");
+        while rx.try_recv().is_ok() {}
+
+        let timeout = TimeoutMessage {
+            view,
+            high_qc: forged_view_zero_qc(),
+            sender: 2,
+            signature: sks[2].sign(&timeout_signing_message(view)),
+        };
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
+            .expect_err("a view-0 QC that is not genesis is no high QC");
+        assert!(matches!(err, crate::error::ConsensusError::InvalidQC { view: 0, .. }), "{err:?}");
+    }
+
+    /// Audit 2026-10 A-8: a future-view vote whose signature does not verify
+    /// is dropped, and the caller is told it was forged.
+    #[test]
+    fn test_forged_future_view_vote_is_reported_unauthenticated() {
+        use crate::protocol::quorum::signing_message;
+        let (mut engine, sks, _vs, _rx) = make_engine(4, 0);
+        let view = engine.current_view() + 2;
+        let block_hash = B256::repeat_byte(0xF1);
+        let vote = Vote {
+            view,
+            block_hash,
+            voter: 1,
+            signature: sks[2].sign(&signing_message(view, &block_hash)),
+        };
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+            .expect_err("a forged vote is reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
+        assert!(engine.future_msg_buffer.is_empty(), "and still not buffered");
+    }
+
+    /// Audit 2026-10 A-8: a far-future message whose QC does not verify
+    /// moves no view, and the caller is told the QC was forged.
+    #[test]
+    fn test_forged_view_jump_qc_is_reported_unauthenticated() {
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        let start = engine.current_view();
+        let qc_view = start + FUTURE_VIEW_WINDOW + 10;
+        let mut justify_qc = build_test_prepare_qc(qc_view, B256::repeat_byte(0xA1), &sks, &vs, &[0, 1, 2]);
+        justify_qc.block_hash = B256::repeat_byte(0xA2);
+        let view = qc_view + 1;
+        let leader = engine.leader_index_for_view(view);
+        let mut proposal =
+            signed_test_proposal(view, B256::repeat_byte(0xA3), leader, &sks[leader as usize]);
+        proposal.justify_qc = justify_qc;
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect_err("a forged QC is reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
+        assert_eq!(engine.current_view(), start, "and moves no view");
+    }
+
+    /// Audit 2026-10 R2-C2: a proposal's signature does not cover its
+    /// justify QC, so copies of the leader's genuine future proposal with
+    /// forged QCs pass the signature check. They must not take the leader's
+    /// future-buffer share: the genuine proposal that follows is buffered.
+    /// Both a QC that would jump (view = current) and one below the jump
+    /// threshold are refused.
+    #[test]
+    fn forged_qc_copies_of_a_future_proposal_do_not_crowd_out_the_genuine_one() {
+        for qc_back in [0u64, 1] {
+            let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+            for view in 1..=2u64 {
+                let block_hash = B256::repeat_byte(0xC0 + view as u8);
+                let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+                engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                        view,
+                        block_hash,
+                        commit_qc,
+                        validator_changes_hash: B256::ZERO,
+                    })))
+                    .expect("valid Decide");
+            }
+            let current = engine.current_view();
+            assert_eq!(current, 3);
+            let view = current + 1;
+            let leader = engine.leader_index_for_view(view);
+            let block_hash = B256::repeat_byte(0xC7);
+            let genuine = signed_test_proposal(view, block_hash, leader, &sks[leader as usize]);
+            for i in 0..MAX_FUTURE_MESSAGES_PER_SENDER as u8 + 2 {
+                let mut forged = genuine.clone();
+                let mut qc =
+                    build_test_prepare_qc(current - qc_back, B256::repeat_byte(0xA0), &sks, &vs, &[0, 1, 2]);
+                qc.block_hash = B256::repeat_byte(0x10 + i);
+                forged.justify_qc = qc;
+                let err = engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(forged)))
+                    .expect_err("a forged QC is reported");
+                assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
+            }
+            assert!(engine.future_msg_buffer.is_empty(), "qc_back {qc_back}: no forged copy is buffered");
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(genuine)))
+                .expect("the genuine proposal is taken");
+            assert_eq!(engine.future_msg_buffer.len(), 1, "qc_back {qc_back}: the genuine one is buffered");
+        }
+    }
+
+    /// Audit 2026-10 R2-C8: a buffered message replayed when the view moves
+    /// is not the triggering message. A forged vote that the replay drops
+    /// must not be reported as the fault of the Decide that moved the view.
+    #[test]
+    fn a_forged_message_found_at_replay_is_not_blamed_on_the_trigger() {
+        use crate::protocol::quorum::signing_message;
+        let (probe, ..) = make_engine(4, 0);
+        let led = probe.current_view() + 1;
+        let me = probe.leader_index_for_view(led);
+        let (mut engine, sks, vs, _rx) = make_engine(4, me);
+        assert_eq!(engine.current_view() + 1, led);
+        // Buffered at `led`: a Decide that moves the view past it, then a
+        // vote for it with a forged signature, which the replay sees late.
+        let led_hash = B256::repeat_byte(0xE2);
+        let led_qc = build_test_commit_qc(led, led_hash, &sks, &vs, &[0, 1, 2]);
+        engine.future_msg_buffer.push((
+            led,
+            ConsensusMessage::Decide(Decide {
+                view: led,
+                block_hash: led_hash,
+                commit_qc: led_qc,
+                validator_changes_hash: B256::ZERO,
+            }),
+        ));
+        let voter = (me + 1) % 4;
+        engine.future_msg_buffer.push((
+            led,
+            ConsensusMessage::Vote(Vote {
+                view: led,
+                block_hash: led_hash,
+                voter,
+                signature: sks[((me + 2) % 4) as usize].sign(&signing_message(led, &led_hash)),
+            }),
+        ));
+        let view = engine.current_view();
+        let block_hash = B256::repeat_byte(0xE1);
+        let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view,
+                block_hash,
+                commit_qc,
+                validator_changes_hash: B256::ZERO,
+            })))
+            .expect("the genuine Decide is not reported for a replayed forgery");
+        assert_eq!(engine.current_view(), led + 1, "the replay ran");
+    }
+
+    /// Audit 2026-10 A-8: a late vote for a view this node led whose
+    /// signature verifies under neither domain is reported, not just ignored.
+    #[test]
+    fn test_forged_late_vote_is_reported_unauthenticated() {
+        use crate::protocol::quorum::signing_message;
+        let (probe, ..) = make_engine(4, 0);
+        let led = probe.current_view();
+        let leader = probe.leader_index_for_view(led);
+        let (mut engine, sks, _vs, _rx) = make_engine(4, leader);
+        engine.advance_to_view(led + 2).expect("advance");
+        let voter = (leader + 1) % 4;
+        let block_hash = B256::repeat_byte(0xB1);
+        let vote = Vote {
+            view: led,
+            block_hash,
+            voter,
+            signature: sks[((voter + 1) % 4) as usize].sign(&signing_message(led, &block_hash)),
+        };
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+            .expect_err("a forged late vote is reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
+    }
+
     #[test]
     fn test_process_timeout_rejects_invalid_signature() {
         use crate::protocol::quorum::timeout_signing_message;
@@ -4211,6 +4845,41 @@ mod tests {
             }
             other => panic!("expected InvalidSignature, got: {:?}", other),
         }
+    }
+
+    /// Audit 2026-10 round 3 (R3-N5): a current-view timeout was verified
+    /// before the collector was asked whether its sender was counted, so
+    /// every copy (two gossip topics, direct streams, relays) paid a BLS
+    /// verification. A counted sender's copy is now dropped unverified.
+    #[test]
+    fn test_a_counted_senders_timeout_copy_is_not_verified_again() {
+        use crate::protocol::quorum::timeout_signing_message;
+        use n42_h2_primitives::consensus::TimeoutMessage;
+
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let view = 1u64;
+        engine.on_timeout().expect("timeout should succeed");
+        while rx.try_recv().is_ok() {}
+
+        let counted = TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 2,
+            signature: sks[2].sign(&timeout_signing_message(view)),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(counted)))
+            .expect("the first copy is counted");
+        // A copy whose signature would not verify shows whether it was checked.
+        let copy = TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 2,
+            signature: sks[2].sign(&timeout_signing_message(999)),
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(copy)))
+            .expect("a counted sender's copy is dropped before verification");
     }
 
     #[test]
@@ -4365,6 +5034,59 @@ mod tests {
                 target_view: 2,
             }
         )));
+    }
+
+    /// Audit 2026-10 A-5 (b): a Decide whose certified changes cannot be
+    /// staged must fail before the commit is recorded, not after it (which
+    /// left the block committed with no `BlockCommitted` and no view advance).
+    #[test]
+    fn test_decide_whose_changes_cannot_be_staged_records_no_commit() {
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        assert!(!engine.signing_profile().is_gov5());
+        engine.epoch_manager = EpochManager::with_epoch_length(vs.clone(), 10);
+        // Removing one of four leaves fewer than MIN_VALIDATOR_COUNT.
+        let changes = vec![ValidatorChange::Remove {
+            address: *vs.get_address(0).expect("member"),
+        }];
+        engine.epoch_manager.replace_pending_from_proposal(&changes);
+
+        let view = 2u64;
+        let block_hash = B256::repeat_byte(0xDB);
+        let changes_hash = EpochManager::hash_changes(&changes);
+        let decide = Decide {
+            view,
+            block_hash,
+            commit_qc: build_test_commit_qc_with_changes(
+                view,
+                block_hash,
+                &sks,
+                &vs,
+                &[0, 1, 2],
+                &changes_hash,
+            ),
+            validator_changes_hash: changes_hash,
+        };
+        let committed_before = engine.last_committed_qc().view;
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(decide)))
+            .expect_err("the certified changes cannot be staged");
+        assert_eq!(
+            engine.last_committed_qc().view,
+            committed_before,
+            "a failed staging must leave the commit unrecorded"
+        );
+    }
+
+    /// Audit 2026-10 A-5 (c): the Native profile drops its import evidence on
+    /// every view advance; the parents recorded beside it go with it.
+    #[test]
+    fn test_native_view_advance_forgets_imported_parents() {
+        let (mut engine, _sks, _vs, _rx) = make_engine(4, 0);
+        assert!(!engine.signing_profile().is_gov5());
+        engine.remember_parent(B256::repeat_byte(0x01), B256::repeat_byte(0x02));
+        let next = engine.current_view() + 1;
+        engine.advance_to_view(next).expect("advance");
+        assert!(engine.imported_parents.is_empty());
     }
 
     #[test]
@@ -5153,11 +5875,12 @@ mod tests {
             validator_changes: None,
         };
 
-        engine
+        let err = engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
                 proposal,
             )))
-            .expect("far-future proposal with invalid QC should be silently dropped");
+            .expect_err("far-future proposal with invalid QC is dropped and reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
 
         assert_eq!(engine.current_view(), 1);
     }
@@ -5411,6 +6134,30 @@ mod tests {
             .count();
         // Repeat timeout re-broadcasts to help late/slow validators collect our vote.
         assert_eq!(broadcast_count_2, 1);
+    }
+
+    /// Audit 2026-10 round 3 (R3-C3): a vote is sent once, so a leader that
+    /// missed it never formed the view's QC. gov5 sends it again with every
+    /// repeated timeout of the view (`timeout.go`), as a follower; a
+    /// duplicate is a no-op in the leader's collector.
+    #[test]
+    fn test_a_repeated_timeout_resends_this_views_vote() {
+        let (mut engine, _, _, mut rx) = make_engine(4, 3);
+        let view = engine.current_view();
+        let leader = engine.leader_index_for_view(view);
+        assert_ne!(leader, 3, "a follower in this view");
+        let hash = B256::repeat_byte(9);
+        engine.send_vote(view, hash).expect("vote");
+        engine.on_timeout().expect("first timeout");
+        while rx.try_recv().is_ok() {}
+        engine.on_timeout().expect("repeat timeout");
+        let mut resent = Vec::new();
+        while let Ok(output) = rx.try_recv() {
+            if let EngineOutput::SendToValidator(to, ConsensusMessage::Vote(vote)) = output {
+                resent.push((to, vote.view, vote.block_hash, vote.voter));
+            }
+        }
+        assert_eq!(resent, vec![(leader, view, hash, 3)]);
     }
 
     #[test]
@@ -5721,6 +6468,36 @@ mod tests {
             .expect("timeout beyond window should be silently dropped");
 
         assert_eq!(engine.current_view(), 1);
+    }
+
+    /// Audit 2026-10 round 2 (R2-C1): validators restarted at scattered
+    /// views. Seven validators (f = 2): this one at view 1, two at view 3, one
+    /// at view 4. No future view has f+1 timeouts of its own, but f+1 senders
+    /// report a view at or above 3, so one of them is honest and gov5's weak
+    /// synchronizer joins view 3 -- the (f+1)-th highest report. Waiting for
+    /// f+1 reports of one exact view left such a fleet stalled for good.
+    #[test]
+    fn scattered_future_timeouts_join_the_f_plus_first_highest_view() {
+        use crate::protocol::quorum::timeout_signing_message;
+
+        let (mut engine, sks, _, _rx) = make_engine(7, 0);
+        assert_eq!(engine.current_view(), 1);
+        let timeout = |sender: u32, view: u64| TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender,
+            signature: sks[sender as usize].sign(&timeout_signing_message(view)),
+        };
+        for (sender, view) in [(1, 3), (2, 4)] {
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout(sender, view))))
+                .expect("a future timeout");
+            assert_eq!(engine.current_view(), 1, "f reports move nothing");
+        }
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout(3, 3))))
+            .expect("a future timeout");
+        assert_eq!(engine.current_view(), 3, "f+1 reports at or above view 3");
     }
 
     #[test]
@@ -6181,17 +6958,19 @@ mod tests {
         let (mut engine, sks, vs, _rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0x61);
         // Same kind, view and block hash; aggregate signatures over other
-        // blocks, so neither verifies and neither moves the view.
+        // blocks. The QC names view 0, so no view jump checks it and the
+        // message is buffered unchecked (one whose QC a jump found forged
+        // is not buffered at all, audit 2026-10 R2-C2).
         let forged = |over: u8| {
             let other = build_test_prepare_qc(5, B256::repeat_byte(over), &sks, &vs, &[0, 1, 2]);
             ConsensusMessage::PrepareQC(PrepareQC {
                 view: 5,
                 block_hash,
-                qc: QuorumCertificate { view: 5, block_hash, ..other },
+                qc: QuorumCertificate { view: 0, block_hash, ..other },
             })
         };
         for message in [forged(0xA1), forged(0xA2), forged(0xA1)] {
-            engine.process_event(ConsensusEvent::Message(message)).expect("buffered or dropped");
+            engine.process_event(ConsensusEvent::Message(message)).expect("buffered or deduplicated");
         }
         assert_eq!(engine.current_view(), 1);
         assert_eq!(
@@ -6226,9 +7005,10 @@ mod tests {
             voter: 1,
             signature: sks[2].sign(&signing_message(3, &B256::repeat_byte(0x5B))),
         };
-        engine
+        let err = engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(forged)))
-            .expect("forged future vote is dropped, not an error");
+            .expect_err("forged future vote is dropped and reported");
+        assert!(matches!(err, crate::error::ConsensusError::Unauthenticated { .. }), "{err:?}");
         assert_eq!(engine.future_msg_buffer.len(), 1, "a bad signature takes no slot");
     }
 

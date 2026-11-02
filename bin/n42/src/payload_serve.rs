@@ -51,14 +51,13 @@ use std::net::SocketAddr;
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::B256;
 use alloy_eips::Encodable2718;
-use alloy_rlp::Encodable;
 use n42_h2_execution::raw_engine::{self, request};
 use reth_engine_primitives::ConsensusEngineHandle;
 use n42_engine_types::N42BuiltPayload;
 use reth_primitives_traits::transaction::TxHashRef as _;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
-use reth_primitives_traits::{Block as _, BlockBody as _, SealedBlock};
+use reth_primitives_traits::{BlockBody as _, SealedBlock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use n42_engine_types::engine_validator::CompactBodyError;
@@ -172,7 +171,7 @@ where
     let transactions_len: usize = transactions.iter().map(Vec::len).sum();
     let transactions_header = alloy_rlp::Header { list: true, payload_length: transactions_len };
     let ommers: &[u8] = &[0xc0];
-    let withdrawals = block.body().withdrawals().map(|w| alloy_rlp::encode(w));
+    let withdrawals = block.body().withdrawals().map(alloy_rlp::encode);
     let payload_length = header.len()
         + transactions_header.length_with_payload()
         + ommers.len()
@@ -199,7 +198,7 @@ where
 #[derive(Clone)]
 pub struct OwnBlockReuse {
     /// Converts a payload into the sealed block, exactly as the engine would.
-    pub validator: std::sync::Arc<n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec>>,
+    pub validator: std::sync::Arc<n42_engine_types::engine_validator::N42EngineValidator<n42_header::N42ChainSpec>>,
     /// The QMDB state, on a chain that declares one.
     pub qmdb: Option<n42_qmdb_reth::QmdbNodeState>,
     /// Into the engine loop.
@@ -225,6 +224,7 @@ pub struct OwnBlockReuse {
     /// without the engine's payload-processor plumbing would cost. An
     /// instrument: it adds its own time to the import, and a leg run with it
     /// is not a measurement of the chain. Returns (ms, gas used, receipts).
+    #[allow(clippy::type_complexity)] // hot-path callback field; its type is kept inline
     pub exec_probe: Option<
         std::sync::Arc<
             dyn Fn(reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Result<(u64, u64, usize), String>
@@ -251,6 +251,7 @@ pub struct OwnBlockReuse {
     /// the wrong state (loop147-152: every header after it rejected). The
     /// head is moved to the sibling's parent first, so the insert extends it.
     /// The head's hash and number.
+    #[allow(clippy::type_complexity)] // hot-path callback field; its type is kept inline
     pub canonical_head: Option<std::sync::Arc<dyn Fn() -> Option<(B256, u64)> + Send + Sync>>,
 }
 
@@ -299,6 +300,7 @@ impl RoadBlock {
     }
 }
 
+/// Callback that imports a block fetched from a peer and returns its executed block and the import result.
 pub type ForeignImport = dyn Fn(
         crate::follower_import::ForeignBlock,
         // The senders, when the caller already has them: the compact body
@@ -343,7 +345,7 @@ async fn reuse_own_build<T>(
 where
     T: PayloadTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
-    use reth_engine_primitives::PayloadValidator as _;
+    
     let v1 = data.payload.as_v1();
     let (parent_hash, number, state_root, receipts_root, gas_used) =
         (v1.parent_hash, v1.block_number, v1.state_root, v1.receipts_root, v1.gas_used);
@@ -371,7 +373,7 @@ where
     let sealed_header = match sealed_header_from_fields(data, built.block.header()) {
         Some(header) if header.hash() == expected_hash => header,
         _ => {
-            let sealed = match <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&reuse.validator, data.clone()) {
+            let sealed = match <n42_engine_types::engine_validator::N42EngineValidator<n42_header::N42ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&reuse.validator, data.clone()) {
                 Ok(sealed) => sealed,
                 Err(err) => {
                     debug!(target: "n42.payload_serve", %err, "own build's payload did not convert; importing it the ordinary way");
@@ -493,9 +495,9 @@ fn encoded_transactions(block: &reth_primitives_traits::RecoveredBlock<n42_tx_ty
 /// so a block of ours always passes, and a block whose fields differ from the
 /// build's is never executed as the build.
 fn build_executes_as_sealed(
-    built: &alloy_consensus::Header,
+    built: &n42_header::N42Header,
     built_withdrawals: Option<&[alloy_eips::eip4895::Withdrawal]>,
-    sealed: &alloy_consensus::Header,
+    sealed: &n42_header::N42Header,
     payload_withdrawals: Option<&[alloy_eips::eip4895::Withdrawal]>,
 ) -> bool {
     built.beneficiary == sealed.beneficiary
@@ -580,7 +582,7 @@ fn head_move_needed(mode: HandoffHeadMove, head: B256, head_number: u64, parent:
 fn resealed_for_handoff(
     built_hash: B256,
     block: std::sync::Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>,
-    sealed_header: reth_primitives_traits::SealedHeader,
+    sealed_header: reth_primitives_traits::SealedHeader<n42_header::N42Header>,
     move_body: bool,
     no_clone: bool,
 ) -> (std::sync::Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>, bool) {
@@ -641,11 +643,12 @@ fn resealed_for_handoff(
 /// build's execution inserted as executed, the QMDB root filed under the
 /// sealed hash, the queue told, the pool pruned. Shared by the payload path
 /// (`reuse_own_build`) and the header-only path (`request::OWN_BLOCK`).
+#[allow(clippy::extra_unused_type_parameters)] // signature kept; callers name the type
 async fn hand_off_own_build<T>(
     reuse: &OwnBlockReuse,
     built_hash: B256,
     built: n42_engine_types::built_executions::BuiltExecution,
-    sealed_header: reth_primitives_traits::SealedHeader,
+    sealed_header: reth_primitives_traits::SealedHeader<n42_header::N42Header>,
     converted: std::time::Duration,
     waits: AnswerWaits,
 ) -> Option<B256>
@@ -729,11 +732,10 @@ fn file_root_and_fields(reuse: &OwnBlockReuse, built_hash: B256, sealed_hash: B2
     // The build's own execution result, recorded by the builder under the
     // build's hash: under deferred execution the next block's header is
     // checked against it under the sealed hash.
-    if built_hash != sealed_hash {
-        if let Some(fields) = n42_engine_types::executed_fields::get(&built_hash) {
+    if built_hash != sealed_hash
+        && let Some(fields) = n42_engine_types::executed_fields::get(&built_hash) {
             n42_engine_types::executed_fields::remember(sealed_hash, fields);
         }
-    }
     Some((rename_wait_ms, rename_deferred))
 }
 
@@ -882,7 +884,7 @@ where
 {
     use alloy_rlp::Decodable;
     let reuse = reuse.ok_or("no own-block reuse on this node")?;
-    let header = alloy_consensus::Header::decode(&mut &frame[..]).map_err(|e| format!("header: {e}"))?;
+    let header = n42_header::N42Header::decode(&mut &frame[..]).map_err(|e| format!("header: {e}"))?;
     if header.block_access_list_hash.is_some() {
         // The build registry does not keep the access list the payload
         // carries; the payload path does.
@@ -1013,13 +1015,13 @@ where
 async fn move_head_to_parent_if_forked<T>(
     reuse: &OwnBlockReuse,
     engine: &ConsensusEngineHandle<T>,
-    header: &alloy_consensus::Header,
+    header: &n42_header::N42Header,
     number: u64,
 ) where
     T: PayloadTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
-    if let Some((head, head_number)) = reuse.canonical_head.as_ref().and_then(|current| current()) {
-        if head_move_needed(handoff_head_move(), head, head_number, header.parent_hash, number) {
+    if let Some((head, head_number)) = reuse.canonical_head.as_ref().and_then(|current| current())
+        && head_move_needed(handoff_head_move(), head, head_number, header.parent_hash, number) {
             let moved_at = std::time::Instant::now();
             // Under the split settlement tags (`n42_h2_execution::settlement`)
             // the parent is committed, not certified or persisted: this head
@@ -1050,11 +1052,10 @@ async fn move_head_to_parent_if_forked<T>(
                 ),
             }
         }
-    }
 }
 
 /// [`own_block_by_header_with`] under `N42_STATE_READY_WITHOUT_MERGE`
-/// (docs/DELTA_LOG_DESIGN.md stage 1): answered VALID once the build's fields
+/// (`docs/DELTA_LOG_DESIGN.md` stage 1): answered VALID once the build's fields
 /// are published, before its merged post-state map lands. What the next
 /// block needs from this one is done before the answer, as on the ordinary
 /// road: the QMDB root and the fields filed under the sealed hash, the queue
@@ -1068,7 +1069,7 @@ async fn move_head_to_parent_if_forked<T>(
 async fn own_block_before_merge<T>(
     reuse: &OwnBlockReuse,
     engine: &ConsensusEngineHandle<T>,
-    header: alloy_consensus::Header,
+    header: n42_header::N42Header,
     deferred: &std::sync::Arc<crate::answer_at_insert::Deferred>,
     stage: crate::follower_import::HandoffStage,
 ) -> Result<(alloy_rpc_types_engine::PayloadStatus, u64, u64, u64), String>
@@ -1413,7 +1414,7 @@ async fn build_on_own_block(
 /// now says so directly). Off by default.
 fn build_start_async() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_START_ASYNC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_START_ASYNC", false))
 }
 
 /// An own block's hand-off ends: the block's transactions held until the
@@ -1448,7 +1449,7 @@ fn hold_and_signal(
 /// seal instead of at its `StateReady` (plan v6 attempt J). Off by default.
 fn build_on_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_ON_OUTPUT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_ON_OUTPUT", false))
 }
 
 /// `N42_TENURE_FIRST_ON_OUTPUT=1` (defect 18b, `docs/FLEET7_PLAN_V4.md`
@@ -1458,7 +1459,7 @@ fn build_on_output() -> bool {
 /// build of its tenure. Off by default.
 fn tenure_first_on_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_TENURE_FIRST_ON_OUTPUT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_TENURE_FIRST_ON_OUTPUT", false))
 }
 
 /// How long the first build of a tenure waits for this node's follower
@@ -1487,7 +1488,7 @@ const PUBLISHED_OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_mil
 /// and the cut transactions are held until the chain settles the height.
 async fn build_on_published_output(
     builder: std::sync::Arc<dyn n42_engine_types::direct_build::DirectBuilder>,
-    header: alloy_consensus::Header,
+    header: n42_header::N42Header,
     attributes: alloy_rpc_types_engine::PayloadAttributes,
     chain: Option<raw_engine::ChainHint>,
     want_hashes: bool,
@@ -1582,7 +1583,7 @@ async fn build_on_published_output(
 async fn build_on_sealed_output(
     reuse: &OwnBlockReuse,
     builder: std::sync::Arc<dyn n42_engine_types::direct_build::DirectBuilder>,
-    header: alloy_consensus::Header,
+    header: n42_header::N42Header,
     attributes: alloy_rpc_types_engine::PayloadAttributes,
     chain: Option<raw_engine::ChainHint>,
     want_hashes: bool,
@@ -1785,7 +1786,7 @@ fn push_compact_answer(
 /// returned (the *built* header in it). An `Err` is the message sent back.
 async fn own_block_body(frame: &[u8]) -> Result<Vec<u8>, String> {
     use alloy_rlp::Decodable;
-    let header = alloy_consensus::Header::decode(&mut &frame[..]).map_err(|e| format!("header: {e}"))?;
+    let header = n42_header::N42Header::decode(&mut &frame[..]).map_err(|e| format!("header: {e}"))?;
     if header.block_access_list_hash.is_some() {
         return Err("unknown build: block access list".to_owned());
     }
@@ -1844,10 +1845,11 @@ fn push_built_payload(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> std::io::
 /// The sealed header a payload describes, given the build it came from: the
 /// payload's fields where the seal may have touched them, the build's where it
 /// cannot. `None` if the shapes disagree; the caller checks the hash.
+#[allow(clippy::suspicious_operation_groupings)] // the comparison is intentional
 fn sealed_header_from_fields(
     data: &alloy_rpc_types_engine::ExecutionData,
-    built: &alloy_consensus::Header,
-) -> Option<reth_primitives_traits::SealedHeader> {
+    built: &n42_header::N42Header,
+) -> Option<reth_primitives_traits::SealedHeader<n42_header::N42Header>> {
     let v1 = data.payload.as_v1();
     if v1.block_number != built.number || v1.parent_hash != built.parent_hash {
         return None;
@@ -2137,7 +2139,7 @@ where
             let convert_at = std::time::Instant::now();
             let sealed = match (pre, payload) {
                 (Some(sealed), _) => sealed,
-                (None, Some(payload)) => <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, payload)
+                (None, Some(payload)) => <n42_engine_types::engine_validator::N42EngineValidator<n42_header::N42ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, payload)
                     .map_err(|err| format!("conversion: {err}"))?
                     .into(),
                 (None, None) => return Err("no block and no payload to import".to_string()),
@@ -2393,7 +2395,7 @@ where
         out.push(1);
         out.extend_from_slice(&frame_len(encoded.len())?);
         out.extend_from_slice(&encoded);
-        stream.write_all(&out).await?;
+        stream.write_all(out).await?;
         let answered = started.elapsed().saturating_sub(decoded).as_millis() as u64;
         let oc = once.map(crate::import_once::Owner::counts).unwrap_or_default();
         if let Some(ms) = direct_ms {
@@ -2472,6 +2474,7 @@ where
         if let (Some(prune), Some(hashes)) = (reuse.and_then(|r| r.prune_pool.clone()), mined_hashes.take()) {
             let count = hashes.len();
             let pruned_at = std::time::Instant::now();
+            #[allow(clippy::let_underscore_future)] // the blocking task is detached on purpose
             let _ = tokio::task::spawn_blocking(move || {
                 prune(hashes);
                 if count > 10_000 {
@@ -2531,7 +2534,7 @@ where
                 let validator = reuse.map(|r| r.validator.clone());
                 if let Some(validator) = validator {
                     let _ = tokio::task::spawn_blocking(move || {
-                        let converted = match <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, probe_data) {
+                        let converted = match <n42_engine_types::engine_validator::N42EngineValidator<n42_header::N42ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, probe_data) {
                             Ok(block) => block,
                             Err(err) => { warn!(target: "n42.payload_serve", %err, "exec probe: conversion failed"); return; }
                         };
@@ -2580,7 +2583,7 @@ where
                 let pruning = tokio::task::spawn_blocking(move || {
                     let hashes: Vec<B256> = mined_hashes.unwrap_or_else(|| {
                         use rayon::prelude::*;
-                        raw_transactions.par_iter().map(|tx| alloy_primitives::keccak256(tx)).collect()
+                        raw_transactions.par_iter().map(alloy_primitives::keccak256).collect()
                     });
                     prune(hashes);
                     if count > 10_000 {
@@ -2708,12 +2711,14 @@ fn checked_frame(hash: B256) -> std::io::Result<Vec<u8>> {
 }
 
 /// Whether a status is a verdict that can answer every later request for the
-/// block (VALID, INVALID) rather than one that may change (SYNCING, ACCEPTED).
+/// block: VALID only. SYNCING and ACCEPTED may change, and INVALID is a
+/// verdict on the bytes this request carried, not on the block its hash
+/// names -- a body with the honest header and other transactions is INVALID
+/// under the honest block's hash, and kept, it answered the honest body too
+/// (audit 2026-10 round 2, R2-I3). Requests waiting on the same import still
+/// get its answer.
 const fn settled_status(status: &alloy_rpc_types_engine::PayloadStatusEnum) -> bool {
-    matches!(
-        status,
-        alloy_rpc_types_engine::PayloadStatusEnum::Valid | alloy_rpc_types_engine::PayloadStatusEnum::Invalid { .. }
-    )
+    matches!(status, alloy_rpc_types_engine::PayloadStatusEnum::Valid)
 }
 
 /// The block hash in an encoded `NEW_PAYLOAD` frame
@@ -2804,7 +2809,7 @@ fn check_only_answer(
     once: Option<&crate::import_once::Registry>,
 ) -> Result<(B256, &'static str), String> {
     let mut cursor = header_rlp;
-    let header = <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut cursor)
+    let header = <n42_header::N42Header as alloy_rlp::Decodable>::decode(&mut cursor)
         .map_err(|err| format!("check-only header: {err}"))?;
     if !cursor.is_empty() {
         return Err("check-only header: trailing bytes".to_owned());
@@ -2817,6 +2822,20 @@ fn check_only_answer(
         return Ok((hash, "registry"));
     }
     Err("not checked here".to_owned())
+}
+
+/// The answer to a layout claim (`request::CLAIM_LAYOUT`, audit 2026-10
+/// round 2, R2-X4): another peer's frame description of a block, filed under
+/// its sender's source for the whole-body fallback to try. Nothing is
+/// assembled or imported.
+fn claim_layout_answer(
+    frame: &[u8],
+    validator: Option<&n42_engine_types::engine_validator::N42EngineValidator<n42_header::N42ChainSpec>>,
+) -> Result<(), String> {
+    let (announced, profile, body, source) =
+        raw_engine::decode_foreign_body_from(frame).map_err(|err| format!("layout claim frame: {err}"))?;
+    let validator = validator.ok_or_else(|| "no direct import; no claims kept".to_owned())?;
+    validator.claim_compact_body(announced, profile, body, source)
 }
 
 /// Answers a held request (`request::HOLD_EXECUTION`) under `N42_IMPORT_ONCE`
@@ -2845,7 +2864,7 @@ async fn refuse_held(stream: &mut TcpStream, out: &mut Vec<u8>) -> std::io::Resu
 /// withdrawals root is compared in both shapes. Comparing it raw is what made
 /// every own block on a shared layer miss and be executed a second time
 /// (loop328/330: 1,175 of 1,179 built blocks).
-fn is_own_build(header: &alloy_consensus::Header) -> bool {
+fn is_own_build(header: &n42_header::N42Header) -> bool {
     let Some((_, built, built_withdrawals)) = n42_engine_types::built_executions::find_kept_sealed_header(
         header.parent_hash,
         header.number,
@@ -2868,7 +2887,7 @@ fn is_own_build(header: &alloy_consensus::Header) -> bool {
 /// The sealed header a follower's payload describes when it is one of this
 /// layer's builds: found by the fields the payload carries, rebuilt in every
 /// shape the seal may have given it, and proved by the payload's hash.
-fn own_sealed_header_of_payload(data: &alloy_rpc_types_engine::ExecutionData) -> Option<alloy_consensus::Header> {
+fn own_sealed_header_of_payload(data: &alloy_rpc_types_engine::ExecutionData) -> Option<n42_header::N42Header> {
     let v1 = data.payload.as_v1();
     let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed_header(
         v1.parent_hash,
@@ -2894,7 +2913,7 @@ async fn serve_from_own_build<T>(
     out: &mut Vec<u8>,
     reuse: Option<&OwnBlockReuse>,
     engine: &ConsensusEngineHandle<T>,
-    header: &alloy_consensus::Header,
+    header: &n42_header::N42Header,
     once: &crate::import_once::Owner,
     road: &'static str,
 ) -> std::io::Result<bool>
@@ -2956,6 +2975,7 @@ async fn answer_own_build(
     stream.write_all(out).await
 }
 
+/// Serves the raw payload protocol on `addr` and forwards payload builds and imports to the engine.
 pub async fn serve<T>(
     addr: SocketAddr,
     payloads: PayloadBuilderHandle<T>,
@@ -3063,12 +3083,11 @@ where
     // Measured only when asked: the socket's receive timestamps, read with
     // the request's first byte. A socket that refuses them serves as before.
     let mut stamped = crate::road_runtime::measure_dispatch_wait();
-    if stamped {
-        if let Err(err) = crate::road_runtime::enable_receive_timestamps(&stream) {
+    if stamped
+        && let Err(err) = crate::road_runtime::enable_receive_timestamps(&stream) {
             warn!(target: "n42.payload_serve", %err, "no receive timestamps; dispatch_wait_ms reads 0");
             stamped = false;
         }
-    }
     // Buffers retained across frames. A newPayload frame is ~19 MB at the
     // bench tier and a served payload the same; allocated fresh per block
     // they are fresh pages first-touched on every block on every node --
@@ -3132,6 +3151,36 @@ where
             );
             continue;
         }
+        if kind == request::CLAIM_LAYOUT {
+            let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
+            if len > MAX_SMALL_FRAME {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "layout claim frame too large"));
+            }
+            let mut buf = vec![0u8; len];
+            within_frame_deadline(stream.read_exact(&mut buf)).await?;
+            let answer = claim_layout_answer(&buf, reuse.as_ref().map(|reuse| &*reuse.validator));
+            out.clear();
+            match &answer {
+                Ok(()) => {
+                    out.push(raw_engine::reply::VALUE);
+                    out.extend_from_slice(&frame_len(0)?);
+                }
+                Err(message) => {
+                    out.push(raw_engine::reply::ERROR);
+                    out.extend_from_slice(&frame_len(message.len())?);
+                    out.extend_from_slice(message.as_bytes());
+                }
+            }
+            stream.write_all(&out).await?;
+            debug!(
+                target: "n42.payload_serve",
+                filed = answer.is_ok(),
+                reason = answer.as_ref().err().map_or("", String::as_str),
+                answered_us = started_at.elapsed().as_micros() as u64,
+                "layout claim request"
+            );
+            continue;
+        }
         if kind == request::OWN_BLOCK {
             let len = within_frame_deadline(stream.read_u32_le()).await? as usize;
             if len > MAX_SMALL_FRAME {
@@ -3142,14 +3191,14 @@ where
             out.clear();
             let started = std::time::Instant::now();
             // The block's road (`post_seal`): the first key's import request.
-            let header = <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut &buf[..]).ok();
+            let header = <n42_header::N42Header as alloy_rlp::Decodable>::decode(&mut &buf[..]).ok();
             if let Some(header) = &header {
                 n42_engine_types::post_seal::note_at(header.number, n42_engine_types::post_seal::Mark::FirstImport, started_at);
             }
             // Under `N42_IMPORT_ONCE` the leader key's import of its own block
             // and every other key's request for it share one hand-off of the
             // build. The road speaks no CHECKED frame.
-            let hash = once.as_ref().and_then(|_| header.as_ref().map(alloy_consensus::Header::hash_slow));
+            let hash = once.as_ref().and_then(|_| header.as_ref().map(n42_header::N42Header::hash_slow));
             let owner = match gate(&mut stream, once.as_ref(), hash, false).await? {
                 Gate::Answered => continue,
                 Gate::Work(owner) => owner,
@@ -3383,7 +3432,7 @@ where
             // this borrows the connection's frame buffer and is tens of
             // milliseconds of rayon work a runtime worker must not sit on.
             let assembled = tokio::task::block_in_place(|| {
-                let (announced, profile, body) = raw_engine::decode_foreign_body(&frame)
+                let (announced, profile, body, source) = raw_engine::decode_foreign_body_from(&frame)
                     .map_err(|err| CompactRefusal::Said(format!("compact body frame: {err}")))?;
                 let validator = validator.ok_or_else(|| {
                     CompactRefusal::Said("no direct import; send the payload".to_owned())
@@ -3402,7 +3451,7 @@ where
                 // header with the queue's transactions held by reference,
                 // then the one copy reth's block type forces.
                 let mut described = validator
-                    .describe_compact_body(announced, profile, body, &queue, miss_wait())
+                    .describe_compact_body_from(announced, profile, body, &queue, miss_wait(), source)
                     .map_err(CompactRefusal::Refused)?;
                 let make_at = std::time::Instant::now();
                 // The payload travels with an empty list until the import
@@ -3896,21 +3945,35 @@ mod once_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{Block, BlockBody, Header, Signed, TxEip1559, TxLegacy};
+    use alloy_consensus::{Block, BlockBody, Signed, TxEip1559, TxLegacy};
     use alloy_primitives::{Address, Signature, TxKind, U256};
     use reth_ethereum_primitives::TransactionSigned;
 
+    /// Audit 2026-10 round 2 (R2-I3): an INVALID answer is not kept for the
+    /// block's later requests. The registry keys on the hash the payload
+    /// names, and a body with the right header and other transactions is
+    /// INVALID under the honest block's hash: kept, it would answer the honest
+    /// body too.
+    #[test]
+    fn only_a_valid_verdict_answers_later_requests() {
+        use alloy_rpc_types_engine::PayloadStatusEnum;
+        assert!(settled_status(&PayloadStatusEnum::Valid));
+        assert!(!settled_status(&PayloadStatusEnum::Invalid { validation_error: "transactions root mismatch".into() }));
+        assert!(!settled_status(&PayloadStatusEnum::Syncing));
+        assert!(!settled_status(&PayloadStatusEnum::Accepted));
+    }
+
     /// A taken build with one transaction, filed and handed out of the store
     /// as `take` hands it to the own-block import, and its sealed header.
-    fn handed_build(number: u64) -> (B256, n42_engine_types::built_executions::BuiltExecution, reth_primitives_traits::SealedHeader) {
-        let header = Header {
+    fn handed_build(number: u64) -> (B256, n42_engine_types::built_executions::BuiltExecution, reth_primitives_traits::SealedHeader<n42_header::N42Header>) {
+        let header = n42_header::N42Header::from(alloy_consensus::Header {
             number,
             parent_hash: B256::repeat_byte(0xD0),
             state_root: B256::with_last_byte(number as u8),
             receipts_root: B256::repeat_byte(0xD2),
             gas_used: 21_000 + number,
             ..Default::default()
-        };
+        });
         let tx: n42_tx_types::N42TxEnvelope = TransactionSigned::new_unhashed(
             reth_ethereum_primitives::Transaction::Legacy(TxLegacy { nonce: number, ..Default::default() }),
             Signature::test_signature(),
@@ -3939,7 +4002,7 @@ mod tests {
         )
         .expect("taken");
         assert_eq!(taken_hash, built_hash);
-        let sealed = reth_primitives_traits::SealedHeader::seal_slow(Header { extra_data: b"view".as_slice().into(), ..header });
+        let sealed = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"view".as_slice().into(), ..header.inner }));
         (built_hash, taken, sealed)
     }
 
@@ -4017,7 +4080,7 @@ mod tests {
                 }
             })
             .collect();
-        let header = Header { number: 9, base_fee_per_gas: Some(7), withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH), ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 9, base_fee_per_gas: Some(7), withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH), ..Default::default() });
         let withdrawals = alloy_eips::eip4895::Withdrawals(vec![alloy_eips::eip4895::Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(7), amount: 3 }]);
         let block = Block { header, body: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(withdrawals) } };
         let sealed = SealedBlock::seal_slow(block);
@@ -4041,7 +4104,7 @@ mod tests {
                 }
             })
             .collect();
-        let header = Header { number: 11, base_fee_per_gas: Some(7), ..Default::default() };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 11, base_fee_per_gas: Some(7), ..Default::default() });
         let block = Block { header, body: BlockBody { transactions: txs.clone(), ommers: Vec::new(), withdrawals: None } };
         let sealed = SealedBlock::seal_slow(block);
         let (rlp, listed) = encode_block_parallel_keeping_transactions(&sealed);
@@ -4073,11 +4136,11 @@ mod tests {
     /// in the view the extra data carries, is (loop157 W).
     #[test]
     fn a_reseal_cannot_change_blob_gas_execution_inputs() {
-        let built = Header {
+        let built = n42_header::N42Header::from(alloy_consensus::Header {
             excess_blob_gas: Some(0),
             blob_gas_used: Some(0),
             ..Default::default()
-        };
+        });
         let mut sealed = built.clone();
         sealed.extra_data = vec![0xBB].into();
         assert!(build_executes_as_sealed(&built, None, &sealed, None));
@@ -4092,7 +4155,7 @@ mod tests {
     #[test]
     fn a_sibling_on_the_same_parent_is_not_executed_as_the_build() {
         use alloy_eips::eip4895::Withdrawal;
-        let built = Header {
+        let built = n42_header::N42Header::from(alloy_consensus::Header {
             number: 183,
             beneficiary: Address::repeat_byte(4),
             timestamp: 1_000,
@@ -4100,7 +4163,7 @@ mod tests {
             base_fee_per_gas: Some(7),
             extra_data: vec![0xAA].into(),
             ..Default::default()
-        };
+        });
         let rewards = [Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(4), amount: 1 }];
         let mut ours = built.clone();
         ours.extra_data = vec![0xBB].into();
@@ -4128,7 +4191,7 @@ mod tests {
             })
             .collect();
         let block = n42_tx_types::Block {
-            header: Header { number: 129, ..Default::default() },
+            header: n42_header::N42Header::from(alloy_consensus::Header { number: 129, ..Default::default() }),
             body: n42_tx_types::BlockBody { transactions: transactions.clone(), ommers: Vec::new(), withdrawals: None },
         };
         let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::repeat_byte(1); 5]);

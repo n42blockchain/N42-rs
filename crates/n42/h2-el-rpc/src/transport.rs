@@ -110,6 +110,29 @@ pub struct HttpTransport {
     url: Url,
     jwt: JwtSecret,
     next_id: AtomicU64,
+    max_response_bytes: usize,
+}
+
+/// The largest response read from the execution layer: the Engine API's
+/// largest payload as hex (twice the 256 MiB raw-payload cap) with room for
+/// its JSON. A response is otherwise read whole into memory whatever it
+/// claims (audit 2026-10 round 3, R3-P9).
+pub const MAX_RESPONSE_BYTES: usize = 1 << 30;
+
+/// Reads a response body, refusing one past `max` bytes as soon as it says
+/// or shows so.
+async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, String> {
+    if response.content_length().is_some_and(|len| len > max as u64) {
+        return Err(format!("response of {} bytes exceeds {max}", response.content_length().unwrap_or_default()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > max {
+            return Err(format!("response exceeds {max} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 impl HttpTransport {
@@ -129,7 +152,14 @@ impl HttpTransport {
             url,
             jwt,
             next_id: AtomicU64::new(1),
+            max_response_bytes: MAX_RESPONSE_BYTES,
         })
+    }
+
+    /// Caps the bytes one response may carry ([`MAX_RESPONSE_BYTES`] unless set).
+    pub const fn with_max_response_bytes(mut self, max: usize) -> Self {
+        self.max_response_bytes = max;
+        self
     }
 
     /// Mints a bearer token for one call.
@@ -175,7 +205,8 @@ impl JsonRpcTransport for HttpTransport {
             .send()
             .await;
         let Ok(response) = response else { return 0 };
-        match response.json::<Value>().await {
+        let Ok(body) = read_capped(response, self.max_response_bytes).await else { return 0 };
+        match serde_json::from_slice::<Value>(&body) {
             Ok(Value::Array(results)) => {
                 results.iter().filter(|r| r.get("error").is_none()).count()
             }
@@ -229,9 +260,10 @@ impl JsonRpcTransport for HttpTransport {
             ));
         }
         let status = response.status();
-        let body: Value = response
-            .json()
+        let body = read_capped(response, self.max_response_bytes)
             .await
+            .map_err(|e| TransportError::Transport(format!("HTTP {status}: {e}")))?;
+        let body: Value = serde_json::from_slice(&body)
             .map_err(|e| TransportError::Transport(format!("HTTP {status}: {e}")))?;
 
         parse_response(body)
@@ -283,6 +315,37 @@ mod tests {
         // failure much later.
         let body = json!({"jsonrpc": "2.0", "id": 1});
         assert!(parse_response(body).is_err());
+    }
+
+    /// Audit 2026-10 round 3 (R3-P9): a response was read whole into memory
+    /// whatever its size, here and on the `--el-rpc` path. One past the cap is
+    /// refused, whether it declares its length or streams to the end.
+    #[tokio::test]
+    async fn a_response_past_its_cap_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let result = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{}\"}}", "a".repeat(4096));
+        for declared in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url: Url = format!("http://{}", listener.local_addr().unwrap()).parse().unwrap();
+            let body = result.clone();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 8192];
+                let _ = socket.read(&mut request).await;
+                let head = if declared {
+                    format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", body.len())
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n".to_string()
+                };
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            });
+            let transport = HttpTransport::new(url, JwtSecret::random(), Duration::from_secs(5))
+                .unwrap()
+                .with_max_response_bytes(1024);
+            let err = transport.call("eth_test", vec![]).await.expect_err("past the cap");
+            assert!(err.to_string().contains("exceeds"), "declared={declared}: {err}");
+        }
     }
 
     #[test]

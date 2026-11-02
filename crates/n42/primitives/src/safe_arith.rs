@@ -3,6 +3,7 @@
 
 /// Extension trait for iterators, providing a safe replacement for `sum`.
 pub trait SafeArithIter<T> {
+    /// Returns the sum of the items, or an error if it overflows.
     fn safe_sum(self) -> Result<T>;
 }
 
@@ -20,11 +21,14 @@ where
 #[derive(thiserror::Error, Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ArithError {
     #[error("overflow")]
+    /// The operation overflowed.
     Overflow,
     #[error("divide by zero")]
+    /// The operation divided by zero.
     DivisionByZero,
 }
 
+/// Result of a checked arithmetic operation.
 pub type Result<T> = std::result::Result<T, ArithError>;
 
 macro_rules! assign_method {
@@ -45,7 +49,9 @@ macro_rules! assign_method {
 
 /// Trait providing safe arithmetic operations for built-in types.
 pub trait SafeArith<Rhs = Self>: Sized + Copy {
+    /// The additive identity.
     const ZERO: Self;
+    /// The multiplicative identity.
     const ONE: Self;
 
     /// Safe variant of `+` that guards against overflow.

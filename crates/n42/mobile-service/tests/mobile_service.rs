@@ -228,3 +228,19 @@ fn a_block_with_no_receipts_has_no_attestation() {
     let service = service_with_block(1, block_hash, None);
     assert!(service.attestation(&block_hash).is_none());
 }
+
+/// Audit 2026-10 round 3 (R3-P5): a block recorded without its receipts
+/// root counted any receipt as valid, so one registered phone reporting any
+/// root made it "attested" at the threshold of one the validator runs. Until
+/// the root is known, no receipt attests the block.
+#[test]
+fn a_block_without_a_known_receipts_root_is_never_attested() {
+    let block_hash = B256::repeat_byte(0x11);
+    let mut service = service_with_block(1, block_hash, None);
+    let (key, pubkey) = phone();
+    service.register_verifier(pubkey);
+    let outcome = service
+        .submit_receipt(&receipt(&key, block_hash, B256::repeat_byte(0x99)))
+        .unwrap();
+    assert!(!outcome.attested, "nothing to check the reported root against");
+}

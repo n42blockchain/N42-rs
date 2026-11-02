@@ -133,7 +133,7 @@ impl AggregatedAttestation {
         let pk_refs: Vec<&BlsPublicKey> = bls_pubkeys.iter().collect();
         let msg = self.signing_message();
 
-        AggregateSignature::verify_aggregate(&msg, &self.aggregate_signature, &pk_refs)
+        AggregateSignature::verify_aggregate_with_dst(&msg, &self.aggregate_signature, &pk_refs, crate::receipt::RECEIPT_DST)
             .map_err(|_| AttestationError::InvalidAggregateSignature)
     }
 

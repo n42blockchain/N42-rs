@@ -10,7 +10,8 @@
 //! plain-transfer path) with [`N42TxEnvelope`] as the transaction, so a block
 //! may carry 0x50 transactions.
 
-use alloy_consensus::Header;
+use alloy_consensus::BlockHeader as _;
+use n42_header::N42Header as Header;
 use alloy_eips::Decodable2718;
 use alloy_evm::{
     eth::{receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, spec::EthExecutorSpec, EthBlockExecutionCtx, EthBlockExecutorFactory},
@@ -25,7 +26,8 @@ use reth_evm::{
     EvmEnv, EvmEnvFor, EvmFactory, ExecutableTxIterator, ExecutionCtxFor, NextBlockEnvAttributes,
     SenderRecoveryCache, TransactionEnvMut,
 };
-use reth_evm_ethereum::{revm_spec_by_timestamp_and_block_number, EthBlockAssembler};
+use crate::assembler::N42HeaderAssembler;
+use reth_evm_ethereum::revm_spec_by_timestamp_and_block_number;
 use reth_primitives_traits::{constants::MAX_TX_GAS_LIMIT_OSAKA, SealedBlock, SealedHeader, SignedTransaction, TxTy};
 use reth_storage_errors::any::AnyError;
 use revm::{
@@ -60,7 +62,7 @@ pub struct N42EvmConfig<C = ChainSpec, EvmF = crate::fast_transfer::N42EvmFactor
     /// The executor factory.
     pub executor_factory: N42BlockExecutorFactory<C, EvmF>,
     /// The block assembler.
-    pub block_assembler: EthBlockAssembler<C>,
+    pub block_assembler: N42HeaderAssembler<C>,
     /// Cache of recovered senders, when the node keeps one.
     pub sender_recovery_cache: Option<SenderRecoveryCache>,
     /// Whether the chain is a HotStuff chain, read from its genesis once.
@@ -71,7 +73,7 @@ impl<C, EvmF> N42EvmConfig<C, EvmF> {
     /// Creates the configuration for `chain_spec` with `evm_factory`.
     pub fn new_with_evm_factory(chain_spec: Arc<C>, evm_factory: EvmF) -> Self {
         Self {
-            block_assembler: EthBlockAssembler::new(chain_spec.clone()),
+            block_assembler: N42HeaderAssembler::new(chain_spec.clone()),
             sender_recovery_cache: None,
             executor_factory: EthBlockExecutorFactory::new(N42ReceiptBuilder, chain_spec, evm_factory),
             hotstuff: std::sync::OnceLock::new(),
@@ -144,7 +146,7 @@ impl<C, EvmF> N42EvmConfig<C, EvmF> {
 
 impl<C, EvmF> ConfigureEvm for N42EvmConfig<C, EvmF>
 where
-    C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static,
+    C: EthExecutorSpec + EthChainSpec + Hardforks + 'static,
     EvmF: EvmFactory<
             Tx: TransactionEnvMut + FromRecoveredTx<N42TxEnvelope> + FromTxWithEncoded<N42TxEnvelope>,
             Spec = SpecId,
@@ -161,7 +163,7 @@ where
     type Error = Infallible;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
     type BlockExecutorFactory = N42BlockExecutorFactory<C, EvmF>;
-    type BlockAssembler = EthBlockAssembler<C>;
+    type BlockAssembler = N42HeaderAssembler<C>;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
         &self.executor_factory
@@ -192,7 +194,7 @@ where
                 gas_limit: attributes.gas_limit,
                 slot_number: attributes.slot_number,
             },
-            self.chain_spec().next_block_base_fee(parent, attributes.timestamp).unwrap_or_default(),
+            parent.next_block_base_fee(self.chain_spec().base_fee_params_at_timestamp(attributes.timestamp)).unwrap_or_default(),
             self.chain_spec(),
             self.chain_spec().chain().id(),
             self.chain_spec().blob_params_at_timestamp(attributes.timestamp),
@@ -207,7 +209,10 @@ where
             tx_count_hint: Some(block.transaction_count()),
             parent_hash: block.header().parent_hash,
             parent_beacon_block_root: block.header().parent_beacon_block_root,
-            ommers: &block.body().ommers,
+            // Ethereum's ommer rewards read alloy headers; no N42 chain has
+            // ommers (APoS has no uncles, HotStuff refuses them in the body
+            // check), so none are paid.
+            ommers: &[],
             withdrawals: block.body().withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
             extra_data: block.header().extra_data.clone(),
             slot_number: block.header().slot_number,
@@ -216,7 +221,7 @@ where
 
     fn context_for_next_block(
         &self,
-        parent: &SealedHeader,
+        parent: &SealedHeader<Header>,
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<EthBlockExecutionCtx<'_>, Self::Error> {
         Ok(EthBlockExecutionCtx {
@@ -233,7 +238,7 @@ where
 
 impl<C, EvmF> ConfigureEngineEvm<ExecutionData> for N42EvmConfig<C, EvmF>
 where
-    C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + EthereumHardforks + 'static,
+    C: EthExecutorSpec + EthChainSpec + Hardforks + EthereumHardforks + 'static,
     EvmF: EvmFactory<
             Tx: TransactionEnvMut + FromRecoveredTx<N42TxEnvelope> + FromTxWithEncoded<N42TxEnvelope>,
             Spec = SpecId,

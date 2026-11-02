@@ -27,6 +27,7 @@ fn attrs() -> PayloadAttributes {
         suggested_fee_recipient: Default::default(),
         withdrawals: None,
         parent_beacon_block_root: None,
+        mobile_registry_root: None,
     }
 }
 
@@ -159,15 +160,20 @@ async fn a_syncing_execution_layer_defers_rather_than_voting_blind() {
     driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
 
     // SYNCING is not a verdict: the EL has not executed the block, so voting
-    // would be voting blind. The driver must ask the caller to retry.
+    // would be voting blind. The driver executes it again after a pause
+    // (audit 2026-10 round 2, R2-R3), and asks for it once the pauses run out.
+    driver.set_import_retry_backoff(vec![std::time::Duration::ZERO]);
     let action = driver.handle_output(&execute(hash)).await;
-    assert_eq!(action.missing_block(), Some(hash));
-    assert!(action.imported_block().is_none());
+    assert!(action.missing_block().is_none() && action.imported_block().is_none(), "{action:?}");
+    assert_eq!(driver.head(), GENESIS);
+    let retried = driver.retry_failed_imports().await;
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].missing_block(), Some(hash), "out of retries");
     assert_eq!(driver.head(), GENESIS);
 }
 
 #[tokio::test]
-async fn an_execution_layer_error_is_a_rejection_not_an_import() {
+async fn an_execution_layer_error_is_asked_again_not_a_rejection_or_an_import() {
     let el = MockExecutionLayer::with_behaviour(MockBehaviour {
         new_payload_error: Some("engine unavailable".into()),
         ..Default::default()
@@ -176,9 +182,17 @@ async fn an_execution_layer_error_is_a_rejection_not_an_import() {
     let hash = B256::repeat_byte(0x11);
     driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
 
+    // Only the execution layer's INVALID is a verdict on the block; an error
+    // reaching it is asked again, as gov5 retries every error but a
+    // deterministic execution failure (audit 2026-10 B-5), executed again
+    // from the payload held (R2-R3).
+    driver.set_import_retry_backoff(vec![std::time::Duration::ZERO]);
     let action = driver.handle_output(&execute(hash)).await;
     assert!(action.imported_block().is_none());
-    assert!(action.rejection().unwrap().1.contains("engine unavailable"));
+    assert!(action.rejection().is_none());
+    assert!(action.missing_block().is_none(), "retried first: {action:?}");
+    let retried = driver.retry_failed_imports().await;
+    assert_eq!(retried[0].missing_block(), Some(hash), "then asked for again");
 }
 
 #[tokio::test]
@@ -543,6 +557,7 @@ fn body_for(hash: B256, number: u64) -> n42_h2_execution::ForeignBody {
         // its own tests in `n42-h2-consensus` and `n42-engine-types`.
         rlp: alloy_primitives::Bytes::from_static(&[0xc0]),
         compact: false,
+        source: None,
     }
 }
 
@@ -934,7 +949,7 @@ async fn the_block_after_a_recovered_own_commit_imports_from_its_body() {
 async fn a_refused_first_build_on_output_falls_back_to_the_forkchoice_build() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
-    let header = alloy_consensus::Header::default();
+    let header = n42_h2_consensus::N42Header::default();
     let what = driver
         .prepare_first_build_on_output(GENESIS, header, attrs(), None)
         .await
@@ -960,7 +975,7 @@ async fn a_finished_build_ahead_is_kept_for_the_first_build_of_a_tenure() {
         tokio::task::yield_now().await;
     }
     let what = driver
-        .prepare_first_build_on_output(GENESIS, alloy_consensus::Header::default(), attrs(), None)
+        .prepare_first_build_on_output(GENESIS, n42_h2_consensus::N42Header::default(), attrs(), None)
         .await
         .expect("nothing to start");
     assert_eq!(what, "a forkchoice build ahead on this parent has already finished");

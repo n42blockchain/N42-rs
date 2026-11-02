@@ -67,7 +67,7 @@
 //! carried whole so nothing about gov5's body has to be re-encoded here and
 //! the receiver checks them exactly as it checks a full body's.
 
-use alloy_consensus::Header;
+use n42_header::N42Header as Header;
 use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
@@ -230,7 +230,7 @@ impl<'a> Reader<'a> {
         let raw = self.take(n.checked_mul(36).ok_or_else(invalid)?)?;
         let mut frames = Vec::with_capacity(n);
         let mut sum = 0usize;
-        for entry in raw.chunks_exact(36) {
+        for entry in raw.as_chunks::<36>().0 {
             let id = B256::from_slice(&entry[..32]);
             let count = u32::from_le_bytes(entry[32..].try_into().map_err(|_| invalid())?);
             // An empty frame is no frame: a layout with one does not
@@ -600,13 +600,14 @@ mod tests {
     use alloy_primitives::Bytes;
 
     fn header() -> Header {
-        Header {
+        alloy_consensus::Header {
             number: 41,
             gas_used: 21_000,
             base_fee_per_gas: Some(7),
             withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
             ..Default::default()
         }
+        .into()
     }
 
     fn transactions() -> Vec<Bytes> {

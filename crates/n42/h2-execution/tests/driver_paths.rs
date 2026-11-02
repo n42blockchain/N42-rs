@@ -32,6 +32,7 @@ fn attrs_at(timestamp: u64, slot: Option<u64>) -> PayloadAttributes {
         suggested_fee_recipient: Default::default(),
         withdrawals: None,
         parent_beacon_block_root: None,
+        mobile_registry_root: None,
     }
 }
 
@@ -60,6 +61,7 @@ fn body_for(hash: B256, number: u64, compact: bool) -> ForeignBody {
         profile: n42_h2_consensus::N42HeaderProfile::Ethereum,
         rlp: alloy_primitives::Bytes::from_static(&[0xc0]),
         compact,
+        source: None,
     }
 }
 
@@ -131,21 +133,29 @@ async fn a_spawned_imports_verdict_becomes_the_action_an_awaited_import_would_re
                 assert_eq!(actions[0].imported_block(), Some(built.hash));
                 assert_eq!(driver.head(), built.hash);
             }
+            // Not a verdict: executed again after a pause, from the payload
+            // still held (audit 2026-10 round 2, R2-R3).
             "syncing" | "accepted" => {
-                assert_eq!(actions[0].missing_block(), Some(built.hash), "not a verdict: asked for again");
+                assert!(matches!(actions[0], DriverAction::Ignored), "{name}: retried, not asked for: {actions:?}");
+                assert!(driver.has_payload(&built.hash), "{name}: kept for the retry");
                 assert_eq!(driver.head(), GENESIS);
             }
             "invalid" => {
                 assert_eq!(actions[0].rejection(), Some((built.hash, "bad state root")));
                 assert!(!driver.has_payload(&built.hash), "a rejected payload is dropped so a fresh copy runs again");
             }
-            _ => assert_eq!(actions[0].rejection(), Some((built.hash, "db closed"))),
+            // An error (a timeout, a dropped connection) says nothing about
+            // the block: asked for again, the payload kept (audit 2026-10 B-5).
+            _ => {
+                assert!(matches!(actions[0], DriverAction::Ignored), "{name}: retried, not asked for: {actions:?}");
+                assert!(driver.has_payload(&built.hash), "kept for the next attempt");
+            }
         }
     }
 }
 
 #[tokio::test]
-async fn a_commit_that_waited_for_an_import_runs_when_it_succeeds_and_is_dropped_when_it_fails() {
+async fn a_commit_that_waited_for_an_import_runs_when_it_or_a_later_copy_succeeds() {
     let built = MockExecutionLayer::built_block(1);
 
     // Success: the commit heard mid-import is sent once the block is in.
@@ -162,7 +172,10 @@ async fn a_commit_that_waited_for_an_import_runs_when_it_succeeds_and_is_dropped
     assert_eq!(driver.finalized(), built.hash);
     assert_eq!(count(&el, |c| matches!(c, ElCall::ForkchoiceUpdated(s) if s.head_block_hash == built.hash)), 1);
 
-    // Failure: the commit can never run, and a later success does not resurrect it.
+    // Failure: an invalid verdict judges the bytes that were sent, not the
+    // block (audit 2026-10 R2-I3), so the commit waits for the next copy;
+    // dropped, the block a quorum committed never became canonical here
+    // until a descendant was committed (round 3, R3-C4).
     let el = MockExecutionLayer::with_behaviour(MockBehaviour { new_payload_status: invalid("bad"), ..Default::default() });
     let (mut driver, mut rx) = spawning(&el);
     driver.cache_payload(built.hash, built.execution_data.clone());
@@ -176,7 +189,12 @@ async fn a_commit_that_waited_for_an_import_runs_when_it_succeeds_and_is_dropped
     driver.handle_output(&execute(built.hash)).await;
     let report = next_report(&mut rx).await;
     driver.finish_execute(report).await;
-    assert_eq!(count(&el, |c| matches!(c, ElCall::ForkchoiceUpdated(_))), 0, "the dropped commit stayed dropped");
+    assert_eq!(
+        count(&el, |c| matches!(c, ElCall::ForkchoiceUpdated(s) if s.head_block_hash == built.hash)),
+        1,
+        "the commit runs when a good copy imports"
+    );
+    assert_eq!(driver.finalized(), built.hash);
 }
 
 #[tokio::test]
@@ -208,9 +226,10 @@ async fn imports_queue_behind_the_one_in_flight_and_a_queued_block_with_no_paylo
 }
 
 #[tokio::test]
-async fn an_import_task_that_dies_reports_an_invalid_verdict_instead_of_hanging() {
+async fn an_import_task_that_dies_reports_not_yet_instead_of_hanging() {
     // An execution layer that panics inside newPayload: the task ends with no
-    // verdict, and the guard says so.
+    // verdict, and the guard says so -- as not executed, not as INVALID: a
+    // local failure is no verdict on the block (audit 2026-10 round 2, R2-I7).
     struct Panics(MockExecutionLayer);
     #[async_trait::async_trait]
     impl ExecutionLayer for Panics {
@@ -247,13 +266,12 @@ async fn an_import_task_that_dies_reports_an_invalid_verdict_instead_of_hanging(
     let mut rx = driver.take_foreign_imports().expect("channel");
     driver.cache_payload(built.hash, built.execution_data.clone());
     driver.handle_output(&execute(built.hash)).await;
-    let ImportReport::Done(hash, ImportVerdict::Invalid(reason)) = next_report(&mut rx).await else {
-        panic!("expected an invalid verdict from the guard");
+    let ImportReport::Done(hash, ImportVerdict::NoVerdict) = next_report(&mut rx).await else {
+        panic!("expected a no-verdict report from the guard");
     };
     assert_eq!(hash, built.hash);
-    assert_eq!(reason, "the import task ended without a verdict");
-    let actions = driver.finish_execute(ImportReport::Done(hash, ImportVerdict::Invalid(reason))).await;
-    assert!(actions[0].rejection().is_some());
+    let actions = driver.finish_execute(ImportReport::Done(hash, ImportVerdict::NoVerdict)).await;
+    assert!(actions.iter().all(|action| action.rejection().is_none()), "no rejection: {actions:?}");
     assert!(!driver.is_importing(&built.hash), "the slot is not held for good");
 }
 
@@ -372,7 +390,7 @@ async fn a_body_the_layer_refuses_falls_back_to_the_payload_or_to_the_whole_body
 }
 
 #[tokio::test]
-async fn a_body_the_layer_takes_and_then_fails_is_rejected_without_a_second_attempt() {
+async fn a_body_the_layer_takes_and_then_fails_is_asked_again_not_resent_as_a_payload() {
     let built = MockExecutionLayer::built_block(1);
     let el = MockExecutionLayer::with_behaviour(MockBehaviour {
         take_bodies: true,
@@ -383,8 +401,10 @@ async fn a_body_the_layer_takes_and_then_fails_is_rejected_without_a_second_atte
     driver.cache_body(body_for(built.hash, 1, false));
     driver.cache_payload(built.hash, built.execution_data.clone());
     driver.handle_output(&execute(built.hash)).await;
-    let ImportReport::Done(_, ImportVerdict::Invalid(reason)) = next_report(&mut rx).await else { panic!("expected invalid") };
-    assert_eq!(reason, "state db corrupt");
+    // A failure after the layer took the body (a timeout while it executed,
+    // a dropped connection) is no verdict on the block: asked for again
+    // (audit 2026-10 B-5), not sent again as a payload on this attempt.
+    let ImportReport::Done(_, ImportVerdict::NoVerdict) = next_report(&mut rx).await else { panic!("expected no verdict") };
     assert_eq!(count(&el, |c| matches!(c, ElCall::NewPayload(_))), 0, "a failure after the body was taken is not retried as a payload");
 
     // INVALID after a VALID check: the check released the vote, the verdict withdraws it.
@@ -509,7 +529,7 @@ async fn a_prepared_build_that_failed_is_reported_and_replaced_by_a_build_now() 
 async fn a_build_on_the_sealed_block_the_layer_refuses_falls_back_to_the_ordinary_build() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
-    let header = alloy_consensus::Header::default();
+    let header = n42_h2_consensus::N42Header::default();
     driver.prepare_build_on_sealed(GENESIS, header.clone(), attrs(), None).await.expect("requested");
     // The mock offers no direct build: the task marks the request refused.
     for _ in 0..16 {
@@ -528,7 +548,7 @@ async fn a_build_on_the_sealed_block_the_layer_refuses_falls_back_to_the_ordinar
 async fn the_first_build_of_a_tenure_keeps_a_build_already_prepared_on_the_parent() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
-    let header = alloy_consensus::Header::default();
+    let header = n42_h2_consensus::N42Header::default();
     assert_eq!(
         driver.prepare_first_build_on_output(GENESIS, header.clone(), attrs(), None).await.expect("ok"),
         "requested"
@@ -616,10 +636,56 @@ async fn an_own_import_is_tracked_while_it_runs_and_reported_when_the_block_is_v
     ] {
         let el = MockExecutionLayer::with_behaviour(behaviour);
         let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+        driver.set_own_import_backoff(vec![Duration::from_millis(1); 2]);
         let mut own = driver.take_own_imports().expect("channel");
         driver.spawn_import_own_block(&built);
         eventually("the import to end", || !driver.is_importing_own_block(&built.hash)).await;
         assert!(own.try_recv().is_err(), "nothing was reported");
+    }
+}
+
+/// Audit 2026-10 round 2 (R2-I4): an own import that ends without a verdict
+/// -- the layer was down or answered SYNCING for a moment -- is tried again.
+/// The service already counts the block as imported and the commit for it
+/// waits for exactly this report; without a retry the leader stayed wedged
+/// on its own block until a restart.
+#[tokio::test]
+async fn an_own_import_without_a_verdict_is_tried_again() {
+    let built = MockExecutionLayer::built_block(1);
+    for behaviour in [
+        MockBehaviour { new_payload_error: Some("down".into()), ..Default::default() },
+        MockBehaviour { new_payload_status: PayloadStatusEnum::Syncing, ..Default::default() },
+    ] {
+        let el = MockExecutionLayer::with_behaviour(behaviour);
+        let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+        driver.set_own_import_backoff(vec![Duration::from_millis(50); 20]);
+        let mut own = driver.take_own_imports().expect("channel");
+        driver.spawn_import_own_block(&built);
+        eventually("a first attempt", || el.calls().contains(&ElCall::NewPayload(built.hash))).await;
+        assert!(driver.is_importing_own_block(&built.hash), "still trying");
+        el.set_behaviour(MockBehaviour::default());
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10), own.recv()).await.expect("in time"), Some(built.hash));
+        eventually("the marker to clear", || !driver.is_importing_own_block(&built.hash)).await;
+    }
+}
+
+/// Audit 2026-10 B-7: a block this node built that its own execution layer
+/// calls invalid is a builder/executor divergence on the leader. It is
+/// counted (and logged at error), unlike a layer that is syncing or down.
+#[tokio::test]
+async fn an_own_block_its_execution_layer_calls_invalid_is_counted() {
+    let built = MockExecutionLayer::built_block(1);
+    for (behaviour, refused) in [
+        (MockBehaviour { new_payload_status: invalid("bad"), ..Default::default() }, 1),
+        (MockBehaviour { new_payload_status: PayloadStatusEnum::Syncing, ..Default::default() }, 0),
+        (MockBehaviour { new_payload_error: Some("down".into()), ..Default::default() }, 0),
+        (MockBehaviour::default(), 0),
+    ] {
+        let mut driver = ExecutionDriver::new(MockExecutionLayer::with_behaviour(behaviour), GENESIS);
+        driver.set_own_import_backoff(vec![Duration::from_millis(1); 2]);
+        driver.spawn_import_own_block(&built);
+        eventually("the import to end", || !driver.is_importing_own_block(&built.hash)).await;
+        assert_eq!(driver.own_blocks_refused(), refused);
     }
 }
 
@@ -753,4 +819,91 @@ fn action_accessors_answer_only_for_their_own_variant() {
     assert_eq!((ignored.imported_block(), ignored.finalized_block(), ignored.missing_block(), ignored.rejection()), (None, None, None, None));
     let checked = DriverAction::Consensus(Box::new(n42_h2_consensus::ConsensusEvent::BlockChecked(hash)));
     assert_eq!(checked.imported_block(), None, "a check is not an import");
+}
+
+/// Audit 2026-10 round 2 (R2-R3): an import that ends without a verdict (an
+/// error, SYNCING, ACCEPTED) is executed again after a pause, from the
+/// payload or body the driver still holds. Before, it became
+/// `PayloadMissing`: nothing executed it again (the body was already here,
+/// so a copy that arrived was a duplicate), and a compact body was dropped
+/// for a whole one asked of every peer.
+#[tokio::test]
+async fn an_awaited_import_that_ends_after_retries_forgets_their_count() {
+    // Audit 2026-10 round 3 (R3-G5): the awaited path ended a retried
+    // import without dropping its retry count, so every block that once had
+    // no verdict left an entry behind for good.
+    let built = MockExecutionLayer::built_block(1);
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        new_payload_status: PayloadStatusEnum::Syncing,
+        ..Default::default()
+    });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_import_retry_backoff(vec![Duration::ZERO, Duration::ZERO]);
+    driver.cache_payload(built.hash, built.execution_data.clone());
+    assert!(matches!(driver.handle_output(&execute(built.hash)).await, DriverAction::Ignored));
+    assert_eq!(driver.import_retries_held(), 1);
+    el.set_behaviour(MockBehaviour::default());
+    let retried = driver.retry_failed_imports().await;
+    assert_eq!(retried[0].imported_block(), Some(built.hash));
+    assert_eq!(driver.import_retries_held(), 0, "the count goes with the verdict");
+
+    // A retry that finds the payload gone is asked of the fleet, and its count goes too.
+    let other = MockExecutionLayer::built_block(2);
+    el.set_behaviour(MockBehaviour { new_payload_status: PayloadStatusEnum::Syncing, ..Default::default() });
+    driver.cache_payload(other.hash, other.execution_data.clone());
+    driver.handle_output(&execute(other.hash)).await;
+    driver.forget_payload(other.hash);
+    let retried = driver.retry_failed_imports().await;
+    assert_eq!(retried[0].missing_block(), Some(other.hash));
+    assert_eq!(driver.import_retries_held(), 0);
+}
+
+#[tokio::test]
+async fn an_import_without_a_verdict_is_executed_again_from_what_is_held() {
+    let built = MockExecutionLayer::built_block(1);
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        new_payload_status: PayloadStatusEnum::Syncing,
+        ..Default::default()
+    });
+    let (mut driver, mut rx) = spawning(&el);
+    driver.set_import_retry_backoff(vec![Duration::ZERO, Duration::ZERO]);
+    driver.cache_payload(built.hash, built.execution_data.clone());
+    driver.handle_output(&execute(built.hash)).await;
+    let actions = driver.finish_execute(next_report(&mut rx).await).await;
+    assert!(actions.iter().all(|a| a.missing_block().is_none()), "not asked of the fleet again: {actions:?}");
+    assert!(driver.has_payload(&built.hash), "kept for the retry");
+    el.set_behaviour(MockBehaviour::default());
+    let retried = driver.retry_failed_imports().await;
+    assert!(retried.iter().all(|a| a.missing_block().is_none()), "{retried:?}");
+    let actions = driver.finish_execute(next_report(&mut rx).await).await;
+    assert_eq!(actions[0].imported_block(), Some(built.hash), "the retry imported it");
+    assert_eq!(count(&el, |c| matches!(c, ElCall::NewPayload(_))), 2);
+
+    // Retries run out: then it is asked for again, as before.
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        new_payload_error: Some("timed out".into()),
+        ..Default::default()
+    });
+    let (mut driver, mut rx) = spawning(&el);
+    driver.set_import_retry_backoff(vec![Duration::ZERO]);
+    driver.cache_payload(built.hash, built.execution_data.clone());
+    driver.handle_output(&execute(built.hash)).await;
+    let first = driver.finish_execute(next_report(&mut rx).await).await;
+    assert!(first.iter().all(|a| a.missing_block().is_none()), "{first:?}");
+    driver.retry_failed_imports().await;
+    let last = driver.finish_execute(next_report(&mut rx).await).await;
+    assert_eq!(last[0].missing_block(), Some(built.hash), "out of retries: asked for again");
+
+    // A compact body the layer took and then failed on is kept and retried.
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        take_bodies: true,
+        new_payload_error: Some("timed out".into()),
+        ..Default::default()
+    });
+    let (mut driver, mut rx) = deferred(&el);
+    driver.set_import_retry_backoff(vec![Duration::ZERO]);
+    driver.cache_body(body_for(built.hash, 1, true));
+    driver.handle_output(&execute(built.hash)).await;
+    let actions = driver.finish_execute(next_report(&mut rx).await).await;
+    assert!(actions.iter().all(|a| a.missing_block().is_none()), "the compact body is not given up: {actions:?}");
 }

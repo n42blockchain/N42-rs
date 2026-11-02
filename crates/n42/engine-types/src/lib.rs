@@ -46,6 +46,7 @@ pub mod claimed_build;
 pub mod fast_transfer;
 pub mod frame_blocks;
 pub mod frame_scan;
+pub mod includability;
 pub mod batch_state;
 pub mod parallel_transfer;
 pub mod warm_ahead;

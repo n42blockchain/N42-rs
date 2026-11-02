@@ -1,7 +1,9 @@
 # QMDB entry-file compaction: a root-neutral design
 
 Status: design, 2026-10-27, amended 2026-10-28 (3.2 consequence, stage order). Item 6.2 of
-`docs/MATURITY_HARDENING_2026_10.md`. Stage 0 is implemented; the stages at the end say what lands first and how each is verified.
+`docs/MATURITY_HARDENING_2026_10.md`. Stage 0 is implemented, and stage 2 (with no production
+caller) on `design/qmdb-compact-stage2`; the stages at the end say what lands first and how each
+is verified.
 
 ## 1. The problem, restated with the code's numbers
 
@@ -157,9 +159,10 @@ from `QmdbNodeState::entry_stats()` -> `QmdbForest::entry_stats()` ->
 | `n42_qmdb_entry_bytes_per_live_slot` | `file_bytes / max(live_slots, 1)` |
 
 A warning, once per process, when the last passes `N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM`
-(default 2,000, 0 disables). `n42_qmdb_entry_relocated_bytes` and `n42_qmdb_entry_punched_bytes`
-come with stages 2 and 3 (nothing produces them yet); the ratio then becomes
-(file + relocated - punched) over live slots. No per-100-block log line: the node has no periodic
+(default 2,000, 0 disables). `n42_qmdb_entry_relocated_bytes` came with stage 2
+(`EntryStoreStats::relocated_bytes`, the complete groups in `entries.relocated`), and the ratio
+is now (file + relocated) over live slots; `n42_qmdb_entry_punched_bytes` comes with stage 3,
+and the ratio then becomes (file + relocated - punched) over live slots. No per-100-block log line: the node has no periodic
 QMDB-counter log to put it in (the read view's lag line is about the view, not the tree).
 
 ## 4. What this does not do
@@ -175,9 +178,46 @@ QMDB-counter log to put it in (the read view's lag line is about the view, not t
 | --- | --- | --- |
 | 0 | metrics of 3.7 (done in 301f82916) | unit tests; one fleet leg shows the growth rates in the table of section 1 |
 | 1 | read view resolves slots through atomic `Offsets` (3.3), no relocation yet | existing read-view and proof tests; an X22 control pair (the hot read path changes: expect noise) |
-| 2 | `entries.relocated`, tagged records, `open_existing` from two files, `Offsets` top bit, checkpoint fields; compaction runs but never punches | tests: compact, restart, same root and same proofs; same portable snapshot bytes before and after; undo across a compacted boundary refused by construction (3.4a) and tested |
+| 2 | `entries.relocated`, tagged records, `open_existing` from two files, `Offsets` top bit, checkpoint fields; compaction runs but never punches (landed on `design/qmdb-compact-stage2`: d0f98a5d6 refactor, 721c9e744 file and records, 7f96f529c `compact_twigs`, 4b07c285d checkpoint v2 and forest, be7b4e93a export refusal and gauge; differences from this design below the table) | tests: compact, restart, same root and same proofs; same portable snapshot bytes before and after; undo across a compacted boundary refused by construction (3.4a) and tested |
 | 3 | scheduler on the pruner thread, epoch-deferred punching, `punched` in the checkpoint | tests with a fake epoch; a fleet leg reads `entry_bytes_per_live_slot` falling to a plateau; `roll --kill` under load restarts on a punched file |
 | 4 | per-twig `base + u32` offsets for compacted twigs | heap growth per slot halves on the metric; control pair |
+
+Stage 2 as landed, where it differs from or adds to the text above:
+
+- **Candidates (3.4).** Besides (a) a last slot below `below_slot`, the twig's last retirement
+  must be before it too (`Twig::last_retired_at < below_slot`, the `trim_dead_twigs` rule): a
+  twig that only has old slots can still have one retired by a block an undo record still holds,
+  and undoing that block revives the slot, which would need its payload. (c) is read as "the
+  slots that died since the twig's last group are at least the threshold, and at least one". A
+  reopened tree reads every twig as never retired, so after a restart `below_slot` must also be
+  at or below every undo record held across it; `QmdbForest::compact_twigs` clamps the horizon
+  to the oldest cursor its own undo records can rewind to. Every group's leaves are hashed from
+  its own bytes and checked against the twig's leaf root before it is written. The scan starts
+  at twig 0 every call (no cursor yet: stage 3).
+- **Read view offsets (3.3, order note).** `entry_offset(slot)` keeps answering in
+  `entries.log` for a relocated slot, from a copy of the twig's main-file offsets kept per
+  relocated twig (16 KiB a compacted twig). That is what keeps the view unchanged in this stage;
+  stage 1 (slot-resolving view) or stage 3 (punching) retires the copy.
+- **Open (3.6).** The walk of `entries.relocated` stops at the first group that is torn, fails
+  its CRC, is malformed, or names a twig not wholly inside the kept slots (a shorter historical
+  prefix, or a main file cut back by an archive restore), and a writable open cuts it there. In
+  stage 2 that loses nothing; stage 3 must revisit it, because a cut group whose old range was
+  punched would be lost data. `relocated_len` in the checkpoint is recorded, not enforced.
+- **Checkpoint.** `ForestCheckpoint::VERSION` is 2 and is always written: a binary from before
+  this stage refuses the checkpoint of a node that ran this one (its version check), so a
+  downgrade needs a version 1 checkpoint written by hand. Version 1 reads as `relocated_len = 0`
+  and serializes back to the same bytes (`legacy-codec` fixture test).
+- **Snapshots and export (3.2 consequence).** `QmdbEntrySnapshot` carries `leaf_hash` in memory
+  (`snapshot()`, `from_snapshot`, and `set_entry_file`, which writes such a slot as an empty
+  placeholder in `entries.log` plus a group holding the hash). The serialized layout of heap
+  checkpoints and deltas is unchanged, so serializing a hash-only entry is an error instead of a
+  silent loss of the hash; no file-mode path serializes one. `portable_export` refuses with
+  `NodeStateError::PortableCompacted`. The verification row's "same portable snapshot bytes
+  before and after" cannot hold once a twig has a hash-only slot: the export is refused. The
+  tests check the same root, twig roots and proofs instead, and the snapshot round trip.
+- **Undo (3.4a).** Besides the store refusing a truncation into a relocated twig, `apply_undo`
+  checks up front, before it changes anything, and returns `QmdbUndoError::RelocatedTwig` or
+  `QmdbUndoError::HashOnlySlot` (a revival of a payload-less slot).
 
 Each stage is a bench pair (X22 control against the change, `scripts/fleet7-runs` stage) before
 it is adopted; stage 0 needs none. Stages 0-2 are additive and can land behind

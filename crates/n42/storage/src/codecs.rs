@@ -12,22 +12,22 @@
 use crate::{StorageError, StorageResult};
 use n42_primitives::{BeaconBlock, BeaconState};
 
-/// Encode a BeaconState to JSON bytes
+/// Encode a `BeaconState` to JSON bytes
 pub fn encode_beacon_state(state: &BeaconState) -> StorageResult<Vec<u8>> {
     serde_json::to_vec(state).map_err(Into::into)
 }
 
-/// Decode a BeaconState from JSON bytes
+/// Decode a `BeaconState` from JSON bytes
 pub fn decode_beacon_state(bytes: &[u8]) -> StorageResult<BeaconState> {
     serde_json::from_slice(bytes).map_err(deserialization_error)
 }
 
-/// Encode a BeaconBlock to JSON bytes
+/// Encode a `BeaconBlock` to JSON bytes
 pub fn encode_beacon_block(block: &BeaconBlock) -> StorageResult<Vec<u8>> {
     serde_json::to_vec(block).map_err(Into::into)
 }
 
-/// Decode a BeaconBlock from JSON bytes
+/// Decode a `BeaconBlock` from JSON bytes
 pub fn decode_beacon_block(bytes: &[u8]) -> StorageResult<BeaconBlock> {
     serde_json::from_slice(bytes).map_err(deserialization_error)
 }

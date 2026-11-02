@@ -89,12 +89,12 @@ struct State {
 }
 
 impl State {
-    fn finished(&self) -> bool {
+    const fn finished(&self) -> bool {
         self.done.is_some()
     }
 
     /// Nobody is working on it and no later request may be answered from it.
-    fn claimable(&self) -> bool {
+    const fn claimable(&self) -> bool {
         (self.owner.is_none() && !self.finished()) || (self.finished() && !self.retain)
     }
 }

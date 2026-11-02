@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long)]
     timestamp: u64,
     /// The genesis block's difficulty; gov5's default is 131072, its newer
-    /// HotStuff chains use 0.
+    /// `HotStuff` chains use 0.
     #[arg(long, default_value_t = 131_072)]
     difficulty: u64,
     /// The genesis block's gas limit; gov5's `params.GenesisGasLimit`.

@@ -1,0 +1,119 @@
+{
+  "_doc": "Receipt signing message: block_hash(32) || block_number u64 LITTLE-endian || receipts_root(32) = 72 bytes; signature = blst Sign(sk, message, dst BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_); timestampMs is not signed. sdk_compat = the vector of sdk_compat_test.go (hash[i]=i, root[i]=0xff-i, number 13220145); header_full = header.json's full header (its hash, number, ReceiptHash). sdk_request_body = the exact bytes evmsdk MobileVerifyClient.SubmitReceipt POSTs (json.Marshal of a map: keys sorted, hex WITHOUT 0x, numbers as JSON numbers) for device 0 on header_full with timestampMs 1784372012345. server_outcomes: a CohortCoordinator-backed handler with devices 0,1,2 committed (indices as in registry.json after step 1) and only header_full known, the cases run IN ORDER (the first receipt for a block opens its window). The wrong-number answer depends on whether the window is open: before, the coordinator's 'receipt number X, block is Y'; after, Collector.Add's 'got N/<hash[:8] hex> want M/<hash[:8] hex>'. Intake closes when the coordinator sees height N+1.",
+  "dst": "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_",
+  "vectors": [
+    {
+      "name": "sdk_compat",
+      "block_hash": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "block_number": 13220145,
+      "receipts_root": "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
+      "message": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f31b9c90000000000fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
+      "signatures": [
+        {
+          "device": 0,
+          "signature": "aac4132f31e6fd25e0c886a9b68cce7052412ab23ce915a9a9abf28f59b1bdbae812bfea8354b54f579a73d950a17c9b159cf843ef34cdfb8ff600ce894542ac2d32af088a438d280b7f5b962a256e1f0918b1ebd19507f7f5f69e2635e9ccee"
+        },
+        {
+          "device": 1,
+          "signature": "91df0d61b4124b26c1a39a415499695084e8d3920a738bcc4399573083e6cd349ae30926254c643f4b6f583d2437003a064f30dcbaf3e249061b69c636ce2f36e7d9b112a3e6168679b402b8bb835c1a74785d863df603788b16726c2aded390"
+        },
+        {
+          "device": 2,
+          "signature": "962367026fbda2a73ecdfffe707d26cdf8179fbcceb7e2c0231b2bd64e2f8e09f3f83bb90763f8f22c2a2be6a9b1315718b21fc07c101b8d813bc0c27b7cc0581344e6b16d45853a5ba189fd335a303338655815d5ed0f370eadd7e7b0698bc8"
+        },
+        {
+          "device": 3,
+          "signature": "8685d02bc8bd380ca0a766035dfd9b607edf8b9b351cc1a4938bf8ed78b352de0afee21bb03d69b0bcbfc8dad8cfff831855d294030861ce17a28d156e9d0b2a8c014d87f01905525fef7241c10829bac45ad4773f299c2e99a4ce62c1ac405b"
+        }
+      ]
+    },
+    {
+      "name": "header_full",
+      "block_hash": "52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb",
+      "block_number": 4000123,
+      "receipts_root": "0505050505050505050505050505050505050505050505050505050505050505",
+      "message": "52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb7b093d00000000000505050505050505050505050505050505050505050505050505050505050505",
+      "signatures": [
+        {
+          "device": 0,
+          "signature": "a9ed9fec001386bd1fab6f4698ff9a9fdbe4570871c1dfa87adac4fe2976e5297d76c74131f4005f40c815ff3df11fbb08aae89119b02ee5f34bd864d59b53d814f7161f4433693466e873809a41798527db86e3827aec86513ceacea5c44b9a"
+        },
+        {
+          "device": 1,
+          "signature": "8cb0ca2c0c87b1c767aa0f74122daedcdfa90ecf7947049556b5a247744f588d84772f451b18dcd8b4017690a1653e5702acb4e21d245be39c513c7cf63e8a6ea2305cc8c0bbf846d573fc6f065799d74f7e29453a419bc29c444ab6c063b838"
+        },
+        {
+          "device": 2,
+          "signature": "833bf9d68a30fe4cc9ceeaae6ae33b14d326afcc49f3002d9b1f3c5ce0a8ded4bad0000c7d560bc696d0780ab37dd1f9065f10207686ccc5dd247a74b4d80ab44f32372aceccffd86163134fa2b98695da5b179161b70d7d94a288fff75b6e91"
+        },
+        {
+          "device": 3,
+          "signature": "83ad938ca244655cd72ec1c64c5ca4939ce134fdc076192b46d8c039a6b20eb8e0f5ed18e18cc5acd7d847248dce71900357c98396e92e523813e8dc752c30def465a9bb7f0552cff29606aae0a0417a2be271607f8d58707d03eadb4a7cbc73"
+        }
+      ]
+    }
+  ],
+  "sdk_request_body": "{\"blockHash\":\"52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000123,\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"a9ed9fec001386bd1fab6f4698ff9a9fdbe4570871c1dfa87adac4fe2976e5297d76c74131f4005f40c815ff3df11fbb08aae89119b02ee5f34bd864d59b53d814f7161f4433693466e873809a41798527db86e3827aec86513ceacea5c44b9a\",\"timestampMs\":1784372012345}",
+  "sdk_response_index": 0,
+  "server_outcomes": [
+    {
+      "case": "unknown block (no header for the hash): 404",
+      "request_body": "{\"blockHash\":\"dead000000000000000000000000000000000000000000000000000000000000\",\"blockNumber\":4000123,\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"838321bdc77c2f6c473223a77ca5de44e3214c2d900685e440ed47bbb900af270917684230ade0a808a72c89f2e41eec17ede2fcac169b68cb7bba34451a8cd8ec37cf1f5bcc827fb17f723f7943398e690bcc3a086c88fc1cf1bcb8996fa6fd\",\"timestampMs\":1784372012345}",
+      "status": 404,
+      "body": "{\"error\":\"mobileverify: unknown block\"}\n"
+    },
+    {
+      "case": "bad hex field length (block hash 31 bytes): 400",
+      "request_body": "{\"blockHash\":\"52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fce\",\"blockNumber\":4000123,\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"a9ed9fec001386bd1fab6f4698ff9a9fdbe4570871c1dfa87adac4fe2976e5297d76c74131f4005f40c815ff3df11fbb08aae89119b02ee5f34bd864d59b53d814f7161f4433693466e873809a41798527db86e3827aec86513ceacea5c44b9a\",\"timestampMs\":1784372012345}",
+      "status": 400,
+      "body": "{\"error\":\"bad hex field lengths\"}\n"
+    },
+    {
+      "case": "wrong number while no window is open for the block",
+      "request_body": "{\"blockHash\":\"52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000124,\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"83e4dfb79d948334c7f904f060dc375bc52e9f344c2af60fbf2c6fcd3c0e6f28fe9f7d2b0d1658c98e1248b52d47a5f900c83375a41d0af7c0e7f14c91270e5cea470b6d2fbf6227d6591252e5e8a8f22371e3b4723569afb6eaa3c8885a1e8d\",\"timestampMs\":1784372012345}",
+      "status": 403,
+      "body": "{\"error\":\"mobileverify: receipt is for a different block: receipt number 4000124, block is 4000123\"}\n"
+    },
+    {
+      "case": "unregistered key (device 3, valid signature)",
+      "request_body": "{\"blockHash\":\"52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000123,\"pubkey\":\"ad28c09d369a40c5d6317f8aeb5cfdc85c7a6321db19bd10512f0a0acac684c930f51b8a5b9960d9b001a62294b2df13\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"83ad938ca244655cd72ec1c64c5ca4939ce134fdc076192b46d8c039a6b20eb8e0f5ed18e18cc5acd7d847248dce71900357c98396e92e523813e8dc752c30def465a9bb7f0552cff29606aae0a0417a2be271607f8d58707d03eadb4a7cbc73\",\"timestampMs\":1784372012345}",
+      "status": 403,
+      "body": "{\"error\":\"mobileverify: verifier not registered\"}\n"
+    },
+    {
+      "case": "bad signature (device 1's signature under device 0's pubkey)",
+      "request_body": "{\"blockHash\":\"52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000123,\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"8cb0ca2c0c87b1c767aa0f74122daedcdfa90ecf7947049556b5a247744f588d84772f451b18dcd8b4017690a1653e5702acb4e21d245be39c513c7cf63e8a6ea2305cc8c0bbf846d573fc6f065799d74f7e29453a419bc29c444ab6c063b838\",\"timestampMs\":1784372012345}",
+      "status": 403,
+      "body": "{\"error\":\"mobileverify: invalid receipt signature\"}\n"
+    },
+    {
+      "case": "valid receipt from device 0",
+      "request_body": "{\"blockHash\":\"52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000123,\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"a9ed9fec001386bd1fab6f4698ff9a9fdbe4570871c1dfa87adac4fe2976e5297d76c74131f4005f40c815ff3df11fbb08aae89119b02ee5f34bd864d59b53d814f7161f4433693466e873809a41798527db86e3827aec86513ceacea5c44b9a\",\"timestampMs\":1784372012345}",
+      "status": 200,
+      "body": "{\"index\":0}\n"
+    },
+    {
+      "case": "wrong number once the block's window is open (Collector.Add's message)",
+      "request_body": "{\"blockHash\":\"52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000124,\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"83e4dfb79d948334c7f904f060dc375bc52e9f344c2af60fbf2c6fcd3c0e6f28fe9f7d2b0d1658c98e1248b52d47a5f900c83375a41d0af7c0e7f14c91270e5cea470b6d2fbf6227d6591252e5e8a8f22371e3b4723569afb6eaa3c8885a1e8d\",\"timestampMs\":1784372012345}",
+      "status": 403,
+      "body": "{\"error\":\"mobileverify: receipt is for a different block: got 4000124/52c027b145765dab want 4000123/52c027b145765dab\"}\n"
+    },
+    {
+      "case": "valid receipt from device 2 with a 0x-prefixed blockHash",
+      "request_body": "{\"blockHash\":\"0x52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000123,\"pubkey\":\"a223fc9333906c0bd5ecb218a4ea9029c33177060ac583d2d1e8e15616b123e73ddfa65981d7dbb4d0f4349263f94a02\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"833bf9d68a30fe4cc9ceeaae6ae33b14d326afcc49f3002d9b1f3c5ce0a8ded4bad0000c7d560bc696d0780ab37dd1f9065f10207686ccc5dd247a74b4d80ab44f32372aceccffd86163134fa2b98695da5b179161b70d7d94a288fff75b6e91\",\"timestampMs\":1784372012345}",
+      "status": 200,
+      "body": "{\"index\":1}\n"
+    },
+    {
+      "case": "valid receipt from device 1 after the chain reached N+1",
+      "request_body": "{\"blockHash\":\"52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000123,\"pubkey\":\"9199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605\",\"receiptsRoot\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signature\":\"8cb0ca2c0c87b1c767aa0f74122daedcdfa90ecf7947049556b5a247744f588d84772f451b18dcd8b4017690a1653e5702acb4e21d245be39c513c7cf63e8a6ea2305cc8c0bbf846d573fc6f065799d74f7e29453a419bc29c444ab6c063b838\",\"timestampMs\":1784372012345}",
+      "status": 403,
+      "body": "{\"error\":\"mobileverify: collection window closed\"}\n"
+    },
+    {
+      "case": "GET instead of POST",
+      "status": 405,
+      "body": "{\"error\":\"POST only\"}\n"
+    }
+  ]
+}

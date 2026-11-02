@@ -10,6 +10,7 @@ exclude.workspace = true
 
 [dependencies]
 n42-tx-types.workspace = true
+n42-header.workspace = true
 reth-ethereum-primitives.workspace = true
 n42-clique-utils.workspace = true
 once_cell.workspace = true

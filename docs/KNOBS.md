@@ -10,9 +10,9 @@ file differ, so changing a row's status means changing the profile in the same c
 2026-10-27 the profile reproduces the node-side environment of an X22 leg (loop351 stage fl): the
 adopted stage sets X3..X22, the X22 base set (the loop351 `ALLA` line and its per-leg additions, each
 row noting "X22 base set: `value`"), and the tuned values whose compiled default differs. Two groups
-stay with the launcher: the `bench-only` rows the leg also passes (`N42_FRAME_GATEWAYS`,
+stay with the launcher: the `bench-only` rows the leg also passes (`N42_BENCH_UNSAFE`, which the gateway and the direct ingest need, `N42_FRAME_GATEWAYS`,
 `N42_FRAME_ATTEST_MIN`, `N42_IMPORT_ONCE`, `N42_HASHED_TABLES=off`, `N42_QMDB_READS=on`,
-`N42_ACCOUNT_HISTORY=off`, `N42_SETTLEMENT_TAGS=legacy`, `N42_PERSIST_QMDB_IN_SCOPE=1`,
+`N42_ACCOUNT_HISTORY=off`, `N42_CANON_NOTIFY_LEAN=1`, `N42_SETTLEMENT_TAGS=legacy`, `N42_PERSIST_QMDB_IN_SCOPE=1`,
 `N42_STORAGE_OP_METRICS=0`, `N42_LOCK_SITES=1`), and the non-`N42_*` variables `MALLOC_CONF`,
 `TOKIO_WORKER_THREADS`, `RAYON_NUM_THREADS`. A knob whose Meaning says "Needs `frameBlocks` in the
 genesis" is chain-gated: once the chain spec is parsed, and before any such knob is read, the binary
@@ -23,7 +23,10 @@ removes it again when the profile set it on a chain whose genesis does not set `
 **Truthiness (since the knob-profile branch).** Every former presence-only and `!= "0"` switch is read
 by `n42_env::flag`: on = `1|true|on|yes`, off = `0|false|off|no|""` (case-insensitive, trimmed),
 anything else warns once and reads the default; so notes 4-5 below describe the tree before it.
-The `== "1"` switches are unchanged.
+Since audit 2026-10 E-10 every switch the x22 profile sets to `1` is read the same way (a test in
+`crates/n42/env/src/profile.rs` scans the sources for one compared with `== "1"`); other `== "1"`
+switches are unchanged. **An empty value is off**, also for a default-on switch: `NAME=` turns off
+`N42_PARALLEL_STATE_COMMIT` or `N42_FOLLOWER_EXEC_GATE`, where unsetting the variable keeps the default.
 
 1. Generated from an audit of the tree at commit 393cc1e70 (audit/maturity-2026-10): 273 knobs, plus the four the hardening branches added (`N42_TX_INGEST_ALLOW_REMOTE`, `N42_PAYLOAD_SERVE_ALLOW_REMOTE`, `N42_BENCH_UNSAFE`, `N42_RAW_CHANNEL_TIMEOUT_MS`) read by code under bin/n42, crates/n42, crates/chain-state and crates/storage; none is read from a config file or CLI flag.
 2. Almost every knob is read once, behind a `OnceLock`/`static`, at first use. Set it in the environment before the process starts; changing it afterwards has no effect. A few are read at service construction without a cache ("startup"), still once per process.
@@ -94,7 +97,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_THP_DISABLE` | off (1) | `1` | prctl PR_SET_THP_DISABLE for this process. | `bin/n42:main.rs:50` | bench-only |
 | `N42_TX_INGEST` | unset: ingest server off (value: SocketAddr) | see Default | Address of the transaction ingest server (unauthenticated; loopback). | `bin/n42:main.rs:802` | unknown |
 | `N42_TX_INGEST_ALLOW_REMOTE` | off (1 enables) | `1` | Allow the ingest server to bind off loopback; refused outright with `N42_TX_INGEST_DIRECT`, `N42_INGEST_VERIFY=shard|leader` or attested frames (audit/ingest-hardening). | `bin/n42:main.rs` | default |
-| `N42_BENCH_UNSAFE` | off (1 enables) | `1` | Start-up acknowledgement required before `N42_INGEST_VERIFY=shard|leader` is accepted (audit/ingest-hardening). | `bin/n42:main.rs` | bench-only |
+| `N42_BENCH_UNSAFE` | off (1 enables) | `1` | Start-up acknowledgement required before `N42_INGEST_VERIFY=shard|leader`, `N42_FRAME_GATEWAYS` or `N42_TX_INGEST_DIRECT` is accepted (audit/ingest-hardening; gateways and direct since audit 2026-10 C-2/C-3). | `bin/n42:main.rs` | bench-only |
 | `N42_TX_QUEUE` | off (any value enables) | presence only (`=0` still counts) | Enable the builder's tx queue (fed by ingest, pruned per canonical block). | `bin/n42:main.rs:607` | experimental |
 | `N42_TX_QUEUE_DRAINER` | off (any value enables) | presence only (`=0` still counts) | Drain the queue inbox off the builder thread. | `bin/n42:main.rs:609,620` | experimental |
 | `N42_VOTE_BEFORE_SLOT` | off (1) | `1` | Vote before the slot (held execution); incompatible with IMPORT_ONCE. | `bin/n42:import_once.rs:62; h2-execution:driver.rs:172` | experimental |
@@ -230,7 +233,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_TX_INGEST_ASYNC` | off (any value enables) | presence only (`=0` still counts) | Ingest answers frames asynchronously. | `tx-ingest:lib.rs:1089` | experimental |
 | `N42_TX_INGEST_ASYNC_FRAMES` | ASYNC_FRAMES_IN_FLIGHT | integer | N42_TX_INGEST_ASYNC_FRAMES: frames a connection may have recovering or awaiting admission before its next answer waits; the default above. | `tx-ingest:lib.rs:208` | default |
 | `N42_TX_INGEST_BLOCK_TXS` | 0 | integer | Per-block allowance the ingest gate grants (0 = old gate). | `tx-ingest:lib.rs:1029` | undocumented-before |
-| `N42_TX_INGEST_DIRECT` | off (any value enables) | presence only (`=0` still counts) | Ingest feeds the tx queue directly (queue is a tx's only holder). | `tx-ingest:lib.rs:389` | unsafe-bench |
+| `N42_TX_INGEST_DIRECT` | off | `n42_env::flag`: 1/true/on/yes enable, 0/false/off/no disable | Ingest feeds the tx queue directly (queue is a tx's only holder), past the pool's checks; the node refuses it without `N42_BENCH_UNSAFE=1`. | `tx-ingest:lib.rs:456` | unsafe-bench |
 | `N42_TX_INGEST_GATE_FOR_BLOCK` | off | `1` (or the knob's own value; see code) | Opt-in opening of the ingest gate while a block is pending. | `tx-ingest:lib.rs:562` | unknown |
 | `N42_TX_INGEST_GATE_MAX_WAIT_MS` | 15_000 | integer | N42_TX_INGEST_GATE_MAX_WAIT_MS, 15 seconds by default, 0 to wait for ever (the behaviour before this). The gate is backpressure, not a rule: wait... | `tx-ingest:lib.rs:479` | default |
 | `N42_TX_INGEST_GATE_STRICT` | off | `1` (or the knob's own value; see code) | that is. N42_TX_INGEST_GATE_STRICT=1 is the same as leaving the opt-in unset and is read for the older runners. | `tx-ingest:lib.rs:563` | undocumented-before |
@@ -247,10 +250,10 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_ALTSIG_SENDER_CACHE` | 1 << 20 | integer | Sized by N42_ALTSIG_SENDER_CACHE (entries, a power of two; default 2^20, about six blocks of the bench tier). X22 base set: `4194304` (compiled default differs). | `tx-types:sender_cache.rs:49` | adopted |
 | `N42_ED25519_BATCH` | 64 (max 256) in prod; 128 in a #[ignore] timing test | integer | Ed25519 batch-verification size at ingest (prod: sender_cache.rs; timing test reads it too). X22 base set: `256` (compiled default differs). | `tx-types:alt_sig.rs:847; tx-types:sender_cache.rs:203` | adopted |
 | `N42_ED25519_KEY_CACHE` | on (0 disables) | on unless `0` | key is the sender's, and senders repeat; N42_ED25519_KEY_CACHE=0 turns the cache off. Bounded by sharding: each of 256 shards keeps at most KEY_... | `tx-types:sender_cache.rs:230` | default |
-| `N42_ED25519_MERGE` | on (0 disables) | on unless `0` | Merged (single-equation) Ed25519 batch verification; 0 falls back to dalek verify_batch. | `tx-types:alt_sig.rs:414` | default |
+| `N42_ED25519_MERGE` | on (0 disables) | on unless `0` | Merged Ed25519 batch verification (one key point per sender); 0 keeps one term per signature. Same cofactored verdict either way (no longer falls back to dalek's cofactorless verify_batch). | `tx-types:alt_sig.rs:415` | default |
 | `N42_FRAME_ATTEST_MIN` | 1 (only read when FRAME_GATEWAYS is set) | integer | Distinct gateways a frame needs (with FRAME_GATEWAYS). Bench-only: only meaningful with the bench gateway key of `N42_FRAME_GATEWAYS`. | `tx-types:frame.rs:231` | bench-only |
 | `N42_FRAME_BLOCKS` | off | `1` (or the knob's own value; see code) | N42_FRAME_BLOCKS=1, read once: this node builds, describes and checks frame-aligned blocks (phase B of step 1). Meaningful only on a chain whose ... X22 base set: `1`. Needs `frameBlocks` in the genesis. | `tx-types:frame.rs:88` | adopted |
-| `N42_FRAME_GATEWAYS` | unset: no gateway attestation | see Default | List of frame gateways whose attestation a frame needs. Bench-only: a trusted bench gateway key, not a product trust root. | `tx-types:frame.rs:230` | bench-only |
+| `N42_FRAME_GATEWAYS` | unset: no gateway attestation | see Default | List of frame gateways whose attestation a frame needs. Bench-only: a trusted bench gateway key, not a product trust root; the node refuses it without `N42_BENCH_UNSAFE=1`. | `tx-types:frame.rs:230` | bench-only |
 | `N42_INGEST_SHARD` | unset (required as i/n when INGEST_VERIFY=shard) | see Default | This node's i/n shard of ingest signature work (INGEST_VERIFY=shard). | `tx-types:sender_cache.rs:163` | unsafe-bench |
 | `N42_INGEST_VERIFY` | all (leader, shard) | see Default | N42_INGEST_VERIFY=leader, against the default all. The supply is a ceiling every member pays alike: each one ingests every transaction and veri... | `tx-types:sender_cache.rs:109,162` | unsafe-bench |
 
@@ -313,6 +316,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_GOSSIP_HANDLER_QUEUE` | 5000 | integer | Gossipsub handler queue length. X22 base set: `64` (compiled default differs). | `h2-net:config.rs:130` | adopted |
 | `N42_GOSSIP_MAX_IHAVE` | 5000 | integer | Gossipsub max IHAVE messages. X22 base set: `500` (compiled default differs). | `h2-net:config.rs:131` | adopted |
 | `N42_HALT_ON_COMMIT_INVALID` | on (0 disables) | on unless `0` | Stop voting and proposing (keep following) when the execution layer answers `Invalid` to a commit forkchoice; see docs/OPERATOR_FAULTS.md. | `h2-node:service.rs` (startup) | default |
+| `N42_H2_MAX_INBOUND` | 128 | integer (0 or unparsable: the default) | Inbound libp2p connections accepted at most (audit 2026-10 B-3). A fleet of seven holds six. | `h2-net:transport.rs` (`max_inbound_connections`) | default |
 | `N42_H2_REMEMBERED_BODIES` | REMEMBERED_BODIES | integer | How many bodies the store keeps: N42_H2_REMEMBERED_BODIES, else REMEMBERED_BODIES. An environment knob so a round can bookend the old 4,096 again... | `h2-node:service.rs:751` | default |
 | `N42_H2_TRACE_MSGS` | off | `1` (or the knob's own value; see code) | N42_H2_TRACE_MSGS=1: one info line per consensus message sent or received, with its kind and view, so a round's hops can be timed across the flee... | `h2-node:service.rs:4795` | bench-only |
 | `N42_MAX_GOSSIP_MB` | 1 MiB (1<<20 bytes) | integer | reads N42_MAX_GOSSIP_MB, and two clients on one chain that disagree about this do not merely differ in throughput — the one with the smaller cap ... | `h2-net:config.rs:57` | default |
@@ -322,8 +326,8 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_TAKE_COMPACT` | off | `1` (or the knob's own value; see code) | N42_TAKE_COMPACT, read once: the proposer asks its execution layer for a build-on-own answer *without the transactions* -- the header, the small ... X22 base set: `1`. | `h2-execution:driver.rs:892` | adopted |
 | `N42_VOTE_AGGREGATE_VERIFY` | off | `1` (or the knob's own value; see code) | Batched vote verification on a leader. X22 base set: `1`. | `h2-node:service.rs:4790` | adopted |
 | `N42_VOTE_LOG_FATAL_AFTER` | 3 | integer (`0` disables) | Consecutive vote-log write/fsync failures after which the validator stops and exits non-zero (code 3); see docs/OPERATOR_FAULTS.md. | `h2-node:service.rs` (startup) | default |
-| `N42_VOTE_LOG_NOSYNC` | off | `1` (or the knob's own value; see code) | Skip the vote-log sync (bench knob; gives up crash safety). | `h2-node:persistence.rs:486` | unsafe-bench |
-| `N42_VOTE_TRANSPORT` | gossip (direct, both) | see Default | Vote transport: direct, both, or gossip. X22 base set: `direct` (compiled default differs). | `h2-node:direct_votes.rs:43` | adopted |
+| `N42_VOTE_LOG_NOSYNC` | off | `1`, and only with `N42_BENCH_UNSAFE=1` (h2_validator refuses to start without it) | Skip the vote-log sync (bench knob; gives up crash safety). | `h2-node:persistence.rs:506` | unsafe-bench |
+| `N42_VOTE_TRANSPORT` | gossip (direct, both) | see Default | Vote transport: direct, both, or gossip. X22 base set: `direct` (compiled default differs). Needs `frameBlocks` in the genesis: a chain a gov5 member can join keeps the mesh (audit 2026-10 E-5). | `h2-node:direct_votes.rs:43` | adopted |
 | `N42_YAMUX_WINDOW_MB` | ignored (only logs a warning: unsupported by libp2p 0.57) | see Default | Yamux window; unsupported, only logs a warning. | `h2-net:config.rs:247` | bench-only |
 
 ## Chain state and storage provider (chain-state, storage/provider)
@@ -333,7 +337,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_ACCOUNT_HISTORY` | unset: index written; off skips it | see Default | Whether the AccountsHistory index write is skipped (N42_ACCOUNT_HISTORY=off). Read once; on, any other value or no value writes it (reth's be... Bench-only: `off` drops the AccountsHistory index. | `storage/provider:providers/n42_persist.rs:118` | bench-only |
 | `N42_HASHED_TABLES` | unset: hashed state tables written (`off` stops them) | `off` | Whether the hashed state tables are no longer written (QMDB reader hooks). Read once. Bench-only: `off` is the bench's storage mode; a product node decides it separately. | `storage-api:n42_state.rs:81` | bench-only |
 | `N42_ACCOUNT_HISTORY_SCAN_MAX` | DEFAULT_ACCOUNT_HISTORY_SCAN_MAX | integer | (N42_ACCOUNT_HISTORY_SCAN_MAX overrides). A read that finds no change within that many blocks of a longer range returns an error that names the m... | `storage/provider:providers/n42_persist.rs:155` | default |
-| `N42_CANON_NOTIFY_LEAN` | off | `1` (or the knob's own value; see code) | Read once from N42_CANON_NOTIFY_LEAN (1 turns it on; default off). Measured in loop351 stage k (E=1, seven validator keys on one execution laye... | `chain-state:in_memory.rs:984` | adopted |
+| `N42_CANON_NOTIFY_LEAN` | off | `1` (or the knob's own value; see code) | Read once from N42_CANON_NOTIFY_LEAN (1 turns it on; default off). Measured in loop351 stage k (E=1, seven validator keys on one execution laye... Bench-only (audit 2026-10 E-1): notifications carry no execution outcome, so `logs`/receipt subscriptions, RPC caches and pool maintenance see nothing; was in X22 until 2026-10-28. | `chain-state:in_memory.rs:984` | bench-only |
 | `N42_OVERLAY_FILTER` | on (0 disables) | on unless `0` | Whether the filters are on (N42_OVERLAY_FILTER=0 turns them off; on by default). | `storage/provider:providers/state/overlay_filter.rs:61` | default |
 | `N42_OVERLAY_FILTER_CAP` | 1024 (floor 64) | integer | Max entries of the overlay filter side map. | `storage/provider:providers/state/overlay_filter.rs:55` | undocumented-before |
 | `N42_OVERLAY_READS` | local overlay (upstream selects reth overlay) | see Default | N42: N42_OVERLAY_READS=upstream reads state under in-memory blocks through upstream's flattened OverlayStateProvider instead of MemoryOverlaySt... | `storage/provider:providers/blockchain_provider.rs:63` | experimental |

@@ -1,0 +1,93 @@
+# 2026-10 5M 审计:第三轮
+
+第二轮(`ROUND2.md`)全部处理完后做的第三轮深度审计。五路并行只读审阅:第二轮修复的回归复核、
+网络输入解析(h2-net/h2-wire/h2-node 消费端)、engine-types 执行确定性、共识核心薄弱区、
+RPC/快照/tx-queue/mobile。每项修复前先按代码核实,先写复现测试(修复前失败)。
+
+编号:R3-G(回归)、R3-N(网络)、R3-E(执行)、R3-C(共识)、R3-P(RPC/快照/队列/mobile)。
+
+## 发现
+
+| id | 级别 | 位置 | 问题 | 修复要点 |
+|---|---|---|---|---|
+| R3-P1 | P1 | `bin/n42/src/init_snapshot.rs:190-297` | `init` 只核对 JSONL 首行自报的 root,账户/槽位不与 portable 快照对照就写入 MDBX;默认读 MDBX,篡改的 dump 让节点在错误前状态上执行 | 先验证 portable 快照得到树,逐行对照每个账户/槽位的叶值,地址严格递增,最后按 gov5 `verifyExportCoverage` 核对覆盖 |
+| R3-P2 | P1 | `tx-queue/src/lib.rs`, `bin/n42/src/main.rs:817-886` | 队列无上限;池的淘汰/替换不同步到队列;非 nonce 拒绝永远 give_back,外部可复现 round-44 形状 | 有界 lane、只喂 pending 或镜像 Discarded/Replaced、多次拒绝后丢弃(热路径,需 A/B) |
+| R3-P3 | P2 | `tx-queue/src/lib.rs:6413,6476` | 同 (sender, nonce) 的加价替换被当重复丢弃 | 费用更高且未被取走时替换 |
+| R3-P4 | P2 | `bin/n42/src/main.rs:937-972`, `tx-queue/src/lib.rs:3781` | 规范通知 `Lagged` 只告警:跳过的块不 prune;`settle_own_block` 丢掉被跳高度上自己块的交易 | Lagged 时从 provider 补齐 `pruned_through()+1..head` |
+| R3-P5 | P2 | `h2_validator.rs:367,703`, `mobile-service/src/service.rs:239`, `mobile-verify/src/verification.rs:51` | mobile 阈值 1、期望 receipts root 恒为 None:任何人一张收据即 `attested`,诚实收据永远聚合不成 | 传真实块号与 receipts root;root 未知不报 attested |
+| R3-P6 | P2 | `mobile-verify/src/attestation.rs:54,136`, `mobile-service/src/rpc.rs:102` | 注册无 PoP(rogue key 聚合)、注册表无界、收据与共识共用 DST | 注册带 PoP、上限、独立 DST |
+| R3-P7 | P2 | `mobile-service/src/http.rs:38-160` | 单线程阻塞 HTTP,无读写超时,头部无长度上限 | 超时、头部 `take(16 KiB)`、有界并发 |
+| R3-P8 | P2 | `bin/n42/src/consensus_ext.rs:154-235`, `consensus-client/src/miner.rs:671` | APoS:公开订阅任务泄漏;验证队列可被公开调用占满 | 监听 `sink.closed()`;入队前校验成员与块哈希 |
+| R3-P9 | P3 | `h2-el-rpc/src/transport.rs:181,236` | EL 响应体无大小上限(`--el-rpc` 也走它) | 按字节上限读取 |
+| R3-N1 | P1 | `h2-net/src/rpc.rs:75-95`, `status.rs:259-308` | 帧读取每读一块就从头重扫;零长度可跳过块不限个数,O(N²) 钉住 tokio worker;声明长度直接 `vec![0; len]` | 增量扫描、限制块数、按实际解码增长、每 peer 连接上限 |
+| R3-N2 | P0 | `h2-net/src/rpc.rs:478-507`, `h2-node/src/service.rs:1237,5144,5838` | `block_txns` 请求 2^20 个可重复索引,先拷贝出回复再查字节预算,超额回复被截到整个预算后照发:远程 OOM | 索引严格递增唯一;拷贝前求和,超过 32 MiB 拒绝;超额不再截断放行 |
+| R3-N3 | P1 | `block_body.rs:281`, `service.rs:2710-2773,5093` | push/by-hash 允许 64 MiB 解码、1 字节交易无数量上限;by-hash 回复先全解码后核哈希 | 先核头哈希再解 body;交易数上限;push/by-hash 上限对齐 gossip |
+| R3-N4 | P2 | `h2-net/src/config.rs:151`, `transport.rs:918` | gossip 未开 `validate_messages()`,先转发后校验;来源 peer 被丢弃 | 开启校验并回报 Accept/Reject/Ignore;透传 `propagation_source` |
+| R3-N5 | P2 | `transport.rs:1144`, `direct_votes.rs:144`, `timeout.rs:337-381` | `/n42/vote/1` 任意 peer 任意消息类型,无去重限速;Timeout 先验签后查重 | gossip 模式忽略;只收 Vote/CommitVote;限速与去重 |
+| R3-N6 | P3 | `h2-net/src/message_id.rs:34` | message id 每份拷贝整份 payload 后再哈希 | 增量 Keccak |
+| R3-C1 | P1 | `engine-types/src/hotstuff_consensus.rs:303` | 延迟执行下头部 `gas_used` 是父块的执行,却按本头 `gas_limit` 校验;gov5 按父 limit(`adapter.go:446-460`)。满块后 limit 下调即 Rust 拒绝 gov5 接受的头 | 延迟执行激活时 `gas_used` 对照父 `gas_limit` |
+| R3-C2 | P1 | `h2-consensus/src/header_profile.rs:197-278`, `h2-node/src/service.rs:4577-4638`, `wire_bridge.rs:125` | 实时路径不解码/验证头部 QC(gov5 拒绝不可解码、`qc.view > view`、验签失败);拉取路径反而比 gov5 严(位图填充位、祖先链) | 共用一个按 gov5 的检查,投票前与拉取路径都用 |
+| R3-C3 | P3 | `h2-consensus/src/protocol/timeout.rs:241-273` | 重复超时时不重发本 view 的投票(gov5 `timeout.go:61-71` 重发) | 记住本 view 发出的 Vote,重复超时时重发 |
+| R3-C4 | P3 | `h2-execution/src/driver.rs:2771,3001,2443` | 首个 body 被拒(R2-I3 后按字节判)时丢掉 `pending_commits`,下一份副本导入后不再提交;`remember_commit_ahead` 从 HashSet 任意驱逐 | Invalid 时移入 `commits_ahead`;驱逐按顺序 |
+| R3-E1 | P1 | `engine-types/src/payload.rs:5199,2524`, `fast_transfer.rs:535`, `bin/n42/src/follower_import.rs:1081` | 延迟执行下 follower 按 Σgas_limit ≤ L 与按 max_fee 的最坏花费校验可纳入性,builder 按实际用量/有效价格装块:一笔 gas_limit 富余的交易即让每个 leader 造出被拒的块 | builder 用同一规则(累计 gas_limit、每 sender 最坏花费),或提议前自查剔除 |
+| R3-E2 | P2 | `parallel_transfer.rs:4806,5268`, `payload.rs:3374` | 零手续费块并行路径不写 beneficiary,串行路径写(touch),QMDB 根不同;当前因 coinbase 奖励而潜伏 | 并行执行过交易即总是提交 beneficiary |
+| R3-E3 | P3 | `parallel_transfer.rs:4603,5108` | 并行执行器不查单笔 gas_limit ≤ 剩余 gas(可纳入性更强,当前不可达) | 加累计检查 |
+| R3-G1 | P2 | `qmdb-state/src/forest.rs:1293,1308,1641` | R2-Q1 修复不完整:追加失败后被取走的 delta 不还给记录,重试换到更高目标时走 `delta_since` 回退路径,已被 `forget_changes` 清掉的更高块翻转丢失 | 失败时把取走的 delta 还回各记录 |
+| R3-G2 | P2 | `h2-node/src/service.rs:2654,5839` | R2-I6 的 512 MiB 预算全局共享,一个慢读 peer 可占满,所有 fill/by-hash 回复被拒 | 每 peer 字节上限 |
+| R3-G3 | P3 | `h2-consensus/src/state_machine.rs:1224,1262` | R2-C7 每个事件都重试并计入连续失败,几毫秒内达到致命阈值 3 | 重试不计入,或限速 |
+| R3-G4 | P3 | `h2-execution/src/driver.rs:1880` | R2-I4 首次导入也多克隆一次整个 payload(leader 每块) | 只在需要重试时克隆 |
+| R3-G5 | P3 | `driver.rs:2749,2770` | 等待式 `execute()` 的 Valid/Invalid 不清 `import_retries` | 各终态清除 |
+| R3-G6 | P3 | `tx-ingest/src/lib.rs:435,1431` | R2-X2 的 256 KiB 单笔上限拒绝带 sidecar 的 blob 交易并断开连接 | type 3 单独上限 |
+
+## 状态
+
+| id | 状态 |
+|---|---|
+| R3-P1 | 已修:`init` 先验证 portable 快照得到树(在链上、在头部块、root 等于头部),写入时逐行核对账户叶值与每个非零槽位,地址严格递增,最后按 gov5 `verifyExportCoverage` 核对覆盖(保留的 EIP-161 空账户除外);测试 `init_refuses_a_dump_the_snapshot_does_not_authenticate` 修复前失败(篡改余额的 dump 被接受)。仅 init,无热路径 |
+| R3-N1 | 已修:`read_framed_limit` 逐块累计(不再每块从头重扫),可跳过块(流标识/填充)至多 16 个;`unframe_payload_limit` 按实际解码增长输出(不再按声明长度 `vec![0; len]`)。测试 `a_frame_padded_with_skippable_chunks_is_refused` 修复前失败(10,000 个填充块被接受)。热路径:body 解码器,只减不增;线格式不变(gov5 只发一个流标识)。未做:每 peer 连接上限。 A/B 2026-10-30(X22 配对 stage fv,审计后对审计前,见 `HANDOFF.md`):无可见差异 |
+| R3-N3 | 已修(主体):`decode_raw_block_body_ref` 的交易数上限为 `gas_limit / 21000`(任何交易至少 21,000 gas,合法块不会超过),超出即 `TooManyTransactions`;测试 `a_body_with_more_transactions_than_its_gas_limit_allows_is_refused` 修复前失败。一个旧测试夹具补上 gas limit。热路径:每块一次除法、每笔一次比较。未做:by-hash 回复先核头哈希再解码(推送路径本就允许任意 body,收益有限)、push 上限对齐 gossip、只收握手完成 peer 的推送。 A/B 2026-10-30(X22 配对 stage fv,审计后对审计前,见 `HANDOFF.md`):无可见差异 |
+| R3-C4 | 已修:派生导入 `Invalid` 时等待中的提交移入 `commits_ahead`,下一份副本导入后照常提交;`remember_commit_ahead` 按记住的先后驱逐最旧的(原 HashSet 任意驱逐)。旧测试 `a_commit_that_waited_for_an_import_runs_when_it_succeeds_and_is_dropped_when_it_fails` 断言"丢弃",按 R2-I3 后的语义改为 `..._runs_when_it_or_a_later_copy_succeeds`,修复前失败。非热路径 |
+| R3-G3 | 已修:`retry_vote_log_work` 期间置 `vote_log_retrying`,重试失败只计总数、不加长连续失败(致命阈值只由首次尝试累计,与 R2-C7 之前一致);测试 `retries_of_a_failed_leader_write_do_not_count_toward_the_fatal_run` 修复前失败(两次重试即 Fatal)。热路径无变化 |
+| R3-N2 | 已修:`named_txns`(by-hash 存档 body 与 EL 两条路径共用)要求索引严格递增(本节点请求本就按块序),拷贝前累计字节,超过 `MAX_BLOCK_TXNS_BYTES`(32 MiB,读取端自身上限)即拒;测试 `a_fill_request_cannot_name_more_than_a_reply_may_carry` 修复前把测试进程撑到 40 GB。旧测试 `[2, 0]` 乱序请求改为块序。热路径:fill 回复多一次 O(n) 遍历。`reply_permit` 的截断未改:回复已被 32 MiB 限住。 A/B 2026-10-30(X22 配对 stage fv,审计后对审计前,见 `HANDOFF.md`):无可见差异 |
+| R3-C1 | 已修:延迟执行激活时 `validate_header` 只查 gas limit 上限,`gas_used` 在 `validate_header_against_parent` 中对照父块 gas limit(深度 1,与 gov5 `verifyHeaderWithBatch` 一致;更深时由执行字段相等检查约束);测试 `under_deferred_execution_gas_used_is_bounded_by_the_parents_limit` 修复前失败(满块后 limit 下调的子头被拒)。每头一次分支,非热路径 |
+| R3-G1 | 已修:追加失败时把未入日志的 delta 交还各自记录(`forest.restore_deltas`),换到更高目标重试仍走逐块路径;测试 `a_failed_append_retried_at_a_later_block_loses_no_flip`(修前报 duplicate active key) |
+| R3-G5 | 已修:等待式导入的 Valid/Invalid 与重试改向 fleet 索取时清除 `import_retries`;测试 `an_awaited_import_that_ends_after_retries_forgets_their_count` |
+| R3-C3 | 已修:记住本节点最后发出的 R1 投票,同一 view 重复超时时(非 leader)随超时一并重发给 leader,与 gov5 `timeout.go` 一致;测试 `test_a_repeated_timeout_resends_this_views_vote`。 A/B 2026-10-30(X22 配对 stage fv,审计后对审计前,见 `HANDOFF.md`):无可见差异 |
+| R3-N5 | 已修(部分):`/n42/vote/1` 只放行本节点会在其上发送的 Vote/CommitVote/Timeout(Timeout 由 gossip 去重时直发重传,必须保留),其余类型拒绝;测试 `the_vote_protocol_carries_only_votes_and_timeouts`。限速与 Timeout 先验签后查重未做 |
+| R3-N6 | 已修:message id 改为增量 Keccak,不再为每份 gossip 拷贝整份 payload;gov5 字节级向量 `matches_gov5_message_id_vectors` 覆盖正确性(纯降成本)。 A/B 2026-10-30(X22 配对 stage fv,审计后对审计前,见 `HANDOFF.md`):无可见差异 |
+| R3-P7 | 已修:每个请求 10 s 绝对期限(逐次读按剩余时间设超时,涓流无法延长)与写超时;请求行+头部 16 KiB 上限;测试 `an_idle_connection_does_not_hold_the_endpoint`、`a_header_section_past_its_limit_is_refused`。仍单线程,一个慢客户端最多占 10 s |
+| R3-P5 | 已修(部分):未知 receipts root 的块不再报 `attested`(之前任一已注册手机报任意 root 即达阈值 1);测试 `a_block_without_a_known_receipts_root_is_never_attested`。h2_validator 仍传 view 当块号、root 为 None:需从 EL 取块号与 receipts root 才能真正出证明,`--mobile` 默认关闭(F7_MOBILE) |
+| R3-P6 | 已修(部分):注册表上限 `MAX_VERIFIERS`=100,000,满后 RPC 拒绝新 key(`REGISTRY_FULL`),已知 key 仍返回索引;测试 `the_verifier_registry_is_bounded`。PoP 注册与收据独立 DST 是手机协议变更(需 mobile-sdk 同步),未做 |
+| R3-E1 | 已修(分支 `fix/r3-e1-builder-includability` 527e009fb,未合入):延迟执行激活时 builder 按 follower `check_includable_laid_out` 同一规则装块:串行循环按累计 Σgas_limit 准入(`includability::GasBudget`,header 的 gas_used 仍为执行用量),每 sender 账本(`SenderLedger`)在该 sender 首笔前读父后状态余额,累加 `frame_scan::tx_cost` = gas_limit×max_fee_per_gas + value + blob_gas×max_fee_per_blob_gas,超出即 `InsufficientFunds` 拒绝(连带后续);并行步已入块的 sender 在串行循环中以 `ExceedsGasLimit` 交还(其最坏花费此处未知)。并行步(`execute_for_build_counted` 新增 `includable`)每个 sender run 按 run 起始余额累加 `max_balance_spending`,在 commit 前跳过——原以为并行步一致,实际同一 sender 第二笔起只对照扣除实际花费后的余额,fee cap 高于有效价格时同样造出被拒块。nonce 连续、fee cap ≥ base fee、tip ≤ cap 由执行保证(注释说明)。非延迟链规则不变(对照测试)。测试 `a_deferred_build_keeps_the_gas_limits_within_the_block`、`a_deferred_build_keeps_each_senders_worst_case_within_its_balance`(均在构建出的块上重算 follower 判定)、`the_build_run_keeps_a_senders_worst_case_within_its_balance`,修复前均失败;对照 `a_build_before_the_fork_*` 两项前后均通过。热路径:每笔一次加法与一次比较,每 sender 一个账本项(并行步每笔多一次 U256 乘加与比较,仅延迟执行)。合入前 X22 配对 by Linux |
+| R3-C2 | 未修(需跨客户端一致性工作):实时路径不验头部 QC,拉取路径比 gov5 严(h2-wire 位图解码拒绝 gov5 `unpackBoolBitmap` 接受的填充位)。若直接在 EL 加 QC 解码,会拒绝 gov5 接受的块。需先按 gov5 `decodeHeaderExtra`(先去 seal 再原样)与 `verifyHeaderWithBatch`(`qc.View <= headerView`,两种域都验)写一个共用检查并用 gov5 夹具对齐 |
+| R3-E2 | Rust unchanged (premise wrong: no Rust path, serial or parallel, writes an unchanged account; pinned by `an_unchanged_account_writes_no_leaf_on_any_path`, f163ff525). The divergence is gov5: `IntraBlockState.AddBalance` on a not-yet-loaded account dirties it even for 0, so a zero-tip/zero-value block mismatches (devnet: stock gov5 rejects Rust block 6). gov5 patch `unchangedAccountNoOpTime` (unpushed, `docs/patches/gov5-unchanged-account-no-op/`) passes go test and the devnet; awaiting the user's decision. See `R3_E2.md` |
+| R3-E3 | 已修(随 R3-E1,同一提交):三处并行执行器(build 批、follower 批、follower 的 State 回退)逐笔检查 gas_limit ≤ 块 gas_limit − index×21000(`includability::fits_block_gas`;前面每笔都是恰用 21000 的转账,follower 上精确、builder 候选上保守),不满足时 builder 跳过、follower 交串行执行器给出确切错误。测试 `the_build_run_keeps_the_block_gas` 修复前失败(63,000 的块执行了 4 笔)。每笔一次乘加与比较,合入前 X22 配对 by Linux |
+| R3-G4 | 未修:leader 每块在 worker 线程上多一次 payload 克隆(毫秒级),改为按需克隆要改导入重试的所有权,收益小于风险 |
+| R3-P2 | 未修(需设计,热路径):tx-queue 有界 lane、镜像池的 Discarded/Replaced、多次非 nonce 拒绝后丢弃。与 P3/P4 同属 tx-queue,且 `frames::FrameIndex` 按帧整体引用交易,需一并设计并做 A/B |
+| R3-P3 | 未修(随 P2):同 (sender, nonce) 加价替换。lane 内替换会使已登记的帧(块可整体引用的 frame)与 lane 不一致,需与帧索引一起设计 |
+| R3-P4 | 未修(随 P2):`Lagged` 时需从 provider 补齐跳过的块再 prune;`settle_own_block` 对被跳高度的自有块丢弃交易。改为交还会降低 sender 水位并与 build 的 stale 拒绝交互,需与 P2 一起设计 |
+| R3-P9 | 未修(信任边界内):两条路径都是本节点自己的执行层(Engine API 带 JWT;`--el-rpc` 由运维指定),响应体上限防的是本机进程,优先级低 |
+| R3-N4 | 未修(热路径,gov5 交互):开启 `validate_messages()` 后每条 gossip 需显式回报 Accept/Reject/Ignore,遗漏即不转发;转发时机变化影响出块关键路径与 gov5 网格评分,需单独设计与 A/B |
+| R2-C1(high_tc) | 未修:复核结论为无永久停滞,只有延迟(TC 由任一节点形成并推进);最小移植方案已记录,留待 C2 一并做跨客户端一致性 |
+| R3-G2 | 已修:fill/by-hash 回复预算按 peer 分份(`FillBudget`,每 peer 至多总量 1/8 = 64 MiB,超过一份的回复取整份),断开时 `forget` 释放,peer 表至多 1,024 项、满时丢弃空闲项;测试 `one_peer_cannot_hold_the_whole_fill_budget` 修复前编译失败(无按 peer 预算)。热路径:每个 fill/by-hash 回复多一次 HashMap 查找与一个 semaphore permit,需同机 A/B。 A/B 2026-10-30(X22 配对 stage fv,审计后对审计前,见 `HANDOFF.md`):无可见差异 |
+| R3-G6 | 已修:单笔上限按类型:type 3(带 sidecar 的 blob 交易)至多 1 MiB,其余仍 256 KiB;长度过 1 MiB 仍只凭长度拒绝,过 256 KiB 的非 blob 交易在读入后按类型拒绝。测试 `a_blob_transaction_with_its_sidecar_is_not_refused_for_size` 修复前编译失败;`an_oversized_transaction_closes_the_connection` 按新语义补发 body。帧总量上限不变 |
+| R3-P8 | 已修(部分):APoS 公开订阅任务同时监听 `sink.closed()`,客户端离开即结束,并向 router 发 `Disconnect` 释放其条目(之前对无人发布的 key 永远挂起,任务与条目泄漏);测试 `a_closed_subscription_leaves_the_router_without_an_event` 修复前失败(订阅丢弃后 router 收不到任何消息)。验证队列入队前校验成员与块哈希未做 |
+| R3-N5 余项 | 已修:当前 view 的 Timeout 先问 collector 发送者是否已计入,已计入的副本(两个 gossip topic、直连流、转发)不再做 BLS 验证即丢弃,与未来 view 路径一致;测试 `test_a_counted_senders_timeout_copy_is_not_verified_again` 修复前失败(重复副本被验签并报 InvalidSignature)。热路径:每个 Timeout 多一次 Option/HashMap 查询,省掉重复副本的 BLS 验证。`/n42/vote/1` 限速仍未做 |
+| R3-P9 | 已修:EL 响应按字节上限读取(`MAX_RESPONSE_BYTES` 1 GiB = 256 MiB 原始 payload 上限的十六进制两倍再留余量),声明长度超限即拒,未声明时逐块累计超限即拒;Engine API 与 `--el-rpc` 两条路径(`call` 与 `call_many`)共用。测试 `a_response_past_its_cap_is_refused`(声明/未声明两种)修复前编译失败(无上限)。热路径:读取方式由 `json()` 改为逐块读入后 `from_slice`,同样一次缓冲,每块一次比较 |
+| R3-N1 余项 | 已修:每 peer 连接上限 `MAX_CONNECTIONS_PER_PEER`=4(双向合计,容许同时互拨与重拨),之前一个身份反复拨号可占满全部 128 个入站名额;测试 `tests/per_peer_connections.rs` 修复前失败(同一 peer 保持 8 条连接)。非热路径 |
+| R3-N3 余项 | 不修:by-hash 回复只对本节点发出的请求生效,每个请求至多一次解码,无放大;先核头哈希只省掉一次错误回复的 body 解码 |
+| R3-P8 余项 | 暂缓:矿工已逐条核块哈希、成员、重复与签名;剩下的是公开调用灌满队列使诚实签名得到 "retry"。在 RPC 层过滤需矿工导出当前待定块并提供成员查询;这是 APoS 旧路径(HotStuff 链不启动矿工),价值低 |
+| R2-X2 余项 | 不修:帧体读取已有期限(`FRAME_READ_TIMEOUT`);剩下的帧间空闲只占一个连接名额(256 个,每个 1 MiB 读缓冲,合计有界),空闲超时会断开长期空闲的合法客户端(本节点 relay、flood 工具) |
+| R3-C2 | 已修(实时路径):拉取路径的检查抽成 `check_header_qc`(gov5 `decodeHeaderExtra` 两种布局、`qc.view > header view` 即拒、已知集合下必须验签通过,未知集合或无 QC 放行);实时路径在 `BlockImported`/`BlockChecked` 交给 engine 之前(`apply_driver_action` 与已导入块的 `ExecuteBlock` 分支)检查本节点持有的头部,被拒则不投票、不在其上建块。已验证 QC 按字节哈希缓存 64 个。测试 `a_live_block_whose_header_qc_gov5_refuses_is_not_voted_for` 修复前失败(伪造 QC 的块到达 engine)。热路径:每次投票一次 keccak(QC 字节)与缓存查询,缓存未命中一次 BLS 聚合验签;需 Linux X22 A/B 与 devnet gov5 三形态。未改:h2-wire 位图严格解码(集合未知时比 gov5 严,诚实 gov5 不产生) |
+| R2-C1 余项 | 已修:移植 gov5 `processEmbeddedTC`:Vote/CommitVote/Timeout 携带的 `high_tc` 在消息本身之前交给 engine(`adopt_embedded_tc`),只有能让本节点前进的 TC 才按其 view 的集合验签并验 high QC,通过即锁定 high QC、重置连续超时、进入 tc.view+1;验签失败忽略。测试 `a_tc_piggybacked_on_a_vote_moves_a_lagging_node_to_the_view_after_it` 修复前失败(TC 被丢弃,view 停在 1)。热路径:每条消息一次 Option 判断与一次 view 比较。未做:本节点发出的消息不携带 `high_tc`(gov5 不依赖它;重传最新 TC 留待需要时) |
+| R3-G4 | 已修:`import_own` 改为借用 payload;elided 路径(5M 默认:leader 的块以封好的头部交给 EL)按头部导入成功时不再整份克隆 payload,只在回退到 `newPayload` 时克隆;非 elided 路径每次尝试一次克隆,与之前相同。纯降成本,无行为变化,`tests/elided_own_import.rs` 六个用例覆盖。热路径:leader 每块少一次 payload 深拷贝 |
+| R2-R2 | 已修:同一高度已被先到的未请求 body 占用时,头部封印由其 view 的 leader(按该 view 确切已知的集合与 tenure)签出的兄弟块照样立即导入并占用该高度;他人封印或无封印的仍等 proposal。测试 `a_body_sealed_by_its_views_leader_is_imported_after_a_peers_made_up_one` 修复前失败。代价:只有本会等待的兄弟块付一次 BLS 单签验证,首个 body 不变 |
+| R3-P5 余项 | 已修:h2_validator 从本节点持有的头部取块号与 receipts root 交给 mobile 服务(`H2Service::mobile_commit_facts`);延迟执行下头部执行字段是父块的,不给 root(attested 保持不可达,不认证错的 root);头部已不在内存时退回用 view、无 root。测试 `a_committed_block_gives_phones_its_number_and_receipts_root` 修复前编译失败。延迟执行下的 root 需取子块头部,未做 |
+| R3-P7 余项 | 已修:mobile HTTP 每连接一个线程,至多 `MAX_CONCURRENT_CONNECTIONS`=32 个同时服务,超出即回 503 并关闭(槽位由 Drop 归还);`serve` 与 `serve_on` 共用。测试 `a_request_is_served_beside_idle_connections` 修复前失败(三个空闲连接后的请求 3 s 内得不到应答)。非热路径(`--mobile` 默认关) |
+| R2-X4 余项 | 已合 main 766a89654(A/B 过:stage fx VX2,win1 4.993/4.980M 对 main 5.040/4.920M,轮总量 443.4/450.6M 对 452.1/443.2M,闸门干净):声明按来源分键,h2-node 把至多 4 份不同 layout(每 peer 一份)带来源交给 EL(`request::CLAIM_LAYOUT` + foreign body 帧可选来源尾),EL 每 root 每来源一槽、本节点声明不被挤掉;详见 ROUND2 状态行"R2-X4 余项"。原暂缓理由(两端须一起改)已按此处理,P3 |
+| R3-P6 余项 | 已修:回执与其聚合改用独立域 `RECEIPT_DST`(`mobile-verify` `sign_receipt` / `verify_signature` / `AggregatedAttestation::verify`),共识域签名不再被当作回执(测试 `a_receipt_is_signed_in_its_own_domain`);`mobile_registerVerifier` 对新 key 要求 `[pubkey_hex, pop_hex]`,PoP 为公钥在 `POP_DST` 下的签名(`proof_of_possession` / `verify_proof_of_possession`),缺失 → `INVALID_PARAMS`,不符 → `INVALID_SIGNATURE`,已知 key 不需 PoP、满表先于验签拒绝(测试 `a_new_verifier_proves_it_holds_its_key`)。h2-primitives 新增 `sign_with_dst` / `verify_with_dst` / `verify_aggregate_with_dst`(纯增量)。仓库内没有手机端回执签名方(mobile-sdk 只做质押密钥),手机客户端需按新 DST 签名并在注册时带 PoP。39b3657ae / dd68fba75 / 886468e86 |
+| R3-P2/P3/P4 余项 | 已修(待 Linux A/B):**P4** 修剪任务以 `GapWatch` 跟踪已交付高度，下一条通知的起始高度出现断档(`Lagged`)时从 provider 读回最新 `MAX_BACKFILL`=64 块作为 lean feed 先行修剪(自有块随之按真实 hash 结算);fold 内遇 Lagged 即结束 fold(测试 `blocks_a_lagging_pruner_skipped_are_read_back_and_pruned`,4f6256c4d)。**P3** 同 (sender, nonce) 的交易若 fee cap 与 tip 都高出 10%(池的 price bump)即替换 lane 中未取走的旧交易(两种 drain 均是;新 drop 原因 `outbid`),同 hash 重发仍是 duplicate;被替换成员所在帧按指针检查失败走逐笔路径，不会两笔都出(测试 `a_higher_fee_replaces_a_queued_transaction`,c1814476f)。**P2** (a) 构建器对非 nonce 的 EVM 拒绝一律报 `TxTypeNotSupported`,无法区分永久/暂时，故按 (sender, nonce) 计数，第 4 次丢弃(`refused`),`ExceedsGasLimit` 与 nonce 判定不计，达到后保留计数使 gap 回填的副本下次即丢;`N42_TX_QUEUE_REFUSALS=0` 恢复旧行为(测试 `a_transaction_every_build_refuses_is_dropped`,ad3ece18d);(b) 到达上限：队列 `N42_TX_QUEUE_MAX`=4,000,000、单 lane `N42_TX_QUEUE_LANE_MAX`=2^20,超出的到达计为 `full`,构建交还不受限(测试 `arrivals_past_the_queues_bounds_are_refused`,c402f298a)。未做：镜像池的 Discarded 事件(直接 ingest 下池不持有这些交易，上限与拒绝计数已覆盖其目的)。P2/P3 在 drain 热路径上，合入后需 Linux 同机 A/B |
+| R3-N4 | 已修(待 Linux A/B):gossipsub 配置加 `validate_messages()`,`TransportCore::next_event` 对每条消息当场回报——v4 envelope / native 解码失败 → `Reject`(不转发),区块体与交易批(在传输层之上解码)→ `Accept`,其它 topic → `Ignore`;`Rejected` 的 `from` 取 `propagation_source`(匿名消息无作者)。内联与 off-loop(pump)同一路径。测试 `tests/gossip_validation.rs::a_payload_that_does_not_decode_is_not_forwarded`(A—B—C 一线,C 经 B 收到证明但收不到 A 的垃圾，修复前失败)。转发时机从"收到即转发"变为"解码后转发",共识消息多一次解码延迟(投票含 G2 解压),需 Linux A/B 与 gov5 混跑确认网格评分无影响。区块体未在传输层校验,由 h2-node 判定后不回报(仍 Accept)。eb9146203 |
+| R3-E1 / R3-E3 | 合入 main(2026-10-30,Linux):分支 `fix/r3-e1-builder-includability` 合上 main `5a0d895c3` 为 `6f0913d92`,X22 同机配对 stage `fw`(四腿交替,对 `b91411e27`)win1 4.960/4.945M 对 4.960/5.033M(-0.9%)、轮总量 449.0M 对 452.1M(-0.7%),门全净 → 无可见代价,no-ff 合入。未做:并行步已放入的 sender 在串行循环里被交还的用例 |
+| R3-C2 | Linux 验收(2026-10-30):devnet gov5 三形态两轮(main `a2407baf8` 与 `6f0913d92`)两客户端同哈希,各验证者日志无 header-QC 拒绝;X22 stage `fw` 无可见代价(与 E1 同一配对)。已修 |
+| R3-P2 / P3 / P4、R3-N4、R3-G4、R3-N5 余项、R3-P9 | Linux A/B(2026-10-30,stage `fw`,同上):无可见代价。P2 的上限在 5M 负载下未咬到(`refused=0`、`refused_at_cap=0`、`frames_refused=0`),P4 无 `Lagged` 读回;N4 的解码后转发在 devnet 五形态 gov5 混跑(含两个 `twoPhaseVoteGate` 形态)下同哈希、gov5 error 0。全部已修 |

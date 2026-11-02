@@ -147,6 +147,31 @@ async fn a_range_reply_is_imported_in_order_then_the_pull_probes_past_the_target
     assert_eq!(rig.svc.failed_peer, None, "a complete pull clears the blame");
 }
 
+/// Audit 2026-10 round 2 (R2-I2): a peer's status height is not certified,
+/// and a peer that serves full windows of blocks it made up keeps a probe
+/// going for ever, moving the execution layer's head onto its chain. Past
+/// [`MAX_UNPROVEN_PAST_COMMITTED`] blocks above what consensus committed, a
+/// pulled block nothing proves ends the pull and the peer is refused for the
+/// gap; below it (or with nothing committed yet) the pull runs as before.
+#[tokio::test]
+async fn a_pull_far_past_the_committed_height_stops_at_the_first_unproven_block() {
+    let mut rig = node(1, 0, None).await;
+    let peer = PeerId::random();
+    let total = MAX_UNPROVEN_PAST_COMMITTED + 6;
+    let blocks = chain(total);
+    rig.svc.committed_height = Some(0);
+    catching_up(&mut rig, peer, 1, total);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: total, step: 1 }, chunks(&blocks)));
+    let mut events = Vec::new();
+    for _ in 0..total.div_ceil(PULLED_BLOCKS_PER_STEP as u64) {
+        events.extend(import(&mut rig).await);
+    }
+    assert_eq!(rig.svc.imported.len() as u64, MAX_UNPROVEN_PAST_COMMITTED, "up to the bound");
+    assert!(rig.svc.catch_up.is_none(), "the pull ended");
+    assert!(rig.svc.refused_range_peers.contains_key(&peer), "and the peer is not asked for the gap again");
+    assert!(events.contains(&ServiceEvent::Synced { height: MAX_UNPROVEN_PAST_COMMITTED, complete: false }), "{events:?}");
+}
+
 #[tokio::test]
 async fn a_short_reply_before_the_target_asks_for_the_rest() {
     let mut rig = node(1, 0, None).await;
@@ -293,7 +318,7 @@ fn header_qc(
 /// `qc` embedded.
 fn block_with_extra(number: u64, parent: B256, view: u64, qc: Vec<u8>) -> (B256, Header, alloy_primitives::Bytes) {
     let built = MockExecutionLayer::built_block_on(number, parent);
-    let mut header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+    let mut header = n42_h2_consensus::N42Header::from(built.execution_data.clone().into_block_raw().expect("raw block").header);
     let extra = n42_h2_consensus::HeaderExtra { view, qc, seal: Some([0; n42_h2_consensus::EXTRA_SEAL_LEN]) };
     header.extra_data = extra.encode();
     let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
@@ -349,7 +374,244 @@ async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_n
     rig.svc.note_peer_height(other, 10);
     within(rig.svc.consider_catch_up(&mut events)).await;
     let catch_up = rig.svc.catch_up.as_ref().expect("a pull from the other peer");
-    assert_eq!((catch_up.peer, catch_up.next), (other, 3));
+    // From block 2: its QC proves block 1, not block 2 itself (audit 2026-10
+    // A-7). Block 2 comes back as held and is skipped.
+    assert_eq!((catch_up.peer, catch_up.next), (other, 2));
+}
+
+/// Audit 2026-10 round 3 (R3-C2): a block that arrived live was voted for
+/// whatever its header carried, where gov5's `verifyHeaderWithBatch` refuses
+/// a header whose embedded QC does not decode, names a view past the
+/// header's own, or does not verify under a known set. A Rust quorum could
+/// then certify a block every gov5 member rejects. Such a block's import no
+/// longer reaches the engine, so no vote follows; a good QC still passes.
+#[tokio::test]
+async fn a_live_block_whose_header_qc_gov5_refuses_is_not_voted_for() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let quorum = [0, 1, 2];
+    let parent = B256::ZERO;
+    let refused = [
+        ("forged", header_qc(&rig.svc, &keys, &quorum, 3, parent, B256::repeat_byte(0x77))),
+        ("past the header's view", header_qc(&rig.svc, &keys, &quorum, 5, parent, parent)),
+        ("undecodable", vec![0xff; 10]),
+    ];
+    let mut events = Vec::new();
+    for (checked, (name, qc)) in [false, true].into_iter().flat_map(|c| refused.clone().map(|r| (c, r))) {
+        let (hash, header, _) = block_with_extra(if checked { 2 } else { 1 }, parent, 4, qc);
+        rig.svc.remember_block(hash, &header);
+        let event = if checked { ConsensusEvent::BlockChecked(hash) } else { ConsensusEvent::BlockImported(hash) };
+        rig.svc.apply_driver_action(DriverAction::Consensus(Box::new(event)), &mut events).expect("ok");
+        assert!(!rig.svc.engine.has_imported_block(&hash), "{name} (checked: {checked}) reached the engine");
+        assert!(!rig.svc.imported.contains(&hash), "{name} is not built on");
+    }
+
+    let good = header_qc(&rig.svc, &keys, &quorum, 3, parent, parent);
+    let (hash, header, _) = block_with_extra(1, parent, 4, good);
+    rig.svc.remember_block(hash, &header);
+    rig.svc
+        .apply_driver_action(DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(hash))), &mut events)
+        .expect("ok");
+    assert!(rig.svc.engine.has_imported_block(&hash), "a header QC that verifies passes");
+    // None at all: nothing to check, as gov5.
+    let (hash, header, _) = block_with_extra(1, parent, 5, Vec::new());
+    rig.svc.remember_block(hash, &header);
+    rig.svc
+        .apply_driver_action(DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(hash))), &mut events)
+        .expect("ok");
+    assert!(rig.svc.engine.has_imported_block(&hash), "a header without a QC passes");
+}
+
+/// Audit 2026-10 R2-C9 (the remainder): under gov5's two-phase gate a held
+/// header is what releases Round 1 (gov5's `tryHeaderVote`), once its QC
+/// passes the check every vote of this node passes (R3-C2). Without the gate
+/// a header tells the engine nothing.
+#[tokio::test]
+async fn under_the_two_phase_gate_a_header_reaches_the_engine_once_its_qc_passes() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let quorum = [0, 1, 2];
+    let parent = B256::ZERO;
+    let good = header_qc(&rig.svc, &keys, &quorum, 3, parent, parent);
+    let (hash, header, _) = block_with_extra(1, parent, 4, good.clone());
+    rig.svc.remember_block(hash, &header);
+    assert!(!rig.svc.engine.knows_parent(&hash), "no gate: the header waits for the import");
+    rig.svc.engine.set_two_phase_vote_gate(true);
+    let (hash, header, _) = block_with_extra(2, parent, 4, good);
+    rig.svc.remember_block(hash, &header);
+    assert!(rig.svc.engine.knows_parent(&hash), "the gate: the header reaches the engine");
+    let forged = header_qc(&rig.svc, &keys, &quorum, 3, parent, B256::repeat_byte(0x77));
+    let (hash, header, _) = block_with_extra(3, parent, 4, forged);
+    rig.svc.remember_block(hash, &header);
+    assert!(!rig.svc.engine.knows_parent(&hash), "a header QC refused: no header vote");
+}
+
+/// A TC for `view`, signed by `signers`, over the genesis high QC.
+fn timeout_cert(
+    svc: &H2Service<MockExecutionLayer>,
+    keys: &[BlsSecretKey],
+    set: &ValidatorSet,
+    signers: &[u32],
+    view: u64,
+) -> n42_h2_primitives::consensus::TimeoutCertificate {
+    let profile = svc.engine.signing_profile();
+    let mut collector = n42_h2_consensus::TimeoutCollector::new(view, set.len());
+    for &sender in signers {
+        collector
+            .add_timeout(sender, profile.sign(&keys[sender as usize], &profile.timeout_message(view)), QuorumCertificate::genesis())
+            .expect("distinct senders");
+    }
+    collector.build_tc_with_profile(set, profile).expect("a TC")
+}
+
+/// A vote from validator 1 for a view far ahead, carrying `tc` as gov5's
+/// `SyncInfo` `high_tc`.
+fn vote_carrying(svc: &H2Service<MockExecutionLayer>, keys: &[BlsSecretKey], view: u64, tc: Option<&n42_h2_primitives::consensus::TimeoutCertificate>) -> H2V4Envelope {
+    let profile = svc.engine.signing_profile();
+    let block_hash = B256::repeat_byte(0x42);
+    n42_h2_wire::h2_v4::H2V4Envelope {
+        identity: svc.identity,
+        changes_hash: B256::ZERO,
+        message: n42_h2_wire::h2_wire::H2Message::Vote(n42_h2_wire::h2_wire::H2Vote {
+            view,
+            block_hash,
+            voter: 1,
+            signature: profile.sign(&keys[1], &profile.vote_message(view, block_hash)),
+            high_tc: tc.map(|tc| wire_bridge::tc_to_wire(tc).expect("wire TC")),
+        }),
+    }
+}
+
+/// Audit 2026-10 round 2 (R2-C1, the inbound half): gov5 piggybacks its
+/// highest TC on votes, commit votes and timeouts (`SyncInfo`) and a lagging
+/// member adopts it at once (`processEmbeddedTC`): it locks on the TC's high
+/// QC and moves to the view after it. This node dropped the field, so a
+/// member that missed the `NewView` waited out its own timeouts instead. A TC
+/// that does not verify, or would not move the node, changes nothing.
+#[tokio::test]
+async fn a_tc_piggybacked_on_a_vote_moves_a_lagging_node_to_the_view_after_it() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    assert_eq!(rig.svc.engine.current_view(), 1);
+
+    // Signed over another view: does not verify, no move.
+    let mut forged = timeout_cert(&rig.svc, &keys, &set, &[1, 2, 3], 5);
+    forged.aggregate_signature = timeout_cert(&rig.svc, &keys, &set, &[1, 2, 3], 4).aggregate_signature;
+    rig.svc.accept_envelope(&vote_carrying(&rig.svc, &keys, 7, Some(&forged)));
+    assert_eq!(rig.svc.engine.current_view(), 1, "a TC that does not verify is ignored");
+
+    let tc = timeout_cert(&rig.svc, &keys, &set, &[1, 2, 3], 5);
+    rig.svc.accept_envelope(&vote_carrying(&rig.svc, &keys, 7, Some(&tc)));
+    assert_eq!(rig.svc.engine.current_view(), 6, "the view after the TC's");
+
+    // An older TC does not move it back.
+    let old = timeout_cert(&rig.svc, &keys, &set, &[1, 2, 3], 3);
+    rig.svc.accept_envelope(&vote_carrying(&rig.svc, &keys, 8, Some(&old)));
+    assert_eq!(rig.svc.engine.current_view(), 6);
+}
+
+/// Audit 2026-10 round 2 (R2-R2): only the first body nobody asked for at a
+/// height was imported at once (B-3), so an anonymous peer that sent a made-up
+/// block first took the slot and the honest leader's block waited for its
+/// proposal. A body sealed by the leader of the view its header names is
+/// imported at once whatever came first; an unsealed or wrongly sealed
+/// sibling still waits.
+#[tokio::test]
+async fn a_body_sealed_by_its_views_leader_is_imported_after_a_peers_made_up_one() {
+    let (keys, set) = keys(1);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let gossip = |rig: &mut Rig, rlp: &alloy_primitives::Bytes| {
+        let data = compress_block_rlp(rlp).expect("snappy");
+        rig.svc.handle_transport_event(TransportEvent::Block { from: None, data }).expect("ok");
+    };
+    let sealed = |parent: B256, view: u64, key: &BlsSecretKey| {
+        let (_, mut header, _) = block_with_extra(1, parent, view, Vec::new());
+        n42_h2_consensus::seal_header(&mut header, key).expect("seal");
+        let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
+        (header.hash_slow(), alloy_primitives::Bytes::from(rlp))
+    };
+    let (made_up, _, made_up_rlp) = block_with_extra(1, B256::repeat_byte(1), 3, Vec::new());
+    gossip(&mut rig, &made_up_rlp);
+    assert_eq!(rig.svc.ready_bodies, vec![made_up], "the first takes the height");
+
+    let stranger = BlsSecretKey::random().expect("bls keygen");
+    let (forged, forged_rlp) = sealed(B256::repeat_byte(2), 3, &stranger);
+    gossip(&mut rig, &forged_rlp);
+    assert!(!rig.svc.ready_bodies.contains(&forged), "a seal by anyone else does not count");
+
+    let (leaders, leaders_rlp) = sealed(B256::repeat_byte(3), 3, &keys[0]);
+    gossip(&mut rig, &leaders_rlp);
+    assert!(rig.svc.ready_bodies.contains(&leaders), "the leader's block is imported at once");
+}
+
+/// Audit 2026-10 B-6: a step that returns early -- a range reply part
+/// imported, the rest left for the next step -- still checks for local
+/// faults: a vote-log halt ends it as it ends a step on the slow path.
+#[tokio::test]
+async fn a_step_on_the_fast_path_still_stops_on_a_local_fault() {
+    let mut rig = node(1, 0, None).await;
+    let peer = PeerId::random();
+    let mut blocks: Vec<(B256, Header, alloy_primitives::Bytes)> = Vec::new();
+    let mut parent = B256::ZERO;
+    for number in 1..=(PULLED_BLOCKS_PER_STEP as u64 * 6) {
+        let block = block_with_extra(number, parent, number, Vec::new());
+        parent = block.0;
+        blocks.push(block);
+    }
+    let count = blocks.len() as u64;
+    catching_up(&mut rig, peer, 1, count);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count, step: 1 }, chunks(&blocks)));
+    rig.svc.engine.halt_voting("vote_log");
+    let err = within(rig.svc.step()).await.expect_err("the fault ends the step");
+    assert!(matches!(err, ServiceError::Fatal { reason: "vote_log", .. }), "{err:?}");
+    assert!(!rig.svc.pending_imports.is_empty(), "the step took the fast path");
+}
+
+/// Audit 2026-10 A-7: a header QC proves the block it names and the chain
+/// below it, not the block that carries it. A range server that copies one
+/// real QC into blocks it made up above the certified one gets them past the
+/// header check (gov5 accepts them too); they stay unproven for catch-up, and
+/// a pulled block is never committed, safe or finalized -- the one defence
+/// against such a chain is that only a commit settles a block.
+#[tokio::test]
+async fn a_header_qc_proves_the_chain_up_to_the_block_it_names_not_the_block_carrying_it() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let peer = PeerId::random();
+    let quorum = [0, 1, 2];
+    let mut blocks: Vec<(B256, Header, alloy_primitives::Bytes)> = Vec::new();
+    let mut parent = B256::ZERO;
+    let mut real_qc = Vec::new();
+    for number in 1..=4u64 {
+        let qc = match number {
+            1 => Vec::new(),
+            2 => header_qc(&rig.svc, &keys, &quorum, 1, parent, parent),
+            3 => {
+                real_qc = header_qc(&rig.svc, &keys, &quorum, 2, parent, parent);
+                real_qc.clone()
+            }
+            // Made up above block 2: the same real QC, copied.
+            _ => real_qc.clone(),
+        };
+        let block = block_with_extra(number, parent, number, qc);
+        parent = block.0;
+        blocks.push(block);
+    }
+    catching_up(&mut rig, peer, 1, 4);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&blocks)));
+    import(&mut rig).await;
+
+    assert!(blocks.iter().all(|(hash, ..)| rig.svc.imported.contains(hash)), "every block passes the header check");
+    assert_eq!(rig.svc.unproven_from, Some(3), "only blocks 1 and 2 are certified");
+    assert_eq!(rig.svc.engine.last_committed_qc().view, 0, "a pulled block is not committed");
+    for call in rig.el.calls() {
+        if let ElCall::ForkchoiceUpdated(state) = call {
+            assert!(
+                blocks.iter().all(|(hash, ..)| *hash != state.safe_block_hash && *hash != state.finalized_block_hash),
+                "a pulled block is never safe or finalized: {state:?}"
+            );
+        }
+    }
 }
 
 /// Sections 6.6 and 6.9: a pulled block whose embedded QC names a view in an
@@ -388,6 +650,36 @@ async fn a_pulled_block_whose_qc_names_an_unknown_epoch_is_checked_by_its_parent
         prev_hash: Some(B256::repeat_byte(0x01)),
     });
     assert!(rig.svc.check_pulled_block(&header).is_err(), "a block that does not extend the last one");
+}
+
+/// Audit 2026-10 B-1: a range server that answers a node behind it with a
+/// chain whose headers carry no certificate it can check (here none at all)
+/// gets that chain imported on its parent links alone, and the execution
+/// layer's head moves to it. That head must not then stand for "caught up":
+/// an honest peer at the same height still has to be pulled from, or the
+/// node never leaves the forged chain -- a restart reads the same head.
+#[tokio::test]
+async fn an_uncertified_pulled_chain_does_not_stop_a_pull_from_an_honest_peer() {
+    let mut rig = node(1, 0, None).await;
+    let forger = PeerId::random();
+    let forged = chain(4);
+    catching_up(&mut rig, forger, 1, 4);
+    rig.svc.pending_imports.push((forger, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&forged)));
+    import(&mut rig).await;
+    assert!(
+        rig.el.calls().iter().any(|c| matches!(c, ElCall::NewPayload(h) if *h == forged[3].0)),
+        "the uncertified chain reached the execution layer"
+    );
+
+    let honest = PeerId::random();
+    rig.svc.catch_up = None;
+    rig.svc.catch_up_retry_after = None;
+    rig.svc.peer_heights.remove(&forger);
+    rig.svc.note_peer_height(honest, 4);
+    let mut events = Vec::new();
+    within(rig.svc.consider_catch_up(&mut events)).await;
+    let catch_up = rig.svc.catch_up.as_ref().expect("the honest peer is pulled from");
+    assert_eq!(catch_up.peer, honest);
 }
 
 /// A block that does not extend the one pulled before it is refused before
@@ -774,7 +1066,7 @@ async fn a_block_asked_for_by_hash_is_served_from_the_store_or_the_execution_lay
 }
 
 #[tokio::test]
-async fn a_range_is_served_off_the_loop_and_its_slots_free_before_the_answer_goes_out() {
+async fn a_range_is_served_off_the_loop_and_its_slots_are_held_until_the_answer_is_sent() {
     let (mut a, mut b) = pair(0).await;
     let mut parent = B256::ZERO;
     for number in 1..=3 {
@@ -792,22 +1084,25 @@ async fn a_range_is_served_off_the_loop_and_its_slots_free_before_the_answer_goe
     assert_eq!((request.start, request.count), (2, 10));
     assert_eq!(served.len(), 2, "blocks 2 and 3");
 
-    // Four requests (one peer's share) to a node that is not draining: the work runs
-    // off its loop, and each slot is back as soon as the work is done --
-    // before the loop has handed a single answer over.
+    // Four requests (one peer's share) to a node that is not draining: the
+    // work runs off its loop, and each slot -- with its reply's bytes -- is
+    // held until libp2p has sent the answer, not only until the work is done
+    // (audit 2026-10 B-4).
     a.svc.pending_imports.clear();
     let before = b.seen.len();
     for start in 100..104 {
         a.svc.transport.request_range(target, RangeRequest { start, count: 1, step: 1 });
     }
-    pump(&mut a, &mut b, (false, false), &mut a_events, |_, b, _| {
-        b.seen.len() >= before + 4 && slots_taken(&b.svc.serve_slots) == 0
+    pump(&mut a, &mut b, (false, false), &mut a_events, |_, b, _| b.seen.len() >= before + 4).await;
+    assert!(a.svc.pending_imports.is_empty(), "nothing is answered until the loop hands it over");
+    assert_eq!(slots_taken(&b.svc.serve_slots), 4, "held while the answers wait");
+
+    // The loop hands the answers over; none was lost or refused, and the
+    // slots come back once they are sent.
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, b, _| {
+        a.svc.pending_imports.len() == 4 && slots_taken(&b.svc.serve_slots) == 0
     })
     .await;
-    assert!(a.svc.pending_imports.is_empty(), "nothing is answered until the loop hands it over");
-
-    // The loop hands the answers over; none was lost or refused.
-    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| a.svc.pending_imports.len() == 4).await;
 }
 
 #[tokio::test]
@@ -874,4 +1169,104 @@ async fn a_member_behind_its_peer_pulls_the_gap_and_finishes_level() {
     assert_eq!(a.svc.driver.head(), blocks[2].0);
     assert!(a.svc.catch_up.is_none());
     assert_eq!(a.svc.failed_peer, None);
+}
+
+// ---------------------------------------------------------------------------
+// Layout claims of compact frame descriptions (audit 2026-10 R2-X4)
+// ---------------------------------------------------------------------------
+
+/// A frame description of one block (the same header every call) under
+/// `layout`.
+fn frame_description(layout: &[(B256, u32)]) -> (B256, alloy_primitives::Bytes) {
+    let (hash, header, _) = block(2, B256::repeat_byte(1));
+    let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
+    let frame = n42_h2_consensus::encode_compact_frame_body(&rlp, layout, HeaderProfile::Ethereum).expect("frames");
+    (hash, alloy_primitives::Bytes::from(frame))
+}
+
+fn layout(k: u8) -> Vec<(B256, u32)> {
+    vec![(B256::repeat_byte(0x30 + k), 2), (B256::repeat_byte(0x60 + k), 1)]
+}
+
+/// The claims the execution layer was handed, once `want` of them are in
+/// (and every task spawned before them has run).
+async fn claims_seen(rig: &Rig, want: usize) -> Vec<(B256, Option<n42_h2_execution::raw_engine::ClaimSource>)> {
+    let seen = || {
+        rig.el
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                ElCall::ClaimLayout(hash, source) => Some((hash, source)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    within(async {
+        while seen().len() < want {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    seen()
+}
+
+fn source_of(peer: &PeerId) -> Option<n42_h2_execution::raw_engine::ClaimSource> {
+    Some(n42_h2_execution::raw_engine::claim_source_of(&peer.to_bytes()))
+}
+
+/// A second peer's frame description of a block already taken compact,
+/// with another layout, reaches the execution layer as a claim under that
+/// peer's source; the block is not imported a second time. One body alone
+/// costs nothing: no claim, no bookkeeping.
+#[tokio::test]
+async fn distinct_frame_layouts_from_two_peers_both_reach_the_execution_layer_with_their_sources() {
+    let mut rig = node(1, 0, None).await;
+    let (first, second) = (PeerId::random(), PeerId::random());
+    let (hash, body) = frame_description(&layout(0));
+    let (_, _, fresh) = rig.svc.accept_compact_body(body, Some(first)).expect("first");
+    assert!(fresh);
+    assert!(rig.svc.compact_claims.is_empty(), "one body: the fast path keeps no claims");
+    assert!(claims_seen(&rig, 0).await.is_empty());
+
+    let (_, other) = frame_description(&layout(1));
+    let (_, _, fresh) = rig.svc.accept_compact_body(other, Some(second)).expect("second");
+    assert!(!fresh, "not imported again");
+    assert_eq!(claims_seen(&rig, 1).await, vec![(hash, source_of(&second))]);
+    let sources: Vec<_> = rig.svc.compact_claims[&hash].iter().map(|(source, _)| *source).collect();
+    assert_eq!(sources, vec![source_of(&first), source_of(&second)], "the frame of record's sender first");
+}
+
+/// At most [`CLAIMS_PER_BLOCK`] layouts per block reach the execution
+/// layer, one per peer, each distinct: a peer's second layout, a layout
+/// already seen and a fifth peer's layout are dropped.
+#[tokio::test]
+async fn layout_claims_per_block_are_one_per_peer_distinct_and_bounded() {
+    let mut rig = node(1, 0, None).await;
+    let peers: Vec<PeerId> = (0..6).map(|_| PeerId::random()).collect();
+    let (hash, body) = frame_description(&layout(0));
+    rig.svc.accept_compact_body(body, Some(peers[0])).expect("first");
+    let mut send = |k: u8, peer: PeerId| {
+        let (_, body) = frame_description(&layout(k));
+        rig.svc.accept_compact_body(body, Some(peer)).expect("compact");
+    };
+    send(1, peers[1]);
+    send(2, peers[1]); // the same peer again: dropped
+    send(0, peers[2]); // the frame of record's layout: dropped
+    send(2, peers[2]);
+    send(3, peers[3]);
+    send(4, peers[4]); // a fifth layout: over the bound, dropped
+    send(5, peers[5]);
+    let mut seen = claims_seen(&rig, CLAIMS_PER_BLOCK - 1).await;
+    seen.sort();
+    let mut want: Vec<_> = peers[1..4].iter().map(|peer| (hash, source_of(peer))).collect();
+    want.sort();
+    assert_eq!(seen, want);
+    assert_eq!(rig.svc.compact_claims[&hash].len(), CLAIMS_PER_BLOCK);
+
+    // Bounded with the compact bodies: the claims go with the frame.
+    rig.svc.forget_compact_body(hash);
+    assert!(!rig.svc.compact_claims.contains_key(&hash));
 }

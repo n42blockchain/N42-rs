@@ -579,6 +579,20 @@
 - `crates/n42/alloy-rpc-types-beacon/` - Beacon RPC 类型
 - `crates/ethereum/hardforks/` - N42 特定硬分叉
 
+## 手机验证 v3（gov5 `/mobileverify`，2026-11-02；除 fork 的 alloy 外不改任何 fork 的 reth crate）
+### 定制文件:
+- `crates/n42/mobileverify/` - **N42独有**新 crate `n42-mobileverify`：gov5 `internal/mobileverify` 的 Rust 实现——注册表与 BMT 累加器、快照导出、PoP/PoW、StreamPacket V2 及 gov5 header/交易编解码、collector 与 cohort 证书、hyper 1.x 路由（路由、状态码、错误体与 gov5 `httpserver.go` 一致；新增回环 `PUT /mobileverify/packet` 与过载时的 `503 busy`）；`Service::set_on_ingest` 在回环收到新 packet 时回调。字节契约见 `testdata/` 中 gov5 的 `cross_client_v1` fixtures
+- `crates/n42/h2-node/src/mobile.rs` - **N42独有**：验证者侧接线——`CommittedHead`（按提交推进的 head）、每 45 s 的注册表 epoch 提交（日志 `registry epoch committed`，持久化到 `<datadir>/mobileverify/registry.bin`，启动时导入）、gossip 中继（packet 校验 header 哈希后缓存，注册校验 PoP 后接纳，均不重发）、本节点注册与回环 packet 发布到 fleet（同 gov5 `PublishLocal`）
+- `crates/n42/h2-node/examples/h2_validator.rs` - 新参数 `--mobileverify.http/.pow-bits/.packet-window/.collect-window-sec/.cert-blocks`；leader 的 payload attributes 带上注册表根；**旧的 `--mobile`（n42-mobile-service JSON-RPC）已移除**，n42-h2-node 不再依赖 n42-mobile-service
+- `crates/n42/h2-net/src/transport.rs` - gov5 的两个话题 `/n42/<fork digest>/mobileverify_{packet,registration}/ssz_snappy`（载荷为原始字节，后缀名不代表压缩）；`TransportConfig::with_mobileverify`（默认关）、`MobileTopic`、`TransportEvent::MobilePacket/MobileRegistration`、`publish_mobile`
+- `crates/n42/alloy-rpc-types-engine`（fork 的 alloy）- `PayloadAttributes` 新增 `mobile_registry_root: Option<B256>`（serde 默认、为空时不序列化，旧调用方不受影响）
+- `crates/n42/engine-types/src/assembler.rs` / `payload.rs` - 组装器把 attributes 中的根写入 `N42Header.mobile_registry_root`：仅在 MobileAnchor 闸门（`mobileAnchorTime` 与 Glamsterdam 同时激活，`mobile_registry_root_in_header_at`）下写入，闸门内缺根则拒绝出块，闸门外忽略；raw engine 尾部新增 tag 5
+- `scripts/devnet-fleet.sh` - `MOBILEVERIFY=1`（验证者 i 监听 `127.0.0.1:2101<i>`，gov5 成员 `:21020`）、`PACKETD=<gov5 mobileverify-packetd>`（在验证者 0 旁运行 packet sidecar）；执行层 RPC 开放 `eth,net,web3,debug`
+
+### 说明:
+- 规范、分阶段计划与 devnet 验证记录：`docs/MOBILEVERIFY_V3_PARITY.md`；跨客户端规则：`docs/N42_26_PORT.md`“Mobile verification”
+- 证书只在设备提交的节点上产生；各节点按自己的计时器提交 epoch，注册跨 epoch 边界时索引可能不一致（gov5 亦然）
+
 ## h2-net GossipSub 本地队列上限（环境变量）
 
 - `crates/n42/h2-net/src/config.rs`：`N42_GOSSIP_HANDLER_QUEUE`（`connection_handler_queue_len`，每个 peer 发送队列的消息条数，默认 5000）

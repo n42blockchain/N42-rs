@@ -296,11 +296,21 @@ pub enum Dropped {
     HeldEvicted,
     /// An own block still held at a height the chain had already passed.
     HeldBehind,
+    /// A queued transaction another at its (sender, nonce) outbid by the
+    /// pool's price bump (audit 2026-10 round 3, R3-P3). Harmless: the
+    /// sender replaced it.
+    Outbid,
+    /// A transaction builds refused [`REFUSALS_BEFORE_DROP`] times for
+    /// something other than its nonce or a full block (R3-P2).
+    Refused,
+    /// An arrival past the queue's bound or its lane's
+    /// ([`TxQueue::with_bounds`], R3-P2).
+    Full,
 }
 
 impl Dropped {
     /// Every reason, in report order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::Duplicate,
         Self::Mined,
         Self::StaleArrival,
@@ -310,6 +320,9 @@ impl Dropped {
         Self::NoLane,
         Self::HeldEvicted,
         Self::HeldBehind,
+        Self::Outbid,
+        Self::Refused,
+        Self::Full,
     ];
 
     /// The name this reason is reported under.
@@ -324,6 +337,9 @@ impl Dropped {
             Self::NoLane => "no_lane",
             Self::HeldEvicted => "held_evicted",
             Self::HeldBehind => "held_behind",
+            Self::Outbid => "outbid",
+            Self::Refused => "refused",
+            Self::Full => "full",
         }
     }
 
@@ -338,8 +354,68 @@ impl Dropped {
             Self::NoLane => 6,
             Self::HeldEvicted => 7,
             Self::HeldBehind => 8,
+            Self::Outbid => 9,
+            Self::Refused => 10,
+            Self::Full => 11,
         }
     }
+
+    /// Whether this reason is ordinary traffic rather than a suspect: not
+    /// sampled, and no reason to report the drops.
+    const fn harmless(self) -> bool {
+        matches!(self, Self::Duplicate | Self::Mined | Self::Outbid)
+    }
+}
+
+/// How many refusals by builds a transaction takes before the queue drops
+/// it, counting those for anything but its nonce or a full block (audit
+/// 2026-10 round 3, R3-P2). The builder reports every EVM refusal that is
+/// not a nonce's as an unsupported type, so a refusal cannot say whether it
+/// is for good (no funds) or for now (a base fee above its cap): it is
+/// counted, and given back until the count is reached.
+/// `N42_TX_QUEUE_REFUSALS` overrides it; 0 never drops (the old behaviour).
+const REFUSALS_BEFORE_DROP: u8 = 4;
+
+fn refusals_before_drop() -> u8 {
+    static AT: OnceLock<u8> = OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("N42_TX_QUEUE_REFUSALS").ok().and_then(|v| v.parse().ok()).unwrap_or(REFUSALS_BEFORE_DROP)
+    })
+}
+
+/// The most transactions the queue holds from arrivals (R3-P2):
+/// `N42_TX_QUEUE_MAX`. A 480M bench block is ~163,000 transactions and the
+/// deepest queue measured ~360,000.
+const QUEUE_MAX: usize = 4_000_000;
+
+/// The most one sender's lane holds from arrivals: `N42_TX_QUEUE_LANE_MAX`.
+/// Generous: the flood keeps deep lanes, and the queue's own bound is what
+/// caps memory.
+const LANE_MAX: usize = 1 << 20;
+
+fn env_bound(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(default)
+}
+
+/// The most (sender, nonce) refusal counts kept; past it they start over.
+const REFUSAL_COUNTS_MAX: usize = 1 << 16;
+
+/// The pool's price bump for a replacement, in percent (reth's
+/// `PriceBumpConfig` default).
+const REPLACE_PRICE_BUMP: u128 = 10;
+
+/// Whether `new` may take `held`'s place at its (sender, nonce): another
+/// transaction whose fee cap and tip both exceed the held one's by
+/// [`REPLACE_PRICE_BUMP`] percent, as the pool requires (R3-P3). The same
+/// transaction again (equal hashes) never does, so a re-sent frame's
+/// duplicates cost one hash comparison.
+fn outbids<T: PoolTransaction>(held: &ValidPoolTransaction<T>, new: &ValidPoolTransaction<T>) -> bool {
+    if held.hash() == new.hash() {
+        return false;
+    }
+    let bumped = |fee: u128| fee.saturating_mul(100 + REPLACE_PRICE_BUMP) / 100;
+    new.max_fee_per_gas() >= bumped(held.max_fee_per_gas())
+        && new.priority_fee_or_price() >= bumped(held.priority_fee_or_price())
 }
 
 /// The pool [`TxQueue::forget_mined_parallel`] runs on: eight threads of
@@ -479,11 +555,11 @@ pub struct PruneInput<'a> {
 /// removal ([`TxQueue::prune_blocks`]). The pruner's first hold drained the
 /// ingest's backlog and was the lanes lock's longest holder (33-45 ms per
 /// 5 s), and a prune per block at ~22 blocks/s kept the pruner at a
-/// utilisation of ~1 (docs/DEGRADED_ONSET_ANALYSIS.md).
+/// utilisation of ~1 (`docs/DEGRADED_ONSET_ANALYSIS.md`).
 pub fn prune_lean() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_PRUNE_LEAN").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_PRUNE_LEAN", false);
         tracing::info!(target: "n42.tx_queue", prune_lean = on, "N42_PRUNE_LEAN");
         on
     })
@@ -735,11 +811,11 @@ pub fn release_replaced_own_blocks() -> bool {
 /// accounting into one add and frees the evicted transactions on the
 /// queue's freeing thread: after the degraded onset every hold evicts a
 /// 200,000-transaction block, and the next build's selector waited on that
-/// eviction (`start_handoff_ms` 2 -> 10-12, docs/DEGRADED_ONSET_ANALYSIS.md).
+/// eviction (`start_handoff_ms` 2 -> 10-12, `docs/DEGRADED_ONSET_ANALYSIS.md`).
 pub fn handoff_done_first() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_HANDOFF_DONE_FIRST").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_HANDOFF_DONE_FIRST", false);
         tracing::info!(target: "n42.tx_queue", handoff_done_first = on, "N42_HANDOFF_DONE_FIRST");
         on
     })
@@ -814,7 +890,7 @@ fn fold_highest(mined: impl IntoIterator<Item = (Address, u64)>) -> AddressHashM
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DropReport {
     /// Counts in [`Dropped::ALL`] order.
-    pub counts: [u64; 9],
+    pub counts: [u64; 12],
     /// The first few, as (reason, sender, nonce): enough to take one sender
     /// to the generator's own log and see which nonce went missing.
     pub samples: Vec<(Dropped, Address, u64)>,
@@ -830,7 +906,7 @@ impl DropReport {
         self.counts
             .iter()
             .enumerate()
-            .any(|(i, n)| i != Dropped::Duplicate.index() && i != Dropped::Mined.index() && *n > 0)
+            .any(|(i, n)| !Dropped::ALL[i].harmless() && *n > 0)
     }
 
     /// The reasons that fired, as `name=count` pairs.
@@ -966,6 +1042,7 @@ fn note_lock_site(at: &'static std::panic::Location<'static>, hold_ns: u64, wait
 
 /// The lanes' lock by caller since the last call, which resets it, the
 /// largest duty first; empty unless `N42_LOCK_SITES=1`.
+#[allow(clippy::unnecessary_sort_by)] // diagnostic dump; sort call kept as written
 pub fn take_lock_sites() -> Vec<LockSite> {
     let mut sites = std::mem::take(&mut *HOLD_SITES.lock());
     sites.sort_unstable_by(|a, b| b.hold_ns.cmp(&a.hold_ns));
@@ -1167,6 +1244,14 @@ struct Inner<T: PoolTransaction> {
     /// Holes a build ran into: (sender, the account's next nonce, the lowest
     /// queued nonce above it). The feed fills them from the pool.
     gaps: Vec<(Address, u64, u64)>,
+    /// Builds' refusals of a (sender, nonce) for anything but its nonce or
+    /// a full block ([`REFUSALS_BEFORE_DROP`]). Kept at the count once
+    /// reached, so a copy the gap fill brings back goes at its next refusal.
+    refusals: alloy_primitives::map::HashMap<(Address, u64), u8>,
+    /// The most transactions arrivals fill the queue to ([`QUEUE_MAX`]).
+    max_len: usize,
+    /// The most one lane holds from arrivals ([`LANE_MAX`]).
+    lane_max: usize,
     /// Transactions this node's own built blocks took out of the queue before
     /// the chain committed them: (block number, block hash, the
     /// transactions). A block that consensus never commits -- its view timed
@@ -1176,6 +1261,7 @@ struct Inner<T: PoolTransaction> {
     /// nonce refusals a block after a stall). Settled by the canonical
     /// pruner: the same hash drops them, another hash at the height gives
     /// back the ones it does not carry. Bounded to the last few blocks.
+    #[allow(clippy::type_complexity)] // hot-path queue field; its type is kept inline
     held: VecDeque<(u64, B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
     /// Lanes stepped over behind a hole ([`Parked`]), roughly in the order
     /// their parks expire -- a park always ends `PARK_BUILDS` builds after
@@ -1576,7 +1662,7 @@ pub fn take_ahead_discards() -> Vec<(&'static str, u64)> {
 /// right after its own ([`Prepared`]). Off by default.
 pub fn plan_ahead() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_PLAN_AHEAD", false))
 }
 
 /// `N42_PLAN_AHEAD_WAIT_MS=<ms>`, read once (unset or 0: off). With
@@ -1614,7 +1700,7 @@ const AHEAD_LOOP_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 /// the one-hold path's. A test sets it per queue ([`TxQueue::with_offlock`]).
 fn queue_offlock() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QUEUE_OFFLOCK").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_QUEUE_OFFLOCK", false))
 }
 
 /// Senders whose lanes one hold of an off-lock prune splits
@@ -1663,7 +1749,7 @@ fn drain_chunk() -> usize {
 fn drain_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_TX_QUEUE_DRAIN_RUNS").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_TX_QUEUE_DRAIN_RUNS", false);
         tracing::info!(target: "n42.tx_queue", drain_runs = on, "N42_TX_QUEUE_DRAIN_RUNS");
         on
     })
@@ -1691,7 +1777,7 @@ fn run_length() -> usize {
 /// road reads the same index, by reference instead of by copy.
 fn compact_body() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1") || block_by_description())
+    *ON.get_or_init(|| n42_env::flag("N42_COMPACT_BODY", false) || block_by_description())
 }
 
 /// `N42_BLOCK_BY_DESCRIPTION`, read once: a follower checks a compact body
@@ -1702,7 +1788,7 @@ fn compact_body() -> bool {
 /// the index it needs cannot disagree about whether the index is kept.
 pub fn block_by_description() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BLOCK_BY_DESCRIPTION").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BLOCK_BY_DESCRIPTION", false))
 }
 
 /// `N42_SENDERS_FROM_QUEUE`, read once: a follower takes the senders of a
@@ -2287,6 +2373,9 @@ impl<T: PoolTransaction> TxQueue<T> {
                 pending: Vec::new(),
                 settling: Vec::new(),
                 gaps: Vec::new(),
+                refusals: Default::default(),
+                max_len: env_bound("N42_TX_QUEUE_MAX", QUEUE_MAX),
+                lane_max: env_bound("N42_TX_QUEUE_LANE_MAX", LANE_MAX),
                 held: VecDeque::new(),
                 parked_order: VecDeque::new(),
                 parked_len: 0,
@@ -2388,6 +2477,18 @@ impl<T: PoolTransaction> TxQueue<T> {
     #[must_use]
     pub fn with_drain_chunk(self, chunk: usize) -> Self {
         self.drain_chunk.store(chunk, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// The queue's bound and each lane's on arrivals, whatever the
+    /// environment says (`N42_TX_QUEUE_MAX`, `N42_TX_QUEUE_LANE_MAX`).
+    #[must_use]
+    pub fn with_bounds(self, total: usize, lane: usize) -> Self {
+        {
+            let mut inner = self.inner.lock();
+            inner.max_len = total;
+            inner.lane_max = lane;
+        }
         self
     }
 
@@ -3626,15 +3727,14 @@ impl<T: PoolTransaction> TxQueue<T> {
                 removed.extend(gone.into_values());
             }
         }
-        if let Some((_, taken)) = inner.last_build.as_mut() {
-            if !taken.is_empty() {
+        if let Some((_, taken)) = inner.last_build.as_mut()
+            && !taken.is_empty() {
                 let (mined, kept): (Vec<_>, Vec<_>) = std::mem::take(taken)
                     .into_iter()
                     .partition(|t| highest.get(&t.sender()).is_some_and(|m| t.nonce() <= *m));
                 *taken = kept;
                 removed.extend(mined);
             }
-        }
         removed
     }
 
@@ -3658,7 +3758,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         Self::mark_handed_in(&mut inner, hash);
     }
 
-    fn mark_handed_in(inner: &mut Inner<T>, hash: B256) {
+    const fn mark_handed_in(inner: &mut Inner<T>, hash: B256) {
         let build = inner.builds;
         if let Some(handed) = inner.handed.as_mut()
             && handed.build == build
@@ -4704,6 +4804,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// takes handed to the settling thread (which, with `ahead`, then
     /// prepares the next build's plan), and the build's [`QueueBest`].
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)] // hot-path local; its type is kept inline
     fn finish_frame_build(
         &self,
         segments: Vec<(FrameTxs<T>, usize)>,
@@ -5060,11 +5161,10 @@ impl<T: PoolTransaction> TxQueue<T> {
     }
 
     fn prepare_next_in(&self, gas_limit: u64, mode: SelectMode) -> bool {
-        if mode == SelectMode::Parallel && self.plan_snapshot_on() {
-            if let Some(made) = self.prepare_next_snapshot(gas_limit) {
+        if mode == SelectMode::Parallel && self.plan_snapshot_on()
+            && let Some(made) = self.prepare_next_snapshot(gas_limit) {
                 return made;
             }
-        }
         if self.offlock() && mode == SelectMode::Parallel {
             for attempt in 0..2 {
                 if let Some(made) = self.prepare_next_offlock(gas_limit) {
@@ -5933,7 +6033,7 @@ impl<T: PoolTransaction> Inner<T> {
 
     /// Whether a frame build's takes are noted and not all out of their
     /// lanes ([`Self::pending`] or a batched settle's [`Self::settling`]).
-    pub(crate) fn takes_unsettled(&self) -> bool {
+    pub(crate) const fn takes_unsettled(&self) -> bool {
         !self.pending.is_empty() || !self.settling.is_empty()
     }
 
@@ -6389,6 +6489,7 @@ impl<T: PoolTransaction> Inner<T> {
             return moved;
         }
         let sampling = self.drops.samples.len() < DROP_SAMPLES;
+        let (max_len, lane_max, len) = (self.max_len, self.lane_max, self.len);
         let mut samples: Vec<(u32, Dropped, Address, u64)> = Vec::new();
         let mut pushes: Vec<(u32, Address)> = Vec::new();
         let mut in_order = true;
@@ -6410,9 +6511,18 @@ impl<T: PoolTransaction> Inner<T> {
             for &pos in &meta.pos[start..end] {
                 let Some(Keyed { nonce, valid, .. }) = self.pending_drain.pop_front() else { break };
                 moved += 1;
+                let full = len + inserted >= max_len || lane.by_nonce.len() >= lane_max;
                 match lane.by_nonce.entry(nonce) {
-                    std::collections::btree_map::Entry::Occupied(_) => {
-                        self.drops.counts[Dropped::Duplicate.index()] += 1;
+                    std::collections::btree_map::Entry::Occupied(mut held) => {
+                        // Outbid by the pool's bump: the new one takes the
+                        // slot (R3-P3); a frame holding the old one then
+                        // fails its by-pointer check and is not taken whole.
+                        if outbids(held.get(), &valid) {
+                            held.insert(valid);
+                            self.drops.counts[Dropped::Outbid.index()] += 1;
+                        } else {
+                            self.drops.counts[Dropped::Duplicate.index()] += 1;
+                        }
                     }
                     std::collections::btree_map::Entry::Vacant(slot) => {
                         if lane.mined.is_some_and(|mined| nonce <= mined) {
@@ -6424,6 +6534,11 @@ impl<T: PoolTransaction> Inner<T> {
                             self.drops.counts[reason.index()] += 1;
                             if sampling && reason != Dropped::Mined {
                                 samples.push((pos, reason, sender, nonce));
+                            }
+                        } else if full {
+                            self.drops.counts[Dropped::Full.index()] += 1;
+                            if sampling {
+                                samples.push((pos, Dropped::Full, sender, nonce));
                             }
                         } else {
                             slot.insert(valid);
@@ -6469,13 +6584,23 @@ impl<T: PoolTransaction> Inner<T> {
             .lanes
             .entry(sender)
             .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None, chain_mined: None, parked: None, road: 0 });
-        if lane.by_nonce.contains_key(&nonce) {
-            self.dropped(Dropped::Duplicate, sender, nonce);
+        if let Some(held) = lane.by_nonce.get_mut(&nonce) {
+            // Outbid by the pool's bump: the new one takes the slot (R3-P3).
+            if outbids(held, &valid) {
+                *held = valid;
+                self.dropped(Dropped::Outbid, sender, nonce);
+            } else {
+                self.dropped(Dropped::Duplicate, sender, nonce);
+            }
             return;
         }
         if lane.is_stale(nonce) {
             let reason = lane.why_stale(nonce, false);
             self.dropped(reason, sender, nonce);
+            return;
+        }
+        if self.len >= self.max_len || lane.by_nonce.len() >= self.lane_max {
+            self.dropped(Dropped::Full, sender, nonce);
             return;
         }
         // The hole a build parked this lane behind, filled: the ingest saw
@@ -6655,20 +6780,32 @@ impl<T: PoolTransaction> Inner<T> {
     /// result is that of one [`Self::dropped`] call per item, in order.
     fn dropped_many(&mut self, reason: Dropped, items: impl ExactSizeIterator<Item = (Address, u64)>) {
         self.drops.counts[reason.index()] += items.len() as u64;
-        if reason == Dropped::Duplicate || reason == Dropped::Mined {
+        if reason.harmless() {
             return;
         }
         let room = DROP_SAMPLES.saturating_sub(self.drops.samples.len());
         self.drops.samples.extend(items.take(room).map(|(sender, nonce)| (reason, sender, nonce)));
     }
 
+    /// Counts a build's refusal of (sender, nonce); whether it has reached
+    /// [`REFUSALS_BEFORE_DROP`].
+    fn refused_enough(&mut self, sender: Address, nonce: u64) -> bool {
+        let at = refusals_before_drop();
+        if at == 0 {
+            return false;
+        }
+        if self.refusals.len() >= REFUSAL_COUNTS_MAX && !self.refusals.contains_key(&(sender, nonce)) {
+            self.refusals.clear();
+        }
+        let count = self.refusals.entry((sender, nonce)).or_insert(0);
+        *count = count.saturating_add(1).min(at);
+        *count >= at
+    }
+
     /// Records that a transaction left the queue, or never entered it.
     fn dropped(&mut self, reason: Dropped, sender: Address, nonce: u64) {
         self.drops.counts[reason.index()] += 1;
-        if self.drops.samples.len() < DROP_SAMPLES
-            && reason != Dropped::Duplicate
-            && reason != Dropped::Mined
-        {
+        if self.drops.samples.len() < DROP_SAMPLES && !reason.harmless() {
             self.drops.samples.push((reason, sender, nonce));
         }
     }
@@ -6968,9 +7105,9 @@ impl<T: PoolTransaction> Inner<T> {
     fn next_ready(&mut self, skipped: &AddressHashSet) -> Option<Arc<ValidPoolTransaction<T>>> {
         // Continue the current sender's run first.
         if let Some((sender, left)) = self.current.take() {
-            if left > 0 && !skipped.contains(&sender) {
-                if let Some(lane) = self.lanes.get_mut(&sender) {
-                    if let Some((_, valid)) = lane.by_nonce.pop_first() {
+            if left > 0 && !skipped.contains(&sender)
+                && let Some(lane) = self.lanes.get_mut(&sender)
+                    && let Some((_, valid)) = lane.by_nonce.pop_first() {
                         self.len -= 1;
                         if lane.by_nonce.is_empty() {
                             lane.queued = false;
@@ -6984,8 +7121,6 @@ impl<T: PoolTransaction> Inner<T> {
                         }
                         return Some(valid);
                     }
-                }
-            }
             // The run ended, was refused, or the lane emptied: the sender
             // rejoins the rotation if it still has anything.
             if let Some(lane) = self.lanes.get_mut(&sender) {
@@ -7449,11 +7584,10 @@ impl<T: PoolTransaction> QueueBest<T> {
     /// that the build took it. The taken list ends with the buffered ones,
     /// so the search from the back is short.
     fn untake(inner: &mut Inner<T>, transaction: Arc<ValidPoolTransaction<T>>) {
-        if let Some((_, taken)) = inner.last_build.as_mut() {
-            if let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, &transaction)) {
+        if let Some((_, taken)) = inner.last_build.as_mut()
+            && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, &transaction)) {
                 taken.remove(at);
             }
-        }
         inner.give_back(vec![transaction]);
     }
 }
@@ -7628,19 +7762,26 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
                 taken.remove(at);
             }
         }
+        // Refused for what it is rather than where it stands (R3-P2).
+        if let InvalidPoolTransactionError::Consensus(err) = &kind
+            && !matches!(err, InvalidTransactionError::NonceNotConsistent { .. })
+            && inner.refused_enough(sender, transaction.nonce())
+        {
+            let nonce = transaction.nonce();
+            inner.dropped(Dropped::Refused, sender, nonce);
+            return;
+        }
         if let InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent {
             tx,
             state,
         }) = &kind
-        {
-            if tx > state {
+            && tx > state {
                 inner.gaps.push((sender, *state, *tx));
                 // Nothing in this lane can execute until the hole is
                 // filled, and its head is what every build is offered
                 // first: stepped over until then ([`Parked`]).
                 inner.park(sender, *state);
             }
-        }
         inner.give_back(vec![Arc::clone(transaction)]);
     }
 
@@ -8153,6 +8294,124 @@ mod tests {
         assert_eq!(offered.first().copied(), Some(0), "a hole was left at the head of the lane");
         assert_eq!(offered, vec![0, 1, 2, 3]);
         let _ = sender;
+    }
+
+    /// Audit 2026-10 round 3 (R3-P3): a second transaction at a queued
+    /// (sender, nonce) was dropped as a duplicate whatever it paid, so a
+    /// sender could not speed up or cancel one the queue held. One that
+    /// outbids the held one by the pool's price bump (10% on both fees)
+    /// takes its place, through either drain and over a frame's member; a
+    /// lower or equal bid, or the same transaction again, is a duplicate.
+    #[test]
+    fn a_higher_fee_replaces_a_queued_transaction() {
+        use crate::test_support::{frame, sender, tx_priced};
+        for runs in [false, true] {
+            let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64).with_drain_runs(runs);
+            let who = sender(7);
+            queue.push(vec![tx_priced(who, 0, 100, 10), tx_priced(who, 1, 100, 10)]);
+            queue.drain_now();
+            let bump = tx_priced(who, 1, 110, 11);
+            let bumped = *bump.hash();
+            queue.push(vec![tx_priced(who, 1, 109, 20), tx_priced(who, 1, 200, 10), tx_priced(who, 1, 100, 10), bump]);
+            queue.drain_now();
+            assert_eq!(queue.len(), 2, "runs {runs}");
+            let mut best = queue.best_for_build(B256::repeat_byte(1));
+            let offered: Vec<(u64, B256)> = std::iter::from_fn(|| best.next()).map(|t| (t.nonce(), *t.hash())).collect();
+            drop(best);
+            assert_eq!(offered.len(), 2, "runs {runs}");
+            assert_eq!(offered[1], (1, bumped), "runs {runs}: the outbidding one is offered");
+            let named: alloy_primitives::map::HashMap<&str, u64> = queue.take_drops().named().into_iter().collect();
+            assert_eq!(named.get("duplicate"), Some(&3), "runs {runs}: {named:?}");
+            assert_eq!(named.get("outbid"), Some(&1), "runs {runs}: {named:?}");
+        }
+
+        // A frame's member outbid: the build offers the replacement, never both.
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64);
+        let who = sender(8);
+        frame(&queue, who, 0, 3);
+        queue.drain_now();
+        let bump = tx_priced(who, 1, 1_000, 100);
+        let bumped = *bump.hash();
+        queue.push(vec![bump]);
+        queue.drain_now();
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        let offered: Vec<(u64, B256)> = std::iter::from_fn(|| best.next()).map(|t| (t.nonce(), *t.hash())).collect();
+        drop(best);
+        assert_eq!(offered.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(offered[1].1, bumped);
+    }
+
+    /// Audit 2026-10 round 3 (R3-P2): a build's refusal for anything but a
+    /// nonce gave the transaction back every time, so one that can never
+    /// execute (no funds, a fee cap under the base fee: the builder reports
+    /// every such EVM refusal as an unsupported type) was taken and refused
+    /// by every build for the rest of the leg. After `REFUSALS_BEFORE_DROP`
+    /// refusals it is dropped, and a later copy of it goes at the first; a
+    /// block that is full (`ExceedsGasLimit`) never counts.
+    #[test]
+    fn a_transaction_every_build_refuses_is_dropped() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64);
+        let refuse = |seed: u8, kind: fn() -> InvalidPoolTransactionError| {
+            let mut best = queue.best_for_build(B256::repeat_byte(seed));
+            let head = std::iter::from_fn(|| best.next())
+                .find(|t| t.sender() == Address::repeat_byte(4))
+                .expect("offered");
+            best.mark_invalid(&head, kind());
+            drop(best);
+            queue.drain_now();
+        };
+        let unsupported = || InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported);
+        let full = || InvalidPoolTransactionError::ExceedsGasLimit(21_000, 0);
+        queue.push(vec![tx(4, 0)]);
+        queue.drain_now();
+        for round in 0..10u8 {
+            refuse(round, full);
+        }
+        assert_eq!(queue.len(), 1, "a full block says nothing against it");
+        for round in 1..REFUSALS_BEFORE_DROP {
+            refuse(20 + round, unsupported);
+            assert_eq!(queue.len(), 1, "refusal {round} gives it back");
+        }
+        refuse(40, unsupported);
+        assert_eq!(queue.len(), 0, "dropped at the last refusal");
+        let named: alloy_primitives::map::HashMap<&str, u64> = queue.take_drops().named().into_iter().collect();
+        assert_eq!(named.get("refused"), Some(&1), "{named:?}");
+        // Brought back (the pool's gap fill): dropped at its next refusal.
+        queue.push(vec![tx(4, 0)]);
+        queue.drain_now();
+        refuse(41, unsupported);
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// Audit 2026-10 round 3 (R3-P2, the bound): the queue had no limit, so
+    /// with the ingest going straight to it a sender (or many) could fill
+    /// the execution layer's memory. Arrivals past the queue's bound, or past
+    /// a lane's, are refused; what a build gives back is not an arrival and
+    /// always goes back. Through either drain.
+    #[test]
+    fn arrivals_past_the_queues_bounds_are_refused() {
+        for runs in [false, true] {
+            let queue: TxQueue<EthPooledTransaction> =
+                TxQueue::with_run_length(64).with_drain_runs(runs).with_bounds(5, 3);
+            queue.push((0..4).map(|n| tx_hashed(Address::repeat_byte(1), n)));
+            queue.drain_now();
+            assert_eq!(queue.len(), 3, "runs {runs}: a lane holds at most 3");
+            queue.push((0..4).map(|n| tx_hashed(Address::repeat_byte(2), n)));
+            queue.drain_now();
+            assert_eq!(queue.len(), 5, "runs {runs}: the queue holds at most 5");
+            let named: alloy_primitives::map::HashMap<&str, u64> = queue.take_drops().named().into_iter().collect();
+            assert_eq!(named.get("full"), Some(&3), "runs {runs}: {named:?}");
+            // A build's take comes back whole although the queue is full.
+            let mut best = queue.best_for_build(B256::repeat_byte(1));
+            let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+            assert_eq!(taken.len(), 5);
+            drop(best);
+            queue.push(vec![tx_hashed(Address::repeat_byte(3), 0)]);
+            queue.drain_now();
+            assert_eq!(queue.len(), 1, "runs {runs}: room again while the build holds them");
+            queue.untake(taken);
+            assert_eq!(queue.len(), 6, "runs {runs}: a give-back is not refused");
+        }
     }
 
     /// Whatever the queue lets go of is counted and the first few are

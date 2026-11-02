@@ -1,0 +1,96 @@
+{
+  "_doc": "Sparse signer mask (mask.go): uvarint(count) then count uvarints over the strictly ascending indices, the first raw, each later one as (index - previous - 1). bound = the registry's IndexBound (one past the highest committed index). DecodeMask rejects: count > remaining bytes or > bound, a truncated uvarint, a delta of u64::MAX or an index overflow, an index >= bound, and trailing bytes. 'signers' in the cert JSON is the decoded count (0 when decoding fails). EncodeMask refuses a non-ascending input (encode_unsorted_error).",
+  "valid": [
+    {
+      "indices": [],
+      "bound": 1,
+      "mask": "00"
+    },
+    {
+      "indices": [
+        0
+      ],
+      "bound": 1,
+      "mask": "0100"
+    },
+    {
+      "indices": [
+        3
+      ],
+      "bound": 4,
+      "mask": "0103"
+    },
+    {
+      "indices": [
+        0,
+        1,
+        2
+      ],
+      "bound": 3,
+      "mask": "03000000"
+    },
+    {
+      "indices": [
+        1,
+        5,
+        300
+      ],
+      "bound": 301,
+      "mask": "030103a602"
+    },
+    {
+      "indices": [
+        0,
+        65535,
+        70000
+      ],
+      "bound": 70001,
+      "mask": "0300feff03f022"
+    }
+  ],
+  "invalid": [
+    {
+      "class": "count exceeds remaining bytes",
+      "mask": "0500",
+      "bound": 100,
+      "error": "mobileverify: malformed signer mask: count 5 implausible (bytes=1 registry=100)"
+    },
+    {
+      "class": "count exceeds bound",
+      "mask": "03000000",
+      "bound": 2,
+      "error": "mobileverify: malformed signer mask: count 3 implausible (bytes=3 registry=2)"
+    },
+    {
+      "class": "index at or beyond bound",
+      "mask": "0105",
+      "bound": 5,
+      "error": "mobileverify: malformed signer mask: index 5 beyond registry size 5"
+    },
+    {
+      "class": "trailing bytes",
+      "mask": "010000",
+      "bound": 10,
+      "error": "mobileverify: malformed signer mask: 1 trailing bytes"
+    },
+    {
+      "class": "truncated entry",
+      "mask": "020080",
+      "bound": 10,
+      "error": "mobileverify: malformed signer mask: truncated at entry 1"
+    },
+    {
+      "class": "delta overflow (u64::MAX gap)",
+      "mask": "0200ffffffffffffffffff01",
+      "bound": 1073741824,
+      "error": "mobileverify: malformed signer mask: delta overflow at entry 1"
+    },
+    {
+      "class": "empty input (no count)",
+      "mask": "",
+      "bound": 10,
+      "error": "mobileverify: malformed signer mask: bad count"
+    }
+  ],
+  "encode_unsorted_error": "mobileverify: malformed signer mask: indices not strictly ascending (1 after 2)"
+}

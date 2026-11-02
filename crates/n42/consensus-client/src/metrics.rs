@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use reth_metrics::{
-    metrics::{Counter, Gauge, Histogram},
+    metrics::Counter,
     Metrics,
 };
 
 #[derive(Metrics)]
 #[metrics(scope = "consensus.client")]
+#[allow(dead_code)] // metrics set kept for the miner; not constructed today
 pub(crate) struct MinerMetrics {
     /// How many verifications were submitted.
     pub(crate) num_verification_submission: Counter,

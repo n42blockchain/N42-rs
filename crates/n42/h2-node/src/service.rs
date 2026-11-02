@@ -53,7 +53,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_consensus::Header;
+use n42_h2_consensus::N42Header as Header;
 use alloy_primitives::{keccak256, Bytes, B256};
 use n42_h2_consensus::wire_bridge::{self, BridgeError};
 use n42_h2_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
@@ -61,8 +61,7 @@ use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_net::{
     compress_block_rlp, decode_block_rlp_raw, decode_tx_batch, decompress_block_gossip,
-    encode_block_rlp, encode_tx_batch,
-    encode_block_rlp_parts, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
+    encode_block_rlp, encode_tx_batch, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
     TransportEvent, MAX_RANGE_BLOCKS,
 };
 use n42_h2_consensus::withdrawals_to_rewards;
@@ -88,6 +87,9 @@ pub fn local_engine_errors() -> u64 {
 
 /// Counter: vote-log write/fsync failures since start.
 pub const METRIC_VOTE_LOG_FAILURES_TOTAL: &str = "n42_h2_vote_log_failures_total";
+/// Counter: commits whose consensus checkpoint could not be written; the
+/// execution layer is not told of them, while voting goes on.
+pub const METRIC_CHECKPOINT_FAILURES_TOTAL: &str = "n42_h2_checkpoint_failures_total";
 /// Gauge, label `reason`: 1 once a fatal local fault stopped this validator.
 pub const METRIC_FATAL: &str = "n42_h2_fatal";
 /// Gauge, label `reason`: 1 once this node stopped voting and proposing
@@ -382,6 +384,9 @@ pub struct H2Service<E> {
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
     awaiting_bodies: HashSet<B256>,
+    /// The first body nobody asked for (gossip, a push) at each recent
+    /// height: the one imported at once (see [`Self::import_unsolicited`]).
+    unsolicited_heights: std::collections::BTreeMap<u64, B256>,
     /// When each entry of `awaiting_bodies` was first awaited: the set is
     /// capped at [`MAX_AWAITING_BODIES`] (oldest out) and an entry is aged
     /// out after [`BODY_BOOKKEEPING_TTL`], so hashes that never arrive do not
@@ -403,6 +408,13 @@ pub struct H2Service<E> {
     /// The order [`Self::compact_bodies`] was filled in, so the oldest is
     /// what the bound drops.
     compact_order: std::collections::VecDeque<B256>,
+    /// The layout claims handed to the execution layer for a block taken as
+    /// a compact body: (sender's claim source, digest of the claimed frame
+    /// layout), the frame of record's first, [`CLAIMS_PER_BLOCK`] at most
+    /// (audit 2026-10 round 2, R2-X4). Only made once a second, different
+    /// frame description of the block arrives; bounded with
+    /// [`Self::compact_bodies`], whose entries it shadows.
+    compact_claims: std::collections::HashMap<B256, Vec<(Option<n42_h2_execution::raw_engine::ClaimSource>, B256)>>,
     /// Who pushed a block's body, when the sender named itself on the
     /// channel: the member that built it, and so the one member certain to
     /// hold every transaction of it. Asked first for a fill.
@@ -422,7 +434,7 @@ pub struct H2Service<E> {
     /// Requests for named transactions this node holds only as an imported
     /// block: served from the execution layer on the next drain, the way a
     /// whole body is.
-    pending_txns_requests: Vec<(n42_h2_net::BlockTxnsRequest, n42_h2_net::BlockTxnsChannel)>,
+    pending_txns_requests: Vec<(PeerId, n42_h2_net::BlockTxnsRequest, n42_h2_net::BlockTxnsChannel)>,
     /// What this loop did between a commit and the next proposal. See
     /// [`LoopSpend`].
     loop_spend: LoopSpend,
@@ -472,6 +484,18 @@ pub struct H2Service<E> {
     /// Height of the last block the execution layer is known to have
     /// imported, once read; what "far ahead" is measured from.
     imported_height: Option<u64>,
+    /// The lowest height of range-pulled blocks no certificate has proven
+    /// since the last proof -- a verified header QC naming a block at or
+    /// above it (which proves the chain up to that block, not the block
+    /// carrying the QC: audit 2026-10 A-7), or a commit at or above it. Until
+    /// then catch-up measures "behind" from the block below it, not from the
+    /// execution layer's head: a range server feeding a node that is behind
+    /// a chain it made up would otherwise leave every honest peer "not ahead"
+    /// (audit 2026-10 B-1; gov5 measures from its committed height).
+    unproven_from: Option<u64>,
+    /// Whether the restart check of [`Self::unproven_from`] ran: an execution
+    /// layer ahead of the restored commit is unproven past it.
+    unproven_checked: bool,
     /// When the layer's height was last read for a held block; one forced
     /// read every [`HELD_TOO_LONG`] at most.
     last_forced_layer_read: Option<std::time::Instant>,
@@ -530,12 +554,21 @@ pub struct H2Service<E> {
     pending_imports: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>,
     /// Block requests the store could not answer, for the execution layer
     /// on the next drain.
-    pending_block_requests: Vec<(String, B256, n42_h2_net::BlockRequestChannel)>,
+    pending_block_requests: Vec<(PeerId, B256, n42_h2_net::BlockRequestChannel)>,
     /// Range requests being served off the loop; see [`ServeSlots`].
     serve_slots: SharedServeSlots,
+    /// The bytes range replies may hold at once, in KiB, for every peer
+    /// together ([`MAX_SERVE_BYTES`]).
+    serve_bytes: Arc<tokio::sync::Semaphore>,
     /// Fills and block-by-hash requests being served off the loop: their
     /// own share, so range pulls never refuse a vote-path fill.
     fill_slots: SharedServeSlots,
+    /// The bytes fill and block-by-hash replies may hold at once
+    /// ([`MAX_FILL_SERVE_BYTES`]), and each peer's share of them; their own
+    /// budget, as `fill_slots` are.
+    fill_bytes: FillBudget,
+    /// Header QCs that verified, so the vote path checks each once.
+    verified_header_qcs: std::cell::RefCell<VerifiedHeaderQcs>,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -573,6 +606,10 @@ pub struct H2Service<E> {
     gossiped_transactions: std::collections::VecDeque<B256>,
     /// The headers of the same blocks.
     block_headers: std::collections::HashMap<B256, Header>,
+    /// gov5's mobile-verification topics: what arrives goes to the relay
+    /// task (never awaited on this loop), what it hands back is published.
+    mobile_inbound: Option<mpsc::Sender<(n42_h2_net::MobileTopic, Vec<u8>)>>,
+    mobile_outbound: Option<mpsc::Receiver<(n42_h2_net::MobileTopic, Vec<u8>)>>,
     /// Block numbers, same bookkeeping, for the height this node advertises
     /// in the status handshake once a block commits.
     block_numbers: std::collections::HashMap<B256, u64>,
@@ -586,6 +623,12 @@ pub struct H2Service<E> {
     halt_on_commit_invalid: bool,
     /// Vote-log failures already added to [`METRIC_VOTE_LOG_FAILURES_TOTAL`].
     vote_log_failures_exported: u64,
+    /// Commits whose consensus checkpoint could not be written, so were not
+    /// finalised (also [`METRIC_CHECKPOINT_FAILURES_TOTAL`]).
+    checkpoint_failures: u64,
+    /// Whether the engine's voting halt has been reported (gauge, and the
+    /// fatal fault for a vote-log halt).
+    halt_reported: bool,
 }
 
 /// How long a leader whose builder declined waits before asking it again.
@@ -659,6 +702,12 @@ const MAX_SERVES_PER_PEER: usize = 4;
 /// The same for all peers together.
 const MAX_SERVES_IN_FLIGHT: usize = 32;
 
+/// The bytes all range replies may hold at once, from the first block read
+/// until libp2p has sent the reply. The slots alone bound requests, not
+/// bytes: 32 replies of up to 128 MB each, and a slow reader kept a reply's
+/// bytes queued after its slot was given back (audit 2026-10 B-4).
+const MAX_SERVE_BYTES: usize = 512 << 20;
+
 /// Fills and block-by-hash requests one peer may have being served at once.
 /// Their own share, larger than the ranges': a follower asks for them on
 /// its vote path (fills for pipelined blocks, their retry rounds, the
@@ -668,6 +717,13 @@ const MAX_FILL_SERVES_PER_PEER: usize = 16;
 
 /// The same for all peers together.
 const MAX_FILL_SERVES_IN_FLIGHT: usize = 64;
+
+/// The bytes fill and block-by-hash replies may hold at once, from the reply
+/// until libp2p has sent it. A store hit took no slot and counted no bytes,
+/// so a peer asking for a 26 MB body over and over queued copies nothing
+/// bounded (audit 2026-10 R2-I6). Their own budget, so range pulls never
+/// spend what the vote path needs.
+const MAX_FILL_SERVE_BYTES: usize = 512 << 20;
 
 /// The most blocks one range reply carries: gov5's 1,024, so a gov5 member
 /// catching up from this node on a small-block chain is not slowed. The
@@ -747,6 +803,7 @@ impl Drop for ServeSlot {
 }
 
 /// How many slots of `slots` are taken.
+#[allow(dead_code)] // helper kept for serve-slot accounting; not used today
 fn slots_taken(slots: &SharedServeSlots) -> usize {
     slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).total
 }
@@ -911,7 +968,7 @@ impl HeaderQc {
 /// encoding wants, and the header came out of sealing.
 fn encode_own_body(
     execution: &alloy_rpc_types_engine::ExecutionData,
-    header: &alloy_consensus::Header,
+    header: &Header,
 ) -> Vec<u8> {
     let rewards = n42_h2_consensus::withdrawals_to_rewards(
         execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice()),
@@ -933,7 +990,7 @@ fn encode_own_body(
 /// this is byte for byte what `publish_body` makes of the whole block.
 fn elided_compact_body(
     execution: &alloy_rpc_types_engine::ExecutionData,
-    header: &alloy_consensus::Header,
+    header: &Header,
     tx_count: usize,
     tx_hashes: &[B256],
     frame_layout: &[(B256, u32)],
@@ -958,7 +1015,7 @@ fn elided_compact_body(
 fn elided_compact_body_with(
     frame_blocks: bool,
     execution: &alloy_rpc_types_engine::ExecutionData,
-    header: &alloy_consensus::Header,
+    header: &Header,
     tx_count: usize,
     tx_hashes: &[B256],
     frame_layout: &[(B256, u32)],
@@ -998,6 +1055,13 @@ const MAX_TRANSPORT_DRAIN: usize = 256;
 /// batches the loop polls the transport and reads consensus, which the
 /// guards on far-ahead blocks and unimported commits make safe.
 const PULLED_BLOCKS_PER_STEP: usize = 32;
+
+/// How far past the committed height a pull may import blocks nothing proves
+/// (no header QC this node can verify): past it the pull ends at the first
+/// such block and its peer is refused for the gap (audit 2026-10 round 2,
+/// R2-I2). Honest blocks that far up carry a verifiable QC; a cold node with
+/// nothing committed yet is not bounded.
+const MAX_UNPROVEN_PAST_COMMITTED: u64 = 64;
 
 /// How many block bodies to keep for peers that ask. gov5 asks for the
 /// parent of a block it cannot place and for the block a proposal names —
@@ -1062,6 +1126,7 @@ impl LoopSpend {
     /// The proposal for `view` is being made: closes the window the commit
     /// for `view - 1` opened and hands back what it cost, when that is worth
     /// a line.
+    #[allow(clippy::type_complexity)] // hot-path return type kept as is
     fn close(&mut self, view: u64) -> Option<(u64, Vec<(&'static str, u32, u64)>)> {
         let (opened, at) = self.since.take()?;
         if opened + 1 != view {
@@ -1086,12 +1151,14 @@ enum Served {
         channel: n42_h2_net::BlockRequestChannel,
         body: Option<alloy_primitives::Bytes>,
     },
-    /// A range of blocks, from the execution layer.
+    /// A range of blocks, from the execution layer, with what it holds (its
+    /// serve slot, its bytes) until the transport has sent it.
     Range {
         peer: PeerId,
         request: n42_h2_net::RangeRequest,
         channel: n42_h2_net::RangeRequestChannel,
-        rlps: Vec<Vec<u8>>,
+        range: ServedRange,
+        slot: ServeSlot,
     },
 }
 
@@ -1189,23 +1256,47 @@ fn fill_from_body(
 ) -> n42_h2_net::BlockTxnsReply {
     let decoded = n42_h2_consensus::decode_raw_block_body_ref(body, profile)
         .map_err(|err| err.to_string())?;
-    request
-        .indices
-        .iter()
-        .map(|&i| {
-            decoded
-                .transactions
-                .get(i as usize)
-                .map(|tx| alloy_primitives::Bytes::copy_from_slice(tx))
-                .ok_or_else(|| format!("block {} has no index {i}", request.hash))
-        })
-        .collect()
+    named_txns(&decoded.transactions, request)
+}
+
+/// The transactions at `request`'s positions of a block's `txs`. The
+/// positions must be in block order with none repeated, as this node asks
+/// for them, and the reply is refused before anything is copied once it
+/// would pass [`n42_h2_net::MAX_BLOCK_TXNS_BYTES`], the reader's own limit:
+/// a peer that named one large transaction a million times was answered
+/// with all of it (audit 2026-10 round 3, R3-N2).
+fn named_txns<T: AsRef<[u8]>>(txs: &[T], request: &n42_h2_net::BlockTxnsRequest) -> n42_h2_net::BlockTxnsReply {
+    let mut previous = None;
+    let mut bytes = 0u64;
+    for &i in &request.indices {
+        if previous.is_some_and(|previous| previous >= i) {
+            return Err(format!("positions asked of block {} are not strictly ascending", request.hash));
+        }
+        previous = Some(i);
+        let tx = txs.get(i as usize).ok_or_else(|| format!("block {} has no index {i}", request.hash))?;
+        bytes += 4 + tx.as_ref().len() as u64;
+        if bytes > n42_h2_net::MAX_BLOCK_TXNS_BYTES {
+            return Err(format!(
+                "the transactions asked of block {} exceed {} bytes",
+                request.hash,
+                n42_h2_net::MAX_BLOCK_TXNS_BYTES
+            ));
+        }
+    }
+    Ok(request.indices.iter().map(|&i| alloy_primitives::Bytes::copy_from_slice(txs[i as usize].as_ref())).collect())
 }
 
 /// How many compact frames are kept. Fewer than the other per-block maps,
 /// because each is ~5 MB: enough for a fill's round trip and for the gossip
 /// copy of a block already imported, not a history.
 const REMEMBERED_COMPACT_BODIES: usize = 8;
+
+/// Distinct frame layouts handed to the execution layer per block hash, one
+/// per peer: the first compact body's and up to three other peers' (audit
+/// 2026-10 round 2, R2-X4). The execution layer keeps as many per root, one
+/// per source (`n42_engine_types::frame_blocks::CLAIMS_PER_ROOT`), so a peer
+/// sending wrong layouts after the right one cannot push it out there.
+pub(crate) const CLAIMS_PER_BLOCK: usize = 4;
 
 const REMEMBERED_TIMESTAMPS: usize = 256;
 
@@ -1314,13 +1405,13 @@ fn build_start_fields(
 /// set on the execution layer, which serves the request. Off by default.
 fn tenure_first_on_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_TENURE_FIRST_ON_OUTPUT").is_ok_and(|value| value == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_TENURE_FIRST_ON_OUTPUT", false))
 }
 
 const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<u64> {
     match (remembered, header) {
         (Some(stamp), _) => Some(stamp),
-        (None, Some(header)) => Some(header.timestamp),
+        (None, Some(header)) => Some(header.inner.timestamp),
         (None, None) => None,
     }
 }
@@ -1485,10 +1576,12 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
+            unsolicited_heights: std::collections::BTreeMap::new(),
             awaiting_since: std::collections::HashMap::new(),
             last_body_age_out: None,
             compact_bodies: std::collections::HashMap::new(),
             compact_order: std::collections::VecDeque::new(),
+            compact_claims: std::collections::HashMap::new(),
             body_from: std::collections::HashMap::new(),
             fill_peers: std::collections::HashMap::new(),
             fill_asked: std::collections::HashMap::new(),
@@ -1506,6 +1599,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
+            unproven_from: None,
+            unproven_checked: false,
             last_forced_layer_read: None,
             silent_keys: SilentKeys::default(),
             silent_checked_view: None,
@@ -1529,7 +1624,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             pending_imports: Vec::new(),
             pending_block_requests: Vec::new(),
             serve_slots: ServeSlots::shared(MAX_SERVES_PER_PEER, MAX_SERVES_IN_FLIGHT),
+            serve_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_SERVE_BYTES >> 10)),
             fill_slots: ServeSlots::shared(MAX_FILL_SERVES_PER_PEER, MAX_FILL_SERVES_IN_FLIGHT),
+            fill_bytes: FillBudget::new(MAX_FILL_SERVE_BYTES >> 10),
+            verified_header_qcs: std::cell::RefCell::default(),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -1539,12 +1637,16 @@ impl<E: ExecutionLayer> H2Service<E> {
             outbound_transactions: None,
             gossiped_transactions: std::collections::VecDeque::new(),
             block_headers: std::collections::HashMap::new(),
+            mobile_inbound: None,
+            mobile_outbound: None,
             block_numbers: std::collections::HashMap::new(),
             block_seen: std::collections::HashMap::new(),
             timestamp_order: Vec::new(),
             fatal: None,
             halt_on_commit_invalid: halt_on_commit_invalid_from_env(),
             vote_log_failures_exported: 0,
+            checkpoint_failures: 0,
+            halt_reported: false,
         }
     }
 
@@ -1552,7 +1654,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// stops this node's voting and proposing (default from
     /// `N42_HALT_ON_COMMIT_INVALID`, on).
     #[must_use]
-    pub fn with_halt_on_commit_invalid(mut self, on: bool) -> Self {
+    pub const fn with_halt_on_commit_invalid(mut self, on: bool) -> Self {
         self.halt_on_commit_invalid = on;
         self
     }
@@ -1598,6 +1700,19 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.vote_log_failures_exported = failures;
         }
         self.halt_on_commit_refusal();
+        // However the engine came to halt -- the batch vote paths drop its
+        // `Fatal` for a vote log that keeps failing, at debug -- the halt is
+        // reported here, once: the gauge, and for the vote log the same
+        // fatal stop the direct path gives (audit 2026-10 A-1).
+        if !self.halt_reported
+            && let Some(reason) = self.engine.voting_halted()
+        {
+            self.halt_reported = true;
+            metrics::gauge!(METRIC_VOTING_HALTED, "reason" => reason).set(1.0);
+            if reason == "vote_log" && self.fatal.is_none() {
+                self.fatal = Some((reason, "voting halted: the vote log kept failing".to_owned()));
+            }
+        }
         if let Some((reason, detail)) = self.fatal.take() {
             metrics::gauge!(METRIC_FATAL, "reason" => reason).set(1.0);
             error!(
@@ -1665,6 +1780,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// domain to canonicalize a catching-up node from a header. The view-0
     /// genesis sentinel embeds nothing, as gov5's `buildHeaderExtra(view,
     /// nil)`. A certificate that does not encode keeps the previous bytes.
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     fn refresh_header_qc(&mut self) {
         let qc = self.engine.last_committed_qc();
         let mut held = self.header_qc.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1838,6 +1954,20 @@ impl<E: ExecutionLayer> H2Service<E> {
         self
     }
 
+    /// Relays gov5's mobile-verification topics: messages from them are
+    /// handed to `inbound` (dropped when it is full, never awaited), and what
+    /// arrives on `outbound` is published. The transport must have joined the
+    /// topics (`TransportConfig::mobileverify`).
+    pub fn with_mobile_gossip(
+        mut self,
+        inbound: mpsc::Sender<(n42_h2_net::MobileTopic, Vec<u8>)>,
+        outbound: mpsc::Receiver<(n42_h2_net::MobileTopic, Vec<u8>)>,
+    ) -> Self {
+        self.mobile_inbound = Some(inbound);
+        self.mobile_outbound = Some(outbound);
+        self
+    }
+
     /// Hands gossiped transactions to the execution layer's binary ingest
     /// instead of its JSON-RPC. The outbound direction is unchanged, so this
     /// goes after [`Self::with_transaction_source`] and replaces only the
@@ -1936,6 +2066,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.drain_outputs(&mut events).await?;
             self.forward_inbound_transactions();
             self.flush_outbox(&mut events);
+            // A fault the engine raised in this step ends it here too: the
+            // fast path is the one a node under load takes every step.
+            self.check_local_faults()?;
             return Ok(events);
         }
 
@@ -1953,6 +2086,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let propose_at = tick.map_or(retry_at, |tick| retry_at.min(tick));
         let on_tick = tick.is_some_and(|tick| tick <= retry_at);
         let outbound = self.outbound_transactions.as_mut();
+        let mobile_outbound = self.mobile_outbound.as_mut();
         let body_rx = self.body_rx.as_mut();
         let own_imports = self.own_imports.as_mut();
         let foreign_imports = self.foreign_imports.as_mut();
@@ -2009,6 +2143,18 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return Err(ServiceError::TransportEnded);
                 };
                 self.handle_transport_event(event)?;
+            }
+            mobile = async {
+                match mobile_outbound {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some((topic, data)) = mobile
+                    && let Err(err) = self.transport.publish_mobile(topic, data)
+                {
+                    debug!(target: "n42.h2.node", %err, ?topic, "could not gossip a mobile-verification message");
+                }
             }
             batch = async {
                 match outbound {
@@ -2150,6 +2296,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Bounded because the transport can always have more: an unbounded drain
     /// under sustained gossip would never return to the engine, which is the
     /// same starvation this fixes, pointed the other way.
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     async fn drain_transport(&mut self, events: &mut Vec<ServiceEvent>) -> Result<usize, ServiceError> {
         let mut drained = 0;
         // The phase's time, split: polling the swarm (which runs libp2p's
@@ -2373,7 +2520,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                                 self.note_peer_height(peer, header.number);
                             }
                             if fresh {
-                                self.import_eagerly(block_hash);
+                                self.import_unsolicited(block_hash, header.number);
                                 self.body_arrived.insert(block_hash, std::time::Instant::now());
                                 info!(target: "n42.h2.node", ?block_hash, "block body received (header only)");
                                 self.received_bodies.push(block_hash);
@@ -2401,7 +2548,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         let txs = block.transactions.len();
                         self.driver.cache_payload(block_hash, block.execution_data());
                         let convert_ms = convert_at.elapsed().as_millis() as u64;
-                        self.import_eagerly(block_hash);
+                        self.import_unsolicited(block_hash, block.header.number);
                         self.body_arrived.insert(block_hash, std::time::Instant::now());
                         info!(target: "n42.h2.node", ?block_hash, txs, convert_ms, "block body received");
                         self.received_bodies.push(block_hash);
@@ -2430,43 +2577,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return Ok(());
                 }
                 match held {
-                    Some(body) => {
-                        // The body is shared, not copied, and the walk that
-                        // picks the named transactions out of its 26 MB
-                        // happens on a worker: this loop is the leader's
-                        // between committing one view and proposing the
-                        // next, and loop196 put 230-330 of these a leg on it.
-                        let profile = self.header_profile;
-                        let back = self.served_txns.0.clone();
-                        let asked_at = std::time::Instant::now();
-                        tokio::task::spawn_blocking(move || {
-                            let reply = fill_from_body(&body, profile, &request);
-                            debug!(
-                                target: "n42.h2.node",
-                                %peer,
-                                hash = ?request.hash,
-                                wanted = request.indices.len(),
-                                served = reply.as_ref().map(Vec::len).unwrap_or(0),
-                                "peer asked for named transactions; served from the stored body"
-                            );
-                            // The loop wakes on this (see the step's select):
-                            // a follower is waiting on it to vote. Waits for
-                            // room in the channel (this is a blocking-pool
-                            // thread); a closed one (shutdown) just ends it.
-                            // The slot goes back once the answer is handed
-                            // on, not when the loop hands it to the peer.
-                            let _ = back.blocking_send(Served::Txns(ServedTxns {
-                                peer,
-                                channel,
-                                reply,
-                                hash: request.hash,
-                                wanted: request.indices.len(),
-                                asked_at,
-                                ready_at: std::time::Instant::now(),
-                            }));
-                            drop(slot);
-                        });
-                    }
+                    Some(body) => self.spawn_fill_from_body(peer, request, channel, body, slot),
                     // A member that took this block as a compact body holds
                     // no whole body -- and on a fleet where every member
                     // does that, "not held here whole" was every answer
@@ -2488,7 +2599,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         if self.pending_txns_requests.len() >= MAX_PENDING_SERVES {
                             self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
                         } else {
-                            self.pending_txns_requests.push((request, channel));
+                            self.pending_txns_requests.push((peer, request, channel));
                         }
                     }
                     None => {
@@ -2583,6 +2694,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                             profile: self.header_profile,
                             rlp: filled,
                             compact: true,
+                            // The frame of record's sender, who claimed its layout.
+                            source: self
+                                .body_from
+                                .get(&request.hash)
+                                .map(|from| n42_h2_execution::raw_engine::claim_source_of(&from.to_bytes())),
                         });
                         self.import_eagerly(request.hash);
                     }
@@ -2612,7 +2728,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 match self.body_store.get(&hash).map(|body| body.to_shared()) {
                     Some(body) => {
                         debug!(target: "n42.h2.node", %peer, ?hash, "peer asked for a block; served from the store");
-                        self.transport.respond_block(channel, Some(body));
+                        self.respond_block_within_budget(peer, channel, Some(body));
                     }
                     // A block this node took elided is fetched by its header
                     // on the next drain (it needs this loop's state).
@@ -2624,7 +2740,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                             debug!(target: "n42.h2.node", %peer, ?hash, "block request queue full; refused");
                             self.transport.respond_block(channel, None);
                         } else {
-                            self.pending_block_requests.push((peer.to_string(), hash, channel));
+                            self.pending_block_requests.push((peer, hash, channel));
                         }
                     }
                     // Any other is looked up off the loop, within the
@@ -2697,7 +2813,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 match self.accept_body_once(chunk.rlp) {
                     Ok((hash, header, true)) => {
                         self.note_peer_height(peer, header.number);
-                        self.import_eagerly(hash);
+                        self.import_unsolicited(hash, header.number);
                         self.received_bodies.push(hash);
                     }
                     Ok((hash, header, false)) => {
@@ -2723,7 +2839,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                             self.remember_block(hash, &block.header);
                             self.remember_body(hash, chunk.rlp.clone());
                             self.driver.cache_payload(hash, block.execution_data());
-                            self.import_eagerly(hash);
+                            self.import_unsolicited(hash, block.header.number);
                             self.received_bodies.push(hash);
                         }
                     }
@@ -2746,10 +2862,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
                     let el = self.driver.execution_layer_arc();
                     let back = self.served_txns.0.clone();
+                    let budget = self.serve_bytes.clone();
                     tokio::spawn(async move {
-                        let rlps = serve_range(&*el, request).await;
-                        let _ = back.send(Served::Range { peer, request, channel, rlps }).await;
-                        drop(slot);
+                        let range = serve_range(&*el, request, &budget).await;
+                        let _ = back.send(Served::Range { peer, request, channel, range, slot }).await;
                     });
                 } else {
                     debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; range refused");
@@ -2796,8 +2912,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.direct_votes.forget_peer(&peer);
                 // A height is only worth what the peer can still serve.
                 self.peer_heights.remove(&peer);
+                self.fill_bytes.forget(&peer);
             }
             TransportEvent::VoteHello { peer, index, signature } => {
+                if !self.direct_votes.hello_worth_verifying(index, peer) {
+                    return Ok(());
+                }
                 let verified = n42_h2_primitives::BlsSignature::from_bytes(&signature).is_ok_and(|signature| {
                     self.engine
                         .verify_vote_hello(index, self.identity.genesis_hash, &peer.to_bytes(), &signature)
@@ -2813,6 +2933,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.direct_votes.note_direct();
                 return self.handle_transport_event_inner(*inner);
             }
+            TransportEvent::MobilePacket { data, .. } => self.forward_mobile(n42_h2_net::MobileTopic::Packet, data),
+            TransportEvent::MobileRegistration { data, .. } => {
+                self.forward_mobile(n42_h2_net::MobileTopic::Registration, data);
+            }
             TransportEvent::Rejected { reason, .. } => {
                 debug!(target: "n42.h2.node", reason, "dropped a gossip payload");
             }
@@ -2824,8 +2948,31 @@ impl<E: ExecutionLayer> H2Service<E> {
         Ok(())
     }
 
+    /// Hands a mobile-verification message to the relay task, if there is one.
+    fn forward_mobile(&self, topic: n42_h2_net::MobileTopic, data: Vec<u8>) {
+        if let Some(tx) = &self.mobile_inbound
+            && tx.try_send((topic, data)).is_err()
+        {
+            debug!(target: "n42.h2.node", ?topic, "mobile-verification relay queue full; message dropped");
+        }
+    }
+
     /// Feeds a decoded consensus message to the engine.
     fn accept_envelope(&mut self, envelope: &H2V4Envelope) {
+        // gov5's SyncInfo TC, before the message itself as gov5 orders it;
+        // translated only when it is ahead of this node (R2-C1).
+        if let Some(tc) = wire_bridge::embedded_tc(envelope)
+            && tc.view >= self.engine.current_view()
+        {
+            match wire_bridge::tc_to_engine(tc, self.validator_count) {
+                Ok(tc) => {
+                    if let Err(err) = self.engine.adopt_embedded_tc(&tc) {
+                        report_engine_error(&err, "piggybacked TC", &mut self.fatal);
+                    }
+                }
+                Err(err) => debug!(target: "n42.h2.node", %err, "undecodable piggybacked TC; ignored"),
+            }
+        }
         match wire_bridge::to_engine(envelope, self.validator_count) {
             Ok(message) => {
                 if trace_messages() {
@@ -2880,69 +3027,39 @@ impl<E: ExecutionLayer> H2Service<E> {
         for action in self.driver.retry_failed_commit().await {
             self.apply_driver_action(action, events)?;
         }
+        // An import that ended without a verdict is executed again once its
+        // pause has passed, from what is held (audit 2026-10 round 2, R2-R3).
+        for action in self.driver.retry_failed_imports().await {
+            self.apply_driver_action(action, events)?;
+        }
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
+        // Only blocks taken elided are queued. The first request for one
+        // fetches its body into the store, so the ones behind it are served
+        // from there; one the execution layer no longer holds is answered
+        // "not here" without a second, whole-block lookup on this loop.
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
-            if let Some(body) = self.elided_body(hash).await {
-                debug!(target: "n42.h2.node", peer, ?hash, "peer asked for a block taken elided; body fetched from the execution layer");
-                self.transport.respond_block(channel, Some(body));
-                continue;
-            }
-            let body = match self.driver.execution_layer().block_by_hash(hash).await {
-                Ok(Some(block)) => Some(alloy_primitives::Bytes::from(n42_h2_net::encode_block_rlp_raw(
-                    &block.header,
-                    &block.transactions,
-                    &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
-                    None,
-                ))),
-                Ok(None) => None,
-                Err(err) => {
-                    debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not serve a block");
-                    None
-                }
-            };
-            debug!(target: "n42.h2.node", peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
-            self.transport.respond_block(channel, body);
+            let body = self.queued_body(hash).await;
+            debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block taken elided");
+            self.respond_block_within_budget(peer, channel, body);
         }
         while let Ok(served) = self.served_txns.1.try_recv() {
             self.respond_served(served);
         }
-        for (request, channel) in std::mem::take(&mut self.pending_txns_requests) {
-            if let Some(body) = self.elided_body(request.hash).await {
-                let reply = fill_from_body(&body, self.header_profile, &request);
-                debug!(
-                    target: "n42.h2.node",
-                    hash = ?request.hash,
-                    wanted = request.indices.len(),
-                    served = reply.as_ref().map(Vec::len).unwrap_or(0),
-                    "peer asked for named transactions of a block taken elided; body fetched from the execution layer"
-                );
-                self.transport.respond_block_txns(channel, reply);
+        // The same for named transactions; the walk through the body runs
+        // off the loop within the peer's share, as for a stored body.
+        for (peer, request, channel) in std::mem::take(&mut self.pending_txns_requests) {
+            let Some(body) = self.queued_body(request.hash).await else {
+                debug!(target: "n42.h2.node", %peer, hash = ?request.hash, "peer asked for named transactions of a block no longer held");
+                self.transport.respond_block_txns(channel, Err(format!("block {} is not here", request.hash)));
                 continue;
-            }
-            let reply = match self.driver.execution_layer().block_by_hash(request.hash).await {
-                Ok(Some(block)) => request
-                    .indices
-                    .iter()
-                    .map(|&i| {
-                        block
-                            .transactions
-                            .get(i as usize)
-                            .cloned()
-                            .ok_or_else(|| format!("block {} has no index {i}", request.hash))
-                    })
-                    .collect::<Result<Vec<_>, String>>(),
-                Ok(None) => Err(format!("block {} is not here", request.hash)),
-                Err(err) => Err(err.to_string()),
             };
-            debug!(
-                target: "n42.h2.node",
-                hash = ?request.hash,
-                wanted = request.indices.len(),
-                served = reply.as_ref().map(Vec::len).unwrap_or(0),
-                "peer asked for named transactions; execution layer consulted"
-            );
-            self.transport.respond_block_txns(channel, reply);
+            let Some(slot) = ServeSlot::take(&self.fill_slots, peer) else {
+                debug!(target: "n42.h2.node", %peer, hash = ?request.hash, "too many requests in flight; fill refused");
+                self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
+                continue;
+            };
+            self.spawn_fill_from_body(peer, request, channel, body, Some(slot));
         }
         for block_hash in std::mem::take(&mut self.received_bodies) {
             events.push(ServiceEvent::BodyReceived { block_hash });
@@ -3012,9 +3129,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             (&output, self.checkpoint.as_ref())
             && let Err(error) = write(&self.engine)
         {
-            warn!(
+            self.checkpoint_failures += 1;
+            metrics::counter!(METRIC_CHECKPOINT_FAILURES_TOTAL).increment(1);
+            error!(
                 target: "n42.h2.node",
-                %error, view, ?block_hash,
+                %error, view, ?block_hash, failures = self.checkpoint_failures,
                 "could not persist consensus state; the commit is not being finalised",
             );
             return Ok(());
@@ -3047,6 +3166,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         if let EngineOutput::ExecuteBlock(block_hash) = &output
             && self.imported.contains(block_hash)
         {
+            // The parent first, as for every import: a block the pull brought
+            // in never told the engine, and an unknown parent withholds the
+            // vote (audit 2026-10 round 2, R2-R1).
+            if let Some(reason) = self.header_qc_refusal(block_hash) {
+                warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no vote");
+                return Ok(());
+            }
+            if let Some(header) = self.block_headers.get(block_hash) {
+                self.engine.remember_parent(*block_hash, header.parent_hash);
+            }
             if let Err(err) = self.engine.process_event(ConsensusEvent::BlockImported(*block_hash)) {
                 debug!(target: "n42.h2.node", ?block_hash, "engine refused an import it had already been told of");
                 report_engine_error(&err, "repeated import", &mut self.fatal);
@@ -3104,6 +3233,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if let Some(number) = self.block_numbers.get(&block_hash).copied() {
                     self.transport.set_advertised_height(number);
                     self.committed_height = Some(self.committed_height.map_or(number, |height| height.max(number)));
+                    // A commit at or past the unproven run puts the head on
+                    // the chain consensus decided.
+                    if self.unproven_from.is_some_and(|from| number >= from) {
+                        self.unproven_from = None;
+                    }
                 }
                 self.loop_spend.open(view);
                 events.push(ServiceEvent::Committed {
@@ -3184,6 +3318,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self
     }
 
+    /// Enables or disables building the next payload before this node is the leader (off by default).
     pub const fn with_build_ahead(mut self, enabled: bool) -> Self {
         self.prepare_ahead = enabled;
         self
@@ -3736,7 +3871,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.remember_block(built.hash, &header);
                 } else {
                     match built.execution_data.clone().into_block_raw() {
-                        Ok(block) => self.remember_block(built.hash, &block.header),
+                        Ok(block) => self.remember_block(
+                            built.hash,
+                            &n42_h2_consensus::header_engine::block_with_payload_root(block, &built.execution_data.payload).header,
+                        ),
                         Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
                     }
                 }
@@ -3905,6 +4043,15 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(), ServiceError> {
         match action {
             DriverAction::Consensus(event) => {
+                // A block gov5 refuses for its header QC is not voted for,
+                // nor built on (audit 2026-10 round 3, R3-C2).
+                if let ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) =
+                    event.as_ref()
+                    && let Some(reason) = self.header_qc_refusal(block_hash)
+                {
+                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no vote");
+                    return Ok(());
+                }
                 // The engine's extends rule reads the parent of an imported
                 // block; every block imported here came with its header.
                 if let ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) =
@@ -4044,6 +4191,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // withdraws the block's import evidence, so the hash is
                 // checked again if it is ever proposed again.
                 warn!(target: "n42.h2.node", ?block_hash, reason, "execution layer rejected a block");
+                // The hash names the header, not the transactions: the
+                // rejected bytes may be a forgery under an honest block's
+                // hash. Forgotten, so the next copy is taken and imported
+                // rather than dropped as a duplicate, and the forgery is not
+                // served on (audit 2026-10 round 2, R2-I3).
+                self.forget_rejected_body(block_hash);
                 if let Err(err) = self.engine.process_event(ConsensusEvent::BlockRejected(block_hash)) {
                     debug!(target: "n42.h2.node", ?block_hash, "engine refused the withdrawal of import evidence");
                     report_engine_error(&err, "import withdrawal", &mut self.fatal);
@@ -4258,9 +4411,20 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         };
         // The execution layer is asked only when a peer may be past what was
-        // last read from it.
-        if self.imported_height.is_some_and(|tip| height <= tip) {
+        // last read from it -- below the unproven start, when pulled blocks
+        // wait for a proof: that start stays put, and the layer was read on
+        // every drain while it did (audit 2026-10 round 2, R2-R5).
+        let held = self
+            .imported_height
+            .map(|tip| self.unproven_from.map_or(tip, |from| tip.min(from.saturating_sub(1))));
+        if self.unproven_checked && held.is_some_and(|held| height <= held) {
             return;
+        }
+        if !self.unproven_checked {
+            self.unproven_checked = true;
+            if let Some(from) = self.unproven_after_restart().await {
+                self.unproven_from = Some(self.unproven_from.map_or(from, |known| known.min(from)));
+            }
         }
         let latest = match self.driver.execution_layer().latest_block_number().await {
             Ok(Some(latest)) => latest,
@@ -4272,6 +4436,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
         };
         self.imported_height = Some(latest);
+        // Pulled blocks nothing has proven do not count as held: the pull
+        // starts below them, and an honest peer's chain replaces them
+        // through the forkchoice that follows its blocks.
+        let latest = self.unproven_from.map_or(latest, |from| latest.min(from - 1));
         // Statuses arrive on connect, and a block the fleet gossiped before
         // this node connected never comes by itself — however small the gap.
         if height <= latest {
@@ -4379,14 +4547,39 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // layer sees the block: the first block that fails ends the
                 // batch (what passed before it stays imported), and its peer
                 // is not asked for this gap again.
-                if let Err(reason) = self.check_pulled_block(&block.header) {
-                    warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
+                let proven = match self.check_pulled_block(&block.header) {
+                    Ok(proven) => proven,
+                    Err(reason) => {
+                        warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
+                        self.refused_range_peers.insert(peer, number);
+                        self.finish_catch_up(events, false);
+                        return;
+                    }
+                };
+                if proven.is_none()
+                    && self.committed_height.is_some_and(|committed| number > committed.saturating_add(MAX_UNPROVEN_PAST_COMMITTED))
+                {
+                    warn!(
+                        target: "n42.h2.node",
+                        %peer, number, committed = ?self.committed_height,
+                        "peer served a block far past the committed height that nothing proves; the pull stops and the peer is not asked for this gap again"
+                    );
                     self.refused_range_peers.insert(peer, number);
                     self.finish_catch_up(events, false);
                     return;
                 }
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
+                        // A verified header QC proves the chain up to the
+                        // block it names; this block, above it, is still
+                        // unproven (audit 2026-10 A-7).
+                        let from = match proven {
+                            Some(certified) => {
+                                self.unproven_from.filter(|from| *from > certified).unwrap_or(certified + 1)
+                            }
+                            None => self.unproven_from.unwrap_or(number),
+                        };
+                        self.unproven_from = Some(from.min(number));
                         self.remember_imported(hash);
                         self.note_imported(number);
                         self.remember_block(hash, &block.header);
@@ -4434,7 +4627,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 catch_up.target = catch_up.next + MAX_RANGE_BLOCKS - 1;
                 self.request_next_range();
-            } else if catch_up.probing && catch_up.next - 1 >= catch_up.probe_height {
+            } else if catch_up.probing && catch_up.next > catch_up.probe_height {
                 // Short, and at the height the peer was known at when the
                 // probe began: the rest is what the fleet made since, which
                 // gossip carries.
@@ -4460,26 +4653,56 @@ impl<E: ExecutionLayer> H2Service<E> {
     ///   holds the headers. When this node knows no validator set for the
     ///   QC's view (a cold node, or one further behind than the epoch history
     ///   it keeps) the QC is unchecked and only the parent link is, as gov5's
-    ///   `verifyHeaderWithBatch` does; a pulled block never becomes `safe`
-    ///   either way.
+    ///   `verifyHeaderWithBatch` does.
+    ///
+    /// None of this authenticates the block itself: a header QC proves that a
+    /// quorum certified the block it names, and a range server can copy one
+    /// real QC into blocks it made up above that one (gov5 accepts them as
+    /// well). The defence is that a pulled block is head only -- never
+    /// committed, `safe` or `finalized` (the driver's `import_pulled`) --
+    /// until a commit-domain QC from live consensus names it or a
+    /// descendant, as gov5 canonicalizes only from a commit (audit 2026-10
+    /// A-7); and that catch-up keeps counting it as unproven.
     ///
     /// The seal is not checked: the live path does not check it either (a
     /// block is authenticated by the certificates on the wire, see
     /// `HotStuffConsensus`). A header without the `HotStuff` extra layout is
     /// refused on a gov5 chain and carries no certificate on another.
-    fn check_pulled_block(&self, header: &Header) -> Result<(), String> {
+    ///
+    /// `Ok(Some(height))` when a certificate verified and names the block at
+    /// `height` on this block's parent chain (the chain up to it is the one
+    /// the validator set certified), `Ok(None)` when nothing was proven.
+    fn check_pulled_block(&self, header: &Header) -> Result<Option<u64>, String> {
         if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
             && header.parent_hash != prev
         {
             return Err(format!("parent {} is not the block pulled before it, {prev}", header.parent_hash));
         }
+        let Some(qc) = self.check_header_qc(header)? else {
+            return Ok(None);
+        };
+        if qc.view == 0 {
+            return Ok(None);
+        }
+        self.certified_is_an_ancestor(header, qc.block_hash)
+    }
+
+    /// The committed QC a header embeds, checked as gov5's
+    /// `verifyHeaderWithBatch` does: extra data that does not decode (QC
+    /// then seal, or the legacy QC alone) is refused, as is a QC whose view
+    /// is past the header's own or that does not verify against the set for
+    /// its exact view. No QC, or no set known for its view, is `Ok(None)`:
+    /// gov5 checks nothing more either. A QC that verified once is not
+    /// verified again ([`VerifiedHeaderQcs`]): the live path asks for every
+    /// block it votes on.
+    fn check_header_qc(&self, header: &Header) -> Result<Option<QuorumCertificate>, String> {
         let extra = match n42_h2_consensus::HeaderExtra::decode(&header.extra_data) {
             Ok(extra) => extra,
             Err(err) if self.header_profile == HeaderProfile::Gov5H2 => return Err(err.to_string()),
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(None),
         };
         if extra.qc.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // gov5's `decodeHeaderExtra`: QC then seal, or (legacy) a QC alone.
         let wire = n42_h2_wire::h2_wire::decode_h2_qc(&extra.qc)
@@ -4491,31 +4714,74 @@ impl<E: ExecutionLayer> H2Service<E> {
         if wire.view > extra.view {
             return Err(format!("header QC view {} is past the header's view {}", wire.view, extra.view));
         }
+        let key = alloy_primitives::keccak256(&extra.qc);
+        if let Some(qc) = self.verified_header_qcs.borrow().get(&key) {
+            return Ok(Some(qc));
+        }
         let Some(qc) = self.engine.verify_header_qc(&wire).map_err(|err| err.to_string())? else {
             debug!(
                 target: "n42.h2.node",
                 qc_view = wire.view,
                 number = header.number,
-                "validator set for the certificate's view is not known; only the parent link is checked"
+                "validator set for the certificate's view is not known; the header QC is unchecked"
             );
-            return Ok(());
+            return Ok(None);
         };
+        self.verified_header_qcs.borrow_mut().insert(key, qc.clone());
+        Ok(Some(qc))
+    }
+
+    /// What the mobile service needs of a committed block: its number and,
+    /// when its own header carries it, its receipts root (audit 2026-10
+    /// round 3, R3-P5). Under deferred execution a header's execution fields
+    /// are its parent's, so no root is given: an attestation then waits
+    /// rather than certifying the wrong one. `None` for a block whose header
+    /// this node does not hold.
+    pub fn mobile_commit_facts(&self, block_hash: &B256) -> Option<(u64, Option<B256>)> {
+        let header = self.block_headers.get(block_hash)?;
+        let root = (!self.driver.is_deferred_at(header.timestamp)).then_some(header.receipts_root);
+        Some((header.number, root))
+    }
+
+    /// Why a block's import must not reach the engine, when its header --
+    /// held since its body arrived -- carries a QC gov5 refuses (audit
+    /// 2026-10 round 3, R3-C2). A block whose header this node does not hold
+    /// passes, as before.
+    fn header_qc_refusal(&self, block_hash: &B256) -> Option<String> {
+        let header = self.block_headers.get(block_hash)?;
+        self.check_header_qc(header).err()
+    }
+
+    /// After a restart: the height past which the execution layer holds
+    /// blocks consensus has not committed here, when the restored commit is
+    /// a real one the layer holds. Blocks above it may be a chain a range
+    /// server made up before the restart, so a pull from an honest peer
+    /// starts above the commit. `None` on a fresh consensus state (a node
+    /// started on a snapshot has nothing to measure from) or when the layer
+    /// is not ahead.
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
+    async fn unproven_after_restart(&mut self) -> Option<u64> {
+        let qc = self.engine.last_committed_qc();
         if qc.view == 0 {
-            return Ok(());
+            return None;
         }
-        self.certified_is_an_ancestor(header, qc.block_hash)
+        let el = self.driver.execution_layer();
+        let committed = el.block_by_hash(qc.block_hash).await.ok().flatten()?.header.number;
+        let latest = el.latest_block_number().await.ok().flatten()?;
+        (latest > committed).then_some(committed + 1)
     }
 
     /// Whether `certified` lies on `header`'s parent chain, walking the
-    /// headers this node holds. A certified block this node holds no header
-    /// for, or a walk that leaves the held headers before reaching its
-    /// height, is not a contradiction and passes: the QC itself verified.
-    fn certified_is_an_ancestor(&self, header: &Header, certified: B256) -> Result<(), String> {
+    /// headers this node holds: its height when the walk reaches it. A
+    /// certified block this node holds no header for, or a walk that leaves
+    /// the held headers before reaching its height, is not a contradiction
+    /// and passes, but proves nothing (`None`): the QC itself verified.
+    fn certified_is_an_ancestor(&self, header: &Header, certified: B256) -> Result<Option<u64>, String> {
         /// Steps the walk takes at most; a committed QC names a block one
         /// to a few heights below the header.
         const MAX_WALK: usize = 256;
         let Some(target) = self.block_headers.get(&certified).map(|h| h.number) else {
-            return Ok(());
+            return Ok(None);
         };
         if target >= header.number {
             return Err(format!("header QC certifies block {certified} at height {target}, not below {}", header.number));
@@ -4523,17 +4789,17 @@ impl<E: ExecutionLayer> H2Service<E> {
         let mut cursor = header.parent_hash;
         for _ in 0..MAX_WALK {
             if cursor == certified {
-                return Ok(());
+                return Ok(Some(target));
             }
             let Some(parent) = self.block_headers.get(&cursor) else {
-                return Ok(());
+                return Ok(None);
             };
             if parent.number <= target {
                 return Err(format!("header QC certifies block {certified}, not on this block's parent chain"));
             }
             cursor = parent.parent_hash;
         }
-        Ok(())
+        Ok(None)
     }
 
     fn finish_catch_up(&mut self, events: &mut Vec<ServiceEvent>, complete: bool) {
@@ -4763,6 +5029,70 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
+    /// A body nobody asked for -- gossiped, or pushed by a peer -- is imported
+    /// at once only when it is the first such body at its height, or one
+    /// consensus already waits for. A sibling after it is kept (the body
+    /// store and the driver hold it) and imported when a proposal names it,
+    /// as any named body is. A peer is free to make, and an honest fleet
+    /// sends one body per height (two after a timeout), so a stream of
+    /// self-consistent blocks nobody proposed takes at most one import slot
+    /// per height instead of one per block (audit 2026-10 B-3).
+    ///
+    /// And only in the window just above the execution layer's tip: below it
+    /// the height is settled, far above it the body would only be held, and a
+    /// stream of self-consistent blocks at fresh low heights took one import
+    /// each, every one of them "first" (audit 2026-10 round 2, R2-I1). A
+    /// height below every remembered one is not first either: inserted, it
+    /// was read as first and then evicted.
+    fn import_unsolicited(&mut self, block_hash: B256, number: u64) {
+        /// Heights remembered; far more than the window a body is useful in.
+        const REMEMBERED_HEIGHTS: usize = 256;
+        if !self.awaiting_bodies.contains(&block_hash) {
+            let in_window = self.imported_tip().is_none_or(|tip| {
+                number > tip && number <= tip.saturating_add(far_ahead_limit()).saturating_add(1)
+            });
+            let below_remembered = self.unsolicited_heights.len() >= REMEMBERED_HEIGHTS
+                && self.unsolicited_heights.first_key_value().is_some_and(|(lowest, _)| number < *lowest);
+            if !in_window || below_remembered {
+                debug!(target: "n42.h2.node", ?block_hash, number, tip = ?self.imported_tip(), "an unsolicited body outside the tip's window waits for a proposal to name it");
+                return;
+            }
+        }
+        let first = *self.unsolicited_heights.entry(number).or_insert(block_hash);
+        while self.unsolicited_heights.len() > REMEMBERED_HEIGHTS {
+            self.unsolicited_heights.pop_first();
+        }
+        if first != block_hash && !self.awaiting_bodies.contains(&block_hash) {
+            // The view's leader sealed it: the block an anonymous peer's
+            // made-up one took the height from (audit 2026-10 round 2,
+            // R2-R2). A seal costs one verification, and only a sibling
+            // that would otherwise wait pays it.
+            if self.sealed_by_its_leader(&block_hash) {
+                debug!(target: "n42.h2.node", ?block_hash, number, first = ?first, "an unsolicited sibling sealed by its view's leader is imported at once");
+                self.unsolicited_heights.insert(number, block_hash);
+                self.import_eagerly(block_hash);
+                return;
+            }
+            debug!(target: "n42.h2.node", ?block_hash, number, first = ?first, "an unsolicited sibling waits for a proposal to name it");
+            return;
+        }
+        self.import_eagerly(block_hash);
+    }
+
+    /// Whether the header held for `block_hash` carries a seal by the leader
+    /// of the view it names, under the set known for that exact view.
+    fn sealed_by_its_leader(&self, block_hash: &B256) -> bool {
+        let Some(header) = self.block_headers.get(block_hash) else {
+            return false;
+        };
+        let Ok(view) = n42_h2_consensus::header_view(header) else {
+            return false;
+        };
+        self.engine
+            .leader_public_key_for_view(view)
+            .is_some_and(|leader| n42_h2_consensus::verify_seal(header, &leader).is_ok())
+    }
+
     fn remember_imported(&mut self, block_hash: B256) {
         if self.imported.insert(block_hash) {
             self.imported_order.push_back(block_hash);
@@ -4807,6 +5137,18 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn note_peer_height(&mut self, peer: PeerId, height: u64) {
         let known = self.peer_heights.entry(peer).or_insert(height);
         *known = (*known).max(height);
+    }
+
+    /// Drops every copy of a body the execution layer rejected.
+    fn forget_rejected_body(&mut self, block_hash: B256) {
+        if self.body_store.remove(&block_hash).is_some() {
+            self.body_store_order.retain(|hash| hash != &block_hash);
+        }
+        if self.compact_bodies.remove(&block_hash).is_some() {
+            self.compact_order.retain(|hash| hash != &block_hash);
+        }
+        self.compact_claims.remove(&block_hash);
+        self.driver.forget_payload(block_hash);
     }
 
     fn remember_body(&mut self, block_hash: B256, rlp: impl Into<crate::body_channel::BodyBuf>) {
@@ -4945,6 +5287,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             profile: self.header_profile,
             rlp: rlp.clone(),
             compact: false,
+            source: None,
         });
         self.remember_body(block_hash, rlp);
         Ok((block_hash, header, true))
@@ -4958,11 +5301,16 @@ impl<E: ExecutionLayer> H2Service<E> {
             Served::Txns(served) => self.respond_served_txns(served),
             Served::Block { peer, hash, channel, body } => {
                 debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
-                self.transport.respond_block(channel, body);
+                self.respond_block_within_budget(peer, channel, body);
             }
-            Served::Range { peer, request, channel, rlps } => {
-                debug!(target: "n42.h2.node", %peer, ?request, served = rlps.len(), "peer asked for a range");
-                self.transport.respond_range(channel, rlps);
+            Served::Range { peer, request, channel, mut range, slot } => {
+                debug!(target: "n42.h2.node", %peer, ?request, served = range.rlps.len(), short_of_budget = range.short_of_budget, "peer asked for a range");
+                if range.rlps.is_empty() && range.short_of_budget {
+                    self.transport.respond_range_error(channel, "server busy".to_owned());
+                    return;
+                }
+                let rlps = std::mem::take(&mut range.rlps);
+                self.transport.respond_range_holding(channel, rlps, n42_h2_net::ServeGuard::new((range, slot)));
             }
         }
     }
@@ -4979,7 +5327,45 @@ impl<E: ExecutionLayer> H2Service<E> {
             waited_ms = ready_at.elapsed().as_millis() as u64,
             "served a peer the transactions it was missing"
         );
-        self.transport.respond_block_txns(channel, reply);
+        let Ok(txns) = reply else {
+            self.transport.respond_block_txns(channel, reply);
+            return;
+        };
+        let bytes = txns.iter().map(|tx| tx.len()).sum();
+        match self.fill_bytes.permit(peer, bytes) {
+            Some(permit) => {
+                self.transport.respond_block_txns_holding(channel, Ok(txns), n42_h2_net::ServeGuard::new(permit));
+            }
+            None => {
+                debug!(target: "n42.h2.node", %peer, ?hash, bytes, "fill byte budget spent; fill refused");
+                self.transport.respond_block_txns(channel, Err("server busy".to_owned()));
+            }
+        }
+    }
+
+    /// Answers a block request within [`MAX_FILL_SERVE_BYTES`]: the reply
+    /// holds its share until libp2p has sent it, and one the budget cannot
+    /// cover now is answered "not found", which sends the asker to another
+    /// peer (audit 2026-10 R2-I6).
+    fn respond_block_within_budget(
+        &mut self,
+        peer: PeerId,
+        channel: n42_h2_net::BlockRequestChannel,
+        body: Option<alloy_primitives::Bytes>,
+    ) {
+        let Some(body) = body else {
+            self.transport.respond_block(channel, None);
+            return;
+        };
+        match self.fill_bytes.permit(peer, body.len()) {
+            Some(permit) => {
+                self.transport.respond_block_holding(channel, Some(body), n42_h2_net::ServeGuard::new(permit));
+            }
+            None => {
+                debug!(target: "n42.h2.node", %peer, bytes = body.len(), "fill byte budget spent; block request refused");
+                self.transport.respond_block(channel, None);
+            }
+        }
     }
 
     /// Asks the next peer for a fill this one could not answer, and only
@@ -5018,6 +5404,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.compact_order.retain(|hash| hash != &block_hash);
             self.driver.forget_payload(block_hash);
         }
+        self.compact_claims.remove(&block_hash);
         if self.body_request_due(block_hash) {
             self.await_body(block_hash);
             // One peer, not every peer: a whole body is 26 MB, and six of
@@ -5054,6 +5441,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // A second copy must not replace the frame of record: that one may
         // carry fills this one does not (defect 18).
         if self.body_store.contains_key(&block_hash) || self.compact_bodies.contains_key(&block_hash) {
+            self.forward_other_claim(block_hash, &header, bytes, from);
             return Ok((block_hash, header, false));
         }
         self.compact_bodies.insert(block_hash, bytes.clone());
@@ -5068,6 +5456,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         while self.compact_order.len() > REMEMBERED_COMPACT_BODIES {
             if let Some(oldest) = self.compact_order.pop_front() {
                 self.compact_bodies.remove(&oldest);
+                self.compact_claims.remove(&oldest);
                 self.body_from.remove(&oldest);
                 self.fill_peers.remove(&oldest);
                 self.fill_asked.remove(&oldest);
@@ -5082,14 +5471,84 @@ impl<E: ExecutionLayer> H2Service<E> {
             profile: self.header_profile,
             rlp: bytes,
             compact: true,
+            source: from.map(|peer| n42_h2_execution::raw_engine::claim_source_of(&peer.to_bytes())),
         });
         Ok((block_hash, header, true))
+    }
+
+    /// A second compact body of a block whose first is the frame of record:
+    /// when it is a frame description from a peer not yet heard on the block
+    /// with a layout not yet seen, its claim goes to the execution layer
+    /// under that peer's source (audit 2026-10 round 2, R2-X4) -- the layout
+    /// is not in the header, and the first body's may be wrong while this
+    /// one's is right. [`CLAIMS_PER_BLOCK`] layouts at most per block, one per
+    /// peer; the rest are dropped. Nothing is imported or stored, and a block
+    /// that only ever arrives once costs nothing here.
+    fn forward_other_claim(
+        &mut self,
+        block_hash: B256,
+        header: &Header,
+        bytes: alloy_primitives::Bytes,
+        from: Option<PeerId>,
+    ) {
+        use n42_h2_execution::raw_engine::claim_source_of;
+        let (Some(peer), Some(first)) = (from, self.compact_bodies.get(&block_hash)) else { return };
+        if !n42_h2_consensus::is_compact_frame_body(&bytes) {
+            return;
+        }
+        let profile = self.header_profile;
+        let digest = |body: &[u8]| -> Option<B256> {
+            let frames = n42_h2_consensus::decode_compact_body(body, profile).ok()?.frames?;
+            let mut flat = Vec::with_capacity(frames.len() * 36);
+            for (id, count) in &frames {
+                flat.extend_from_slice(id.as_slice());
+                flat.extend_from_slice(&count.to_le_bytes());
+            }
+            Some(keccak256(&flat))
+        };
+        let source = claim_source_of(&peer.to_bytes());
+        if !self.compact_claims.contains_key(&block_hash) {
+            // The frame of record's claim, made lazily: the first body's
+            // path stays as it was.
+            let first_source = self.body_from.get(&block_hash).map(|from| claim_source_of(&from.to_bytes()));
+            let first_digest = digest(first).unwrap_or(B256::ZERO);
+            self.compact_claims.insert(block_hash, vec![(first_source, first_digest)]);
+        }
+        let Some(claims) = self.compact_claims.get_mut(&block_hash) else { return };
+        if claims.len() >= CLAIMS_PER_BLOCK || claims.iter().any(|(known, _)| *known == Some(source)) {
+            return;
+        }
+        let Some(layout) = digest(&bytes) else { return };
+        if claims.iter().any(|(_, known)| *known == layout) {
+            return;
+        }
+        claims.push((Some(source), layout));
+        debug!(target: "n42.h2.node", ?block_hash, %peer, claims = claims.len(), "another peer's frame layout for a compact block; forwarding its claim");
+        self.driver.forward_claim(n42_h2_execution::ForeignBody {
+            block_hash,
+            number: header.number,
+            timestamp: header.timestamp,
+            profile,
+            rlp: bytes,
+            compact: true,
+            source: Some(source),
+        });
     }
 
     fn remember_block(&mut self, block_hash: B256, header: &Header) {
         if self.block_timestamps.insert(block_hash, header.timestamp).is_none() {
             self.block_numbers.insert(block_hash, header.number);
             self.block_headers.insert(block_hash, header.clone());
+            // gov5's header vote under its two-phase gate (audit 2026-10
+            // R2-C9): the header releases Round 1, once its QC passes the
+            // check every vote of this node passes (R3-C2).
+            if self.engine.two_phase_vote_gate() {
+                if let Some(reason) = self.header_qc_refusal(&block_hash) {
+                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no header vote");
+                } else if let Err(err) = self.engine.header_known(block_hash, header.parent_hash) {
+                    report_engine_error(&err, "header vote", &mut self.fatal);
+                }
+            }
             self.block_seen.insert(block_hash, std::time::Instant::now());
             self.timestamp_order.push(block_hash);
             while self.timestamp_order.len() > REMEMBERED_TIMESTAMPS {
@@ -5174,6 +5633,61 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
+    /// The body a queued request is served from: the store first (an
+    /// earlier request may have fetched it), then the execution layer for a
+    /// block taken elided. `None` when it is held nowhere.
+    async fn queued_body(&mut self, block_hash: B256) -> Option<alloy_primitives::Bytes> {
+        if let Some(body) = self.body_store.get(&block_hash) {
+            return Some(body.to_shared());
+        }
+        self.elided_body(block_hash).await
+    }
+
+    /// Answers a fill from a body this node holds. The body is shared, not
+    /// copied, and the walk that picks the named transactions out of its
+    /// 26 MB happens on a worker: this loop is the leader's between
+    /// committing one view and proposing the next, and loop196 put 230-330 of
+    /// these a leg on it. `slot`, when given, goes back once the answer is
+    /// handed on.
+    fn spawn_fill_from_body(
+        &self,
+        peer: PeerId,
+        request: n42_h2_net::BlockTxnsRequest,
+        channel: n42_h2_net::BlockTxnsChannel,
+        body: alloy_primitives::Bytes,
+        slot: Option<ServeSlot>,
+    ) {
+        let profile = self.header_profile;
+        let back = self.served_txns.0.clone();
+        let asked_at = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            let reply = fill_from_body(&body, profile, &request);
+            debug!(
+                target: "n42.h2.node",
+                %peer,
+                hash = ?request.hash,
+                wanted = request.indices.len(),
+                served = reply.as_ref().map(Vec::len).unwrap_or(0),
+                "peer asked for named transactions; served from the stored body"
+            );
+            // The loop wakes on this (see the step's select): a follower is
+            // waiting on it to vote. Waits for room in the channel (this is a
+            // blocking-pool thread); a closed one (shutdown) just ends it.
+            // The slot goes back once the answer is handed on, not when the
+            // loop hands it to the peer.
+            let _ = back.blocking_send(Served::Txns(ServedTxns {
+                peer,
+                channel,
+                reply,
+                hash: request.hash,
+                wanted: request.indices.len(),
+                asked_at,
+                ready_at: std::time::Instant::now(),
+            }));
+            drop(slot);
+        });
+    }
+
     /// The gov5 body of a block this node took elided, fetched from the
     /// execution layer on demand and kept in the body store, so the next
     /// peer that asks is served from there. `None` for any other block, or
@@ -5204,10 +5718,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     /// Publishes a block body, queueing it if the mesh is not ready.
+    #[allow(unused_assignments)] // initial value documents the loop state
     fn publish_body(
         &mut self,
         execution: &alloy_rpc_types_engine::ExecutionData,
-        sealed: Option<&alloy_consensus::Header>,
+        sealed: Option<&Header>,
         tx_hashes: &[B256],
         frame_layout: &[(B256, u32)],
         encoded: Option<alloy_primitives::Bytes>,
@@ -5332,6 +5847,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.send_body(data, block_hash);
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     fn remember_topic_skipped(&mut self, block_hash: B256) {
         debug!(target: "n42.h2.node", ?block_hash, "body pushed to every member; topic not used");
     }
@@ -5523,9 +6039,15 @@ impl<E: ExecutionLayer> H2Service<E> {
 /// At most [`MAX_SERVED_RANGE_BLOCKS`] blocks and
 /// [`n42_h2_net::MAX_RANGE_REPLY_BYTES`] of them (one block always), so one
 /// request costs a bounded number of lookups and bytes.
-async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeRequest) -> Vec<Vec<u8>> {
+async fn serve_range<E: ExecutionLayer>(
+    el: &E,
+    request: n42_h2_net::RangeRequest,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> ServedRange {
     let count = request.count.min(MAX_RANGE_BLOCKS).min(MAX_SERVED_RANGE_BLOCKS);
     let mut rlps = Vec::new();
+    let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    let mut short_of_budget = false;
     let mut bytes = 0usize;
     for number in request.start..request.start.saturating_add(count) {
         match el.block_by_number(number).await {
@@ -5539,6 +6061,19 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
                 if !range_reply_takes(rlps.len(), bytes, rlp.len()) {
                     break;
                 }
+                // The shared byte budget, in KiB: a reply it cannot cover in
+                // full is cut short, which the asker reads as a short window.
+                let kib = u32::try_from(rlp.len().div_ceil(1024).max(1)).unwrap_or(u32::MAX);
+                match budget.clone().try_acquire_many_owned(kib) {
+                    Ok(permit) => match held.as_mut() {
+                        Some(held) => held.merge(permit),
+                        None => held = Some(permit),
+                    },
+                    Err(_) => {
+                        short_of_budget = true;
+                        break;
+                    }
+                }
                 bytes = bytes.saturating_add(rlp.len());
                 rlps.push(rlp);
             }
@@ -5549,7 +6084,116 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
             }
         }
     }
-    rlps
+    ServedRange { rlps, held, short_of_budget }
+}
+
+/// A range reply and the share of [`MAX_SERVE_BYTES`] it holds until it is
+/// dropped.
+#[derive(Debug)]
+struct ServedRange {
+    rlps: Vec<Vec<u8>>,
+    /// Never read: given back to the budget when the reply is dropped.
+    #[allow(dead_code)]
+    held: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The budget ran out before the reply was complete.
+    short_of_budget: bool,
+}
+
+/// A share of `budget` (KiB permits) for a reply of `bytes`, or none while
+/// the budget cannot cover it. A reply larger than the whole budget asks
+/// for all of it rather than never being served. Fills now go through
+/// [`FillBudget`]; the R2-I6 budget tests still use it.
+#[cfg(test)]
+fn reply_permit(budget: &Arc<tokio::sync::Semaphore>, bytes: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let kib = bytes.div_ceil(1024).clamp(1, MAX_FILL_SERVE_BYTES >> 10);
+    Arc::clone(budget).try_acquire_many_owned(u32::try_from(kib).unwrap_or(u32::MAX)).ok()
+}
+
+/// The shares of the fill budget one peer may hold: 64 MiB of 512, still
+/// two of the largest bodies a 5M-tier block has carried.
+const FILL_PEER_SHARES: usize = 8;
+
+/// Peers with a share kept before the idle ones are dropped: one connected
+/// again after its disconnect was seen would otherwise stay for good.
+const MAX_FILL_PEERS: usize = 1024;
+
+/// The fill and block-by-hash byte budget (KiB permits), and each peer's
+/// share of it: one peer asking for large bodies faster than libp2p sends
+/// them holds its share, not every reply's (audit 2026-10 round 3, R3-G2).
+#[derive(Debug)]
+struct FillBudget {
+    total: Arc<tokio::sync::Semaphore>,
+    per_peer: std::collections::HashMap<PeerId, Arc<tokio::sync::Semaphore>>,
+    total_kib: usize,
+    peer_kib: usize,
+}
+
+impl FillBudget {
+    fn new(total_kib: usize) -> Self {
+        Self {
+            total: Arc::new(tokio::sync::Semaphore::new(total_kib)),
+            per_peer: std::collections::HashMap::new(),
+            total_kib,
+            peer_kib: (total_kib / FILL_PEER_SHARES).max(1),
+        }
+    }
+
+    /// A reply of `bytes` to `peer`, held against both its share and the
+    /// whole, or none while either cannot cover it. A reply larger than a
+    /// share asks for all of it rather than never being served.
+    fn permit(
+        &mut self,
+        peer: PeerId,
+        bytes: usize,
+    ) -> Option<(tokio::sync::OwnedSemaphorePermit, tokio::sync::OwnedSemaphorePermit)> {
+        if self.per_peer.len() >= MAX_FILL_PEERS && !self.per_peer.contains_key(&peer) {
+            let whole = self.peer_kib;
+            self.per_peer.retain(|_, share| share.available_permits() < whole);
+        }
+        let peer_kib = self.peer_kib;
+        let share = self.per_peer.entry(peer).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(peer_kib)));
+        let kib = bytes.div_ceil(1024).max(1);
+        let take = |budget: &Arc<tokio::sync::Semaphore>, cap: usize| {
+            Arc::clone(budget).try_acquire_many_owned(u32::try_from(kib.min(cap)).unwrap_or(u32::MAX)).ok()
+        };
+        let own = take(share, peer_kib)?;
+        Some((own, take(&self.total, self.total_kib)?))
+    }
+
+    /// Drops a peer's share; replies still held keep theirs until sent.
+    fn forget(&mut self, peer: &PeerId) {
+        self.per_peer.remove(peer);
+    }
+}
+
+/// Header QCs that verified, keyed by the hash of their bytes, oldest
+/// dropped first. Consecutive headers mostly embed the same committed QC,
+/// and the live path checks the header of every block it votes on: without
+/// it that is a BLS aggregate verification per block (R3-C2).
+#[derive(Debug, Default)]
+struct VerifiedHeaderQcs {
+    by_bytes: std::collections::HashMap<B256, QuorumCertificate>,
+    order: std::collections::VecDeque<B256>,
+}
+
+impl VerifiedHeaderQcs {
+    /// QCs kept: a few epochs' worth of commits a lagging header may name.
+    const CAPACITY: usize = 64;
+
+    fn get(&self, key: &B256) -> Option<QuorumCertificate> {
+        self.by_bytes.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: B256, qc: QuorumCertificate) {
+        if self.by_bytes.insert(key, qc).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > Self::CAPACITY
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.by_bytes.remove(&oldest);
+            }
+        }
+    }
 }
 
 /// Whether a range reply holding `blocks` blocks of `bytes` takes one more
@@ -5582,17 +6226,7 @@ async fn txns_from_execution_layer<E: ExecutionLayer>(
     request: &n42_h2_net::BlockTxnsRequest,
 ) -> n42_h2_net::BlockTxnsReply {
     let reply = match el.block_by_hash(request.hash).await {
-        Ok(Some(block)) => request
-            .indices
-            .iter()
-            .map(|&i| {
-                block
-                    .transactions
-                    .get(i as usize)
-                    .cloned()
-                    .ok_or_else(|| format!("block {} has no index {i}", request.hash))
-            })
-            .collect::<Result<Vec<_>, String>>(),
+        Ok(Some(block)) => named_txns(&block.transactions, request),
         Ok(None) => Err(format!("block {} is not here", request.hash)),
         Err(err) => Err(err.to_string()),
     };
@@ -5611,7 +6245,7 @@ async fn txns_from_execution_layer<E: ExecutionLayer>(
 /// the fleet's logs (all on one clock when the fleet is on one box).
 /// `N42_VOTE_AGGREGATE_VERIFY=1`: batched vote verification on a leader.
 fn vote_aggregate_from_env() -> bool {
-    std::env::var("N42_VOTE_AGGREGATE_VERIFY").is_ok_and(|v| v == "1")
+    n42_env::flag("N42_VOTE_AGGREGATE_VERIFY", false)
 }
 
 fn trace_messages() -> bool {
@@ -5619,7 +6253,7 @@ fn trace_messages() -> bool {
     *ON.get_or_init(|| std::env::var("N42_H2_TRACE_MSGS").is_ok_and(|v| v == "1"))
 }
 
-fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'static str {
+const fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'static str {
     use n42_h2_primitives::consensus::ConsensusMessage as M;
     match message {
         M::Proposal(_) => "proposal",
@@ -5632,7 +6266,7 @@ fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'s
     }
 }
 
-fn transport_event_kind(event: &TransportEvent) -> &'static str {
+const fn transport_event_kind(event: &TransportEvent) -> &'static str {
     match event {
         TransportEvent::Envelope { .. } => "envelope",
         TransportEvent::Native { .. } => "native",
@@ -5807,7 +6441,7 @@ mod tests {
 
     #[test]
     fn the_heads_stamp_falls_back_to_its_header() {
-        let header = Header { timestamp: 1_700_000_042, ..Default::default() };
+        let header: Header = alloy_consensus::Header { timestamp: 1_700_000_042, ..Default::default() }.into();
         assert_eq!(head_stamp(Some(1_700_000_000), Some(&header)), Some(1_700_000_000), "what the node saw wins");
         assert_eq!(head_stamp(None, Some(&header)), Some(1_700_000_042), "a restart reads the header");
         assert_eq!(head_stamp(None, None), None, "genesis, which has no parent at all");

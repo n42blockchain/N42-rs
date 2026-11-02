@@ -150,3 +150,32 @@ faults per window on a D-A-D-A round, then by windows 2-3.
    replay tests (`node_state.rs` already has the rotation, torn-log and sealed-segment tests).
 4. The restart path (hash-everything rebuild) and `portable_export` from the file.
 5. Step 2 (twig trimming) behind a knob, measured on its own.
+
+## 9. The second file: `entries.relocated` (compaction stage 2, 2026-10-28)
+
+`docs/QMDB_COMPACTION_DESIGN.md` stage 2 adds a second append-only file beside
+`entries.log`: `entries.relocated` (the main file's name with the extension `relocated`).
+`entries.log` is unchanged -- one `[key 32][len u32][value]` record per slot, in slot order,
+cut by undo -- and keeps every slot's record, a compacted one included (nothing is punched
+until stage 3). `entries.relocated` receives compacted twigs, one group per twig, never cut by
+undo:
+
+```
+[0x01][slot u64][key 32][len u32][value]   a live slot, the main file's payload
+[0x02][slot u64][leaf_hash 32]             a dead slot: its leaf hash only
+[0x03][twig u64][crc32 u32]                trailer
+```
+
+Integers are little endian; the CRC-32 is IEEE (`crc32fast`) over every byte of the group
+before the CRC, the trailer's tag and twig included. A group is exactly the twig's 2048 slots
+in order. Bit 63 of a slot's in-memory offset says the record is in `entries.relocated`; a
+record's end is read from its own length field. Both files share the chunk/tail machinery
+(`entry_store::LogFile`).
+
+Open walks `entries.log` as before, then `entries.relocated` group by group, pointing each
+complete group's slots at it (a later group of the same twig wins). The walk stops at the first
+group that is torn, fails its CRC, is malformed, or names a twig not wholly inside the kept
+slots, and a writable open cuts the file there. In stage 2 a lost group loses nothing. The
+file-mode checkpoint (`ForestCheckpoint` version 2) records `relocated_len`. The read view still
+reads byte offsets in `entries.log` (`QmdbCompatTree::entry_offset` answers there for a relocated
+slot too). `FileEntries::create` removes a stale `entries.relocated`.

@@ -17,6 +17,14 @@ impl ConsensusEngine {
             return Ok(());
         }
 
+        // gov5's commit signatures do not cover the changes hash, so on a
+        // gov5 chain the envelope's value is unauthenticated, and such a
+        // chain carries no validator changes: anything but zero is a relay's
+        // edit (audit 2026-10 R2-C6).
+        if self.signing_profile.is_gov5() && decide.validator_changes_hash != alloy_primitives::B256::ZERO {
+            return Err(ConsensusError::H2V4ValidatorChangesUnsupported);
+        }
+
         let commit_set = self.resolve_qc_validator_set(&decide.commit_qc)?;
         let quorum_size = commit_set.quorum_size();
         if decide.commit_qc.signer_count() < quorum_size {
@@ -81,7 +89,6 @@ impl ConsensusEngine {
         self.view_timing.commit_qc_formed = Some(std::time::Instant::now());
 
         self.round_state.update_locked_qc(&decide.commit_qc);
-        self.round_state.commit(decide.commit_qc.clone());
 
         // Commit-then-Activate: only commit/stage validator changes when the decided
         // block actually carried them (hash != ZERO).  Gating on the Decide hash
@@ -133,6 +140,10 @@ impl ConsensusEngine {
             // Proposal when this node becomes leader.
             None
         };
+        // Recorded only once the changes are staged: a staging failure returns
+        // before this, so the commit is not left recorded without its
+        // `BlockCommitted` and view advance (audit 2026-10 A-5).
+        self.round_state.commit(decide.commit_qc.clone());
 
         // Clean up pending tx_root_hash for the committed block.
         self.pending_tx_roots.remove(&decide.block_hash);

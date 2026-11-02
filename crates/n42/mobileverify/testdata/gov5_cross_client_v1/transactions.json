@@ -1,0 +1,83 @@
+{
+  "_doc": "gov5 protobuf transactions (transaction.Marshal = types_pb.Transaction with V/R/S), the bytes a StreamPacket carries. Signed with secp256k1 key 0x4646...46 on chain mainnet_qmdb_staggered (chain id 94). protobuf = with field 11 'from' set (SetFrom after signing, as the packet producer's transactions carry it; AsMessage then skips recovery); protobuf_without_from = the same transaction straight out of SignTx, which does NOT set from. Field numbers: 1 type, 2 nonce, 3 gasPrice (H256), 4 gas, 5 feePerGas, 6 priorityFeePerGas, 7 value, 8 data, 9 sign, 10 to (H160), 11 from, 12 chainID (u64; NOT written for legacy, whose chain id lives in v), 16 v, 14 r, 15 s (H256, uint256 word mapping as header.json), 23 accessList. Field 13 hash is never written by Marshal. A uint256 field that is non-nil but zero (gasPrice of a 1559 tx is its feeCap) is an H256 of empty H128s. ethereum_encoding = EncodeEthereumTransaction (legacy RLP / typed 0x01, 0x02 envelope); hash = keccak256 of it.",
+  "chain_id": 94,
+  "transactions": [
+    {
+      "name": "legacy (EIP-155)",
+      "type": 0,
+      "protobuf": "10091a0a0a001206108090dfc04a2088a4013a0e0a00120a10808090bbbad6adf00d521c0a1408b5ead4a9d3a6cd9a3510b5ead4a9d3a6cd9a3510b5ead4a9035a1d0a1508e1a2a3b5e5de98c59d0110b39fa78fd79fa5895c10cfb495a40e722e0a1508d38dd7dfd6a8e5c4910110ffb0f594e6f09e983c121508b4dfe4cfe7e1c3f149108f9489aef6c28bf686017a2e0a1508b186b5cfadd3afc23b10d5e78de0ecdd8c9a8c01121508b78dad99edccd4ea6110bbad89b9bbe3e8cecc018201070a00120310e001",
+      "protobuf_fields_present": [
+        "2 nonce",
+        "3 gasPrice",
+        "4 gas",
+        "7 value",
+        "10 to",
+        "11 from",
+        "14 r",
+        "15 s",
+        "16 v"
+      ],
+      "protobuf_without_from": "10091a0a0a001206108090dfc04a2088a4013a0e0a00120a10808090bbbad6adf00d521c0a1408b5ead4a9d3a6cd9a3510b5ead4a9d3a6cd9a3510b5ead4a903722e0a1508d38dd7dfd6a8e5c4910110ffb0f594e6f09e983c121508b4dfe4cfe7e1c3f149108f9489aef6c28bf686017a2e0a1508b186b5cfadd3afc23b10d5e78de0ecdd8c9a8c01121508b78dad99edccd4ea6110bbad89b9bbe3e8cecc018201070a00120310e001",
+      "ethereum_encoding": "f86d098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008081e0a0918995456bf5c6d33c307b86629d587f49e30f0e79f92fb486ec2e1765c24a0fa03b84be9ad9ed43318c3432eecc0373d561d55266d32b46b7cc9da31bb72256bb",
+      "hash": "668d501fb31987776a8b594d6af41c28b8a3c9c819490b27a4b7e459fd5a5e37",
+      "from": "9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f",
+      "v": "0xe0",
+      "r": "0x918995456bf5c6d33c307b86629d587f49e30f0e79f92fb486ec2e1765c24a0f",
+      "s": "0x3b84be9ad9ed43318c3432eecc0373d561d55266d32b46b7cc9da31bb72256bb"
+    },
+    {
+      "name": "eip-2930 access list",
+      "type": 1,
+      "protobuf": "0801100a1a0a0a001206108090dfc04a20b0ea013a060a00120210014204deadbeef521c0a1408b5ead4a9d3a6cd9a3510b5ead4a9d3a6cd9a3510b5ead4a9035a1d0a1508e1a2a3b5e5de98c59d0110b39fa78fd79fa5895c10cfb495a40e605e722d0a140888ef9bdedd98dcfa5e10bf85c18d8392c6d40a121508c2e4c8b6ea9ab6a3e7011094c3d0e382bbe2f2707a2d0a1508b284a4f488fccbac3a1080c793b48be48fd2dd01121408aa848ee0d0dccfb76310f4d5deb6a2d0c5c0078201060a0012021001ba01260a1c0a1408b5ead4a9d3a6cd9a3510b5ead4a9d3a6cd9a3510b5ead4a90312060a0012021001",
+      "protobuf_fields_present": [
+        "1 type",
+        "2 nonce",
+        "3 gasPrice",
+        "4 gas",
+        "7 value",
+        "8 data",
+        "10 to",
+        "11 from",
+        "12 chainID",
+        "14 r",
+        "15 s",
+        "16 v",
+        "23 accessList"
+      ],
+      "protobuf_without_from": "0801100a1a0a0a001206108090dfc04a20b0ea013a060a00120210014204deadbeef521c0a1408b5ead4a9d3a6cd9a3510b5ead4a9d3a6cd9a3510b5ead4a903605e722d0a140888ef9bdedd98dcfa5e10bf85c18d8392c6d40a121508c2e4c8b6ea9ab6a3e7011094c3d0e382bbe2f2707a2d0a1508b284a4f488fccbac3a1080c793b48be48fd2dd01121408aa848ee0d0dccfb76310f4d5deb6a2d0c5c0078201060a0012021001ba01260a1c0a1408b5ead4a9d3a6cd9a3510b5ead4a9d3a6cd9a3510b5ead4a90312060a0012021001",
+      "ethereum_encoding": "01f8a35e0a8504a817c8008275309435353535353535353535353535353535353535350184deadbeeff838f7943535353535353535353535353535353535353535e1a0000000000000000000000000000000000000000000000000000000000000000101a05ef570c5dbc6f7880aa9189031b042bfe746d8d6a6d2324270e589d82c742194a03a592fe08e890232dda43f20b684e380636f3ee50c03822a0781168226d7aaf4",
+      "hash": "a08e48daf462e53bd691668bf62cdf14004961fce7546efed29b91e53189039d",
+      "from": "9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f",
+      "v": "0x1",
+      "r": "0x5ef570c5dbc6f7880aa9189031b042bfe746d8d6a6d2324270e589d82c742194",
+      "s": "0x3a592fe08e890232dda43f20b684e380636f3ee50c03822a0781168226d7aaf4"
+    },
+    {
+      "name": "eip-1559 dynamic fee",
+      "type": 2,
+      "protobuf": "0802100b1a0a0a0012061080d88ee16f2088a4012a0a0a0012061080d88ee16f320a0a0012061080a8d6b9073a070a00120310b960521c0a1408b5ead4a9d3a6cd9a3510b5ead4a9d3a6cd9a3510b5ead4a9035a1d0a1508e1a2a3b5e5de98c59d0110b39fa78fd79fa5895c10cfb495a40e605e722c0a1408f197a1afe180dad116109e9ddaa3d59adfaf2a121408e196b9aec7b2f0fd6610d2ffe6a6ba94bb90157a2f0a15089bcb8bdfdfd8bca86410a19ef6ecdefa83bbed01121608d7f2dde8b8d8aafebd0110c9d4f0a2c7b6a09d91018201040a001200",
+      "protobuf_fields_present": [
+        "1 type",
+        "2 nonce",
+        "3 gasPrice",
+        "4 gas",
+        "5 feePerGas",
+        "6 priorityFeePerGas",
+        "7 value",
+        "10 to",
+        "11 from",
+        "12 chainID",
+        "14 r",
+        "15 s",
+        "16 v"
+      ],
+      "protobuf_without_from": "0802100b1a0a0a0012061080d88ee16f2088a4012a0a0a0012061080d88ee16f320a0a0012061080a8d6b9073a070a00120310b960521c0a1408b5ead4a9d3a6cd9a3510b5ead4a9d3a6cd9a3510b5ead4a903605e722c0a1408f197a1afe180dad116109e9ddaa3d59adfaf2a121408e196b9aec7b2f0fd6610d2ffe6a6ba94bb90157a2f0a15089bcb8bdfdfd8bca86410a19ef6ecdefa83bbed01121608d7f2dde8b8d8aafebd0110c9d4f0a2c7b6a09d91018201040a001200",
+      "ethereum_encoding": "02f86d5e0b84773594008506fc23ac0082520894353535353535353535353535353535353535353582303980c080a016a3680615e84bf12a5f7cd554768e9e66fbc19475ce4b611520eca3a4d9bfd2a06450f2c5fbe2e59bed760fd5ed9d8f21bdfcaac38d177957913a81b4745c2a49",
+      "hash": "af4a6d461d25a8a932a75bfb0f2f27af4fa67ad5f0b4c960eba5cb2f7d4e9df0",
+      "from": "9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f",
+      "v": "0x0",
+      "r": "0x16a3680615e84bf12a5f7cd554768e9e66fbc19475ce4b611520eca3a4d9bfd2",
+      "s": "0x6450f2c5fbe2e59bed760fd5ed9d8f21bdfcaac38d177957913a81b4745c2a49"
+    }
+  ]
+}

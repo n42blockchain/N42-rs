@@ -3,35 +3,26 @@
 
 use alloy_primitives::Sealable;
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
-use blst::min_pk::{PublicKey, Signature};
-use merkle_db_rs::tree::{Tree, VecTree};
 use reth_chainspec::EthereumHardforks;
 use n42_tx_types::Block;
-use reth_primitives_traits::Header;
 // reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
 type SealedBlock<B = Block> = reth_primitives_traits::SealedBlock<B>;
-use reth_primitives_traits::AlloyBlockHeader;
 use reth_provider::{
     BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,
 };
 
 use alloy_eips::{
-    eip4895::{Withdrawal, Withdrawals},
+    eip4895::Withdrawal,
     eip7685::Requests,
 };
-use alloy_primitives::{keccak256, BlockHash, Log, B256};
-use alloy_primitives::{Address, Bytes};
-use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
+use alloy_primitives::BlockHash;
 use n42_primitives::{
-    Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate,
-    CommitteeIndex, Deposit, DepositData, Epoch, ExecutionRequests, Validator,
-    VoluntaryExitWithSig, SLOTS_PER_EPOCH,
+    Attestation, BeaconBlock, BeaconBlockBody, BeaconState, DepositData,
 };
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use tracing::{debug, error, info, trace, warn};
+use tracing::debug;
 
 #[derive(Debug)]
+/// Beacon-layer state machine: builds beacon blocks and applies them to beacon states.
 pub struct Beacon<Provider> {
     provider: Provider,
 }
@@ -46,10 +37,13 @@ where
         + 'static
         + Clone,
 {
-    pub fn new(provider: Provider) -> Self {
+    /// Creates a beacon state machine over `provider`.
+    pub const fn new(provider: Provider) -> Self {
         Self { provider }
     }
 
+    /// Builds the beacon block that follows `old_beacon_state` for the given execution block.
+    #[allow(clippy::ptr_arg)] // public signature takes &Vec; kept for API compatibility
     pub fn gen_beacon_block(
         &mut self,
         old_beacon_state: BeaconState,
@@ -92,6 +86,7 @@ where
         Ok(beacon_block)
     }
 
+    /// Applies `beacon_block` to the old state (read from the provider when `None`) and stores the result.
     pub fn state_transition(
         &mut self,
         old_beacon_state: Option<BeaconState>,
@@ -103,7 +98,7 @@ where
             None => self
                 .provider
                 .get_beacon_state_by_hash(&beacon_block.parent_hash)?
-                .ok_or(eyre::eyre!(
+                .ok_or_else(|| eyre::eyre!(
                     "beacon_state not found by hash, {:?}",
                     beacon_block.parent_hash
                 ))?,
@@ -121,6 +116,7 @@ where
         Ok(new_beacon_state)
     }
 
+    /// Returns the withdrawals due for the execution block `eth1_block_hash` and the beacon state they were computed on.
     pub fn gen_withdrawals(
         &mut self,
         eth1_block_hash: BlockHash,
@@ -129,7 +125,7 @@ where
         let beacon_block_hash = self
             .provider
             .get_beacon_block_hash_by_eth1_hash(&eth1_block_hash)?
-            .ok_or(eyre::eyre!(
+            .ok_or_else(|| eyre::eyre!(
                 "beacon block hash not found, eth1_block_hash={:?}",
                 eth1_block_hash
             ))?;
@@ -138,13 +134,13 @@ where
         let mut beacon_state = self
             .provider
             .get_beacon_state_by_hash(&beacon_block_hash)?
-            .ok_or(eyre::eyre!(
+            .ok_or_else(|| eyre::eyre!(
                 "beacon_state not found by hash, beacon_block_hash={:?}",
                 beacon_block_hash
             ))?;
         debug!(target: "consensus-client", ?beacon_state, "gen_withdrawals");
 
-        let (expected_withdrawals, processed_partial_withdrawals_count) =
+        let (expected_withdrawals, _processed_partial_withdrawals_count) =
             beacon_state.process_withdrawals()?;
         Ok((Some(expected_withdrawals), beacon_state))
     }
@@ -158,14 +154,14 @@ where
         let beacon_block_hash = self
             .provider
             .get_beacon_block_hash_by_eth1_hash(&block_hash)?
-            .ok_or(eyre::eyre!(
+            .ok_or_else(|| eyre::eyre!(
                 "beacon_block_hash not found by eth1_hash, {:?}",
                 block_hash
             ))?;
         let beacon_state = self
             .provider
             .get_beacon_state_by_hash(&beacon_block_hash)?
-            .ok_or(eyre::eyre!(
+            .ok_or_else(|| eyre::eyre!(
                 "beacon_state not found by hash, {:?}",
                 beacon_block_hash
             ))?;
@@ -214,6 +210,9 @@ mod tests {
 #[cfg(test)]
 mod provider_tests {
     use super::*;
+    use alloy_primitives::B256;
+    use n42_primitives::Validator;
+    use reth_primitives_traits::Header;
     use reth_provider::providers::BlockchainProvider;
     use reth_provider::test_utils::{
         create_test_provider_factory, MockNodeTypesWithDB,

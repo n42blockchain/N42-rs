@@ -1,18 +1,16 @@
-use reth_chainspec::{ChainSpec, EthChainSpec, Hardforks};
+use reth_chainspec::Hardforks;
 use reth_eth_wire_types::BasicNetworkPrimitives;
-use reth_ethereum_primitives::EthPrimitives;
 use reth_network::config::NetworkMode;
 use reth_network::{NetworkHandle, NetworkManager, PeersInfo};
-use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, PrimitivesTy, TxTy};
+use reth_node_api::{PrimitivesTy, TxTy};
 use reth_node_builder::{
-    components::{NetworkBuilder, PoolBuilder},
+    components::NetworkBuilder,
     node::{FullNodeTypes, NodeTypes},
     BuilderContext,
 };
-use reth_tracing::tracing::{debug, info};
+use reth_tracing::tracing::info;
 use reth_transaction_pool::{
-    EthTransactionPool, PoolPooledTx, PoolTransaction, TransactionPool,
-    TransactionValidationTaskExecutor,
+    PoolPooledTx, PoolTransaction, TransactionPool,
 };
 
 /// A basic N42 network builder.

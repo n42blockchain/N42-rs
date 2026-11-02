@@ -209,6 +209,7 @@ pub mod beacon_api_payload_attributes {
             parent_beacon_block_root: beacon_api_payload_attributes.parent_beacon_block_root,
             slot_number: beacon_api_payload_attributes.slot_number,
             target_gas_limit: beacon_api_payload_attributes.target_gas_limit,
+            mobile_registry_root: None,
         })
     }
 }
@@ -476,13 +477,15 @@ impl<'a> From<BeaconExecutionPayloadV4<'a>> for ExecutionPayloadV4 {
             payload_inner: payload_inner.into(),
             block_access_list: block_access_list.into_owned(),
             slot_number,
+            // N42: the beacon API's payload has no registry root.
+            mobile_registry_root: None,
         }
     }
 }
 
 impl<'a> From<&'a ExecutionPayloadV4> for BeaconExecutionPayloadV4<'a> {
     fn from(value: &'a ExecutionPayloadV4) -> Self {
-        let ExecutionPayloadV4 { payload_inner, block_access_list, slot_number } = value;
+        let ExecutionPayloadV4 { payload_inner, block_access_list, slot_number, .. } = value;
         BeaconExecutionPayloadV4 {
             payload_inner: payload_inner.into(),
             block_access_list: Cow::Borrowed(block_access_list),
@@ -878,6 +881,7 @@ mod tests {
             parent_beacon_block_root: attrs.parent_beacon_block_root,
             slot_number: attrs.slot_number,
             target_gas_limit: attrs.target_gas_limit,
+            mobile_registry_root: None,
         };
         assert!(engine_attrs.slot_number.is_none());
         assert!(engine_attrs.target_gas_limit.is_none());

@@ -211,6 +211,7 @@ fn an_amsterdam_payload_goes_to_v5_with_its_access_list() {
             payload_inner: payload_v3(),
             block_access_list: Bytes::from_static(&[0xc0]),
             slot_number: 7,
+            mobile_registry_root: None,
         }),
         ExecutionPayloadSidecar::v3(cancun),
     );
@@ -245,6 +246,7 @@ async fn attributes_choose_the_forkchoice_version() {
         parent_beacon_block_root: Some(B256::repeat_byte(0xBB)),
         target_gas_limit: None,
         slot_number: None,
+        mobile_registry_root: None,
     };
     client
         .fork_choice_updated_with_attrs(state, attrs.clone())
@@ -339,6 +341,7 @@ async fn a_collected_build_carries_the_beacon_root_it_was_started_with() {
                 parent_beacon_block_root: Some(beacon_root),
                 target_gas_limit: None,
                 slot_number: None,
+                mobile_registry_root: None,
             },
         )
         .await
@@ -504,7 +507,7 @@ async fn chain_lookups_come_back_as_consensus_types() {
 
     let served = client.block_by_number(7).await.unwrap().expect("served");
     let (by_number, txs) = (served.header, served.transactions);
-    assert_eq!(by_number, header);
+    assert_eq!(by_number, n42_header::N42Header::from(header.clone()));
     assert!(txs.is_empty());
     let by_hash = client.block_by_hash(hash).await.unwrap().expect("served").header;
     assert_eq!(by_hash.hash_slow(), hash);

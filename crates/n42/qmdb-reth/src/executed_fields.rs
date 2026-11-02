@@ -187,9 +187,10 @@ pub fn built_of(sealed: &B256) -> Option<B256> {
 }
 
 /// Which half of `block_hash`'s entry (or of the builder hash it was noted
-/// as) is still missing: "none" when complete, "state_root", "receipts",
+/// as) is still missing: "none" when complete, "`state_root`", "receipts",
 /// or "both" (no entry yet). Diagnostic: the builder's seal names what its
 /// wait for the carried ancestor's fields was on.
+#[allow(clippy::match_same_arms)] // arms are kept apart to document each case
 pub fn missing_half(block_hash: &B256) -> &'static str {
     // Read only: no `with_registry`, whose notify would wake every waiter.
     let guard = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -209,7 +210,7 @@ pub fn missing_half(block_hash: &B256) -> &'static str {
 }
 
 /// [`get`], waiting up to `timeout` for the fields to be recorded: a parent
-/// sealed before its finish (docs/PHASE_D_DEFERRED_EXECUTION.md section 13)
+/// sealed before its finish (`docs/PHASE_D_DEFERRED_EXECUTION.md` section 13)
 /// records them a moment after its child's build has started.
 pub fn wait_for(block_hash: &B256, timeout: std::time::Duration) -> Option<ExecutedFields> {
     if let Some(fields) = get(block_hash) { return Some(fields); }
@@ -248,7 +249,7 @@ pub fn seed_from_header(block_hash: B256, header: &alloy_consensus::Header) {
 /// header. The name is historical: the fields are those of the header's
 /// depth-D ancestor (`deferredExecutionDepth`, `docs/DEFERRED_DEPTH_2_DESIGN.md`),
 /// the parent at depth 1 and the parent's parent at depth 2.
-pub fn fields_from_child_header(child: &alloy_consensus::Header) -> ExecutedFields {
+pub const fn fields_from_child_header(child: &alloy_consensus::Header) -> ExecutedFields {
     ExecutedFields {
         state_root: child.state_root,
         receipts_root: child.receipts_root,

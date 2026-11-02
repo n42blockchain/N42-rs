@@ -277,40 +277,60 @@ impl CohortCoordinator {
     }
 
     /// Routes one receipt into its block's window, opening it on the first
-    /// receipt (gov5 `Submit`). Order: unknown block, number mismatch, open
-    /// window cap, intake closed, then the collector's checks.
+    /// receipt (gov5 `Submit`). Order: unknown block, number mismatch, then
+    /// (for a block without a window) the key and signature, the open window
+    /// cap, intake closed, then the collector's checks.
+    ///
+    /// A window opens only for an authenticated receipt (a registered key
+    /// and a valid signature), so junk receipts for known hashes cannot fill
+    /// [`MAX_OPEN_WINDOWS`]; gov5 opens first and checks after. The chain
+    /// lookup and the signature check run outside the coordinator's lock.
+    ///
+    /// CPU-bound (a BLS pairing) and the chain lookup may read the database:
+    /// call it from a blocking context, not from an async task's poll.
     pub fn submit(&self, r: &Receipt) -> Result<MobileIndex, MobileVerifyError> {
-        let col = {
-            let mut st = self.state.lock();
-            if st.stopped {
-                return Err(MobileVerifyError::WindowClosed);
-            }
-            if !st.windows.contains_key(&r.block_hash) {
-                let number = self.head.number_of(&r.block_hash).ok_or(MobileVerifyError::UnknownBlock)?;
-                if number != r.block_number {
-                    return Err(MobileVerifyError::WrongBlockNumber { receipt: r.block_number, block: number });
+        let mut verified = false;
+        let col = loop {
+            {
+                let mut st = self.state.lock();
+                if st.stopped {
+                    return Err(MobileVerifyError::WindowClosed);
                 }
-                if st.windows.len() >= MAX_OPEN_WINDOWS {
-                    return Err(MobileVerifyError::TooManyWindows);
+                if let Some(w) = st.windows.get(&r.block_hash) {
+                    if w.phase != Phase::Collecting {
+                        return Err(MobileVerifyError::WindowClosed);
+                    }
+                    break w.col.clone();
                 }
-                st.windows.insert(
-                    r.block_hash,
-                    Window {
-                        block_number: r.block_number,
-                        opened_height: r.block_number,
-                        col: Arc::new(Collector::new(self.reg.clone(), r.block_hash, r.block_number)),
-                        phase: Phase::Collecting,
-                        peer_certs: BTreeMap::new(),
-                    },
-                );
+                if verified {
+                    if st.windows.len() >= MAX_OPEN_WINDOWS {
+                        return Err(MobileVerifyError::TooManyWindows);
+                    }
+                    let col = Arc::new(Collector::new(self.reg.clone(), r.block_hash, r.block_number));
+                    st.windows.insert(
+                        r.block_hash,
+                        Window {
+                            block_number: r.block_number,
+                            opened_height: r.block_number,
+                            col: col.clone(),
+                            phase: Phase::Collecting,
+                            peer_certs: BTreeMap::new(),
+                        },
+                    );
+                    break col;
+                }
             }
-            let w = st.windows.get(&r.block_hash).ok_or(MobileVerifyError::UnknownBlock)?;
-            if w.phase != Phase::Collecting {
-                return Err(MobileVerifyError::WindowClosed);
+            // No window yet: check the block and authenticate the receipt
+            // with the lock released, then take it again to open one.
+            let number = self.head.number_of(&r.block_hash).ok_or(MobileVerifyError::UnknownBlock)?;
+            if number != r.block_number {
+                return Err(MobileVerifyError::WrongBlockNumber { receipt: r.block_number, block: number });
             }
-            w.col.clone()
+            self.reg.lookup(&r.verifier_pubkey).ok_or(MobileVerifyError::NotRegistered)?;
+            r.verify_signature()?;
+            verified = true;
         };
-        let idx = col.add(r)?;
+        let idx = col.add_checked(r, verified)?;
         self.reg.mark_active(&r.verifier_pubkey);
         Ok(idx)
     }
@@ -336,29 +356,61 @@ impl CohortCoordinator {
 
     /// Advances every window whose next checkpoint `number` reaches. Call on
     /// every committed block.
+    ///
+    /// CPU-bound when a window closes or merges (signature aggregation and
+    /// a certificate pairing): from async code use
+    /// [`Self::on_block_committed_async`].
     pub fn on_block_committed(&self, number: u64) {
-        let _guard = self.cascade.lock();
-        let hashes: Vec<B256> = {
-            let mut st = self.state.lock();
-            st.current_height = st.current_height.max(number);
-            st.windows.keys().copied().collect()
+        let alarms = {
+            let _guard = self.cascade.lock();
+            let hashes: Vec<B256> = {
+                let mut st = self.state.lock();
+                st.current_height = st.current_height.max(number);
+                st.windows.keys().copied().collect()
+            };
+            hashes.into_iter().filter_map(|hash| self.cascade_window(hash, false)).collect::<Vec<_>>()
         };
-        for hash in hashes {
-            self.cascade_window(hash, false);
-        }
+        self.fire(alarms);
+    }
+
+    /// [`Self::on_block_committed`] on tokio's blocking pool.
+    pub async fn on_block_committed_async(self: &Arc<Self>, number: u64) {
+        let this = self.clone();
+        join_blocking(tokio::task::spawn_blocking(move || this.on_block_committed(number))).await;
     }
 
     /// Finalises every open window now, merging what was collected, and
     /// refuses further receipts.
     pub fn stop(&self) {
-        let _guard = self.cascade.lock();
-        let hashes: Vec<B256> = {
-            let mut st = self.state.lock();
-            st.stopped = true;
-            st.windows.keys().copied().collect()
+        let alarms = {
+            let _guard = self.cascade.lock();
+            let hashes: Vec<B256> = {
+                let mut st = self.state.lock();
+                st.stopped = true;
+                st.windows.keys().copied().collect()
+            };
+            hashes.into_iter().filter_map(|hash| self.cascade_window(hash, true)).collect::<Vec<_>>()
         };
-        for hash in hashes {
-            self.cascade_window(hash, true);
+        self.fire(alarms);
+    }
+
+    /// [`Self::stop`] on tokio's blocking pool.
+    pub async fn stop_async(self: &Arc<Self>) {
+        let this = self.clone();
+        join_blocking(tokio::task::spawn_blocking(move || this.stop())).await;
+    }
+
+    /// Hands alarms to the sink with no coordinator lock held, so the sink
+    /// may call back into the coordinator.
+    fn fire(&self, alarms: Vec<DivergenceAlarm>) {
+        if alarms.is_empty() {
+            return;
+        }
+        let sink = self.on_divergence.lock().clone();
+        if let Some(sink) = sink {
+            for alarm in alarms {
+                sink(alarm);
+            }
         }
     }
 
@@ -381,14 +433,16 @@ impl CohortCoordinator {
         (force || h >= o.saturating_add(at)).then_some(next)
     }
 
-    fn cascade_window(&self, hash: B256, force: bool) {
+    /// Runs `hash`'s due phases; returns the divergence alarm its merge
+    /// raised, for the caller to fire once the cascade lock is released.
+    fn cascade_window(&self, hash: B256, force: bool) -> Option<DivergenceAlarm> {
         loop {
             let (phase, col) = {
                 let mut st = self.state.lock();
                 let st = &mut *st;
-                let Some(w) = st.windows.get(&hash) else { return };
-                let Some(next) = self.next_due(st, w, force) else { return };
-                let Some(w) = st.windows.get_mut(&hash) else { return };
+                let w = st.windows.get(&hash)?;
+                let next = self.next_due(st, w, force)?;
+                let w = st.windows.get_mut(&hash)?;
                 w.phase = next;
                 (next, w.col.clone())
             };
@@ -398,10 +452,7 @@ impl CohortCoordinator {
                 }
                 Phase::Revealed | Phase::Collecting => {}
                 Phase::Reconciled => self.close_locally(hash, &col),
-                Phase::Final => {
-                    self.merge_and_finalize(hash);
-                    return;
-                }
+                Phase::Final => return self.merge_and_finalize(hash),
             }
         }
     }
@@ -418,16 +469,16 @@ impl CohortCoordinator {
         }
     }
 
-    fn merge_and_finalize(&self, hash: B256) {
+    fn merge_and_finalize(&self, hash: B256) -> Option<DivergenceAlarm> {
         let (per_root, block_number) = {
             let mut st = self.state.lock();
-            let Some(w) = st.windows.remove(&hash) else { return };
+            let w = st.windows.remove(&hash)?;
             let per_root: Vec<(B256, Vec<MobileAttestationCert>)> =
                 w.peer_certs.into_iter().map(|(root, m)| (root, m.into_values().collect())).collect();
             (per_root, w.block_number)
         };
         if per_root.is_empty() {
-            return;
+            return None;
         }
         // BTreeMap order: ascending root, gov5's sort before selection.
         let mut merged = Vec::with_capacity(per_root.len());
@@ -443,28 +494,35 @@ impl CohortCoordinator {
             }
         }
         if merged.is_empty() {
-            return;
+            return None;
         }
         let bound = self.reg.index_bound();
         let (winner, discarded) = match select_majority_bucket(&merged, bound) {
             Ok(x) => x,
             Err(e) => {
                 warn!(target: "mobileverify", block = block_number, err = %e, "majority-bucket selection failed");
-                return;
+                return None;
             }
         };
         if let Err(e) = winner.verify(&self.reg) {
             warn!(target: "mobileverify", block = block_number, err = %e, "merged certificate failed self-verification");
-            return;
+            return None;
         }
         self.certs.put(vec![winner]);
-        if !discarded.is_empty() {
-            warn!(target: "mobileverify", block = block_number, %hash, buckets = discarded.len() + 1, "divergent attestation cohorts");
-            let sink = self.on_divergence.lock().clone();
-            if let Some(sink) = sink {
-                sink(DivergenceAlarm { block_hash: hash, block_number, cohorts: discarded.len() + 1, at_ms: (self.clock)() });
-            }
+        if discarded.is_empty() {
+            return None;
         }
+        warn!(target: "mobileverify", block = block_number, %hash, buckets = discarded.len() + 1, "divergent attestation cohorts");
+        Some(DivergenceAlarm { block_hash: hash, block_number, cohorts: discarded.len() + 1, at_ms: (self.clock)() })
+    }
+}
+
+/// Awaits a blocking task, re-raising its panic.
+async fn join_blocking(task: tokio::task::JoinHandle<()>) {
+    if let Err(e) = task.await
+        && e.is_panic()
+    {
+        std::panic::resume_unwind(e.into_panic());
     }
 }
 
@@ -566,6 +624,104 @@ mod tests {
         co.stop();
         assert_eq!(certs.get(&h2).len(), 1);
         assert_eq!(co.submit(&receipt(&keys[2], h2, 20, r)).unwrap_err(), MobileVerifyError::WindowClosed);
+    }
+
+    /// Runs `f` on a thread; fails instead of hanging if it deadlocks.
+    fn within(f: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("deadlocked");
+    }
+
+    #[test]
+    fn unauthenticated_receipts_open_no_window() {
+        let (reg, chain, certs, keys) = setup();
+        let h = B256::repeat_byte(0x30);
+        chain.blocks.write().insert(h, 7);
+        let co = CohortCoordinator::new(reg, chain, certs, CohortConfig::default());
+        let stranger = DeviceKey::from_ikm(&[99; 32]).unwrap();
+        let root = B256::repeat_byte(1);
+        assert_eq!(co.submit(&receipt(&stranger, h, 7, root)).unwrap_err(), MobileVerifyError::NotRegistered);
+        let mut forged = receipt(&keys[0], h, 7, root);
+        forged.computed_receipts_root = B256::repeat_byte(2);
+        assert_eq!(co.submit(&forged).unwrap_err(), MobileVerifyError::BadReceiptSignature);
+        assert_eq!(co.open_windows(), 0);
+        co.submit(&receipt(&keys[0], h, 7, root)).unwrap();
+        assert_eq!(co.open_windows(), 1);
+        // Once open, the collector's own checks answer, with gov5's texts.
+        assert_eq!(co.submit(&receipt(&stranger, h, 7, root)).unwrap_err(), MobileVerifyError::NotRegistered);
+    }
+
+    /// A chain whose lookup reads the coordinator back, as a provider that
+    /// takes its own locks could.
+    struct Reentrant {
+        inner: Chain,
+        co: std::sync::OnceLock<std::sync::Weak<CohortCoordinator>>,
+    }
+    impl HeadSource for Reentrant {
+        fn head(&self) -> Option<(u64, B256)> {
+            None
+        }
+        fn number_of(&self, hash: &B256) -> Option<u64> {
+            if let Some(co) = self.co.get().and_then(std::sync::Weak::upgrade) {
+                let _ = co.open_windows();
+            }
+            self.inner.number_of(hash)
+        }
+    }
+
+    #[test]
+    fn chain_lookup_runs_outside_the_lock() {
+        let (reg, _, certs, keys) = setup();
+        let h = B256::repeat_byte(0x31);
+        let chain = Arc::new(Reentrant { inner: Chain::default(), co: std::sync::OnceLock::new() });
+        chain.inner.blocks.write().insert(h, 3);
+        let co = Arc::new(CohortCoordinator::new(reg, chain.clone(), certs, CohortConfig::default()));
+        let _ = chain.co.set(Arc::downgrade(&co));
+        let k = keys[0].clone();
+        within(move || {
+            co.submit(&receipt(&k, h, 3, B256::ZERO)).unwrap();
+            assert_eq!(co.open_windows(), 1);
+        });
+    }
+
+    #[test]
+    fn divergence_sink_may_call_back() {
+        let (reg, chain, certs, keys) = setup();
+        let h = B256::repeat_byte(0x32);
+        chain.blocks.write().insert(h, 40);
+        let co = Arc::new(CohortCoordinator::new(reg, chain, certs, CohortConfig::default()));
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let weak = Arc::downgrade(&co);
+        let count = fired.clone();
+        co.set_divergence_sink(Arc::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(co) = weak.upgrade() {
+                co.stop();
+            }
+        }));
+        co.submit(&receipt(&keys[0], h, 40, B256::repeat_byte(1))).unwrap();
+        co.submit(&receipt(&keys[1], h, 40, B256::repeat_byte(2))).unwrap();
+        let co2 = co.clone();
+        within(move || co2.on_block_committed(45));
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(co.submit(&receipt(&keys[2], h, 40, B256::ZERO)).unwrap_err(), MobileVerifyError::WindowClosed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_variants_run_the_cascade() {
+        let (reg, chain, certs, keys) = setup();
+        let h = B256::repeat_byte(0x33);
+        chain.blocks.write().insert(h, 60);
+        let co = Arc::new(CohortCoordinator::new(reg, chain, certs.clone(), CohortConfig::default()));
+        co.submit(&receipt(&keys[0], h, 60, B256::ZERO)).unwrap();
+        co.on_block_committed_async(65).await;
+        assert_eq!(certs.get(&h).len(), 1);
+        co.stop_async().await;
+        assert_eq!(co.submit(&receipt(&keys[0], h, 60, B256::ZERO)).unwrap_err(), MobileVerifyError::WindowClosed);
     }
 
     #[test]

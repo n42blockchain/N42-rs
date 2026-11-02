@@ -43,6 +43,12 @@ impl Collector {
 
     /// Validates and admits one receipt; returns the device's index.
     pub fn add(&self, r: &Receipt) -> Result<MobileIndex, MobileVerifyError> {
+        self.add_checked(r, false)
+    }
+
+    /// [`Self::add`], skipping the signature pairing when the caller has
+    /// already verified this receipt's signature.
+    pub(crate) fn add_checked(&self, r: &Receipt, signature_verified: bool) -> Result<MobileIndex, MobileVerifyError> {
         if r.block_hash != self.block_hash || r.block_number != self.block_number {
             return Err(MobileVerifyError::WrongBlock {
                 got_number: r.block_number,
@@ -52,7 +58,9 @@ impl Collector {
             });
         }
         let idx = self.reg.lookup(&r.verifier_pubkey).ok_or(MobileVerifyError::NotRegistered)?;
-        r.verify_signature()?;
+        if !signature_verified {
+            r.verify_signature()?;
+        }
         let mut st = self.state.lock();
         if st.closed || st.frozen {
             return Err(MobileVerifyError::WindowClosed);
@@ -181,5 +189,22 @@ mod tests {
         assert_eq!(certs[1].verify(&reg).unwrap().len(), 1);
         assert_eq!(certs[0].window_closed_at, 77);
         assert_eq!(col.close(78).unwrap_err(), MobileVerifyError::WindowClosed);
+    }
+
+    #[test]
+    fn close_order_ties_by_smaller_root() {
+        let reg = Arc::new(Registry::new());
+        let keys: Vec<_> = (1..=2u8).map(|i| DeviceKey::from_ikm(&[i; 32]).unwrap()).collect();
+        for k in &keys {
+            reg.register(&k.pubkey(), &k.proof_of_possession()).unwrap();
+        }
+        reg.commit_epoch_at(1);
+        let h = B256::repeat_byte(0x22);
+        let col = Collector::new(reg, h, 9);
+        let (low, high) = (B256::repeat_byte(1), B256::repeat_byte(2));
+        col.add(&receipt(&keys[0], h, 9, high)).unwrap();
+        col.add(&receipt(&keys[1], h, 9, low)).unwrap();
+        let roots: Vec<_> = col.close(0).unwrap().iter().map(|c| c.receipts_root).collect();
+        assert_eq!(roots, vec![low, high]);
     }
 }

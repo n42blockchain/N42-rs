@@ -445,8 +445,9 @@ async fn cert_aggregate_and_routes() {
     for r in &receipts {
         col.add(r).expect("collector add");
     }
-    let mut buckets = col.close(WINDOW_CLOSED_AT).expect("close");
-    buckets.sort_by_key(|c| std::cmp::Reverse(c.signers(reg.index_bound())));
+    // Close's own order (largest cohort first, ties by the smaller root) is
+    // the window manager's; it is compared as returned, never re-sorted.
+    let buckets = col.close(WINDOW_CLOSED_AT).expect("close");
     assert_eq!(buckets.len(), 2);
     assert_eq!(buckets[0], cert);
     let mb = &fx["minority_bucket"];

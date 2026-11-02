@@ -877,6 +877,35 @@ where
         version: EngineApiMessageVersion,
         payload_or_attrs: PayloadOrAttributes<'_, ExecutionData, EthPayloadAttributes>,
     ) -> Result<(), EngineObjectValidationError> {
+        // gov5's Glamsterdam on an N42-native chain without reth's Amsterdam:
+        // the header carries a slot number (and, under MobileAnchor, a
+        // registry root) but no access list and no Amsterdam execution, so its
+        // block travels as a V4 payload with an empty list
+        // (`n42_header::engine::put_header_tail`) to `newPayloadV5`. reth's
+        // version rules refuse a slot or a list before Amsterdam; the payload
+        // is checked as the Osaka/Prague V3 payload it otherwise is, under the
+        // version that takes one. The tail itself is checked where the header
+        // is rebuilt (`validate_gov5_header_tail`).
+        if version == EngineApiMessageVersion::V5
+            && let PayloadOrAttributes::ExecutionPayload(data) = &payload_or_attrs
+            && let Some(v4) = data.payload.as_v4()
+            && v4.block_access_list.is_empty()
+        {
+            let timestamp = v4.payload_inner.payload_inner.payload_inner.timestamp;
+            if !self.chain_spec.is_amsterdam_active_at_timestamp(timestamp)
+                && crate::hotstuff_consensus::header_tail_rules(self.chain_spec.genesis(), timestamp).slot_number
+            {
+                let v3 = ExecutionData {
+                    payload: alloy_rpc_types_engine::ExecutionPayload::V3(v4.payload_inner.clone()),
+                    sidecar: data.sidecar.clone(),
+                };
+                return <EthereumEngineValidator<ChainSpec> as EngineApiValidator<Types>>::validate_version_specific_fields(
+                    &self.inner,
+                    EngineApiMessageVersion::V4,
+                    PayloadOrAttributes::ExecutionPayload(&v3),
+                );
+            }
+        }
         <EthereumEngineValidator<ChainSpec> as EngineApiValidator<Types>>::validate_version_specific_fields(
             &self.inner,
             version,
@@ -1653,6 +1682,41 @@ mod tests {
         let expected = payload.block_hash();
         let sealed = convert(&validator(N42HeaderProfile::Gov5H2), payload).unwrap();
         assert_eq!(sealed.hash(), expected);
+    }
+
+    /// gov5's Glamsterdam and MobileAnchor tail on an Osaka chain without
+    /// reth's Amsterdam: the V4 payload with an empty access list passes
+    /// `newPayloadV5`'s version rules where the genesis schedules the tail
+    /// (and only there), and rebuilds the sealed hash with its slot and root.
+    #[test]
+    fn a_gov5_tail_passes_new_payload_v5_before_amsterdam() {
+        let mut header = gov5_header(B256::ZERO, U256::ZERO);
+        header.slot_number = Some(7);
+        header.mobile_registry_root = Some(B256::repeat_byte(0x24));
+        let block = block_for_header(header, vec![]);
+        let hash = block.header.hash_slow();
+        let payload = n42_header::engine::execution_data_from_block(hash, &block, None).unwrap();
+        assert!(payload.payload.as_v4().is_some_and(|v4| v4.block_access_list.is_empty()));
+
+        let mut genesis = MAINNET.genesis().clone();
+        for key in [reth_chainspec::qmdb::GLAMSTERDAM_TIME_KEY, reth_chainspec::qmdb::MOBILE_ANCHOR_TIME_KEY] {
+            genesis.config.extra_fields.insert(key.to_owned(), serde_json::json!(0));
+        }
+        let gated = Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().genesis(genesis).osaka_activated().build());
+        let ungated = Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().osaka_activated().build());
+        let check = |spec: Arc<ChainSpec>| {
+            <N42EngineValidator<ChainSpec> as EngineApiValidator<EthEngineTypes>>::validate_version_specific_fields(
+                &N42EngineValidator::new(spec, N42HeaderProfile::Gov5H2),
+                EngineApiMessageVersion::V5,
+                PayloadOrAttributes::ExecutionPayload(&payload),
+            )
+        };
+        check(gated.clone()).expect("the scheduled tail passes");
+        assert!(check(ungated).is_err(), "and nowhere else");
+
+        let sealed = convert(&N42EngineValidator::new(gated, N42HeaderProfile::Gov5H2), payload).unwrap();
+        assert_eq!(sealed.hash(), hash);
+        assert_eq!(sealed.header().mobile_registry_root, Some(B256::repeat_byte(0x24)));
     }
 
     #[test]

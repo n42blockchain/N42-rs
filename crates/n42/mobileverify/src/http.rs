@@ -24,6 +24,17 @@
 //! limits (4 KiB register, 8 KiB receipt) are gov5's. Unknown paths get Go's
 //! plain-text 404, and a subtree root without its slash Go's 301.
 //!
+//! Departure from gov5, on overload:
+//!
+//! - **`503 {"error":"busy"}`** (new): registration (the proof-of-possession
+//!   pairing) and receipt intake (the signature pairing) run on tokio's
+//!   blocking pool behind a semaphore of [`ServiceConfig::blocking_limit`]
+//!   permits, so a flood cannot occupy the runtime's workers. A request that
+//!   waits longer than [`ServiceConfig::blocking_wait`] for a permit gets
+//!   `503` with the usual JSON error body `{"error":"busy"}\n`; a client may
+//!   retry it. gov5 runs this work in unbounded goroutines and never answers
+//!   `busy`.
+//!
 //! Not reproduced: the device attestor (never wired in production), Go's
 //! path cleaning and percent-decoding, and the 15 s write timeout (reads are
 //! bounded: 5 s for the headers, 15 s for the body).
@@ -46,6 +57,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use parking_lot::Mutex;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::cert::CertStore;
@@ -71,6 +83,10 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_HEADER_BYTES: usize = 16 << 10;
 /// Graceful-stop budget.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// Default number of pairings run at once on the blocking pool.
+pub const DEFAULT_BLOCKING_LIMIT: usize = 4;
+/// Default wait for a blocking-pool permit before answering `busy`.
+pub const DEFAULT_BLOCKING_WAIT: Duration = Duration::from_secs(2);
 
 const JSON: &str = "application/json";
 const OCTETS: &str = "application/octet-stream";
@@ -91,11 +107,23 @@ pub struct ServiceConfig {
     pub register_window: Duration,
     /// The largest packet `PUT /mobileverify/packet` takes.
     pub ingest_limit: usize,
+    /// Registrations and receipts verified at once on the blocking pool
+    /// (at least 1).
+    pub blocking_limit: usize,
+    /// How long a request waits for a blocking-pool permit before `503 busy`.
+    pub blocking_wait: Duration,
 }
 
 impl Default for ServiceConfig {
     fn default() -> Self {
-        Self { pow_bits: 0, register_limit: 10, register_window: Duration::from_secs(60), ingest_limit: DEFAULT_INGEST_LIMIT }
+        Self {
+            pow_bits: 0,
+            register_limit: 10,
+            register_window: Duration::from_secs(60),
+            ingest_limit: DEFAULT_INGEST_LIMIT,
+            blocking_limit: DEFAULT_BLOCKING_LIMIT,
+            blocking_wait: DEFAULT_BLOCKING_WAIT,
+        }
     }
 }
 
@@ -132,7 +160,14 @@ pub struct Service {
     head: Arc<dyn HeadSource>,
     cfg: ServiceConfig,
     rate: Mutex<RateLimiter>,
+    /// Permits for pairings on the blocking pool.
+    blocking: Arc<Semaphore>,
 }
+
+/// No blocking-pool permit came free in time.
+#[derive(Debug)]
+struct Busy;
+
 
 impl std::fmt::Debug for Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -152,14 +187,39 @@ impl Service {
         mut cfg: ServiceConfig,
     ) -> Self {
         cfg.pow_bits = cfg.pow_bits.min(MAX_POW_BITS);
+        cfg.blocking_limit = cfg.blocking_limit.clamp(1, Semaphore::MAX_PERMITS);
         let rate = RateLimiter {
             limit: cfg.register_limit,
             window: cfg.register_window,
             start: Instant::now(),
             counts: HashMap::new(),
         };
-        Self { registry, packets, coordinator, certs, alarms, head, cfg, rate: Mutex::new(rate) }
+        let blocking = Arc::new(Semaphore::new(cfg.blocking_limit));
+        Self { registry, packets, coordinator, certs, alarms, head, cfg, rate: Mutex::new(rate), blocking }
     }
+
+    /// Runs CPU-bound `f` on the blocking pool once a permit is free, or
+    /// gives up after [`ServiceConfig::blocking_wait`].
+    async fn blocking<T, F>(&self, f: F) -> Result<T, Busy>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = match tokio::time::timeout(self.cfg.blocking_wait, self.blocking.clone().acquire_owned()).await {
+            Ok(Ok(p)) => p,
+            _ => return Err(Busy),
+        };
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        });
+        match task.await {
+            Ok(v) => Ok(v),
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => Err(Busy),
+        }
+    }
+
 
     /// Answers one request from `peer`.
     pub async fn handle<B>(&self, req: Request<B>, peer: SocketAddr) -> HttpResponse
@@ -232,11 +292,13 @@ impl Service {
                 return respond(StatusCode::PRECONDITION_REQUIRED, JSON, body.into(), &[]);
             }
         }
-        match self.registry.register(&pubkey, &pop) {
-            Ok((index, committed)) => {
+        let registry = self.registry.clone();
+        match self.blocking(move || registry.register(&pubkey, &pop)).await {
+            Ok(Ok((index, committed))) => {
                 ok_json(gojson::line(Obj::new().bool("committed", committed).num("index", u64::from(index))), &[])
             }
-            Err(e) => error(StatusCode::FORBIDDEN, &e.to_string()),
+            Ok(Err(e)) => error(StatusCode::FORBIDDEN, &e.to_string()),
+            Err(Busy) => busy(),
         }
     }
 
@@ -257,10 +319,12 @@ impl Service {
                 return error(StatusCode::BAD_REQUEST, &e.to_string());
             }
         };
-        match self.coordinator.submit(&receipt) {
-            Ok(index) => ok_json(gojson::line(Obj::new().num("index", u64::from(index))), &[]),
-            Err(e @ MobileVerifyError::UnknownBlock) => error(StatusCode::NOT_FOUND, &e.to_string()),
-            Err(e) => error(StatusCode::FORBIDDEN, &e.to_string()),
+        let coordinator = self.coordinator.clone();
+        match self.blocking(move || coordinator.submit(&receipt)).await {
+            Ok(Ok(index)) => ok_json(gojson::line(Obj::new().num("index", u64::from(index))), &[]),
+            Ok(Err(e @ MobileVerifyError::UnknownBlock)) => error(StatusCode::NOT_FOUND, &e.to_string()),
+            Ok(Err(e)) => error(StatusCode::FORBIDDEN, &e.to_string()),
+            Err(Busy) => busy(),
         }
     }
 
@@ -423,6 +487,11 @@ fn error(status: StatusCode, msg: &str) -> HttpResponse {
     respond(status, JSON, gojson::error_body(msg).into(), &[])
 }
 
+/// The overflow answer of the blocking pool (new; see the module docs).
+fn busy() -> HttpResponse {
+    error(StatusCode::SERVICE_UNAVAILABLE, "busy")
+}
+
 /// Go `http.NotFound`.
 fn not_found() -> HttpResponse {
     respond(
@@ -514,6 +583,69 @@ mod tests {
         assert_eq!(hash_from_path(&format!("{h}/x")), None);
         assert_eq!(hash_from_path(""), None);
         assert_eq!(hash_from_path("abcd"), None);
+    }
+
+    struct NoChain;
+    impl HeadSource for NoChain {
+        fn head(&self) -> Option<(u64, B256)> {
+            None
+        }
+        fn number_of(&self, _: &B256) -> Option<u64> {
+            None
+        }
+    }
+
+    fn service(cfg: ServiceConfig) -> Service {
+        let registry = Arc::new(Registry::new());
+        let certs = Arc::new(CertStore::new(16));
+        let head: Arc<dyn HeadSource> = Arc::new(NoChain);
+        let coordinator =
+            Arc::new(CohortCoordinator::new(registry.clone(), head.clone(), certs.clone(), Default::default()));
+        Service::new(registry, Arc::new(PacketCache::new(16)), coordinator, certs, Arc::default(), head, cfg)
+    }
+
+    async fn post(svc: &Service, path: &str, body: &str) -> (StatusCode, Bytes) {
+        let req = Request::post(path).body(Full::new(Bytes::from(body.to_string()))).unwrap();
+        let resp = svc.handle(req, "127.0.0.1:1".parse().unwrap()).await;
+        (resp.status(), resp.into_body().collect().await.unwrap().to_bytes())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pairings_overflow_to_busy() {
+        let svc = service(ServiceConfig {
+            blocking_limit: 2,
+            blocking_wait: Duration::from_millis(50),
+            ..ServiceConfig::default()
+        });
+        let k = crate::keys::DeviceKey::from_ikm(&[1; 32]).unwrap();
+        let reg_body = format!(
+            "{{\"pubkey\":\"{}\",\"pop\":\"{}\"}}",
+            hex::encode(k.pubkey()),
+            hex::encode(k.proof_of_possession())
+        );
+        let receipt = crate::receipt::Receipt {
+            block_hash: B256::repeat_byte(1),
+            block_number: 1,
+            computed_receipts_root: B256::ZERO,
+            verifier_pubkey: k.pubkey(),
+            signature: k.sign_receipt(B256::repeat_byte(1), 1, B256::ZERO),
+            timestamp_ms: 0,
+        }
+        .to_request_json();
+
+        // Every permit taken: both pairing routes answer busy.
+        let held = svc.blocking.clone().acquire_many_owned(2).await.unwrap();
+        let busy_body = Bytes::from_static(b"{\"error\":\"busy\"}\n");
+        assert_eq!(post(&svc, "/mobileverify/register", &reg_body).await, (StatusCode::SERVICE_UNAVAILABLE, busy_body.clone()));
+        assert_eq!(post(&svc, "/mobileverify/receipt", &receipt).await, (StatusCode::SERVICE_UNAVAILABLE, busy_body));
+        drop(held);
+
+        // Freed: they run (on the blocking pool) and answer as before.
+        let (status, body) = post(&svc, "/mobileverify/register", &reg_body).await;
+        assert_eq!((status, &body[..]), (StatusCode::OK, &b"{\"committed\":false,\"index\":0}\n"[..]));
+        let (status, body) = post(&svc, "/mobileverify/receipt", &receipt).await;
+        assert_eq!((status, &body[..]), (StatusCode::NOT_FOUND, &b"{\"error\":\"mobileverify: unknown block\"}\n"[..]));
+        assert_eq!(svc.blocking.available_permits(), 2);
     }
 
     #[test]

@@ -36,6 +36,14 @@ EF_TESTS_PATH=/path/to/execution-spec-tests/fixtures \
   cargo test -p n42-ef-tests --test blockchain_tests -- --ignored
 ```
 
+The MobileAnchor gate end to end (the `n42` binary plus four `h2_validator`s on
+`n42_devnet_mobileanchor.json`, JSON Engine API between them; `#[ignore]`d, needs
+`cargo build -p n42` and `cargo build -p n42-h2-node --example h2_validator`; no box claim):
+
+```bash
+cargo test -p n42-h2-node --test mobile_anchor_gate -- --ignored --test-threads 1
+```
+
 End-to-end (needs release binaries + node/npm + `jq`):
 
 ```bash

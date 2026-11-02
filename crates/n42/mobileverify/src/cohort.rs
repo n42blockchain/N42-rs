@@ -24,7 +24,7 @@
 // TODO(stage 2): index-commitment / reveal gossip and `ReconcileWithReveals`
 // (`cohort_relay.go`, `reconcile_reveal.go`) for multi-node fleets.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use alloy_primitives::B256;
@@ -42,6 +42,10 @@ use crate::registry::{MobileIndex, Registry, now_ms};
 pub const MAX_OPEN_WINDOWS: usize = 128;
 /// The bound on distinct reporters per window (`maxReportersPerWindow`).
 pub const MAX_REPORTERS_PER_WINDOW: usize = 256;
+/// Blocks remembered as finalised, so their windows never open again. More
+/// than a node's lookup holds by default (`packet_window` + `cert_blocks`),
+/// so a block is forgotten here only after receipts for it stop being placed.
+pub const FINALISED_KEPT: usize = 4096;
 /// Alarms the node retains (`NewAlarmBuffer(256)` in `node.go`).
 pub const DEFAULT_ALARM_CAPACITY: usize = 256;
 /// Alarms `GET /mobileverify/alarms` returns.
@@ -200,6 +204,25 @@ struct State {
     current_height: u64,
     windows: HashMap<B256, Window>,
     stopped: bool,
+    /// Blocks whose window has run, oldest first (at most [`FINALISED_KEPT`]).
+    /// A window is one block's only cohort: a receipt arriving after the
+    /// merge would otherwise open a second one, and its cohort of one would
+    /// replace the block's stored certificate.
+    finalised: HashSet<B256>,
+    finalised_order: VecDeque<B256>,
+}
+
+impl State {
+    fn mark_finalised(&mut self, hash: B256) {
+        if self.finalised.insert(hash) {
+            self.finalised_order.push_back(hash);
+        }
+        while self.finalised_order.len() > FINALISED_KEPT {
+            if let Some(old) = self.finalised_order.pop_front() {
+                self.finalised.remove(&old);
+            }
+        }
+    }
 }
 
 /// A wall clock in Unix milliseconds (injectable for reproducible
@@ -242,7 +265,13 @@ impl CohortCoordinator {
             certs,
             cfg: cfg.sane(),
             self_reporter: SELF_REPORTER,
-            state: Mutex::new(State { current_height: 0, windows: HashMap::new(), stopped: false }),
+            state: Mutex::new(State {
+                current_height: 0,
+                windows: HashMap::new(),
+                stopped: false,
+                finalised: HashSet::new(),
+                finalised_order: VecDeque::new(),
+            }),
             cascade: Mutex::new(()),
             on_divergence: Mutex::new(None),
         }
@@ -283,8 +312,10 @@ impl CohortCoordinator {
     ///
     /// A window opens only for an authenticated receipt (a registered key
     /// and a valid signature), so junk receipts for known hashes cannot fill
-    /// [`MAX_OPEN_WINDOWS`]; gov5 opens first and checks after. The chain
-    /// lookup and the signature check run outside the coordinator's lock.
+    /// [`MAX_OPEN_WINDOWS`]; gov5 opens first and checks after. A block whose
+    /// window has finalised answers `collection window closed`: its
+    /// certificate is not replaced by a later cohort. The chain lookup and
+    /// the signature check run outside the coordinator's lock.
     ///
     /// CPU-bound (a BLS pairing) and the chain lookup may read the database:
     /// call it from a blocking context, not from an async task's poll.
@@ -301,6 +332,9 @@ impl CohortCoordinator {
                         return Err(MobileVerifyError::WindowClosed);
                     }
                     break w.col.clone();
+                }
+                if st.finalised.contains(&r.block_hash) {
+                    return Err(MobileVerifyError::WindowClosed);
                 }
                 if verified {
                     if st.windows.len() >= MAX_OPEN_WINDOWS {
@@ -473,6 +507,9 @@ impl CohortCoordinator {
         let (per_root, block_number) = {
             let mut st = self.state.lock();
             let w = st.windows.remove(&hash)?;
+            // In the removal's own critical section: no receipt may open a
+            // new window between the two.
+            st.mark_finalised(hash);
             let per_root: Vec<(B256, Vec<MobileAttestationCert>)> =
                 w.peer_certs.into_iter().map(|(root, m)| (root, m.into_values().collect())).collect();
             (per_root, w.block_number)
@@ -606,6 +643,32 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].cohorts, 2);
         assert_eq!(a[0].block_number, 100);
+    }
+
+    /// A window that has run is not opened again: one device arriving after
+    /// the merge would otherwise run a cohort of one, whose certificate
+    /// replaces the block's majority certificate in the store.
+    #[test]
+    fn a_late_receipt_cannot_replace_a_finalised_certificate() {
+        let (reg, chain, certs, keys) = setup();
+        let h = B256::repeat_byte(0x20);
+        chain.blocks.write().insert(h, 100);
+        let co = CohortCoordinator::new(reg.clone(), chain, certs.clone(), CohortConfig::default());
+        let good = B256::repeat_byte(0xAA);
+        for k in &keys[..3] {
+            co.submit(&receipt(k, h, 100, good)).unwrap();
+        }
+        co.on_block_committed(105);
+        assert_eq!(certs.get(&h)[0].verify(&reg).unwrap().len(), 3);
+
+        let forged = B256::repeat_byte(0xBB);
+        assert_eq!(co.submit(&receipt(&keys[3], h, 100, forged)).unwrap_err(), MobileVerifyError::WindowClosed);
+        assert_eq!(co.open_windows(), 0);
+        co.on_block_committed(106);
+        let stored = certs.get(&h);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].receipts_root, good);
+        assert_eq!(stored[0].verify(&reg).unwrap().len(), 3);
     }
 
     #[test]

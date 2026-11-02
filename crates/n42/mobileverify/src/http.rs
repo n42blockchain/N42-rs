@@ -1,0 +1,529 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! gov5's phone-facing HTTP surface (`internal/mobileverify/httpserver.go`)
+//! on hyper 1.x.
+//!
+//! | route | method | success | errors |
+//! |---|---|---|---|
+//! | `/mobileverify/register` | POST | `{"committed":b,"index":N}` | 405, 429, 400, 428, 403 |
+//! | `/mobileverify/packet/<hash>` | GET | raw packet, immutable | 405, 400, 404 |
+//! | `/mobileverify/packet` | PUT (loopback) | `{"hash","new","number"}` | 403, 413, 400 |
+//! | `/mobileverify/receipt` | POST | `{"index":N}` | 405, 400, 404, 403 |
+//! | `/mobileverify/cert/<hash>` | GET | `[cert]` | 405, 400, 404 |
+//! | `/mobileverify/magnet/<hash>` | GET | — (no torrent seeding) | 405, 400, 404 |
+//! | `/mobileverify/alarms` | GET | `[alarm]`, newest first, ≤ 100 | 405 |
+//! | `/mobileverify/snapshot` | GET | committed-set snapshot | 405 |
+//! | `/mobileverify/health` | any | counters | — |
+//! | `/mobileverify/latest` | GET | `{"hash","number","packet"}` | 405, 503 |
+//!
+//! Every error body is `{"error":"<msg>"}\n` with `Content-Type:
+//! application/json`; success JSON is Go's encoder output (sorted map keys,
+//! trailing newline). The register rate limit (10 per minute per IP, one
+//! fixed window for all IPs, counted before the body is read) and the body
+//! limits (4 KiB register, 8 KiB receipt) are gov5's. Unknown paths get Go's
+//! plain-text 404, and a subtree root without its slash Go's 301.
+//!
+//! Not reproduced: the device attestor (never wired in production), Go's
+//! path cleaning and percent-decoding, and the 15 s write timeout (reads are
+//! bounded: 5 s for the headers, 15 s for the body).
+
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use alloy_primitives::B256;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::Body;
+use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use parking_lot::Mutex;
+use tokio::net::TcpListener;
+use tracing::{debug, warn};
+
+use crate::cert::CertStore;
+use crate::cohort::{ALARMS_SERVED, AlarmBuffer, CohortCoordinator, HeadSource};
+use crate::error::MobileVerifyError;
+use crate::gojson::{self, Obj};
+use crate::packet::{PacketCache, validate_packet_bytes};
+use crate::pow::{MAX_POW_BITS, verify_pow};
+use crate::receipt::{ReceiptRequestError, parse_receipt_request};
+use crate::registry::Registry;
+
+/// The register body limit.
+pub const REGISTER_BODY_LIMIT: usize = 4 << 10;
+/// The receipt body limit.
+pub const RECEIPT_BODY_LIMIT: usize = 8 << 10;
+/// The default limit on a loopback-ingested packet (the Go client's read cap).
+pub const DEFAULT_INGEST_LIMIT: usize = 256 << 20;
+/// `ReadHeaderTimeout`.
+pub const READ_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+/// `ReadTimeout`, applied to reading the body.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// `MaxHeaderBytes`.
+pub const MAX_HEADER_BYTES: usize = 16 << 10;
+/// Graceful-stop budget.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+const JSON: &str = "application/json";
+const OCTETS: &str = "application/octet-stream";
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+const NO_STORE: &str = "no-store";
+
+/// The HTTP response type.
+pub type HttpResponse = Response<Full<Bytes>>;
+
+/// Server settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceConfig {
+    /// Registration proof-of-work difficulty (0 disables), capped at 32.
+    pub pow_bits: u32,
+    /// Registrations per IP per window.
+    pub register_limit: u32,
+    /// The rate-limit window.
+    pub register_window: Duration,
+    /// The largest packet `PUT /mobileverify/packet` takes.
+    pub ingest_limit: usize,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self { pow_bits: 0, register_limit: 10, register_window: Duration::from_secs(60), ingest_limit: DEFAULT_INGEST_LIMIT }
+    }
+}
+
+/// gov5's fixed-window per-IP counter: one window start for every IP, the
+/// whole map cleared when it expires; denied attempts count too.
+#[derive(Debug)]
+struct RateLimiter {
+    limit: u32,
+    window: Duration,
+    start: Instant,
+    counts: HashMap<String, u32>,
+}
+
+impl RateLimiter {
+    fn allow(&mut self, ip: &str) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.start) > self.window {
+            self.start = now;
+            self.counts.clear();
+        }
+        let c = self.counts.entry(ip.to_string()).or_insert(0);
+        *c = c.saturating_add(1);
+        *c <= self.limit
+    }
+}
+
+/// The surface's state: everything a handler reads.
+pub struct Service {
+    registry: Arc<Registry>,
+    packets: Arc<PacketCache>,
+    coordinator: Arc<CohortCoordinator>,
+    certs: Arc<CertStore>,
+    alarms: Arc<AlarmBuffer>,
+    head: Arc<dyn HeadSource>,
+    cfg: ServiceConfig,
+    rate: Mutex<RateLimiter>,
+}
+
+impl std::fmt::Debug for Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Service").field("cfg", &self.cfg).finish_non_exhaustive()
+    }
+}
+
+impl Service {
+    /// Builds the service.
+    pub fn new(
+        registry: Arc<Registry>,
+        packets: Arc<PacketCache>,
+        coordinator: Arc<CohortCoordinator>,
+        certs: Arc<CertStore>,
+        alarms: Arc<AlarmBuffer>,
+        head: Arc<dyn HeadSource>,
+        mut cfg: ServiceConfig,
+    ) -> Self {
+        cfg.pow_bits = cfg.pow_bits.min(MAX_POW_BITS);
+        let rate = RateLimiter {
+            limit: cfg.register_limit,
+            window: cfg.register_window,
+            start: Instant::now(),
+            counts: HashMap::new(),
+        };
+        Self { registry, packets, coordinator, certs, alarms, head, cfg, rate: Mutex::new(rate) }
+    }
+
+    /// Answers one request from `peer`.
+    pub async fn handle<B>(&self, req: Request<B>, peer: SocketAddr) -> HttpResponse
+    where
+        B: Body<Data = Bytes>,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let path = req.uri().path().to_string();
+        match path.as_str() {
+            "/mobileverify/register" => self.register(req, peer).await,
+            "/mobileverify/receipt" => self.receipt(req).await,
+            "/mobileverify/latest" => self.latest(req.method()),
+            "/mobileverify/health" => self.health(),
+            "/mobileverify/alarms" => self.alarms(req.method()),
+            "/mobileverify/snapshot" => self.snapshot(req.method()),
+            "/mobileverify/packet" if req.method() == Method::PUT => self.ingest(req, peer).await,
+            "/mobileverify/packet" | "/mobileverify/cert" | "/mobileverify/magnet" => {
+                redirect(&format!("{path}/"), req.uri().query())
+            }
+            p => {
+                if let Some(rest) = p.strip_prefix("/mobileverify/packet/") {
+                    self.packet(req.method(), rest)
+                } else if let Some(rest) = p.strip_prefix("/mobileverify/cert/") {
+                    self.cert(req.method(), rest)
+                } else if let Some(rest) = p.strip_prefix("/mobileverify/magnet/") {
+                    magnet(req.method(), rest)
+                } else {
+                    not_found()
+                }
+            }
+        }
+    }
+
+    async fn register<B>(&self, req: Request<B>, peer: SocketAddr) -> HttpResponse
+    where
+        B: Body<Data = Bytes>,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        if req.method() != Method::POST {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "POST only");
+        }
+        if !self.rate.lock().allow(&peer.ip().to_string()) {
+            return error(StatusCode::TOO_MANY_REQUESTS, "registration rate limit");
+        }
+        let Some(body) = read_body(req.into_body(), REGISTER_BODY_LIMIT).await else {
+            return error(StatusCode::BAD_REQUEST, "bad json");
+        };
+        let fields = (|| {
+            let obj = gojson::decode_object(&body)?;
+            let o = obj.as_ref();
+            Ok::<_, gojson::BadJson>((
+                gojson::get_string(o, "pubkey")?,
+                gojson::get_string(o, "pop")?,
+                gojson::get_string(o, "pow_nonce")?,
+                gojson::get_string(o, "attestation")?,
+            ))
+        })();
+        let Ok((pubkey, pop, pow_nonce, _attestation)) = fields else {
+            return error(StatusCode::BAD_REQUEST, "bad json");
+        };
+        let (Some(pubkey), Some(pop)) = (gojson::hex_into::<48>(&pubkey), gojson::hex_into::<96>(&pop)) else {
+            return error(StatusCode::BAD_REQUEST, "pubkey must be 48 hex bytes, pop 96");
+        };
+        if self.cfg.pow_bits > 0 {
+            let solved = parse_go_uint(&pow_nonce).is_some_and(|n| verify_pow(&pubkey, n, self.cfg.pow_bits));
+            if !solved {
+                let body = gojson::line(
+                    Obj::new().str("error", &MobileVerifyError::PowRequired.to_string()).num("pow_bits", u64::from(self.cfg.pow_bits)),
+                );
+                return respond(StatusCode::PRECONDITION_REQUIRED, JSON, body.into(), &[]);
+            }
+        }
+        match self.registry.register(&pubkey, &pop) {
+            Ok((index, committed)) => {
+                ok_json(gojson::line(Obj::new().bool("committed", committed).num("index", u64::from(index))), &[])
+            }
+            Err(e) => error(StatusCode::FORBIDDEN, &e.to_string()),
+        }
+    }
+
+    async fn receipt<B>(&self, req: Request<B>) -> HttpResponse
+    where
+        B: Body<Data = Bytes>,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        if req.method() != Method::POST {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "POST only");
+        }
+        let Some(body) = read_body(req.into_body(), RECEIPT_BODY_LIMIT).await else {
+            return error(StatusCode::BAD_REQUEST, "bad json");
+        };
+        let receipt = match parse_receipt_request(&body) {
+            Ok(r) => r,
+            Err(e @ (ReceiptRequestError::BadJson | ReceiptRequestError::BadHex)) => {
+                return error(StatusCode::BAD_REQUEST, &e.to_string());
+            }
+        };
+        match self.coordinator.submit(&receipt) {
+            Ok(index) => ok_json(gojson::line(Obj::new().num("index", u64::from(index))), &[]),
+            Err(e @ MobileVerifyError::UnknownBlock) => error(StatusCode::NOT_FOUND, &e.to_string()),
+            Err(e) => error(StatusCode::FORBIDDEN, &e.to_string()),
+        }
+    }
+
+    fn packet(&self, method: &Method, rest: &str) -> HttpResponse {
+        if method != Method::GET {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "GET only");
+        }
+        let Some(hash) = hash_from_path(rest) else {
+            return error(StatusCode::BAD_REQUEST, "bad block hash");
+        };
+        match self.packets.get(&hash) {
+            Some(data) => respond(StatusCode::OK, OCTETS, data, &[(CACHE_CONTROL, IMMUTABLE)]),
+            None => error(StatusCode::NOT_FOUND, "packet not in window"),
+        }
+    }
+
+    fn cert(&self, method: &Method, rest: &str) -> HttpResponse {
+        if method != Method::GET {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "GET only");
+        }
+        let Some(hash) = hash_from_path(rest) else {
+            return error(StatusCode::BAD_REQUEST, "bad block hash");
+        };
+        let certs = self.certs.get(&hash);
+        if certs.is_empty() {
+            return error(StatusCode::NOT_FOUND, "no certificates for block");
+        }
+        let bound = self.registry.index_bound();
+        ok_json(gojson::array_line(certs.iter().map(|c| c.to_json(bound))), &[])
+    }
+
+    fn alarms(&self, method: &Method) -> HttpResponse {
+        if method != Method::GET {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "GET only");
+        }
+        ok_json(gojson::array_line(self.alarms.recent(ALARMS_SERVED).iter().map(|a| a.to_json())), &[])
+    }
+
+    fn snapshot(&self, method: &Method) -> HttpResponse {
+        if method != Method::GET {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "GET only");
+        }
+        let blob = self.registry.export_committed();
+        let root = gojson::hex0x(self.registry.root().as_slice());
+        let mut resp = respond(StatusCode::OK, OCTETS, blob.into(), &[(CACHE_CONTROL, NO_STORE)]);
+        if let Ok(v) = HeaderValue::from_str(&root) {
+            resp.headers_mut().insert("X-Mobileverify-Root", v);
+        }
+        resp
+    }
+
+    fn health(&self) -> HttpResponse {
+        let body = Obj::new()
+            .str("accumulator", &gojson::hex0x(self.registry.root().as_slice()))
+            .num("alarms", self.alarms.len() as u64)
+            .num("certBlocks", self.certs.len() as u64)
+            .num("openWindows", self.coordinator.open_windows() as u64)
+            .num("pending", self.registry.pending_count() as u64)
+            .num("registry", self.registry.count() as u64);
+        ok_json(gojson::line(body), &[])
+    }
+
+    fn latest(&self, method: &Method) -> HttpResponse {
+        if method != Method::GET {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "GET only");
+        }
+        let Some((number, hash)) = self.head.head() else {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "head not available");
+        };
+        let body = Obj::new()
+            .str("hash", &gojson::hex0x(hash.as_slice()))
+            .num("number", number)
+            .bool("packet", self.packets.has(&hash));
+        ok_json(gojson::line(body), &[(CACHE_CONTROL, NO_STORE)])
+    }
+
+    /// `PUT /mobileverify/packet` (new, loopback only): a packet built by the
+    /// sidecar. It must decode and its header hash to its block hash.
+    async fn ingest<B>(&self, req: Request<B>, peer: SocketAddr) -> HttpResponse
+    where
+        B: Body<Data = Bytes>,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        if !peer.ip().to_canonical().is_loopback() {
+            return error(StatusCode::FORBIDDEN, "loopback only");
+        }
+        let Some(body) = read_body(req.into_body(), self.cfg.ingest_limit).await else {
+            return error(StatusCode::PAYLOAD_TOO_LARGE, "packet body unreadable or too large");
+        };
+        match validate_packet_bytes(&body) {
+            Ok((hash, number)) => {
+                let new = self.packets.put(hash, number, body);
+                debug!(target: "mobileverify", %hash, number, new, "ingested packet");
+                ok_json(
+                    gojson::line(Obj::new().str("hash", &gojson::hex0x(hash.as_slice())).bool("new", new).num("number", number)),
+                    &[],
+                )
+            }
+            Err(e) => error(StatusCode::BAD_REQUEST, &e.to_string()),
+        }
+    }
+}
+
+fn magnet(method: &Method, rest: &str) -> HttpResponse {
+    if method != Method::GET {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "GET only");
+    }
+    if hash_from_path(rest).is_none() {
+        return error(StatusCode::BAD_REQUEST, "bad block hash");
+    }
+    error(StatusCode::NOT_FOUND, "packet not seeded")
+}
+
+/// Go `strconv.ParseUint(s, 10, 64)`: ASCII digits only, no sign.
+fn parse_go_uint(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// gov5 `hashFromPath` on the part after the prefix.
+fn hash_from_path(rest: &str) -> Option<B256> {
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    gojson::hex_into::<32>(rest).map(B256::from)
+}
+
+async fn read_body<B>(body: B, limit: usize) -> Option<Bytes>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let collected = tokio::time::timeout(READ_TIMEOUT, Limited::new(body, limit).collect()).await.ok()?;
+    collected.ok().map(|c| c.to_bytes())
+}
+
+fn respond(status: StatusCode, content_type: &str, body: Bytes, extra: &[(hyper::header::HeaderName, &str)]) -> HttpResponse {
+    let mut resp = Response::new(Full::new(body));
+    *resp.status_mut() = status;
+    let h = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(content_type) {
+        h.insert(CONTENT_TYPE, v);
+    }
+    for (k, v) in extra {
+        if let Ok(v) = HeaderValue::from_str(v) {
+            h.insert(k.clone(), v);
+        }
+    }
+    resp
+}
+
+fn ok_json(body: String, extra: &[(hyper::header::HeaderName, &str)]) -> HttpResponse {
+    respond(StatusCode::OK, JSON, body.into(), extra)
+}
+
+/// gov5 `httpError`.
+fn error(status: StatusCode, msg: &str) -> HttpResponse {
+    respond(status, JSON, gojson::error_body(msg).into(), &[])
+}
+
+/// Go `http.NotFound`.
+fn not_found() -> HttpResponse {
+    respond(
+        StatusCode::NOT_FOUND,
+        "text/plain; charset=utf-8",
+        Bytes::from_static(b"404 page not found\n"),
+        &[(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")],
+    )
+}
+
+/// Go `ServeMux`'s redirect of a subtree root requested without its slash.
+fn redirect(to: &str, query: Option<&str>) -> HttpResponse {
+    let target = match query {
+        Some(q) => format!("{to}?{q}"),
+        None => to.to_string(),
+    };
+    let body = format!("<a href=\"{target}\">Moved Permanently</a>.\n\n");
+    respond(StatusCode::MOVED_PERMANENTLY, "text/html; charset=utf-8", body.into(), &[(LOCATION, &target)])
+}
+
+/// Serves `listener` until `shutdown` resolves, then gives open connections
+/// [`SHUTDOWN_GRACE`] to finish.
+pub async fn serve<F>(listener: TcpListener, service: Arc<Service>, shutdown: F)
+where
+    F: Future<Output = ()>,
+{
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut conns = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(x) => x,
+                    Err(e) => {
+                        warn!(target: "mobileverify", err = %e, "accept failed");
+                        continue;
+                    }
+                };
+                let svc = service.clone();
+                let mut stop = stop_rx.clone();
+                conns.spawn(async move {
+                    let handler = service_fn(move |req| {
+                        let svc = svc.clone();
+                        async move { Ok::<_, Infallible>(svc.handle(req, peer).await) }
+                    });
+                    let mut builder = http1::Builder::new();
+                    builder
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(READ_HEADER_TIMEOUT)
+                        .max_buf_size(MAX_HEADER_BYTES);
+                    let conn = builder.serve_connection(TokioIo::new(stream), handler);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        res = conn.as_mut() => {
+                            if let Err(e) = res {
+                                debug!(target: "mobileverify", %peer, err = %e, "connection ended");
+                            }
+                        }
+                        _ = stop.changed() => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = conn.await;
+                        }
+                    }
+                });
+            }
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+        }
+    }
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, async { while conns.join_next().await.is_some() {} }).await;
+    conns.abort_all();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn go_uint_and_hash_path() {
+        assert_eq!(parse_go_uint("42"), Some(42));
+        assert_eq!(parse_go_uint("+42"), None);
+        assert_eq!(parse_go_uint(""), None);
+        assert_eq!(parse_go_uint("18446744073709551616"), None);
+        let h = "ab".repeat(32);
+        assert_eq!(hash_from_path(&h), Some(B256::repeat_byte(0xab)));
+        assert_eq!(hash_from_path(&format!("0x{h}")), Some(B256::repeat_byte(0xab)));
+        assert_eq!(hash_from_path(&format!("{h}/x")), None);
+        assert_eq!(hash_from_path(""), None);
+        assert_eq!(hash_from_path("abcd"), None);
+    }
+
+    #[test]
+    fn rate_limiter_fixed_window() {
+        let mut r = RateLimiter { limit: 2, window: Duration::from_secs(60), start: Instant::now(), counts: HashMap::new() };
+        assert!(r.allow("a"));
+        assert!(r.allow("a"));
+        assert!(!r.allow("a"));
+        assert!(r.allow("b"));
+        r.start = Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
+        assert!(r.allow("a"));
+    }
+}

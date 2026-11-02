@@ -7149,6 +7149,7 @@ dependencies = [
  "alloy-signer-local",
  "aquamarine",
  "backon",
+ "backtrace",
  "clap",
  "consensus-client",
  "eyre",

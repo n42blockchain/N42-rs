@@ -16,6 +16,7 @@ workspace = true
 n42-env.workspace = true
 n42-tx-types.workspace = true
 libc.workspace = true
+backtrace = "0.3"
 reth-primitives-traits.workspace = true
 #n42
 pubsub-mem.workspace = true

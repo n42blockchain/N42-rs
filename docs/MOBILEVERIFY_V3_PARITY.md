@@ -1,6 +1,7 @@
 # Mobile verification v3 (`/mobileverify`) parity for the Rust node
 
-Status: design + specification, 2026-11-01. Nothing of this is implemented in n42-rs yet.
+Status: specification 2026-11-01; stages 0-2 implemented (see the table in section 4 and
+"Stage 2 verification" at the end).
 
 gov5's phone app (n42appv2, "mining v3", `docs/mobile-app-mobileverify-plan.md` in N42-gov5)
 runs the Go SDK's `MobileVerifyMiner` loop against one HTTP surface on a fleet node:
@@ -363,14 +364,68 @@ one complete StreamPacket for an empty block under `mainnet_qmdb_staggered`.
 
 ## 4. Plan
 
-| Stage | Where | Content | Done when |
-|---|---|---|---|
-| 0 | gov5 branch `test/mobileverify-cross-client-fixtures` | the Go fixture writer of §3.4, `internal/mobileverify/testdata/cross_client_v1/*.json` | `go test ./internal/mobileverify/... -run Fixture` writes them; copied to n42-rs with SHAs |
-| 1 | n42-rs crate `crates/n42/mobileverify` | registry + gov5 BMT accumulator + snapshot export; PoP/PoW; mask; collector + cohort coordinator (single node, majority bucket, alarms); cert JSON; packet cache + window; StreamPacket V2 decoder with the gov5 header/tx protobuf codecs (encode too, for the sidecar path's validation); HTTP router on hyper 1.x with the exact routes, bodies, status codes and limits of §1.2 | unit tests against the stage-0 fixtures; an `httptest`-style test per route |
-| 2 | `n42-h2-node` | `--mobileverify.http`, head from commits, epoch commit every 45 s, gossip relay of packets and registrations (`h2-net` topics), registry root → payload attributes → assembler, anchor log; `--mobile` retired | mixed devnet: gov5 `cmd/mobileverify-device` pointed at the **Rust** member registers, verifies gov5-produced packets, gets certified |
-| 3 | gov5 `cmd/mobileverify-packetd` + Rust loopback ingest | the sidecar builder of §3.2 | all-Rust devnet on chain 94's genesis: `cmd/mobileverify-device` against a Rust node, 20/20 certified (gov5's own regression bar) |
-| 4 | docs | `N42_26_PORT.md` "Joining a Go fleet" rules, `N42_CUSTOMIZATIONS.md`, this document's status | — |
+| Stage | Where | Content | Done when | Status |
+|---|---|---|---|---|
+| 0 | gov5 branch `test/mobileverify-cross-client-fixtures` | the Go fixture writer of §3.4, `internal/mobileverify/testdata/cross_client_v1/*.json` | `go test ./internal/mobileverify/... -run Fixture` writes them; copied to n42-rs with SHAs | done (gov5 76bc53c5, 961e4601) |
+| 1 | n42-rs crate `crates/n42/mobileverify` | registry + gov5 BMT accumulator + snapshot export; PoP/PoW; mask; collector + cohort coordinator (single node, majority bucket, alarms); cert JSON; packet cache + window; StreamPacket V2 decoder with the gov5 header/tx protobuf codecs (encode too, for the sidecar path's validation); HTTP router on hyper 1.x with the exact routes, bodies, status codes and limits of §1.2 | unit tests against the stage-0 fixtures; an `httptest`-style test per route | done (635ce8538..8bc262b2f; hardening merged af7ba3771) |
+| 2 | `n42-h2-node` | `--mobileverify.http`, head from commits, epoch commit every 45 s, gossip relay of packets and registrations (`h2-net` topics), registry root → payload attributes → assembler, anchor log; `--mobile` retired | mixed devnet: gov5 `cmd/mobileverify-device` pointed at the **Rust** member registers, verifies gov5-produced packets, gets certified | done (c36733319, 7a4f44fa8, 05657d113, f5bc78235, d3efa4651, 98dafeb94; gov5 harness 448db194); verified on a mixed devnet, see "Stage 2 verification" |
+| 3 | gov5 `cmd/mobileverify-packetd` + Rust loopback ingest | the sidecar builder of §3.2 | all-Rust devnet on chain 94's genesis: `cmd/mobileverify-device` against a Rust node, 20/20 certified (gov5's own regression bar) | open |
+| 4 | docs | `N42_26_PORT.md` "Joining a Go fleet" rules, `N42_CUSTOMIZATIONS.md`, this document's status | — | open |
 
 Open for the owner: the reward model (gov5 item 8), TLS exposure (item 4), an `n42_devnet`
 chain config in gov5 `params`, and whether the old `mobile-service` JSON-RPC API has any client
 left (none known; it is retired in stage 2).
+
+## Stage 2 verification
+
+Run `mv2b`, 2026-11-02, n42-rs `feat/mobileverify-v3` at 98dafeb94 (debug build), gov5
+`test/mobileverify-device-genesis` 448db194 (node and `cmd/mobileverify-device`). Mixed devnet on
+`n42_devnet.json` (chain 1143, 3 s slots, four validators round-robin: three Rust, one gov5), 420 s:
+
+```bash
+DEVNET_BIN=/data/n42-build/mobile-target/debug N42_GOV5=<gov5 worktree> MOBILEVERIFY=1 GOV5_DELAY=0 \
+  scripts/devnet-fleet.sh mv2b 420 --gov5
+# Rust validator i serves http://127.0.0.1:2101<i>/mobileverify, the gov5 member :21020
+mobileverify-device -mv http://127.0.0.1:21010 -rpc http://127.0.0.1:18545 \
+  -genesis crates/chainspec/res/genesis/n42_devnet.json -devices 2 -blocks 5 \
+  -skip-no-packet -commit-wait 150s -settle 30s
+```
+
+The device is aimed at Rust validator 0. gov5's harness gained `-genesis` (chain config from a
+genesis file instead of `params`), `-skip-no-packet` and `-packet-wait`; the devnet has no packet
+for a Rust-led block until stage 3, so 13 Rust-led blocks were skipped and the five verified blocks
+are the gov5-led ones (packets relayed to the Rust node over `mobileverify_packet`).
+
+```
+SUMMARY devices=2 blocks=5 skipped=13 failures=0 certified(all devices)=5/5
+```
+
+Certificate served by the Rust node for block 19 (blocks 23, 27, 31, 35 alike, `signers` 2):
+
+```json
+[{"blockHash":"0x0f9fec1864e5facf250aab672889834022a6af6b6cede706686771723f4f4b66","blockNumber":19,
+  "receiptsRoot":"0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+  "aggregateSig":"b3362ae2…bc731143","signerMask":"020000","signers":2,"windowClosedAt":1793601758747}]
+```
+
+Fleet summary at 420 s: the three Rust validators committed 185 blocks each, gov5 height 185, block
+185 hash equal on reth and gov5 (`0xa0046c14…29bd1cf`), EL errors 0. `/mobileverify/health` on all
+four members after the run: `registry` 2, accumulator `0x0faa5a99…8b06c1a5` on every member
+(registrations made at the Rust node reached gov5 over `mobileverify_registration` and were
+committed by each node's own 45 s epoch timer to the same index), `alarms` 0; `certBlocks` 5 on the
+node the device used, 0 elsewhere (certificates are per serving node, as in gov5). Every
+consensus dir has `mobileverify/registry.bin` (315 bytes); the three files carry the same keys and
+indices and differ only in the node-local admission timestamp. Headers carry no
+`mobileRegistryRoot`: the devnet has no Glamsterdam/`mobileAnchorTime`, so the gate is off
+(the stamping under the gate is covered by `assembler::tests::the_registry_root_is_stamped_under_the_gate_only`).
+
+Open after stage 2:
+
+- Each node commits epochs on its own timer, so two nodes can assign different indices if
+  registrations arrive on either side of an epoch boundary (gov5 has the same property; the
+  device harness says "committed per node on its own epoch timer"). Here both registrations landed
+  in one epoch everywhere. A header-anchored registry root would need a common commit point.
+- The engine's payload id does not cover `mobile_registry_root` (upstream reth computes it); two
+  builds that differ only in the root would share an id. The leader sets the root once per slot.
+- Stage 3 needs from the Rust side: a hook that publishes a packet ingested through the loopback
+  `PUT` on `mobileverify_packet` (gov5 `PublishLocal`); the loopback ingest itself exists.

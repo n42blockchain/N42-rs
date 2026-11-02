@@ -31,7 +31,7 @@ use alloy_primitives::B256;
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
-use crate::cert::{CertStore, MobileAttestationCert, merge_certs, select_majority_bucket};
+use crate::cert::{CertStore, MobileAttestationCert, merge_certs_at, select_majority_bucket};
 use crate::collector::Collector;
 use crate::error::MobileVerifyError;
 use crate::gojson::{self, Obj};
@@ -202,8 +202,13 @@ struct State {
     stopped: bool,
 }
 
+/// A wall clock in Unix milliseconds (injectable for reproducible
+/// `windowClosedAt` / alarm timestamps).
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// The per-block certificate lifecycle, driven by committed heights.
 pub struct CohortCoordinator {
+    clock: Clock,
     reg: Arc<Registry>,
     head: Arc<dyn HeadSource>,
     certs: Arc<CertStore>,
@@ -231,6 +236,7 @@ impl CohortCoordinator {
     /// A coordinator storing finalised certificates into `certs`.
     pub fn new(reg: Arc<Registry>, head: Arc<dyn HeadSource>, certs: Arc<CertStore>, cfg: CohortConfig) -> Self {
         Self {
+            clock: Arc::new(now_ms),
             reg,
             head,
             certs,
@@ -246,6 +252,12 @@ impl CohortCoordinator {
     /// (gov5 uses the validator address).
     pub const fn with_self_reporter(mut self, reporter: [u8; 20]) -> Self {
         self.self_reporter = reporter;
+        self
+    }
+
+    /// Replaces the wall clock used for `windowClosedAt` and alarm times.
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -395,7 +407,7 @@ impl CohortCoordinator {
     }
 
     fn close_locally(&self, hash: B256, col: &Collector) {
-        let local = col.close(now_ms()).unwrap_or_else(|e| {
+        let local = col.close((self.clock)()).unwrap_or_else(|e| {
             warn!(target: "mobileverify", err = %e, "local close failed");
             Vec::new()
         });
@@ -420,7 +432,7 @@ impl CohortCoordinator {
         // BTreeMap order: ascending root, gov5's sort before selection.
         let mut merged = Vec::with_capacity(per_root.len());
         for (root, certs) in per_root {
-            match merge_certs(&certs, &self.reg) {
+            match merge_certs_at(&certs, &self.reg, (self.clock)()) {
                 Ok(m) => {
                     if !m.dropped_for_overlap.is_empty() {
                         warn!(target: "mobileverify", block = block_number, %root, dropped = m.dropped_for_overlap.len(), "certs conflicted at merge time");
@@ -450,7 +462,7 @@ impl CohortCoordinator {
             warn!(target: "mobileverify", block = block_number, %hash, buckets = discarded.len() + 1, "divergent attestation cohorts");
             let sink = self.on_divergence.lock().clone();
             if let Some(sink) = sink {
-                sink(DivergenceAlarm { block_hash: hash, block_number, cohorts: discarded.len() + 1, at_ms: now_ms() });
+                sink(DivergenceAlarm { block_hash: hash, block_number, cohorts: discarded.len() + 1, at_ms: (self.clock)() });
             }
         }
     }

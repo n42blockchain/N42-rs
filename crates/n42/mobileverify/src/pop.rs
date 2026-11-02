@@ -7,6 +7,7 @@ use blst::min_pk::PublicKey;
 
 use crate::bls::{self, PUBKEY_LEN, SIGNATURE_LEN};
 use crate::error::MobileVerifyError;
+use crate::gojson;
 
 /// The 24-byte tag that prefixes a proof-of-possession message.
 pub const POP_TAG: &[u8; 24] = b"n42/mobileverify/pop/v1\x00";
@@ -30,6 +31,17 @@ pub fn verify_pop(pubkey: &[u8; PUBKEY_LEN], pop: &[u8; SIGNATURE_LEN]) -> Resul
         return Err(MobileVerifyError::BadPop);
     }
     Ok(pk)
+}
+
+/// The registration body exactly as the SDK POSTs it
+/// (`cmd/evmsdk/mobileverify_client.go`: `json.Marshal` of a map, keys
+/// sorted, hex without `0x`; the PoW nonce, when solved, as a decimal string).
+pub fn register_request_json(pubkey: &[u8; PUBKEY_LEN], pop: &[u8; SIGNATURE_LEN], pow_nonce: Option<u64>) -> String {
+    let mut obj = gojson::Obj::new().str("pop", &hex::encode(pop));
+    if let Some(n) = pow_nonce {
+        obj = obj.str("pow_nonce", &n.to_string());
+    }
+    obj.str("pubkey", &hex::encode(pubkey)).finish()
 }
 
 #[cfg(test)]

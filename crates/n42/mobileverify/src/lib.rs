@@ -21,6 +21,8 @@
 //!   1/2/3/5-block schedule that turns receipts into stored certificates.
 //! - [`packet`]: StreamPacket V2, gov5's header `Marshal` and transaction
 //!   protobuf codecs, the read log, and the packet cache.
+//! - [`receipts_root`]: the native receipts root a phone recomputes.
+//! - [`topics`]: gossip topic names and the registration payload.
 //! - [`http`]: the hyper server with gov5's exact routes, status codes,
 //!   bodies and headers, plus a loopback-only `PUT /mobileverify/packet`
 //!   ingest for a packet-building sidecar.
@@ -41,10 +43,12 @@ pub mod packet;
 pub mod pop;
 pub mod pow;
 pub mod receipt;
+pub mod receipts_root;
 pub mod registry;
+pub mod topics;
 
 pub use cert::{CertStore, MobileAttestationCert};
-pub use cohort::{AlarmBuffer, CohortConfig, CohortCoordinator, DivergenceAlarm, HeadSource};
+pub use cohort::{AlarmBuffer, Clock, CohortConfig, CohortCoordinator, DivergenceAlarm, HeadSource};
 pub use error::MobileVerifyError;
 pub use http::{Service, ServiceConfig, serve};
 pub use keys::DeviceKey;

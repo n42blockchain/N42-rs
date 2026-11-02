@@ -1,0 +1,62 @@
+{
+  "_doc": "Registration proof of work for device 0's pubkey (keys.json). message = \"n42/mobileverify/pow/v1\" (23 bytes, no NUL) || pubkey(48) || nonce u64 BIG-endian = 79 bytes; digest = legacy Keccak256(message); a nonce solves `bits` when the digest has >= bits leading zero bits, MSB first. solved_nonce = the smallest solving nonce, which is what both the server's SolvePoW and the SDK's SolveRegistrationPoW find (they grind 0,1,2,... up to 1<<(bits+4)); bits 0 always verifies with nonce 0. server_428 = the handler's answers with --mobileverify.pow-bits 8: missing nonce, then a non-decimal nonce (pow_nonce is a decimal uint64 STRING). sdk_round_trip = the two request bodies the SDK client sends against that server: the plain register, then (after the 428) the retry with pow_nonce.",
+  "pubkey": "a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1",
+  "vectors": [
+    {
+      "bits": 0,
+      "message_nonce0": "6e34322f6d6f62696c657665726966792f706f772f7631a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e10000000000000000",
+      "digest_nonce0": "a7dd7b279f9ad1ded451f8d2e8d42c29edaa95de809f4926c62e693d189fe52f",
+      "leading_zero_bits_nonce0": 0,
+      "solved_nonce": 0,
+      "solved_message": "6e34322f6d6f62696c657665726966792f706f772f7631a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e10000000000000000",
+      "solved_digest": "a7dd7b279f9ad1ded451f8d2e8d42c29edaa95de809f4926c62e693d189fe52f",
+      "leading_zero_bits_solved": 0
+    },
+    {
+      "bits": 4,
+      "message_nonce0": "6e34322f6d6f62696c657665726966792f706f772f7631a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e10000000000000000",
+      "digest_nonce0": "a7dd7b279f9ad1ded451f8d2e8d42c29edaa95de809f4926c62e693d189fe52f",
+      "leading_zero_bits_nonce0": 0,
+      "solved_nonce": 50,
+      "solved_message": "6e34322f6d6f62696c657665726966792f706f772f7631a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e10000000000000032",
+      "solved_digest": "0b8725a1f2fe15ceb80c8ca5e5f6a633630df8bb9012785cdf7a2c04acdde813",
+      "leading_zero_bits_solved": 4
+    },
+    {
+      "bits": 8,
+      "message_nonce0": "6e34322f6d6f62696c657665726966792f706f772f7631a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e10000000000000000",
+      "digest_nonce0": "a7dd7b279f9ad1ded451f8d2e8d42c29edaa95de809f4926c62e693d189fe52f",
+      "leading_zero_bits_nonce0": 0,
+      "solved_nonce": 320,
+      "solved_message": "6e34322f6d6f62696c657665726966792f706f772f7631a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e10000000000000140",
+      "solved_digest": "00165ca13f80f4c6410d1896103dc3ca997b2efa9a4b7e1b96115f73b69f66e3",
+      "leading_zero_bits_solved": 11
+    },
+    {
+      "bits": 12,
+      "message_nonce0": "6e34322f6d6f62696c657665726966792f706f772f7631a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e10000000000000000",
+      "digest_nonce0": "a7dd7b279f9ad1ded451f8d2e8d42c29edaa95de809f4926c62e693d189fe52f",
+      "leading_zero_bits_nonce0": 0,
+      "solved_nonce": 1784,
+      "solved_message": "6e34322f6d6f62696c657665726966792f706f772f7631a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e100000000000006f8",
+      "solved_digest": "000b2ed9e56b6c1a1a17817d8313fb60c62629fd27d59eaa45bd5bfcc535206e",
+      "leading_zero_bits_solved": 12
+    }
+  ],
+  "server_428": {
+    "pow_bits": 8,
+    "missing_nonce": {
+      "status": 428,
+      "body": "{\"error\":\"mobileverify: registration proof-of-work required\",\"pow_bits\":8}\n"
+    },
+    "non_decimal_nonce": {
+      "request_body": "{\"pop\":\"8b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb\",\"pow_nonce\":\"0x01\",\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\"}",
+      "status": 428,
+      "body": "{\"error\":\"mobileverify: registration proof-of-work required\",\"pow_bits\":8}\n"
+    }
+  },
+  "sdk_round_trip": [
+    "{\"pop\":\"8b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb\",\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\"}",
+    "{\"pop\":\"8b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb\",\"pow_nonce\":\"320\",\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\"}"
+  ]
+}

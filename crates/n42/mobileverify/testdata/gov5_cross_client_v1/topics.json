@@ -1,0 +1,12 @@
+{
+  "_doc": "Gossip topics as internal/node/node.go builds them: fmt.Sprintf(\"/n42/%x/<name>\", genesis4) + encoder suffix \"/ssz_snappy\", genesis4 = the first 4 bytes of the chain's canonical genesis hash (params.GenesisHashByChainName; --p2p.genesis-override replaces it). Payloads are raw despite the suffix: a packet is the StreamPacket bytes, a registration is pubkey48 || pop96 (registration_payload_device0, 144 bytes).",
+  "chain": "mainnet_qmdb_staggered",
+  "genesis_hash": "a2d2ff5d814552bb9a113b68ad7ed2b824fbb52caed42dbe573068845b57be99",
+  "genesis4": "a2d2ff5d",
+  "mobileverify_packet": "/n42/a2d2ff5d/mobileverify_packet/ssz_snappy",
+  "mobileverify_registration": "/n42/a2d2ff5d/mobileverify_registration/ssz_snappy",
+  "mobileverify_cohort_index": "/n42/a2d2ff5d/mobileverify_cohort_index/ssz_snappy",
+  "mobileverify_cohort_reveal": "/n42/a2d2ff5d/mobileverify_cohort_reveal/ssz_snappy",
+  "mobileverify_cohort_cert": "/n42/a2d2ff5d/mobileverify_cohort_cert/ssz_snappy",
+  "registration_payload_device0": "a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e18b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb"
+}

@@ -27,6 +27,11 @@ impl DeviceKey {
         Ok(Self { sk, pubkey })
     }
 
+    /// The 32-byte big-endian secret scalar blst `KeyGen` derived.
+    pub fn secret_scalar(&self) -> [u8; 32] {
+        self.sk.to_bytes()
+    }
+
     /// The compressed G1 public key.
     pub const fn pubkey(&self) -> [u8; PUBKEY_LEN] {
         self.pubkey

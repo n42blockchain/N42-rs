@@ -98,6 +98,15 @@ pub struct Merged {
 /// their (disjoint) signers (gov5 `MergeCerts`). Every input is verified
 /// first; overlapping ones are dropped whole, largest first.
 pub fn merge_certs(certs: &[MobileAttestationCert], reg: &Registry) -> Result<Merged, MobileVerifyError> {
+    merge_certs_at(certs, reg, now_ms())
+}
+
+/// [`merge_certs`] with the merged certificate's `windowClosedAt` given.
+pub fn merge_certs_at(
+    certs: &[MobileAttestationCert],
+    reg: &Registry,
+    closed_at_ms: u64,
+) -> Result<Merged, MobileVerifyError> {
     if certs.is_empty() {
         return Err(MobileVerifyError::EmptyCertSet);
     }
@@ -150,7 +159,7 @@ pub fn merge_certs(certs: &[MobileAttestationCert], reg: &Registry) -> Result<Me
             receipts_root: first.receipts_root,
             aggregate_sig: agg.compress(),
             signer_mask: mask,
-            window_closed_at: now_ms(),
+            window_closed_at: closed_at_ms,
         },
         dropped_for_overlap: dropped,
         invalid,

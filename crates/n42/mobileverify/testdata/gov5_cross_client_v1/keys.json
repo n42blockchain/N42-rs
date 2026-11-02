@@ -1,0 +1,37 @@
+{
+  "_doc": "Device BLS identities (blst min-pk). ikm = sha256(ikm_seed) is the 32-byte secret the SDK persists (PrivHex); the key is blst KeyGen(ikm, info=empty) (evmsdk decodeSecretKey -> bls.SecretKeyFromRandom32Byte), NOT the ikm read as a scalar. secret_scalar = the resulting 32-byte big-endian scalar (sk.Marshal). pubkey = 48-byte compressed G1 (evmsdk.MobileBLSPublicKey). addr = AddrHex = first 20 bytes of pubkey (evmsdk.MobileBLSAddress).",
+  "devices": [
+    {
+      "device": 0,
+      "ikm_seed": "n42/mobileverify/cross-client-fixture/device/0",
+      "ikm": "702b27f17f6a2ba246d6552509f4ed4843ca9add14c288b12560494cc6f64be8",
+      "secret_scalar": "63f4e2c1cd4c9c42c44c5f460213544d9118f7d762f7aa1d258a11d517d9831e",
+      "pubkey": "a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1",
+      "addr": "a5e80bb7b744af578d5d12ae02ca2333fbe138b3"
+    },
+    {
+      "device": 1,
+      "ikm_seed": "n42/mobileverify/cross-client-fixture/device/1",
+      "ikm": "4c1b23700324d9205ce4c537c419fcb270528a080d67ac1b963ff40c295d2fc0",
+      "secret_scalar": "58fad4e506d912b2ce77d2f4bab4c6aa7fb6eb62826fd7242ac79be896dfb021",
+      "pubkey": "9199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605",
+      "addr": "9199593a963d8bee9880178aee19c73192cf5ddd"
+    },
+    {
+      "device": 2,
+      "ikm_seed": "n42/mobileverify/cross-client-fixture/device/2",
+      "ikm": "ee58af6c3ea2dd1bb528bc3987f1d2b54e7edd071bf2c5cf6e4570d7db9c05a2",
+      "secret_scalar": "6267613334c70a5503a40da9965ec4ca433661f43de8f9ee8335bb905b8e5914",
+      "pubkey": "a223fc9333906c0bd5ecb218a4ea9029c33177060ac583d2d1e8e15616b123e73ddfa65981d7dbb4d0f4349263f94a02",
+      "addr": "a223fc9333906c0bd5ecb218a4ea9029c3317706"
+    },
+    {
+      "device": 3,
+      "ikm_seed": "n42/mobileverify/cross-client-fixture/device/3",
+      "ikm": "276615da4d1040b878c47a11d7c8690f2212d23b009f3c11f80794e214f8d883",
+      "secret_scalar": "0563cf69ab9085abdcbc3d6f52778aafea0eaa1f36b78293222e2435e5ada1b4",
+      "pubkey": "ad28c09d369a40c5d6317f8aeb5cfdc85c7a6321db19bd10512f0a0acac684c930f51b8a5b9960d9b001a62294b2df13",
+      "addr": "ad28c09d369a40c5d6317f8aeb5cfdc85c7a6321"
+    }
+  ]
+}

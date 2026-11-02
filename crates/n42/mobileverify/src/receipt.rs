@@ -58,14 +58,15 @@ impl Receipt {
         Ok(())
     }
 
-    /// The request JSON in gov5's field names, hex without `0x` as the SDK
-    /// sends it (`cmd/evmsdk/mobileverify_client.go:303-310`).
+    /// The request body exactly as the SDK POSTs it
+    /// (`cmd/evmsdk/mobileverify_client.go:303-310`: `json.Marshal` of a map,
+    /// so keys sorted, hex without `0x`, numbers as JSON numbers).
     pub fn to_request_json(&self) -> String {
         gojson::Obj::new()
             .str("blockHash", &hex::encode(self.block_hash))
             .num("blockNumber", self.block_number)
-            .str("receiptsRoot", &hex::encode(self.computed_receipts_root))
             .str("pubkey", &hex::encode(self.verifier_pubkey))
+            .str("receiptsRoot", &hex::encode(self.computed_receipts_root))
             .str("signature", &hex::encode(self.signature))
             .num("timestampMs", self.timestamp_ms)
             .finish()

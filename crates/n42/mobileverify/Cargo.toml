@@ -16,6 +16,7 @@ n42-h2-primitives.workspace = true
 n42-header.workspace = true
 alloy-consensus = { workspace = true, features = ["std"] }
 alloy-primitives = { workspace = true, features = ["std"] }
+alloy-rlp = { workspace = true, features = ["std"] }
 blst.workspace = true
 blake3.workspace = true
 prost.workspace = true
@@ -34,3 +35,4 @@ http-body-util.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "io-util", "sync"] }
 sha2.workspace = true
+alloy-eips = { workspace = true, features = ["std"] }

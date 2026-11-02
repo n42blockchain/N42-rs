@@ -122,7 +122,9 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, ReadLogError> {
     if count > MAX_READ_LOG_ENTRIES {
         return Err(ReadLogError(format!("entry count {count} exceeds max {MAX_READ_LOG_ENTRIES}")));
     }
-    let mut out = Vec::with_capacity(count as usize);
+    // Every entry takes at least one byte, so the data bounds the count an
+    // honest log can carry; never reserve from the untrusted count alone.
+    let mut out = Vec::with_capacity((count as usize).min(data.len() - 4));
     let mut pos = 4usize;
     let take = |pos: &mut usize, n: usize| -> Result<&[u8], ReadLogError> {
         if *pos + n > data.len() {
@@ -224,6 +226,11 @@ mod tests {
         assert!(decode_read_log(&[1, 0, 0, 0, 0xA1]).is_err()); // 0xA1 > 0x80+32, != 0xC0
         assert!(decode_read_log(&[1, 0, 0, 0, 0x82, 0x01]).is_err()); // truncated
         assert!(decode_read_log(&[1, 0, 0, 0, 0x11, 33]).is_err()); // balance len > 32
+        // A maximal count over four bytes of data fails on the data, without
+        // trusting the count.
+        let err = decode_read_log(&[0x20, 0xA1, 0x07, 0x00, 0, 0, 0, 0]).unwrap_err();
+        assert!(err.0.contains("truncated at offset 8"), "{}", err.0);
+        assert_eq!(decode_read_log(&[0x20, 0xA1, 0x07, 0x00, 0, 0, 0, 0][..4]).unwrap_err().0, "truncated at offset 4 (need 1, have 0)");
         // Trailing bytes are ignored.
         assert_eq!(decode_read_log(&[1, 0, 0, 0, 0x00, 0xEE]).unwrap(), vec![ReadLogEntry::AccountNotFound]);
     }

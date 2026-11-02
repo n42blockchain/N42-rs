@@ -65,7 +65,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
@@ -183,6 +183,11 @@ impl RateLimiter {
     }
 }
 
+/// Called once for each packet `PUT /mobileverify/packet` adds to the
+/// cache (not for one it already held): `(block hash, number, raw bytes)`.
+/// The node publishes it to the fleet, as gov5's `PublishLocal` does.
+pub type OnIngest = Arc<dyn Fn(B256, u64, &Bytes) + Send + Sync>;
+
 /// The surface's state: everything a handler reads.
 pub struct Service {
     registry: Arc<Registry>,
@@ -195,6 +200,8 @@ pub struct Service {
     rate: Mutex<RateLimiter>,
     /// Permits for pairings on the blocking pool.
     blocking: Arc<Semaphore>,
+    /// See [`OnIngest`].
+    on_ingest: RwLock<Option<OnIngest>>,
 }
 
 /// No blocking-pool permit came free in time.
@@ -228,7 +235,23 @@ impl Service {
             counts: HashMap::new(),
         };
         let blocking = Arc::new(Semaphore::new(cfg.blocking_limit));
-        Self { registry, packets, coordinator, certs, alarms, head, cfg, rate: Mutex::new(rate), blocking }
+        Self {
+            registry,
+            packets,
+            coordinator,
+            certs,
+            alarms,
+            head,
+            cfg,
+            rate: Mutex::new(rate),
+            blocking,
+            on_ingest: RwLock::new(None),
+        }
+    }
+
+    /// Installs the hook called for every newly ingested packet.
+    pub fn set_on_ingest(&self, hook: OnIngest) {
+        *self.on_ingest.write() = Some(hook);
     }
 
     /// Runs CPU-bound `f` on the blocking pool once a permit is free, or
@@ -448,8 +471,11 @@ impl Service {
         };
         match validate_packet_bytes(&body) {
             Ok((hash, number)) => {
-                let new = self.packets.put(hash, number, body);
+                let new = self.packets.put(hash, number, body.clone());
                 debug!(target: "mobileverify", %hash, number, new, "ingested packet");
+                if new && let Some(hook) = self.on_ingest.read().clone() {
+                    hook(hash, number, &body);
+                }
                 ok_json(
                     gojson::line(Obj::new().str("hash", &gojson::hex0x(hash.as_slice())).bool("new", new).num("number", number)),
                     &[],

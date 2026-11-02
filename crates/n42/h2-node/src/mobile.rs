@@ -200,6 +200,19 @@ impl MobileVerify {
             head.clone(),
             n42_mobileverify::ServiceConfig { pow_bits: cfg.pow_bits, ..Default::default() },
         ));
+        // A packet the sidecar hands in over the loopback goes to the fleet
+        // (gov5's PublishLocal), so one sidecar serves every member. Relayed
+        // packets are not republished: gossipsub forwards them.
+        {
+            let out_tx = out_tx.clone();
+            let head = head.clone();
+            service.set_on_ingest(Arc::new(move |hash, number, bytes| {
+                head.remember(number, hash);
+                if out_tx.try_send((MobileTopic::Packet, bytes.to_vec())).is_err() {
+                    debug!(target: "n42::mobileverify", %hash, "packet gossip queue full; not published");
+                }
+            }));
+        }
         tokio::spawn(n42_mobileverify::serve(listener, service, std::future::pending()));
 
         tokio::spawn(commit_epochs(registry.clone(), cfg.collect_window, snapshot));

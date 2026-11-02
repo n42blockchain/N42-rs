@@ -51,7 +51,7 @@ pub mod topics;
 pub use cert::{CertStore, MobileAttestationCert};
 pub use cohort::{AlarmBuffer, Clock, CohortConfig, CohortCoordinator, DivergenceAlarm, HeadSource};
 pub use error::MobileVerifyError;
-pub use http::{Service, ServiceConfig, serve};
+pub use http::{OnIngest, Service, ServiceConfig, serve};
 pub use keys::DeviceKey;
 pub use packet::{PacketCache, StreamPacket};
 pub use receipt::Receipt;

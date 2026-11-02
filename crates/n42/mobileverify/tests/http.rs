@@ -48,6 +48,7 @@ struct Fixture {
     coordinator: Arc<CohortCoordinator>,
     alarms: Arc<AlarmBuffer>,
     chain: Arc<Chain>,
+    service: Arc<Service>,
     _stop: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -72,10 +73,10 @@ async fn start(cfg: ServiceConfig) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(serve(listener, svc, async {
+    tokio::spawn(serve(listener, svc.clone(), async {
         let _ = rx.await;
     }));
-    Fixture { addr, registry, packets, coordinator, alarms, chain, _stop: tx }
+    Fixture { addr, registry, packets, coordinator, alarms, chain, service: svc, _stop: tx }
 }
 
 #[derive(Debug)]
@@ -209,6 +210,35 @@ fn sample_packet(number: u64) -> (StreamPacket, B256) {
         ..Default::default()
     };
     (pkt, hash)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingest_hook_fires_once_per_new_packet() {
+    let f = start(ServiceConfig::default()).await;
+    let seen: Arc<parking_lot::Mutex<Vec<(B256, u64, Bytes)>>> = Arc::default();
+    {
+        let seen = seen.clone();
+        f.service.set_on_ingest(Arc::new(move |hash, number, bytes| {
+            seen.lock().push((hash, number, bytes.clone()));
+        }));
+    }
+    let (pkt, hash) = sample_packet(91);
+    let enc = pkt.encode();
+    let r = request(f.addr, "PUT", "/mobileverify/packet", &enc).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    // A duplicate is accepted but not handed on again.
+    let r = request(f.addr, "PUT", "/mobileverify/packet", &enc).await;
+    assert_eq!(r.text(), format!("{{\"hash\":\"0x{}\",\"new\":false,\"number\":91}}\n", hex::encode(hash)));
+    // Nor is a refused one.
+    let mut forged = pkt.clone();
+    forged.block_hash = B256::repeat_byte(1);
+    let r = request(f.addr, "PUT", "/mobileverify/packet", &forged.encode()).await;
+    assert_eq!(r.status, 400);
+    let seen = seen.lock();
+    assert_eq!(seen.len(), 1, "one call for one new packet");
+    assert_eq!(seen[0].0, hash);
+    assert_eq!(seen[0].1, 91);
+    assert_eq!(&seen[0].2[..], &enc[..]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

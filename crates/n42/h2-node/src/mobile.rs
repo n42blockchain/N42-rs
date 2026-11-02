@@ -205,9 +205,12 @@ impl MobileVerify {
 
     /// A committed block: the head for `/latest`, the lookup for receipts,
     /// and the cohort's height clock.
+    /// The cohort cascade (aggregation pairings) runs on the blocking pool,
+    /// never on the consensus loop; must be called inside the runtime.
     pub fn on_commit(&self, number: u64, hash: B256) {
         self.head.record(number, hash);
-        self.coordinator.on_block_committed(number);
+        let coordinator = self.coordinator.clone();
+        tokio::spawn(async move { coordinator.on_block_committed_async(number).await });
     }
 
     /// The committed accumulator root the leader names in its payload

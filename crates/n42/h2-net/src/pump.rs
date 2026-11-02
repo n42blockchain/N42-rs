@@ -66,6 +66,8 @@ pub(crate) enum PubTopic {
     Block,
     /// The transaction topic.
     Tx,
+    /// A mobile-verification topic.
+    Mobile(crate::transport::MobileTopic),
 }
 
 /// What the loop asks the task to do, other than publish.

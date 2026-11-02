@@ -125,6 +125,20 @@ impl PublishError {
     }
 }
 
+/// gov5's `GossipMobilePacketMessage` (`internal/p2p/topics.go`).
+pub const MOBILEVERIFY_PACKET_KIND: &str = "mobileverify_packet";
+/// gov5's `GossipMobileRegistrationMessage`.
+pub const MOBILEVERIFY_REGISTRATION_KIND: &str = "mobileverify_registration";
+
+/// One of the two mobile-verification topics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileTopic {
+    /// `mobileverify_packet`: `StreamPacket` V2 bytes.
+    Packet,
+    /// `mobileverify_registration`: `pubkey48 ‖ pop96`.
+    Registration,
+}
+
 /// How a transport is wired to a fleet.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
@@ -140,6 +154,11 @@ pub struct TransportConfig {
     pub bootstrap_peers: Vec<Multiaddr>,
     /// Idle connection timeout. gov5 keeps fleet connections long-lived.
     pub idle_connection_timeout: Duration,
+    /// Joins gov5's two mobile-verification topics,
+    /// `/n42/<fork digest>/mobileverify_{packet,registration}/ssz_snappy`
+    /// (raw payloads despite the suffix). Off by default: a node that serves
+    /// no phones neither subscribes nor relays them.
+    pub mobileverify: bool,
 }
 
 impl TransportConfig {
@@ -150,7 +169,14 @@ impl TransportConfig {
             listen_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
             idle_connection_timeout: Duration::from_secs(300),
+            mobileverify: false,
         }
+    }
+
+    /// Joins the mobile-verification topics (see [`Self::mobileverify`]).
+    pub const fn with_mobileverify(mut self, on: bool) -> Self {
+        self.mobileverify = on;
+        self
     }
 
     /// Adds a peer to dial on startup.
@@ -321,6 +347,23 @@ pub enum TransportEvent {
         /// The body, as a chunk.
         chunk: BlockChunk,
     },
+    /// A `StreamPacket` from gov5's `mobileverify_packet` topic, raw as
+    /// received (gov5 gossips it uncompressed). Validated above the
+    /// transport, which needs the head.
+    MobilePacket {
+        /// The peer that delivered it, when authored.
+        from: Option<PeerId>,
+        /// The encoded packet.
+        data: Vec<u8>,
+    },
+    /// A registration from gov5's `mobileverify_registration` topic:
+    /// `pubkey48 ‖ pop96`, raw.
+    MobileRegistration {
+        /// The peer that delivered it, when authored.
+        from: Option<PeerId>,
+        /// The payload.
+        data: Vec<u8>,
+    },
     /// A block body arrived on the chain's block topic, still compressed.
     /// Which header shapes to accept is the consumer's decision — see
     /// [`crate::block_gossip::HeaderProfile`] — so it is not decoded here.
@@ -456,6 +499,9 @@ pub(crate) struct TransportCore {
     tx_topic: IdentTopic,
     /// gov5's own consensus topic, likewise fork-scoped.
     native_topic: IdentTopic,
+    /// gov5's `mobileverify_packet` and `mobileverify_registration` topics,
+    /// when the node joined them.
+    mobile_topics: Option<(IdentTopic, IdentTopic)>,
     identity: H2V4ChainIdentity,
     mesh_peers: HashSet<PeerId>,
     /// Events produced before the loop starts (dials that failed immediately).
@@ -571,6 +617,22 @@ impl TransportCore {
                 topic: tx_topic.to_string(),
                 source,
             })?;
+        // The mobile-verification topics, only for a node that serves phones;
+        // the existing topics and the GossipSub parameters are untouched.
+        let mobile_topics = if config.mobileverify {
+            let packet = fork_scoped_topic(config.identity.genesis_hash, MOBILEVERIFY_PACKET_KIND);
+            let registration = fork_scoped_topic(config.identity.genesis_hash, MOBILEVERIFY_REGISTRATION_KIND);
+            for topic in [&packet, &registration] {
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .subscribe(topic)
+                    .map_err(|source| TransportError::Subscribe { topic: topic.to_string(), source })?;
+            }
+            Some((packet, registration))
+        } else {
+            None
+        };
 
         for addr in &config.listen_addrs {
             swarm
@@ -599,6 +661,7 @@ impl TransportCore {
             block_topic,
             tx_topic,
             native_topic,
+            mobile_topics,
             identity: config.identity,
             mesh_peers: HashSet::new(),
             pending_events: dial_errors,
@@ -855,6 +918,19 @@ impl TransportCore {
             .publish(self.tx_topic.clone(), data)?)
     }
 
+    /// Publishes raw bytes on one of the mobile-verification topics;
+    /// refused as a missing subscription when the node did not join them.
+    pub fn publish_mobile(&mut self, topic: MobileTopic, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
+        let Some((packet, registration)) = &self.mobile_topics else {
+            return Err(PublishError::Gossipsub(gossipsub::PublishError::NoPeersSubscribedToTopic));
+        };
+        let topic = match topic {
+            MobileTopic::Packet => packet.clone(),
+            MobileTopic::Registration => registration.clone(),
+        };
+        Ok(self.swarm.behaviour_mut().gossipsub.publish(topic, data)?)
+    }
+
     /// Publishes an already-encoded block body on the chain's block topic.
     ///
     /// Takes the compressed bytes from [`crate::block_gossip::encode_block_gossip`]
@@ -888,8 +964,21 @@ impl TransportCore {
             crate::pump::PubTopic::Native => self.native_topic.clone(),
             crate::pump::PubTopic::Block => self.block_topic.clone(),
             crate::pump::PubTopic::Tx => self.tx_topic.clone(),
+            crate::pump::PubTopic::Mobile(kind) => return self.publish_mobile(kind, data),
         };
         Ok(self.swarm.behaviour_mut().gossipsub.publish(topic, data)?)
+    }
+
+    /// Which mobile-verification topic `hash` is, if the node joined them.
+    fn mobile_topic_of(&self, hash: &gossipsub::TopicHash) -> Option<MobileTopic> {
+        let (packet, registration) = self.mobile_topics.as_ref()?;
+        if *hash == packet.hash() {
+            Some(MobileTopic::Packet)
+        } else if *hash == registration.hash() {
+            Some(MobileTopic::Registration)
+        } else {
+            None
+        }
     }
 
     /// Drives the swarm until something worth reporting happens.
@@ -918,6 +1007,13 @@ impl TransportCore {
                         Some(TransportEvent::Block { from: message.source, data: message.data })
                     } else if message.topic == self.tx_topic.hash() {
                         Some(TransportEvent::Transactions { from: message.source, data: message.data })
+                    } else if let Some(kind) = self.mobile_topic_of(&message.topic) {
+                        Some(match kind {
+                            MobileTopic::Packet => TransportEvent::MobilePacket { from: message.source, data: message.data },
+                            MobileTopic::Registration => {
+                                TransportEvent::MobileRegistration { from: message.source, data: message.data }
+                            }
+                        })
                     } else if message.topic == self.native_topic.hash() {
                         Some(match decode_gov5_gossip_message(&message.data) {
                             Ok(decoded) => TransportEvent::Native {
@@ -1652,6 +1748,15 @@ impl H2V4Transport {
         match &mut self.inner {
             Inner::Inline(core) => core.publish_transactions(data),
             Inner::OffLoop(off) => off.publish(crate::pump::PubTopic::Tx, data),
+        }
+    }
+
+    /// Publishes raw bytes on a mobile-verification topic (the transport
+    /// must have been built with [`TransportConfig::mobileverify`]).
+    pub fn publish_mobile(&mut self, topic: MobileTopic, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
+        match &mut self.inner {
+            Inner::Inline(core) => core.publish_mobile(topic, data),
+            Inner::OffLoop(off) => off.publish(crate::pump::PubTopic::Mobile(topic), data),
         }
     }
 

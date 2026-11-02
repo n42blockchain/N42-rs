@@ -34,6 +34,7 @@ pub mod bls;
 pub mod cert;
 pub mod cohort;
 pub mod collector;
+mod deadline_io;
 pub mod error;
 pub mod gojson;
 pub mod http;

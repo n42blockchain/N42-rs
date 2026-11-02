@@ -375,3 +375,102 @@ async fn snapshot_magnet_and_unknown() {
     let r = request(f.addr, "DELETE", "/mobileverify/health", b"").await;
     assert_eq!(r.status, 200);
 }
+
+/// Writes one keep-alive GET on `s` and reads its response (by
+/// Content-Length).
+async fn get_on(s: &mut TcpStream, path: &str) -> (u16, Vec<u8>) {
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
+        assert!(n > 0, "connection closed mid-response");
+        raw.extend_from_slice(&buf[..n]);
+        let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+        let head = std::str::from_utf8(&raw[..split]).unwrap().to_ascii_lowercase();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length: "))
+            .map(|v| v.trim().parse().unwrap())
+            .unwrap_or(0);
+        if raw.len() >= split + 4 + len {
+            let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+            return (status, raw[split + 4..split + 4 + len].to_vec());
+        }
+    }
+}
+
+/// Reads until the server closes; the bytes received.
+async fn read_until_closed(s: &mut TcpStream) -> usize {
+    let mut total = 0;
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf)).await.expect("server kept the connection") {
+            Ok(0) | Err(_) => return total,
+            Ok(n) => total += n,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_and_header_deadlines_are_separate() {
+    let cfg = ServiceConfig {
+        read_header_timeout: Duration::from_millis(300),
+        idle_timeout: Duration::from_millis(2000),
+        ..ServiceConfig::default()
+    };
+    let f = start(cfg).await;
+
+    // Idle longer than the header deadline, before the first request and
+    // between two on one keep-alive connection: both are served.
+    let mut s = TcpStream::connect(f.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(get_on(&mut s, "/mobileverify/alarms").await, (200, b"[]\n".to_vec()));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(get_on(&mut s, "/mobileverify/alarms").await, (200, b"[]\n".to_vec()));
+    // Past the idle deadline the server closes it.
+    let t = std::time::Instant::now();
+    assert_eq!(read_until_closed(&mut s).await, 0);
+    assert!(t.elapsed() >= Duration::from_millis(1500), "{:?}", t.elapsed());
+
+    // A request whose headers stall is cut at the header deadline.
+    let mut s = TcpStream::connect(f.addr).await.unwrap();
+    s.write_all(b"GET /mobileverify/alarms HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
+    let t = std::time::Instant::now();
+    read_until_closed(&mut s).await;
+    assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_never_reads_is_cut_at_the_write_deadline() {
+    let f = start(ServiceConfig { write_timeout: Duration::from_millis(500), ..ServiceConfig::default() }).await;
+    // Far more than the loopback socket buffers hold.
+    let size = 32 << 20;
+    let hash = B256::repeat_byte(0x5A);
+    f.packets.put(hash, 1, Bytes::from(vec![7u8; size]));
+    let mut s = TcpStream::connect(f.addr).await.unwrap();
+    s.write_all(format!("GET /mobileverify/packet/{} HTTP/1.1\r\nHost: localhost\r\n\r\n", hex::encode(hash)).as_bytes())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let got = read_until_closed(&mut s).await;
+    assert!(got > 0 && got < size, "received {got} of {size}");
+
+    // A reader that keeps up gets the whole response.
+    let r = request(f.addr, "GET", &format!("/mobileverify/packet/{}", hex::encode(hash)), b"").await;
+    assert_eq!(r.body.len(), size);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connections_beyond_the_cap_wait() {
+    let f = start(ServiceConfig { max_connections: 1, ..ServiceConfig::default() }).await;
+    let mut first = TcpStream::connect(f.addr).await.unwrap();
+    assert_eq!(get_on(&mut first, "/mobileverify/alarms").await.0, 200);
+    let mut second = TcpStream::connect(f.addr).await.unwrap();
+    second.write_all(b"GET /mobileverify/alarms HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let mut buf = [0u8; 64];
+    assert!(tokio::time::timeout(Duration::from_millis(500), second.read(&mut buf)).await.is_err(), "served past the cap");
+    drop(first);
+    let n = tokio::time::timeout(Duration::from_secs(5), second.read(&mut buf)).await.unwrap().unwrap();
+    assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "{:?}", String::from_utf8_lossy(&buf[..n]));
+}

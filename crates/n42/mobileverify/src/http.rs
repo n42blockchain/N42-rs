@@ -24,7 +24,7 @@
 //! limits (4 KiB register, 8 KiB receipt) are gov5's. Unknown paths get Go's
 //! plain-text 404, and a subtree root without its slash Go's 301.
 //!
-//! Departure from gov5, on overload:
+//! Departures from gov5, all on overload or abuse:
 //!
 //! - **`503 {"error":"busy"}`** (new): registration (the proof-of-possession
 //!   pairing) and receipt intake (the signature pairing) run on tokio's
@@ -34,10 +34,20 @@
 //!   `503` with the usual JSON error body `{"error":"busy"}\n`; a client may
 //!   retry it. gov5 runs this work in unbounded goroutines and never answers
 //!   `busy`.
+//! - At most [`ServiceConfig::max_connections`] connections are served at
+//!   once; further ones wait in the listen backlog (Go's `LimitListener`
+//!   shape; gov5 sets no cap). A failing `accept` backs off 5 ms doubling to
+//!   1 s, as `net/http` does.
+//!
+//! Timeouts are Go's, kept apart per connection by an IO wrapper (hyper's
+//! own `header_read_timeout` also bounds keep-alive idle time, which would
+//! close a pooled connection the phone reuses for its receipt): 15 s idle
+//! before a request's first byte, 5 s from it to the end of the headers,
+//! 15 s for the body, and a 15 s write deadline from the end of the headers
+//! to the end of the response (`WriteTimeout`).
 //!
 //! Not reproduced: the device attestor (never wired in production), Go's
-//! path cleaning and percent-decoding, and the 15 s write timeout (reads are
-//! bounded: 5 s for the headers, 15 s for the body).
+//! path cleaning and percent-decoding.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -56,12 +66,13 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use parking_lot::Mutex;
-use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use crate::cert::CertStore;
 use crate::cohort::{ALARMS_SERVED, AlarmBuffer, CohortCoordinator, HeadSource};
+use crate::deadline_io::{DeadlineIo, Deadlines};
 use crate::error::MobileVerifyError;
 use crate::gojson::{self, Obj};
 use crate::packet::{PacketCache, validate_packet_bytes};
@@ -83,10 +94,20 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_HEADER_BYTES: usize = 16 << 10;
 /// Graceful-stop budget.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// The keep-alive idle timeout (gov5's effective `IdleTimeout`, its
+/// `ReadTimeout`).
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// `WriteTimeout`: from the end of a request's headers to the end of its
+/// response.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default number of pairings run at once on the blocking pool.
 pub const DEFAULT_BLOCKING_LIMIT: usize = 4;
 /// Default wait for a blocking-pool permit before answering `busy`.
 pub const DEFAULT_BLOCKING_WAIT: Duration = Duration::from_secs(2);
+/// Default cap on connections served at once.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+/// First and last delay after a failed `accept` (`net/http`'s).
+const ACCEPT_BACKOFF: (Duration, Duration) = (Duration::from_millis(5), Duration::from_secs(1));
 
 const JSON: &str = "application/json";
 const OCTETS: &str = "application/octet-stream";
@@ -112,6 +133,14 @@ pub struct ServiceConfig {
     pub blocking_limit: usize,
     /// How long a request waits for a blocking-pool permit before `503 busy`.
     pub blocking_wait: Duration,
+    /// Connections served at once (at least 1); more wait in the backlog.
+    pub max_connections: usize,
+    /// From a request's first byte to the end of its headers.
+    pub read_header_timeout: Duration,
+    /// Between requests on a keep-alive connection.
+    pub idle_timeout: Duration,
+    /// From the end of a request's headers to the end of its response.
+    pub write_timeout: Duration,
 }
 
 impl Default for ServiceConfig {
@@ -123,6 +152,10 @@ impl Default for ServiceConfig {
             ingest_limit: DEFAULT_INGEST_LIMIT,
             blocking_limit: DEFAULT_BLOCKING_LIMIT,
             blocking_wait: DEFAULT_BLOCKING_WAIT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            read_header_timeout: READ_HEADER_TIMEOUT,
+            idle_timeout: IDLE_TIMEOUT,
+            write_timeout: WRITE_TIMEOUT,
         }
     }
 }
@@ -168,7 +201,6 @@ pub struct Service {
 #[derive(Debug)]
 struct Busy;
 
-
 impl std::fmt::Debug for Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Service").field("cfg", &self.cfg).finish_non_exhaustive()
@@ -188,6 +220,7 @@ impl Service {
     ) -> Self {
         cfg.pow_bits = cfg.pow_bits.min(MAX_POW_BITS);
         cfg.blocking_limit = cfg.blocking_limit.clamp(1, Semaphore::MAX_PERMITS);
+        cfg.max_connections = cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS);
         let rate = RateLimiter {
             limit: cfg.register_limit,
             window: cfg.register_window,
@@ -219,7 +252,6 @@ impl Service {
             Err(_) => Err(Busy),
         }
     }
-
 
     /// Answers one request from `peer`.
     pub async fn handle<B>(&self, req: Request<B>, peer: SocketAddr) -> HttpResponse
@@ -512,55 +544,87 @@ fn redirect(to: &str, query: Option<&str>) -> HttpResponse {
     respond(StatusCode::MOVED_PERMANENTLY, "text/html; charset=utf-8", body.into(), &[(LOCATION, &target)])
 }
 
+/// The delay before the next `accept` after `prev` (zero: none yet).
+fn next_backoff(prev: Duration) -> Duration {
+    if prev.is_zero() { ACCEPT_BACKOFF.0 } else { (prev * 2).min(ACCEPT_BACKOFF.1) }
+}
+
+/// Waits out `backoff`, then a connection slot, then one connection.
+async fn accept_one(
+    listener: &TcpListener,
+    slots: &Arc<Semaphore>,
+    backoff: Duration,
+) -> Option<(std::io::Result<(TcpStream, SocketAddr)>, OwnedSemaphorePermit)> {
+    if !backoff.is_zero() {
+        tokio::time::sleep(backoff).await;
+    }
+    let permit = slots.clone().acquire_owned().await.ok()?;
+    Some((listener.accept().await, permit))
+}
+
 /// Serves `listener` until `shutdown` resolves, then gives open connections
-/// [`SHUTDOWN_GRACE`] to finish.
+/// [`SHUTDOWN_GRACE`] to finish. At most [`ServiceConfig::max_connections`]
+/// are served at once.
 pub async fn serve<F>(listener: TcpListener, service: Arc<Service>, shutdown: F)
 where
     F: Future<Output = ()>,
 {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut conns = tokio::task::JoinSet::new();
+    let slots = Arc::new(Semaphore::new(service.cfg.max_connections));
+    let deadlines = Deadlines {
+        idle: service.cfg.idle_timeout,
+        header: service.cfg.read_header_timeout,
+        write: service.cfg.write_timeout,
+    };
+    let mut backoff = Duration::ZERO;
     tokio::pin!(shutdown);
     loop {
-        tokio::select! {
+        while conns.try_join_next().is_some() {}
+        let (accepted, permit) = tokio::select! {
             () = &mut shutdown => break,
-            accepted = listener.accept() => {
-                let (stream, peer) = match accepted {
-                    Ok(x) => x,
-                    Err(e) => {
-                        warn!(target: "mobileverify", err = %e, "accept failed");
-                        continue;
-                    }
-                };
-                let svc = service.clone();
-                let mut stop = stop_rx.clone();
-                conns.spawn(async move {
-                    let handler = service_fn(move |req| {
-                        let svc = svc.clone();
-                        async move { Ok::<_, Infallible>(svc.handle(req, peer).await) }
-                    });
-                    let mut builder = http1::Builder::new();
-                    builder
-                        .timer(TokioTimer::new())
-                        .header_read_timeout(READ_HEADER_TIMEOUT)
-                        .max_buf_size(MAX_HEADER_BYTES);
-                    let conn = builder.serve_connection(TokioIo::new(stream), handler);
-                    tokio::pin!(conn);
-                    tokio::select! {
-                        res = conn.as_mut() => {
-                            if let Err(e) = res {
-                                debug!(target: "mobileverify", %peer, err = %e, "connection ended");
-                            }
-                        }
-                        _ = stop.changed() => {
-                            conn.as_mut().graceful_shutdown();
-                            let _ = conn.await;
-                        }
-                    }
-                });
+            next = accept_one(&listener, &slots, backoff) => match next {
+                Some(x) => x,
+                None => break,
+            },
+        };
+        let (stream, peer) = match accepted {
+            Ok(x) => {
+                backoff = Duration::ZERO;
+                x
             }
-            Some(_) = conns.join_next(), if !conns.is_empty() => {}
-        }
+            Err(e) => {
+                backoff = next_backoff(backoff);
+                warn!(target: "mobileverify", err = %e, retry_in = ?backoff, "accept failed");
+                continue;
+            }
+        };
+        let svc = service.clone();
+        let mut stop = stop_rx.clone();
+        conns.spawn(async move {
+            let _permit = permit;
+            let handler = service_fn(move |req| {
+                let svc = svc.clone();
+                async move { Ok::<_, Infallible>(svc.handle(req, peer).await) }
+            });
+            let mut builder = http1::Builder::new();
+            // The header deadline lives in DeadlineIo: hyper's would also
+            // cut keep-alive idle time to it.
+            builder.timer(TokioTimer::new()).header_read_timeout(None).max_buf_size(MAX_HEADER_BYTES);
+            let conn = builder.serve_connection(TokioIo::new(DeadlineIo::new(stream, deadlines)), handler);
+            tokio::pin!(conn);
+            tokio::select! {
+                res = conn.as_mut() => {
+                    if let Err(e) = res {
+                        debug!(target: "mobileverify", %peer, err = %e, "connection ended");
+                    }
+                }
+                _ = stop.changed() => {
+                    conn.as_mut().graceful_shutdown();
+                    let _ = conn.await;
+                }
+            }
+        });
     }
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, async { while conns.join_next().await.is_some() {} }).await;
@@ -583,6 +647,17 @@ mod tests {
         assert_eq!(hash_from_path(&format!("{h}/x")), None);
         assert_eq!(hash_from_path(""), None);
         assert_eq!(hash_from_path("abcd"), None);
+    }
+
+    #[test]
+    fn accept_backoff_doubles_to_one_second() {
+        let mut d = Duration::ZERO;
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            d = next_backoff(d);
+            seen.push(d.as_millis());
+        }
+        assert_eq!(seen, vec![5, 10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
     }
 
     struct NoChain;

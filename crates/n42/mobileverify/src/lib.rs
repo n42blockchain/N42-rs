@@ -29,14 +29,20 @@
 
 pub mod accumulator;
 pub mod bls;
+pub mod cert;
+pub mod cohort;
+pub mod collector;
 pub mod error;
 pub mod gojson;
 pub mod keys;
+pub mod mask;
 pub mod pop;
 pub mod pow;
 pub mod receipt;
 pub mod registry;
 
+pub use cert::{CertStore, MobileAttestationCert};
+pub use cohort::{AlarmBuffer, CohortConfig, CohortCoordinator, DivergenceAlarm, HeadSource};
 pub use error::MobileVerifyError;
 pub use keys::DeviceKey;
 pub use receipt::Receipt;

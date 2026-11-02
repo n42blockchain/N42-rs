@@ -27,6 +27,7 @@
 //!
 //! Nothing here is wired into a node; `n42-h2-node` mounts it (stage 2).
 
+pub mod accumulator;
 pub mod bls;
 pub mod error;
 pub mod gojson;
@@ -34,7 +35,9 @@ pub mod keys;
 pub mod pop;
 pub mod pow;
 pub mod receipt;
+pub mod registry;
 
 pub use error::MobileVerifyError;
 pub use keys::DeviceKey;
 pub use receipt::Receipt;
+pub use registry::{MobileIndex, Registry};

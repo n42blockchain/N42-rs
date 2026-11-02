@@ -5,6 +5,8 @@
 #   scripts/devnet-fleet.sh <tag> <seconds> [--gov5] [--keep]
 #   LATE_VALIDATOR=<i> LATE_DELAY=<s> [LATE_SNAPSHOT=<dir>] start one member late (from a snapshot)
 #   ABSENT_VALIDATOR=<i> ABSENT_AT=<s> ABSENT_FOR=<s> take one member (own EL) away and bring it back
+#   MOBILEVERIFY=1 serve gov5's /mobileverify on every member: Rust validator i on
+#     127.0.0.1:2101<i> (--mobileverify.http), the gov5 member on 127.0.0.1:21020
 #
 # Data lives under $N42_FLEET_DIR (default: /tmp/n42-fleet). Every process is
 # left running afterwards so it can be inspected; the next run kills them.
@@ -23,6 +25,9 @@ for arg in "$@"; do case $arg in --gov5) WITH_GOV5=1;; --keep) KEEP=1;; esac; do
 # a release build in a target directory of its own.
 GENESIS=${DEVNET_GENESIS:-$REPO/crates/chainspec/res/genesis/n42_devnet.json}
 BIN=${DEVNET_BIN:-$REPO/target/debug}
+# MOBILEVERIFY=1: the phone surface on every member (validator i: port 2101<i>).
+mv_flag() { [ "${MOBILEVERIFY:-}" = 1 ] && echo "--mobileverify.http 127.0.0.1:2101$1"; }
+GOV5_MV=; [ "${MOBILEVERIFY:-}" = 1 ] && GOV5_MV="--mobileverify --mobileverify.http 127.0.0.1:21020"
 mkdir -p $F
 [ -f $F/jwt.hex ] || openssl rand -hex 32 > $F/jwt.hex
 if [ ! -d $F/keys ]; then
@@ -62,7 +67,7 @@ for i in $(seq 0 $LAST); do
       for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG$1.log 2>/dev/null && break; sleep 1; done; }
     own_v() { RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
         --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18561 --el-rpc http://127.0.0.1:18555 --jwt $F/jwt.hex \
-        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
+        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} $(mv_flag $i) \
         > $F/v$i-$TAG$1.log 2>&1 & }
     own_el ""; own_v ""
     (sleep ${ABSENT_AT:-300}
@@ -96,13 +101,13 @@ for i in $(seq 0 $LAST); do
       for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG.log 2>/dev/null && break; sleep 1; done
       RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
         --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18561 --el-rpc http://127.0.0.1:18555 --jwt $F/jwt.hex \
-        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
+        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} $(mv_flag $i) \
         > $F/v$i-$TAG.log 2>&1) > /dev/null 2>&1 &
     continue
   fi
   RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
     --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18551 --el-rpc http://127.0.0.1:18545 --jwt $F/jwt.hex \
-    --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
+    --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} $(mv_flag $i) \
     > $F/v$i-$TAG.log 2>&1 &
   if [ $i = 0 ]; then
     for _ in $(seq 1 30); do grep -aq "node peer id" $F/v0-$TAG.log 2>/dev/null && break; sleep 1; done
@@ -116,7 +121,7 @@ for i in $(seq 0 $LAST); do
       sleep ${GOV5_DELAY:-0}
       $GOV5/build/bin/n42 --chain private --profile n42 --data.dir $F/gov5 --mine --etherbase $ADDR3 \
         --http --http.port 28545 --port 30393 --p2p.no-discovery --p2p.min-sync-peers 0 \
-        --p2p.peer /ip4/127.0.0.1/tcp/19000/p2p/$ID --log.level ${GOV5_LOG:-info} --log.console \
+        --p2p.peer /ip4/127.0.0.1/tcp/19000/p2p/$ID --log.level ${GOV5_LOG:-info} --log.console $GOV5_MV \
         > $F/gov5-$TAG.log 2>&1 &
       sleep 6
       DIALGO="$GOPEER"
@@ -148,4 +153,8 @@ if [ -n "$WITH_GOV5" ]; then
   echo "gov5: sealed=$(grep -ac 'sealed new block' $GL) committed=$(grep -ac 'block committed' $GL) errors=$(grep -ac '"level":"error"' $GL) height=$(height 28545)"
   H2=$(height 28545); M=$(( ${H2:-0} < ${H1:-0} ? ${H2:-0} : ${H1:-0} ))
   echo "block $M: reth=$(hash_at 18545 $M) gov5=$(hash_at 28545 $M)"
+fi
+if [ "${MOBILEVERIFY:-}" = 1 ]; then
+  for i in $(seq 0 $LAST); do echo "mobileverify v$i: $(curl -s http://127.0.0.1:2101$i/mobileverify/health) latest=$(curl -s http://127.0.0.1:2101$i/mobileverify/latest)"; done
+  [ -n "$WITH_GOV5" ] && echo "mobileverify gov5: $(curl -s http://127.0.0.1:21020/mobileverify/health)"
 fi

@@ -879,7 +879,9 @@ where
     ) -> Result<(), EngineObjectValidationError> {
         // gov5's Glamsterdam on an N42-native chain without reth's Amsterdam:
         // the header carries a slot number (and, under MobileAnchor, a
-        // registry root) but no access list and no Amsterdam execution, so its
+        // registry root) but no access list and, on this node, no Amsterdam
+        // execution (gov5 does run it there: `docs/HEADER_FIELD_PARITY.md`
+        // 7.1, an open gap), so its
         // block travels as a V4 payload with an empty list
         // (`n42_header::engine::put_header_tail`) to `newPayloadV5`. reth's
         // version rules refuse a slot or a list before Amsterdam; the payload

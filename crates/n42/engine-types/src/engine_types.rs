@@ -235,8 +235,9 @@ impl TryFrom<N42BuiltPayload> for ExecutionPayloadEnvelopeV5 {
 ///
 /// Those versions type the payload as `ExecutionPayloadV3`, which has neither
 /// field, so a HotStuff header that carries them (gov5's Glamsterdam and
-/// MobileAnchor, which on an N42-native chain change the header alone) came
-/// back without them and its block hash could not be reproduced from the
+/// MobileAnchor; this node runs no access list and, as yet, no Amsterdam
+/// execution for them, see `docs/HEADER_FIELD_PARITY.md` 7.1) came back
+/// without them and its block hash could not be reproduced from the
 /// payload. The fields are absent when the header has none, so the JSON is
 /// alloy's, byte for byte, everywhere else. The validator's client reads them
 /// beside the payload (`n42-h2-el-rpc`, `PayloadMaybeWithBal`).

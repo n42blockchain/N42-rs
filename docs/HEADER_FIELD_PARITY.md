@@ -377,6 +377,43 @@ until a fleet runs the patched gov5 of `docs/patches/gov5-header-field-parity/`.
   attributes (`mobile_registry_root`, JSON `mobileRegistryRoot`); the builder
   stamps it under the gate and still refuses a block there when the
   attributes name none.
+  **Verified on devnet 2026-11-02** (all-Rust, `n42_devnet_mobileanchor.json`:
+  `glamsterdamTime` 0, `mobileAnchorTime` 0; round `mv4g`, n42-rs
+  `feat/mobileverify-v3` 77a12c3f5): 120 commits, every header 24 elements
+  with slot == number, the root zero on blocks 1-15 (before the first epoch
+  commit; the empty accumulator's root) and the leader's committed root from
+  block 16; the leader-root check matched 120/120, and gov5's device harness
+  certified 20/20. A leader started without `--mobileverify.http` builds
+  nothing ("named none"). The JSON Engine API path had never carried a root
+  before; four layers dropped or refused it, each fixed with a unit test on
+  the function that was wrong:
+  1. sealed-header tail: the builder rebuilt the sealed header field by field
+     and lost the slot and the root (f9fd0a91e);
+  2. getPayload envelope: V3/V4/V5 type the payload as `ExecutionPayloadV3`,
+     which has neither field (b12ec12a6);
+  3. `newPayloadV5` params: reth's version rules refuse a slot or a list
+     before its Amsterdam (95fdbb243);
+  4. access-list decode: the tail travels in a V4 payload with zero-length
+     list bytes, which the engine tree tried to RLP-decode (4d8b2cb32).
+  `crates/n42/h2-node/tests/mobile_anchor_gate.rs` (ignored; real EL and four
+  validators, about 40 s) now covers the path end to end.
+- **Glamsterdam execution (open, cross-client, found 2026-11-02).** gov5 runs
+  the Amsterdam state transition wherever `IsGlamsterdam` holds, N42-native
+  chains included: `internal/state_transition.go:447` (EIP-8037
+  two-dimensional gas pool), `:613` `transitionAmsterdam`, `IntrinsicGas` /
+  `FloorDataGas` with `rules.IsGlamsterdam`, `internal/vm/eips_amsterdam.go`.
+  Only EIP-7928 is excluded on native chains (`UsesEIP7928AccessList`,
+  `params/config.go:466`). The Rust node treats `glamsterdamTime` as
+  header-only (`reth_chainspec::qmdb` never activates reth's Amsterdam from
+  it), so under it the two clients execute transfers differently: gas used,
+  transfer logs, receipts root, then state root. Round `mv4f` (the same gated
+  devnet with transfers) shows it: gov5's packetd refused every block with
+  transactions on the receipts root. On chain 94, `glamsterdamTime`
+  1798761600 (2027-01-01) switches gov5 to Amsterdam execution and the Rust
+  node does not follow yet. Fix: activate reth's Amsterdam from gov5's
+  `glamsterdamTime` on native chains, after a rule-set audit (gov5
+  `transitionAmsterdam` against reth 2.8.1's Amsterdam). Not done; the
+  user's decision.
 - **Not covered yet.** `n42-init-snapshot` decodes the snapshot head as
   Ethereum's header, so it cannot start a node at a head that carries a
   root. The APoS miner and reth's own `init` / `db` commands stay on

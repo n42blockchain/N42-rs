@@ -2955,7 +2955,9 @@ impl QmdbNodeState {
             // and which slots are live; the entries come from the file.
             let (ckpt, _) = replay_delta_log(&self.sealed_log_path(), ckpt, None)?;
             let (ckpt, _) = replay_delta_log(&self.delta_log_path(), ckpt, None)?;
-            let mut forest = QmdbForest::from_entry_file(&ckpt, &self.entry_file_path())?;
+            // Read-only: the node may be running, with slots past these
+            // already flushed, and cutting them would corrupt its file.
+            let mut forest = QmdbForest::from_entry_file_readonly(&ckpt, &self.entry_file_path())?;
             forest.snapshot()?
         } else {
             let path = self.snapshot_path();

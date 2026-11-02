@@ -779,10 +779,25 @@ impl QmdbForest {
     /// `checkpoint`: the tree is rebuilt from the file's records. An error if
     /// the file holds fewer slots than the checkpoint names.
     pub fn from_entry_file(checkpoint: &ForestCheckpoint, path: &std::path::Path) -> Result<Self, StateError> {
+        Self::open_entry_file(checkpoint, path, QmdbCompatTree::from_entry_file)
+    }
+
+    /// [`Self::from_entry_file`] for a reader of a file that may be in use:
+    /// nothing past the checkpoint's slots is cut. For reading only; a
+    /// running node's later appends are not this forest's to know about.
+    pub fn from_entry_file_readonly(checkpoint: &ForestCheckpoint, path: &std::path::Path) -> Result<Self, StateError> {
+        Self::open_entry_file(checkpoint, path, QmdbCompatTree::from_entry_file_readonly)
+    }
+
+    fn open_entry_file<E: std::fmt::Display>(
+        checkpoint: &ForestCheckpoint,
+        path: &std::path::Path,
+        open: impl FnOnce(&std::path::Path, u64, &[u64]) -> Result<(QmdbCompatTree, u64), E>,
+    ) -> Result<Self, StateError> {
         if !ForestCheckpoint::reads(checkpoint.version) {
             return Err(StateError::SnapshotVersion { found: checkpoint.version, expected: ForestCheckpoint::VERSION });
         }
-        let (tree, kept) = QmdbCompatTree::from_entry_file(path, checkpoint.next_slot, &checkpoint.active)
+        let (tree, kept) = open(path, checkpoint.next_slot, &checkpoint.active)
             .map_err(|e| StateError::EntryFile(e.to_string()))?;
         if kept != checkpoint.next_slot {
             return Err(StateError::EntryFile(format!(

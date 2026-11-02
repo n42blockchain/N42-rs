@@ -1852,3 +1852,21 @@ fn canonical_errors_split_into_fatal_and_retried() {
     drop(state);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `n42-init-snapshot export` runs beside a live node (the database opens
+/// read-only and only warns). The checkpoint plus the logs stop short of what
+/// the node has flushed by then, and cutting the file back to them leaves the
+/// node writing past a hole: a later read of those slots sees zeros.
+#[test]
+fn a_portable_export_leaves_a_running_nodes_entry_file_alone() {
+    let (state, chain, dir, head, _) = node_at("export-live", true, 5);
+    state.compute(head, &changes_for(6)).expect("an unlogged tip");
+    state.lock_as("export-live").as_mut().expect("initialized").sync_entries().expect("flushed");
+    let path = state.entry_file_path();
+    let before = std::fs::metadata(&path).expect("entry file").len();
+
+    let exporter = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    exporter.portable_export(1143, chain.genesis_hash()).expect("export");
+    assert_eq!(std::fs::metadata(&path).expect("entry file").len(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}

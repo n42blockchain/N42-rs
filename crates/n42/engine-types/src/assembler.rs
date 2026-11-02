@@ -327,7 +327,7 @@ where
         reth_chainspec::qmdb::mobile_registry_root_in_header_at(inner.chain_spec.genesis(), timestamp),
         mobile_registry_root,
     )
-    .map_err(|()| {
+    .ok_or_else(|| {
         BlockExecutionError::msg(format!(
             "a header at {timestamp} carries mobileRegistryRoot, and the payload attributes named none"
         ))
@@ -365,13 +365,13 @@ where
 }
 
 /// What a header's `mobileRegistryRoot` is: the attributes' root where the
-/// chain's schedule carries the field (`gated`), nothing elsewhere. `Err`
-/// where the field is due and no root was named.
-pub const fn registry_root_for_header(gated: bool, named: Option<B256>) -> Result<Option<B256>, ()> {
+/// chain's schedule carries the field (`gated`), nothing elsewhere. `None`
+/// where the field is due and no root was named (the header cannot be built).
+pub const fn registry_root_for_header(gated: bool, named: Option<B256>) -> Option<Option<B256>> {
     match (gated, named) {
-        (true, Some(root)) => Ok(Some(root)),
-        (true, None) => Err(()),
-        (false, _) => Ok(None),
+        (true, Some(root)) => Some(Some(root)),
+        (true, None) => None,
+        (false, _) => Some(None),
     }
 }
 
@@ -573,7 +573,7 @@ mod tests {
         // Off the gate (the devnet's schedule): the root is ignored.
         assert_eq!(assemble_with("", Some(root)).expect("builds").mobile_registry_root, None);
         assert_eq!(assemble_with(r#","mobileAnchorTime":0"#, Some(root)).expect("builds").mobile_registry_root, None);
-        assert_eq!(registry_root_for_header(false, None), Ok(None));
+        assert_eq!(registry_root_for_header(false, None), Some(None));
     }
 
     /// The parallel trie is alloy's ordered trie, at every size where the

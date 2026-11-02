@@ -382,9 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // gov5's phone surface, its epoch committer and its gossip relay.
-        let mut mobile = None;
-        let mut mobile_gossip = None;
-        if let Some(http) = mobile_http {
+        let (mobile, mobile_gossip) = if let Some(http) = mobile_http {
             let (surface, channels) = n42_h2_node::mobile::MobileVerify::start(n42_h2_node::mobile::MobileVerifyConfig {
                 http,
                 pow_bits: mobile_pow_bits,
@@ -396,9 +394,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
             println!("mobileverify : http://{http}/mobileverify (epoch {mobile_collect_window_sec} s, packet window {mobile_packet_window})");
-            mobile = Some(Arc::new(surface));
-            mobile_gossip = Some(channels);
-        }
+            (Some(Arc::new(surface)), Some(channels))
+        } else {
+            (None, None)
+        };
 
         let (output_tx, output_rx) = tokio::sync::mpsc::channel::<EngineOutput>(256);
         let store = datadir

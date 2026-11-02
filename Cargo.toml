@@ -45,6 +45,7 @@ members = [
     "crates/n42/tx-types",
     "crates/n42/h2-node",
     "crates/n42/mobile-verify",
+    "crates/n42/mobileverify",
     "crates/n42/twig-core",
     "crates/n42/storage",
     "crates/n42/ef-tests",
@@ -256,6 +257,7 @@ n42-tx-ingest = { path = "crates/n42/tx-ingest" }
 n42-tx-queue = { path = "crates/n42/tx-queue" }
 n42-h2-node = { path = "crates/n42/h2-node" }
 n42-mobile-verify = { path = "crates/n42/mobile-verify" }
+n42-mobileverify = { path = "crates/n42/mobileverify" }
 n42-twig-core = { path = "crates/n42/twig-core" }
 merkle_db_rs = {path="crates/n42/merkle_db_rs"}
 n42-consensus-traits = {path="crates/n42/consensus-traits"}
@@ -557,6 +559,9 @@ jsonrpsee-types = "0.26.0"
 http = "1.0"
 http-body = "1.0"
 http-body-util = "0.1.2"
+
+# protobuf (gov5 wire messages, derive-only: no protoc/build step)
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 jsonwebtoken = { version = "10.1", default-features = false, features = ["use_pem"] }
 proptest-arbitrary-interop = "0.1.0"
 

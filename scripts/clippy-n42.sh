@@ -14,7 +14,7 @@ PACKAGES=(
   n42-core-layout n42-deferred-reverts n42-dependency-compat-tests n42-ef-tests
   n42-engine-primitives n42-engine-types n42-env n42-fusaka n42-h2-consensus
   n42-h2-el-rpc n42-h2-execution n42-h2-net n42-h2-node n42-h2-primitives n42-h2-wire
-  n42-legacy-codec n42-mobile-service n42-mobile-verify n42-primitives n42-qmdb-reth
+  n42-legacy-codec n42-mobile-service n42-mobile-verify n42-mobileverify n42-primitives n42-qmdb-reth
   n42-qmdb-state n42-sharded-output n42-storage n42-testing n42-twig-core n42-tx-ingest
   n42-tx-queue n42-tx-types
 )

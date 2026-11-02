@@ -64,7 +64,11 @@ pub struct MobileVerifyConfig {
 }
 
 /// The committed chain as the mobile surface sees it: the head and a bounded
-/// hash → number map of recent commits.
+/// hash → number map of recent commits, plus a second bounded map of headers
+/// learned before their commit. A relayed packet's header is only
+/// self-consistent, so the two are bounded apart: a peer's made-up headers
+/// must not push committed blocks out of the lookup, or every receipt for
+/// those blocks is refused as unknown.
 #[derive(Debug)]
 pub struct CommittedHead {
     inner: RwLock<HeadInner>,
@@ -73,16 +77,45 @@ pub struct CommittedHead {
 #[derive(Debug)]
 struct HeadInner {
     head: Option<(u64, B256)>,
+    numbers: BoundedNumbers,
+    learned: BoundedNumbers,
+}
+
+/// A hash → number map keeping the last `cap` hashes inserted.
+#[derive(Debug)]
+struct BoundedNumbers {
     numbers: HashMap<B256, u64>,
     order: VecDeque<B256>,
     cap: usize,
 }
 
+impl BoundedNumbers {
+    fn new(cap: usize) -> Self {
+        Self { numbers: HashMap::new(), order: VecDeque::new(), cap }
+    }
+
+    fn insert(&mut self, number: u64, hash: B256) {
+        if self.numbers.insert(hash, number).is_none() {
+            self.order.push_back(hash);
+        }
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.numbers.remove(&old);
+            }
+        }
+    }
+}
+
 impl CommittedHead {
-    /// Remembers the last `cap` committed blocks.
+    /// Remembers the last `cap` committed blocks, and as many learned headers.
     pub fn new(cap: usize) -> Self {
+        let cap = cap.max(1);
         Self {
-            inner: RwLock::new(HeadInner { head: None, numbers: HashMap::new(), order: VecDeque::new(), cap: cap.max(1) }),
+            inner: RwLock::new(HeadInner {
+                head: None,
+                numbers: BoundedNumbers::new(cap),
+                learned: BoundedNumbers::new(cap),
+            }),
         }
     }
 
@@ -92,7 +125,7 @@ impl CommittedHead {
         if inner.head.is_none_or(|(n, _)| number >= n) {
             inner.head = Some((number, hash));
         }
-        Self::remember_locked(&mut inner, number, hash);
+        inner.numbers.insert(number, hash);
     }
 
     /// Learns a block's number without moving the head: a header this node
@@ -100,18 +133,7 @@ impl CommittedHead {
     /// gov5 pins receipts to any header it has (`ReadHeaderNumber`), so a
     /// receipt that races the commit is not refused as unknown.
     pub fn remember(&self, number: u64, hash: B256) {
-        Self::remember_locked(&mut self.inner.write(), number, hash);
-    }
-
-    fn remember_locked(inner: &mut HeadInner, number: u64, hash: B256) {
-        if inner.numbers.insert(hash, number).is_none() {
-            inner.order.push_back(hash);
-        }
-        while inner.order.len() > inner.cap {
-            if let Some(old) = inner.order.pop_front() {
-                inner.numbers.remove(&old);
-            }
-        }
+        self.inner.write().learned.insert(number, hash);
     }
 }
 
@@ -121,7 +143,8 @@ impl HeadSource for CommittedHead {
     }
 
     fn number_of(&self, hash: &B256) -> Option<u64> {
-        self.inner.read().numbers.get(hash).copied()
+        let inner = self.inner.read();
+        inner.numbers.numbers.get(hash).or_else(|| inner.learned.numbers.get(hash)).copied()
     }
 }
 
@@ -301,7 +324,11 @@ async fn relay(
                 let at = head.head().map(|(n, _)| n);
                 match packets.validate_incoming(Bytes::from(data), at) {
                     Ok((hash, number, new)) => {
-                        head.remember(number, hash);
+                        // One the per-height bound refused is not a header
+                        // this node holds.
+                        if new {
+                            head.remember(number, hash);
+                        }
                         debug!(target: "n42::mobileverify", %hash, number, new, "relayed packet cached");
                     }
                     Err(err) => debug!(target: "n42::mobileverify", %err, "dropped a gossiped packet"),
@@ -344,6 +371,23 @@ mod tests {
         head.remember(9, B256::repeat_byte(9));
         assert_eq!(head.number_of(&B256::repeat_byte(9)), Some(9), "a known header is looked up");
         assert_eq!(head.head(), Some((6, B256::repeat_byte(6))), "but does not move the head");
+    }
+
+    /// A relayed packet's header is only self-consistent, so a peer can make
+    /// up any number of them: they must not push a committed block out of
+    /// the lookup, or every receipt for it is refused as unknown.
+    #[test]
+    fn gossiped_headers_cannot_evict_committed_blocks() {
+        let head = CommittedHead::new(2);
+        head.record(5, B256::repeat_byte(5));
+        head.record(6, B256::repeat_byte(6));
+        for i in 0..64u8 {
+            head.remember(7, B256::repeat_byte(0x80 + i));
+        }
+        assert_eq!(head.number_of(&B256::repeat_byte(5)), Some(5));
+        assert_eq!(head.number_of(&B256::repeat_byte(6)), Some(6));
+        assert_eq!(head.number_of(&B256::repeat_byte(0x80 + 63)), Some(7), "the newest are kept");
+        assert_eq!(head.number_of(&B256::repeat_byte(0x80)), None, "bounded on their own");
     }
 
     #[test]

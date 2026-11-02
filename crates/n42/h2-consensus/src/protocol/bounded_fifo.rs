@@ -69,6 +69,15 @@ where
         removed
     }
 
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
@@ -108,6 +117,20 @@ mod tests {
         assert!(m.get(&1).is_none());
         assert_eq!(m.get(&2), Some(&20));
         assert_eq!(m.get(&3), Some(&30));
+    }
+
+    #[test]
+    fn clear_empties_both_structures() {
+        let mut m = BoundedFifoMap::<u32, u32>::new(2);
+        m.insert(1, 10);
+        m.insert(2, 20);
+        m.clear();
+        assert_eq!(m.len(), 0);
+        assert!(!m.contains_key(&1));
+        // A stale order entry would evict 3 here.
+        m.insert(3, 30);
+        m.insert(4, 40);
+        assert!(m.contains_key(&3) && m.contains_key(&4));
     }
 
     #[test]

@@ -160,6 +160,13 @@ impl ViewTiming {
 /// expensive BLS aggregate verification per message).
 pub const FUTURE_VIEW_WINDOW: u64 = 50;
 
+/// Parents kept in `imported_parents`. Under the two-phase gate every header a
+/// peer delivers is recorded there before any import, and a made-up block
+/// never imports. Far above [`super::proposal`]'s import evidence bound, so
+/// honest blocks keep theirs; one evicted by a flood only withholds a vote,
+/// and its import records it again.
+pub(super) const MAX_IMPORTED_PARENTS: usize = 4096;
+
 /// Maximum number of buffered future-view messages.
 /// When exceeded, the highest-view message is evicted: the lowest views are
 /// the ones the node is about to enter and needs most.
@@ -395,8 +402,9 @@ pub struct ConsensusEngine {
     /// survives view changes because a new leader can repropose the same block.
     pub(super) imported_block_fifo: VecDeque<B256>,
     /// Parent hash of every imported block still in `imported_blocks`, as the
-    /// orchestrator reported it; what the extends rule reads.
-    pub(super) imported_parents: HashMap<B256, B256>,
+    /// orchestrator reported it; what the extends rule reads. Also holds
+    /// headers not imported yet under the two-phase gate, hence its own bound.
+    pub(super) imported_parents: BoundedFifoMap<B256, B256>,
     /// A signature or certificate in the message being processed that did
     /// not verify where the message is dropped quietly; reported as
     /// [`ConsensusError::Unauthenticated`] once the message is done.
@@ -561,7 +569,7 @@ impl ConsensusEngine {
             pending_proposal: None,
             imported_blocks: HashSet::new(),
             imported_block_fifo: VecDeque::new(),
-            imported_parents: HashMap::new(),
+            imported_parents: BoundedFifoMap::new(MAX_IMPORTED_PARENTS),
             unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
@@ -690,7 +698,7 @@ impl ConsensusEngine {
             pending_proposal: None,
             imported_blocks: HashSet::new(),
             imported_block_fifo: VecDeque::new(),
-            imported_parents: HashMap::new(),
+            imported_parents: BoundedFifoMap::new(MAX_IMPORTED_PARENTS),
             unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
@@ -5086,7 +5094,19 @@ mod tests {
         engine.remember_parent(B256::repeat_byte(0x01), B256::repeat_byte(0x02));
         let next = engine.current_view() + 1;
         engine.advance_to_view(next).expect("advance");
-        assert!(engine.imported_parents.is_empty());
+        assert_eq!(engine.imported_parents.len(), 0);
+    }
+
+    /// A peer's headers reach `remember_parent` under the two-phase gate
+    /// before any import, and a made-up block never imports, so no eviction
+    /// from the evidence ever removes its parent: the map has its own bound.
+    #[test]
+    fn test_parents_of_blocks_that_never_import_stay_bounded() {
+        let (mut engine, _sks, _vs, _rx) = make_engine(4, 0);
+        for i in 0..MAX_IMPORTED_PARENTS as u64 + 16 {
+            engine.remember_parent(B256::from(alloy_primitives::U256::from(i)), B256::repeat_byte(0x02));
+        }
+        assert_eq!(engine.imported_parents.len(), MAX_IMPORTED_PARENTS);
     }
 
     #[test]

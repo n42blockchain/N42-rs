@@ -27,6 +27,7 @@ fn attrs() -> PayloadAttributes {
         suggested_fee_recipient: Default::default(),
         withdrawals: None,
         parent_beacon_block_root: None,
+        mobile_registry_root: None,
     }
 }
 

@@ -1647,7 +1647,8 @@ where
     // trie, and collected from here afterwards.
     let qmdb_root: Arc<std::sync::Mutex<Option<Result<n42_qmdb_reth::PreparedBlock, String>>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let mut assembler = crate::assembler::N42BlockAssembler::new(EthBlockAssembler::new(chain_spec.clone()), hotstuff);
+    let mut assembler = crate::assembler::N42BlockAssembler::new(EthBlockAssembler::new(chain_spec.clone()), hotstuff)
+        .with_mobile_registry_root(attributes.mobile_registry_root);
     if let Some(state) = &qmdb {
         assembler = assembler.with_qmdb_root(crate::assembler::QmdbRootJob {
             state: state.clone(),
@@ -6629,6 +6630,7 @@ mod includability_tests {
             parent_beacon_block_root: Some(B256::ZERO),
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let config = PayloadConfig {
             parent_header: Arc::new(SealedHeader::seal_slow(parent)),

@@ -64,6 +64,7 @@ where
             // gas-limit target is left to the builder's own configuration.
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         }
     }
 }

@@ -484,6 +484,7 @@ async fn a_build_is_collected_over_the_channel_with_the_beacon_root_it_started_u
         parent_beacon_block_root: Some(root),
         slot_number: None,
         target_gas_limit: None,
+        mobile_registry_root: None,
     };
     let state = ForkchoiceState {
         head_block_hash: B256::repeat_byte(1),
@@ -553,6 +554,7 @@ async fn a_build_on_the_sealed_block_that_the_execution_layer_declines_is_none()
         parent_beacon_block_root: Some(B256::ZERO),
         slot_number: None,
         target_gas_limit: None,
+        mobile_registry_root: None,
     };
     let header = cancun_header(5, B256::ZERO);
     assert!(client.build_on_own_block(&header, attrs).await.is_none());
@@ -568,6 +570,7 @@ async fn a_refused_or_broken_build_on_the_sealed_block_is_none_and_not_an_error(
         parent_beacon_block_root: Some(B256::ZERO),
         slot_number: None,
         target_gas_limit: None,
+        mobile_registry_root: None,
     };
     let header = cancun_header(5, B256::ZERO);
     let (addr, _) = serve(Arc::new(|_, _| Some(frame(2, b"no direct builder")))).await;
@@ -598,6 +601,7 @@ async fn a_build_on_the_sealed_block_returns_the_block_the_layer_built() {
         parent_beacon_block_root: Some(B256::repeat_byte(8)),
         slot_number: None,
         target_gas_limit: None,
+        mobile_registry_root: None,
     };
     let parent = cancun_header(5, B256::ZERO);
     let built = client.build_on_own_block(&parent, attrs).await.expect("answered").expect("built");
@@ -617,6 +621,7 @@ fn build_attrs() -> PayloadAttributes {
         parent_beacon_block_root: Some(B256::repeat_byte(8)),
         slot_number: None,
         target_gas_limit: None,
+        mobile_registry_root: None,
     }
 }
 

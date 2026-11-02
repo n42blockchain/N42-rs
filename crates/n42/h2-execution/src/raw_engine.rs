@@ -739,6 +739,11 @@ const TAIL_COMPACT_ANSWER: u8 = 3;
 /// to the block), so nothing else follows the request's mark.
 const TAIL_LAYOUT_ONLY: u8 = 4;
 
+/// Tail tag: the payload attributes' mobile-verification registry root
+/// (32 bytes follow). Written last, so an execution layer that predates it
+/// stops at the tag and keeps everything before it.
+const TAIL_MOBILE_REGISTRY_ROOT: u8 = 5;
+
 /// A decoded build-on-own request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuildOnOwn {
@@ -851,6 +856,10 @@ pub fn encode_build_on_own_request_layout(
     if layout_only {
         w.u8(TAIL_LAYOUT_ONLY);
     }
+    if let Some(root) = attrs.mobile_registry_root {
+        w.u8(TAIL_MOBILE_REGISTRY_ROOT);
+        w.fixed(root.as_slice());
+    }
     w.0
 }
 
@@ -895,12 +904,14 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
     let mut want_hashes = false;
     let mut compact_answer = false;
     let mut layout_only = false;
+    let mut mobile_registry_root = None;
     while !r.rest.is_empty() {
         match r.u8()? {
             TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.flag()? }),
             TAIL_WANT_HASHES => want_hashes = true,
             TAIL_COMPACT_ANSWER => compact_answer = true,
             TAIL_LAYOUT_ONLY => layout_only = true,
+            TAIL_MOBILE_REGISTRY_ROOT => mobile_registry_root = Some(r.b256()?),
             // A tag from a newer peer. Its length is not known here, so
             // there is nothing to skip to: stop reading and keep what was
             // understood. Fields are only ever appended, so everything
@@ -908,7 +919,16 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
             _ => break,
         }
     }
-    let attrs = PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit };
+    let attrs = PayloadAttributes {
+        timestamp,
+        prev_randao,
+        suggested_fee_recipient,
+        withdrawals,
+        parent_beacon_block_root,
+        slot_number,
+        target_gas_limit,
+        mobile_registry_root,
+    };
     Ok(BuildOnOwn { header, attrs, chain, want_hashes, compact_answer, layout_only })
 }
 
@@ -1061,8 +1081,16 @@ mod tests {
             parent_beacon_block_root: Some(B256::repeat_byte(7)),
             slot_number: Some(42),
             target_gas_limit: Some(3_600_000_000),
+            mobile_registry_root: Some(B256::repeat_byte(0x24)),
         };
-        let bare = PayloadAttributes { withdrawals: None, parent_beacon_block_root: None, slot_number: None, target_gas_limit: None, ..full.clone() };
+        let bare = PayloadAttributes {
+            withdrawals: None,
+            parent_beacon_block_root: None,
+            slot_number: None,
+            target_gas_limit: None,
+            mobile_registry_root: None,
+            ..full.clone()
+        };
         for attrs in [full, bare] {
             let (h, a, chain, hashes) = decode_build_on_own(&encode_build_on_own(&header, &attrs)).expect("decodes");
             assert_eq!(h, header);
@@ -1078,7 +1106,12 @@ mod tests {
             // The hint is a tail: everything before it is the frame an
             // execution layer that predates it reads, byte for byte.
             let plain = encode_build_on_own(&header, &attrs);
-            assert_eq!(&hinted[..plain.len()], &plain[..], "the hint only appends");
+            // The registry root is the last tail of all, so it is left out
+            // of the prefix comparison.
+            let rootless = PayloadAttributes { mobile_registry_root: None, ..attrs.clone() };
+            let prefix = encode_build_on_own(&header, &rootless);
+            assert_eq!(&hinted[..prefix.len()], &prefix[..], "the hint only appends");
+            assert_eq!(&plain[..prefix.len()], &prefix[..], "so does the registry root");
             // And a tag this build does not know leaves the fields intact.
             let mut unknown = plain.clone();
             unknown.push(0xfe);
@@ -1232,6 +1265,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::repeat_byte(7)),
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let hint = Some(ChainHint { view: 7, chained: true });
         let old = encode_build_on_own_request(&header, &attrs, hint, true, true);
@@ -1257,6 +1291,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::repeat_byte(7)),
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let hint = Some(ChainHint { view: 7, chained: false });
         for (chain, hashes) in [(None, false), (None, true), (hint, true)] {

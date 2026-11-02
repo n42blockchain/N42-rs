@@ -26,6 +26,7 @@ fn attributes_for(context: &ProposalContext) -> PayloadAttributes {
         parent_beacon_block_root: Some(B256::ZERO),
         target_gas_limit: None,
         slot_number: None,
+        mobile_registry_root: None,
     }
 }
 

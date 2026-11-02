@@ -460,6 +460,7 @@ async fn a_build_on_the_sealed_block_asks_for_hashes_and_reads_them() {
         parent_beacon_block_root: Some(B256::ZERO),
         slot_number: None,
         target_gas_limit: None,
+        mobile_registry_root: None,
     };
     let built = client.build_on_own_block(&header(5), attrs).await.expect("answered").expect("built");
     assert_eq!(built.tx_hashes, hashes);

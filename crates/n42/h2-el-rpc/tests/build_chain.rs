@@ -199,6 +199,7 @@ fn sealer() -> n42_h2_execution::ChainSealer {
             parent_beacon_block_root: Some(sealed.hash_slow()),
             slot_number: built_with.slot_number.map(|slot| slot + 1),
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         Some((sealed, next))
     })
@@ -213,6 +214,7 @@ fn attrs(timestamp: u64) -> PayloadAttributes {
         parent_beacon_block_root: Some(B256::repeat_byte(5)),
         slot_number: Some(41),
         target_gas_limit: None,
+        mobile_registry_root: None,
     }
 }
 

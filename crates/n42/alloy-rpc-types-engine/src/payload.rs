@@ -3582,6 +3582,12 @@ pub struct PayloadAttributes {
         )
     )]
     pub target_gas_limit: Option<u64>,
+    /// N42: the mobile-verification registry root the leader asks the
+    /// builder to stamp into `mobileRegistryRoot` (header element 24) on a
+    /// chain whose schedule carries it. Not an Engine API field; an
+    /// execution layer outside that schedule ignores it.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub mobile_registry_root: Option<B256>,
 }
 
 impl PayloadAttributes {
@@ -3720,6 +3726,7 @@ impl ssz::Decode for PayloadAttributes {
                 parent_beacon_block_root: None,
                 slot_number: None,
                 target_gas_limit: None,
+                mobile_registry_root: None,
             });
         }
 
@@ -3756,6 +3763,7 @@ impl ssz::Decode for PayloadAttributes {
                     parent_beacon_block_root: None,
                     slot_number: None,
                     target_gas_limit: None,
+                    mobile_registry_root: None,
                 })
             }
             offset if offset == Self::ssz_v3_fixed_len() => {
@@ -3770,6 +3778,7 @@ impl ssz::Decode for PayloadAttributes {
                     parent_beacon_block_root: Some(decoder.decode_next()?),
                     slot_number: None,
                     target_gas_limit: None,
+                    mobile_registry_root: None,
                 })
             }
             offset if offset == Self::ssz_v4_slot_fixed_len() => {
@@ -3785,6 +3794,7 @@ impl ssz::Decode for PayloadAttributes {
                     parent_beacon_block_root: Some(decoder.decode_next()?),
                     slot_number: Some(decoder.decode_next()?),
                     target_gas_limit: None,
+                    mobile_registry_root: None,
                 })
             }
             offset if offset == Self::ssz_v4_target_fixed_len() => {
@@ -3801,6 +3811,7 @@ impl ssz::Decode for PayloadAttributes {
                     parent_beacon_block_root: Some(decoder.decode_next()?),
                     slot_number: Some(decoder.decode_next()?),
                     target_gas_limit: Some(decoder.decode_next()?),
+                    mobile_registry_root: None,
                 })
             }
             offset => Err(ssz::DecodeError::BytesInvalid(format!(
@@ -4732,6 +4743,7 @@ mod tests {
             parent_beacon_block_root: None,
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let decoded_v1 = PayloadAttributes::from_ssz_bytes(&v1.as_ssz_bytes()).unwrap();
         assert_eq!(decoded_v1, v1);
@@ -4744,6 +4756,7 @@ mod tests {
             parent_beacon_block_root: None,
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let decoded_v2 = PayloadAttributes::from_ssz_bytes(&v2.as_ssz_bytes()).unwrap();
         assert_eq!(decoded_v2, v2);
@@ -4756,6 +4769,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::with_last_byte(33)),
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let decoded_v3 = PayloadAttributes::from_ssz_bytes(&v3.as_ssz_bytes()).unwrap();
         assert_eq!(decoded_v3, v3);
@@ -4768,6 +4782,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::with_last_byte(43)),
             slot_number: Some(44),
             target_gas_limit: Some(45),
+            mobile_registry_root: None,
         };
         let decoded_v4 = PayloadAttributes::from_ssz_bytes(&v4.as_ssz_bytes()).unwrap();
         assert_eq!(decoded_v4, v4);
@@ -4793,6 +4808,7 @@ mod tests {
             parent_beacon_block_root: None,
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         assert_eq!(v1.as_ssz_bytes().len(), 60);
 
@@ -4804,6 +4820,7 @@ mod tests {
             parent_beacon_block_root: None,
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let bytes = v2.as_ssz_bytes();
         assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 64);
@@ -4816,6 +4833,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::with_last_byte(33)),
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let bytes = v3.as_ssz_bytes();
         assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 96);
@@ -4828,6 +4846,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::with_last_byte(43)),
             slot_number: Some(44),
             target_gas_limit: Some(45),
+            mobile_registry_root: None,
         };
         let bytes = v4.as_ssz_bytes();
         assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 112);
@@ -5733,6 +5752,31 @@ mod tests {
         assert_eq!(attrs.timestamp, 0x1234);
         assert!(attrs.slot_number.is_none());
         assert!(attrs.target_gas_limit.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_payload_attributes_mobile_registry_root() {
+        // Absent: defaults to None and is not written back.
+        let json = r#"{
+            "timestamp": "0x1234",
+            "prevRandao": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "suggestedFeeRecipient": "0x0000000000000000000000000000000000000000"
+        }"#;
+        let attrs: PayloadAttributes = serde_json::from_str(json).unwrap();
+        assert!(attrs.mobile_registry_root.is_none());
+        assert!(!serde_json::to_string(&attrs).unwrap().contains("mobileRegistryRoot"));
+
+        // Present: camelCase, round-trips.
+        let attrs = PayloadAttributes {
+            timestamp: 7,
+            mobile_registry_root: Some(B256::repeat_byte(0x24)),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&attrs).unwrap();
+        assert!(text.contains(r#""mobileRegistryRoot":"0x2424"#), "{text}");
+        let back: PayloadAttributes = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, attrs);
     }
 
     #[test]

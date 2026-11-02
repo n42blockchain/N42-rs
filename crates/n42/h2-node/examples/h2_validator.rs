@@ -841,6 +841,8 @@ fn block_attributes(
         // told, and it is what the adapter puts on the payload that comes back,
         // so the two agree by construction.
         slot_number,
+        // Named by the caller from the mobile-verification registry.
+        mobile_registry_root: None,
     })
 }
 

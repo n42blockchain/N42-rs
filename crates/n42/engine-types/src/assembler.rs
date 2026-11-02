@@ -68,13 +68,24 @@ pub struct N42BlockAssembler<ChainSpec> {
     hotstuff: bool,
     /// The QMDB root to compute alongside, on a QMDB chain.
     qmdb: Option<QmdbRootJob>,
+    /// The mobile-verification registry root the leader named in its payload
+    /// attributes, stamped into `mobileRegistryRoot` where the chain's
+    /// schedule puts it in the header.
+    mobile_registry_root: Option<B256>,
 }
 
 impl<ChainSpec> N42BlockAssembler<ChainSpec> {
     /// Wraps reth's assembler. `hotstuff` says the receipts root will be
     /// replaced by the payload builder and need not be computed.
     pub const fn new(inner: EthBlockAssembler<ChainSpec>, hotstuff: bool) -> Self {
-        Self { inner, hotstuff, qmdb: None }
+        Self { inner, hotstuff, qmdb: None, mobile_registry_root: None }
+    }
+
+    /// The registry root to stamp under the `mobileRegistryRoot` gate (from
+    /// the payload attributes); ignored where the gate is off.
+    pub const fn with_mobile_registry_root(mut self, root: Option<B256>) -> Self {
+        self.mobile_registry_root = root;
+        self
     }
 
     /// Computes the QMDB root during assembly as well. See [`QmdbRootJob`].
@@ -287,17 +298,21 @@ fn parallel_ordered_trie_root_inner<T: AsRef<[u8]> + Sync>(items: &[T]) -> B256 
 /// reth's assembler is written for alloy's header: its input names the
 /// parent as one and its block carries one. The parent is handed over as its
 /// Ethereum view (the excess blob gas is all it reads) and the block comes
-/// back without a registry root, which is right for every header this node
-/// builds today. A chain whose schedule puts `mobileRegistryRoot` in the
-/// header at this block's time is refused instead: the builder has no
-/// registry to compute the root from (`docs/HEADER_FIELD_PARITY.md` section
-/// 6), and a header without it would be one the chain's other members refuse.
+/// back without a registry root. A chain whose schedule puts
+/// `mobileRegistryRoot` in the header at this block's time gets
+/// `mobile_registry_root` stamped there -- the root the leader's validator
+/// read from its mobile-verification registry and named in the payload
+/// attributes, as gov5's leader stamps `registry.Root()` -- and is refused
+/// when the leader named none: a header without it would be one the chain's
+/// other members refuse (`docs/HEADER_FIELD_PARITY.md` section 7.1, gap 6).
+/// Outside the gate the root is ignored.
 pub fn assemble_n42_block<F, ChainSpec>(
     inner: &EthBlockAssembler<ChainSpec>,
     input: BlockAssemblerInput<'_, '_, F, N42Header>,
     transactions_root: Option<B256>,
     receipts_root: Option<B256>,
     logs_bloom: Option<alloy_primitives::Bloom>,
+    mobile_registry_root: Option<B256>,
 ) -> Result<Block<F::Transaction, N42Header>, BlockExecutionError>
 where
     F: for<'a> BlockExecutorFactory<
@@ -308,11 +323,15 @@ where
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
     let timestamp: u64 = revm::context::Block::timestamp(&input.evm_env.block_env).saturating_to();
-    if reth_chainspec::qmdb::mobile_registry_root_in_header_at(inner.chain_spec.genesis(), timestamp) {
-        return Err(BlockExecutionError::msg(format!(
-            "a header at {timestamp} carries mobileRegistryRoot, which this builder cannot compute"
-        )));
-    }
+    let stamp = registry_root_for_header(
+        reth_chainspec::qmdb::mobile_registry_root_in_header_at(inner.chain_spec.genesis(), timestamp),
+        mobile_registry_root,
+    )
+    .map_err(|()| {
+        BlockExecutionError::msg(format!(
+            "a header at {timestamp} carries mobileRegistryRoot, and the payload attributes named none"
+        ))
+    })?;
     let BlockAssemblerInput {
         evm_env,
         execution_ctx,
@@ -338,7 +357,22 @@ where
         block_access_list_hash,
     );
     let block = inner.assemble_block(input, transactions_root, receipts_root, logs_bloom)?;
-    Ok(block.map_header(N42Header::from))
+    Ok(block.map_header(|header| {
+        let mut header = N42Header::from(header);
+        header.mobile_registry_root = stamp;
+        header
+    }))
+}
+
+/// What a header's `mobileRegistryRoot` is: the attributes' root where the
+/// chain's schedule carries the field (`gated`), nothing elsewhere. `Err`
+/// where the field is due and no root was named.
+pub const fn registry_root_for_header(gated: bool, named: Option<B256>) -> Result<Option<B256>, ()> {
+    match (gated, named) {
+        (true, Some(root)) => Ok(Some(root)),
+        (true, None) => Err(()),
+        (false, _) => Ok(None),
+    }
 }
 
 /// reth's [`EthBlockAssembler`] producing [`N42Header`] blocks
@@ -368,7 +402,7 @@ where
         &self,
         input: BlockAssemblerInput<'_, '_, F, N42Header>,
     ) -> Result<Self::Block, BlockExecutionError> {
-        assemble_n42_block(&self.0, input, None, None, None)
+        assemble_n42_block(&self.0, input, None, None, None, None)
     }
 }
 
@@ -463,7 +497,14 @@ where
         });
         let roots_ms = assembling.elapsed().as_millis() as u64;
         let tx_count = input.transactions.len();
-        let block = assemble_n42_block(&self.inner, input, Some(transactions_root), Some(receipts_root), Some(bloom));
+        let block = assemble_n42_block(
+            &self.inner,
+            input,
+            Some(transactions_root),
+            Some(receipts_root),
+            Some(bloom),
+            self.mobile_registry_root,
+        );
         if tx_count > 10_000 {
             tracing::info!(
                 target: "n42.assembler",
@@ -485,6 +526,55 @@ mod tests {
     use super::*;
     use alloy_consensus::{Signed, TxEip1559, TxEnvelope, TxLegacy};
     use alloy_primitives::{Address, Signature, TxKind, U256};
+
+    /// Assembles an empty block at timestamp 10 on a chain whose genesis
+    /// says `config`, through the EVM configuration's assembler path with
+    /// `root` named in the attributes.
+    fn assemble_with(config: &str, root: Option<B256>) -> Result<N42Header, BlockExecutionError> {
+        type Factory = <reth_evm_ethereum::EthEvmConfig as reth_evm::ConfigureEvm>::BlockExecutorFactory;
+        let genesis: alloy_genesis::Genesis =
+            serde_json::from_str(&format!(r#"{{"config":{{"chainId":1143{config}}},"alloc":{{}}}}"#)).expect("genesis");
+        let spec = Arc::new(reth_chainspec::ChainSpec::from_genesis(genesis));
+        let parent = reth_primitives_traits::SealedHeader::seal_slow(N42Header::from(alloy_consensus::Header::default()));
+        let mut evm_env: reth_evm::EvmEnv = Default::default();
+        evm_env.block_env.timestamp = U256::from(10);
+        evm_env.block_env.number = U256::from(1);
+        let ctx = alloy_evm::eth::EthBlockExecutionCtx {
+            parent_hash: parent.hash(),
+            parent_beacon_block_root: None,
+            ommers: &[],
+            withdrawals: None,
+            extra_data: Default::default(),
+            tx_count_hint: None,
+            slot_number: None,
+        };
+        let output = reth_execution_types::BlockExecutionResult::<reth_ethereum_primitives::Receipt>::default();
+        let bundle = revm::database::BundleState::default();
+        let provider = reth_storage_api::noop::NoopProvider::default();
+        let input = BlockAssemblerInput::<Factory, N42Header>::new(
+            evm_env, ctx, &parent, Vec::new(), &output, &bundle, &provider, B256::ZERO, None,
+        );
+        N42BlockAssembler::new(EthBlockAssembler::new(spec), false)
+            .with_mobile_registry_root(root)
+            .assemble_block(input)
+            .map(|block| block.header)
+    }
+
+    /// gov5 `worker.go`: under MobileAnchor + Glamsterdam the leader stamps
+    /// `registry.Root()`; the builder takes it from the attributes, refuses
+    /// without one, and ignores one where the gate is off.
+    #[test]
+    fn the_registry_root_is_stamped_under_the_gate_only() {
+        let root = B256::repeat_byte(0x24);
+        let gated = r#","glamsterdamTime":0,"mobileAnchorTime":0"#;
+        assert_eq!(assemble_with(gated, Some(root)).expect("builds").mobile_registry_root, Some(root));
+        let refused = assemble_with(gated, None).expect_err("no root under the gate");
+        assert!(refused.to_string().contains("mobileRegistryRoot"), "{refused}");
+        // Off the gate (the devnet's schedule): the root is ignored.
+        assert_eq!(assemble_with("", Some(root)).expect("builds").mobile_registry_root, None);
+        assert_eq!(assemble_with(r#","mobileAnchorTime":0"#, Some(root)).expect("builds").mobile_registry_root, None);
+        assert_eq!(registry_root_for_header(false, None), Ok(None));
+    }
 
     /// The parallel trie is alloy's ordered trie, at every size where the
     /// key shape changes: one byte, two, three and four bytes of index, and

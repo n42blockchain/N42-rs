@@ -1,0 +1,72 @@
+{
+  "_doc": "Proof of possession. pop_message = \"n42/mobileverify/pop/v1\\x00\" (24 bytes) || pubkey(48) = 72 bytes; pop = 96-byte compressed G2 signature: blst Sign(sk, pop_message, dst) with dst = BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_ (no augmentation). sdk_register_request_body = the exact bytes evmsdk MobileVerifyClient.RegisterStatus POSTs to /mobileverify/register (json.Marshal of a map: keys sorted, hex without 0x, no pow_nonce when the server asks none). rejections = status and exact body the gov5 handler answers (bodies end in \\n: json.Encoder).",
+  "dst": "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_",
+  "devices": [
+    {
+      "device": 0,
+      "pubkey": "a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1",
+      "pop_message": "6e34322f6d6f62696c657665726966792f706f702f763100a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1",
+      "pop": "8b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb"
+    },
+    {
+      "device": 1,
+      "pubkey": "9199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605",
+      "pop_message": "6e34322f6d6f62696c657665726966792f706f702f7631009199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605",
+      "pop": "a32ad0b022cba3a40b7c73de95a9f13c4a216fd1f50f5f7dc8371cc28471ac69ee6106fb57a015a6de28e6ef56ea7a190f186b10d4ff8a47eb6436bf67f1c059fa84b6f4df081a47092b03a52b4626d33df93e54460c93e71eab7554041321ed"
+    },
+    {
+      "device": 2,
+      "pubkey": "a223fc9333906c0bd5ecb218a4ea9029c33177060ac583d2d1e8e15616b123e73ddfa65981d7dbb4d0f4349263f94a02",
+      "pop_message": "6e34322f6d6f62696c657665726966792f706f702f763100a223fc9333906c0bd5ecb218a4ea9029c33177060ac583d2d1e8e15616b123e73ddfa65981d7dbb4d0f4349263f94a02",
+      "pop": "8b309bbc0681e592ae75dcb8a11a754f4eec97912972fa089a7497fb95bc597c116379b2bf51e6a0de59f1583b329b3d026a32113f4a7c82bdd8efc17ce291e9a0fe8f5c18af77e7ebed0f42dab8c9380bc684c904ab139d2d742fb5db6a14cb"
+    },
+    {
+      "device": 3,
+      "pubkey": "ad28c09d369a40c5d6317f8aeb5cfdc85c7a6321db19bd10512f0a0acac684c930f51b8a5b9960d9b001a62294b2df13",
+      "pop_message": "6e34322f6d6f62696c657665726966792f706f702f763100ad28c09d369a40c5d6317f8aeb5cfdc85c7a6321db19bd10512f0a0acac684c930f51b8a5b9960d9b001a62294b2df13",
+      "pop": "b01d232efc8e5533b1237a13db4005d9d8de337df901e8bf163aa31033287681f6ce325c782461105cac60fd127798db01d79c31caee896ea6fcfb7e8a49ee4c27514a60f04e80386f4c3965add32dfd032950377ade405a54428f96f6a79f20"
+    }
+  ],
+  "sdk_register_request_body": "{\"pop\":\"8b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb\",\"pubkey\":\"a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1\"}",
+  "rejections": [
+    {
+      "case": "pop of device 0 presented with device 1's pubkey (valid signature, wrong key)",
+      "pubkey": "9199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605",
+      "pop": "8b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb",
+      "status": 403,
+      "body": "{\"error\":\"mobileverify: invalid proof of possession\"}\n"
+    },
+    {
+      "case": "pop of 96 zero bytes (not a compressed G2 point)",
+      "pubkey": "9199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605",
+      "pop": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "status": 403,
+      "body": "{\"error\":\"mobileverify: invalid proof of possession: signature decode: could not unmarshal bytes into signature\"}\n"
+    },
+    {
+      "case": "pubkey of 48 zero bytes (not a compressed G1 point)",
+      "pubkey": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "pop": "a32ad0b022cba3a40b7c73de95a9f13c4a216fd1f50f5f7dc8371cc28471ac69ee6106fb57a015a6de28e6ef56ea7a190f186b10d4ff8a47eb6436bf67f1c059fa84b6f4df081a47092b03a52b4626d33df93e54460c93e71eab7554041321ed",
+      "status": 403,
+      "body": "{\"error\":\"mobileverify: invalid proof of possession: pubkey decode: could not unmarshal bytes into public key\"}\n"
+    },
+    {
+      "case": "pop one byte short",
+      "pubkey": "9199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605",
+      "pop": "a32ad0b022cba3a40b7c73de95a9f13c4a216fd1f50f5f7dc8371cc28471ac69ee6106fb57a015a6de28e6ef56ea7a190f186b10d4ff8a47eb6436bf67f1c059fa84b6f4df081a47092b03a52b4626d33df93e54460c93e71eab7554041321",
+      "status": 400,
+      "body": "{\"error\":\"pubkey must be 48 hex bytes, pop 96\"}\n"
+    },
+    {
+      "case": "body is not JSON",
+      "request_body": "pubkey=",
+      "status": 400,
+      "body": "{\"error\":\"bad json\"}\n"
+    },
+    {
+      "case": "GET instead of POST",
+      "status": 405,
+      "body": "{\"error\":\"POST only\"}\n"
+    }
+  ]
+}

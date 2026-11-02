@@ -11,7 +11,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
-use alloy_consensus::{BlockBody, Header, TxEnvelope};
+use alloy_consensus::{BlockBody, TxEnvelope};
+use n42_header::N42Header as Header;
 use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{PayloadAttributes, PayloadId, PayloadStatus, PayloadStatusEnum};
@@ -32,6 +33,8 @@ fn env() {
         unsafe {
             std::env::set_var("N42_BODY_ONCE", "1");
             std::env::set_var("N42_COMPACT_BODY", "1");
+            // Short enough for a test to outlast, long for a local exchange.
+            std::env::set_var("N42_RAW_CHANNEL_TIMEOUT_MS", "1000");
         }
     });
 }
@@ -116,6 +119,7 @@ fn body(compact: bool) -> ForeignBody {
         profile: N42HeaderProfile::Gov5H2,
         rlp: vec![0xc0, 1, 2, 3].into(),
         compact,
+        source: None,
     }
 }
 
@@ -288,6 +292,33 @@ async fn a_held_body_votes_then_waits_for_its_release_byte() {
     assert_eq!(seen.byte, Some(raw_engine::release::EXECUTE));
 }
 
+/// Audit 2026-10 B-5: the time a held body waits for its slot is this
+/// node's, not the execution layer's. It does not count toward the raw
+/// channel's deadline (1 s in this binary), so a slot that frees late does
+/// not turn a valid block into a failed import.
+#[tokio::test]
+async fn a_held_bodys_wait_for_its_slot_does_not_count_toward_the_deadline() {
+    env();
+    let (addr, seen) = serve_held().await;
+    let client = EngineApiClient::new(Endpoint(addr));
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let body = body(true);
+    let call = client.new_payload_body_held(ExecutionPath::LIVE_SEQUENTIAL, &body, checked_tx, release_rx);
+    tokio::pin!(call);
+    tokio::select! {
+        checked = checked_rx => assert!(matches!(checked.expect("checked").status, PayloadStatusEnum::Valid)),
+        outcome = &mut call => panic!("answered before the release: {outcome:?}"),
+    }
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        release_tx.send(true).expect("the call waits for it");
+    };
+    let (outcome, ()) = tokio::join!(&mut call, release);
+    assert!(matches!(outcome, BodyOutcome::Answered(Ok(_))), "{outcome:?}");
+    assert_eq!(seen.lock().unwrap().byte, Some(raw_engine::release::EXECUTE));
+}
+
 #[tokio::test]
 async fn a_dropped_held_body_sends_the_drop_byte_and_answers_the_drop() {
     env();
@@ -310,7 +341,7 @@ async fn a_dropped_held_body_sends_the_drop_byte_and_answers_the_drop() {
 // ---- hashed build answers --------------------------------------------------
 
 fn header(number: u64) -> Header {
-    Header {
+    Header::from(alloy_consensus::Header {
         number,
         timestamp: 1_700_000_000,
         gas_limit: 30_000_000,
@@ -320,11 +351,11 @@ fn header(number: u64) -> Header {
         excess_blob_gas: Some(0),
         parent_beacon_block_root: Some(B256::ZERO),
         ..Default::default()
-    }
+    })
 }
 
 fn block_rlp(header: Header) -> Vec<u8> {
-    let block = alloy_consensus::Block::<TxEnvelope> {
+    let block = alloy_consensus::Block::<TxEnvelope, Header> {
         header,
         body: BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: Some(Withdrawals::new(Vec::new())) },
     };
@@ -429,6 +460,7 @@ async fn a_build_on_the_sealed_block_asks_for_hashes_and_reads_them() {
         parent_beacon_block_root: Some(B256::ZERO),
         slot_number: None,
         target_gas_limit: None,
+        mobile_registry_root: None,
     };
     let built = client.build_on_own_block(&header(5), attrs).await.expect("answered").expect("built");
     assert_eq!(built.tx_hashes, hashes);
@@ -449,7 +481,7 @@ async fn a_check_only_answer_vouches_only_for_the_block_asked_about() {
     env();
     let block = B256::repeat_byte(0x11);
     let other = B256::repeat_byte(0x22);
-    let header_rlp = alloy_rlp::encode(Header { number: 7, ..Default::default() });
+    let header_rlp = alloy_rlp::encode(Header::from(alloy_consensus::Header { number: 7, ..Default::default() }));
     // The answer is chosen by the header's number byte: 1 the block, 2 another
     // build, 3 an ERROR, 4 a SYNCING status.
     let answer = Arc::new(Mutex::new(1u8));

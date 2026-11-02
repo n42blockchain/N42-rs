@@ -39,13 +39,14 @@ impl<ChainSpec> N42PayloadAttributesBuilder<ChainSpec> {
     }
 }
 
-impl<ChainSpec> PayloadAttributesBuilder<EthPayloadAttributes>
+impl<ChainSpec, H> PayloadAttributesBuilder<EthPayloadAttributes, H>
     for N42PayloadAttributesBuilder<ChainSpec>
 where
     ChainSpec: Send + Sync + EthereumHardforks + 'static,
+    H: reth_primitives_traits::BlockHeader,
 {
-    fn build(&self, parent: &reth_primitives_traits::SealedHeader) -> EthPayloadAttributes {
-        let timestamp = parent.timestamp;
+    fn build(&self, parent: &reth_primitives_traits::SealedHeader<H>) -> EthPayloadAttributes {
+        let timestamp = alloy_consensus::BlockHeader::timestamp(parent.header());
         EthPayloadAttributes {
             timestamp,
             prev_randao: B256::ZERO,
@@ -63,13 +64,16 @@ where
             // gas-limit target is left to the builder's own configuration.
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         }
     }
 }
 
+/// Payload attribute builder that can also set the withdrawals and the prev-randao mix.
 pub trait PayloadAttributesBuilderExt<Attributes>:
     PayloadAttributesBuilder<Attributes> + Send + Sync + 'static
 {
+    /// Builds payload attributes for `timestamp` with the given withdrawals and prev-randao.
     fn build_ext(
         &self,
         timestamp: u64,
@@ -83,6 +87,7 @@ impl<ChainSpec> PayloadAttributesBuilderExt<EthPayloadAttributes>
 where
     ChainSpec: Send + Sync + EthereumHardforks + 'static,
 {
+    #[allow(clippy::field_reassign_with_default)] // header is built step by step
     fn build_ext(
         &self,
         timestamp: u64,
@@ -96,7 +101,8 @@ where
         header.timestamp = timestamp;
         let sealed_header = SealedHeader::new(header, Default::default());
 
-        let mut payload_attributes = self.build(&sealed_header);
+        let mut payload_attributes =
+            <Self as PayloadAttributesBuilder<EthPayloadAttributes>>::build(self, &sealed_header);
         payload_attributes.withdrawals = withdrawals;
         payload_attributes.prev_randao = prev_randao;
 

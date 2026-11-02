@@ -28,6 +28,7 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
+#[allow(clippy::iter_with_drain)] // the batch buffer is reused, so it is drained rather than consumed
 fn main() {
     // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
     // left unset. First, before any knob is read (they are cached in
@@ -59,8 +60,13 @@ fn main() {
             .chain_spec()
             .is_some_and(|spec| reth_chainspec::qmdb::frame_blocks_enabled(&spec.genesis)),
     };
-    // SAFETY: still single-threaded: parsing the command line spawns no
-    // thread, and nothing else reads or writes the environment.
+    // SAFETY: no thread of this program reads or writes the environment
+    // concurrently. Parsing the command line is not thread-free on a QMDB
+    // chain: the chain parser computes the genesis root, which can start
+    // rayon's global pool (`N42_QMDB_PARALLEL_APPLY`), but those workers run
+    // only the tree's hashing and are idle here; Rust's own environment
+    // accesses are serialised by std's lock, and no C library code on them
+    // calls `getenv` (audit 2026-10 E-9).
     unsafe { n42_env::profile::reconcile_and_report("n42", features) };
     // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
     // would silently verify everything (or nothing); refuse to start instead.
@@ -71,20 +77,20 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // `leader` and `shard` take a frame's word for a sender: benchmark probes,
-    // refused unless the operator acknowledges them with N42_BENCH_UNSAFE=1.
-    if let Some(refusal) = n42_tx_types::trusting_mode_refusal(
-        ingest_mode,
-        std::env::var("N42_BENCH_UNSAFE").ok().as_deref(),
-    ) {
+    // `leader`, `shard` and frame gateways take a frame's word for a sender,
+    // and the direct ingest skips the pool's checks: benchmark probes, refused
+    // unless the operator acknowledges them with N42_BENCH_UNSAFE=1.
+    let bench_unsafe = std::env::var("N42_BENCH_UNSAFE").ok();
+    let gateways = std::env::var_os("N42_FRAME_GATEWAYS").is_some();
+    let direct = n42_env::flag("N42_TX_INGEST_DIRECT", false);
+    if let Some(refusal) = n42_tx_types::trusting_mode_refusal(ingest_mode, bench_unsafe.as_deref())
+        .or_else(|| n42_tx_types::frame_gateways_refusal(gateways, bench_unsafe.as_deref()))
+        .or_else(|| n42_tx_types::ingest_direct_refusal(direct, bench_unsafe.as_deref()))
+    {
         eprintln!("error: {refusal}");
         std::process::exit(2);
     }
-    let trusting_knobs = n42_tx_types::trusting_ingest_knobs(
-        ingest_mode,
-        n42_env::flag("N42_TX_INGEST_DIRECT", false),
-        std::env::var_os("N42_FRAME_GATEWAYS").is_some(),
-    );
+    let trusting_knobs = n42_tx_types::trusting_ingest_knobs(ingest_mode, direct, gateways);
     // `N42_CORE_LAYOUT=isolate`: split the node's affinity mask into the
     // build, critical and background sets before any thread is spawned, and
     // move this thread (and any the allocator already has) to the background
@@ -113,7 +119,7 @@ fn main() {
     // Create router channel for pubsub
     let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(100);
     let router_tx_clone = router_tx.clone();
-    let router_tx_for_bridge = router_tx.clone();
+    let router_tx_for_bridge = router_tx;
     let broadcast_rx_for_bridge = broadcast_tx.subscribe();
 
     // Shared consensus instance holder
@@ -214,6 +220,9 @@ fn main() {
                 node,
                 node_exit_future,
             } = builder
+                // The node's header is `N42Header`; its chain spec wraps the
+                // parsed one (same genesis hash) over that header.
+                .map_chainspec(n42_header::N42ChainSpec::from)
                 .node(N42Node::with_qmdb(qmdb))
                 // Restore state and deferred results before engine/RPC launch.
                 // A cold checkpoint can take seconds to read; an early payload
@@ -268,6 +277,12 @@ fn main() {
                                 n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used });
                             info!(target: "reth::cli", block = parent.number, hash = %parent.hash(), "restored deferred execution parent result");
                         }
+                        // Without deferred execution the head's header carries
+                        // its own root: the restart's check when forest.roots
+                        // lost the head's record (audit 2026-10 D-3).
+                        if !reth_chainspec::qmdb::deferred_execution_active_at(genesis, head.timestamp) {
+                            qmdb.expect_head_root((info.best_number, head_hash), head.state_root);
+                        }
                         qmdb.initialize((info.best_number, head_hash))?;
                         info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
                         // A lagging CL may re-submit persisted blocks below this EL's
@@ -289,7 +304,7 @@ fn main() {
                             if !(1..=2).contains(&depth) { return None; }
                             let mut descendants = Vec::with_capacity(usize::from(depth));
                             for step in 1..=depth {
-                                descendants.push(database.header_by_number(ancestor.number.checked_add(u64::from(step))?).ok()??);
+                                descendants.push(database.header_by_number(ancestor.number.checked_add(u64::from(step))?).ok()??.into_inner());
                             }
                             let carrying = descendants.last()?;
                             if reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, carrying.timestamp) != u64::from(depth) { return None; }
@@ -535,8 +550,10 @@ fn main() {
             //
             // The entry store's growth (`docs/QMDB_COMPACTION_DESIGN.md` 3.7):
             // the entry file's bytes, its slots in all and still live, the
-            // offsets' and the key index's heap, the file's sealed chunks, and
-            // `n42_qmdb_entry_bytes_per_live_slot`, logged once at warn level
+            // offsets' and the key index's heap, the file's sealed chunks, the
+            // compacted twigs' bytes in `entries.relocated`, and
+            // `n42_qmdb_entry_bytes_per_live_slot` ((file + relocated) / live),
+            // logged once at warn level
             // when it passes `N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM` (default
             // 2000, 0 disables). A tick that finds the forest lock held skips
             // these gauges rather than wait.
@@ -551,18 +568,16 @@ fn main() {
                         tick.tick().await;
                         // `poisoned()` answers None while the forest lock is held,
                         // so a reason once seen is latched rather than re-read.
-                        if !poisoned_seen {
-                            if let Some(reason) = qmdb.poisoned() {
+                        if !poisoned_seen
+                            && let Some(reason) = qmdb.poisoned() {
                                 poisoned_seen = true;
                                 error!(target: "reth::cli", %reason, "QMDB forest is poisoned; state applies are refused");
                             }
-                        }
-                        if !unchecked_seen {
-                            if let Some(reason) = qmdb.unchecked_restart() {
+                        if !unchecked_seen
+                            && let Some(reason) = qmdb.unchecked_restart() {
                                 unchecked_seen = true;
                                 error!(target: "reth::cli", %reason, "QMDB restarted on a tree not checked against its recorded head root");
                             }
-                        }
                         metrics::gauge!("n42_qmdb_forest_poisoned").set(if poisoned_seen { 1.0 } else { 0.0 });
                         metrics::gauge!("n42_qmdb_unchecked_restart").set(if unchecked_seen { 1.0 } else { 0.0 });
                         if let Some(stats) = qmdb.entry_stats() {
@@ -573,6 +588,7 @@ fn main() {
                             metrics::gauge!("n42_qmdb_offsets_bytes").set(stats.offsets_bytes as f64);
                             metrics::gauge!("n42_qmdb_index_bytes").set(stats.index_bytes as f64);
                             metrics::gauge!("n42_qmdb_entry_chunks").set(stats.chunks as f64);
+                            metrics::gauge!("n42_qmdb_entry_relocated_bytes").set(stats.relocated_bytes as f64);
                             metrics::gauge!("n42_qmdb_entry_bytes_per_live_slot").set(per_live as f64);
                             if bytes_per_live_alarm > 0 && per_live > bytes_per_live_alarm && !bytes_per_live_warned {
                                 bytes_per_live_warned = true;
@@ -581,6 +597,7 @@ fn main() {
                                     per_live,
                                     alarm = bytes_per_live_alarm,
                                     file_bytes = stats.file_bytes,
+                                    relocated_bytes = stats.relocated_bytes,
                                     live_slots = stats.live_slots,
                                     total_slots = stats.total_slots,
                                     "the QMDB entry store holds more bytes per live slot than N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM; it grows with the append history (docs/QMDB_COMPACTION_DESIGN.md)",
@@ -637,8 +654,7 @@ fn main() {
 
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
             let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
-                let eth_signer: PrivateKeySigner = signer_private_key
-                    .to_string()
+                let eth_signer: PrivateKeySigner = signer_private_key.clone()
                     .parse()
                     .map_err(|err| eyre::eyre!("invalid --dev.consensus-signer-private-key: {err}"))?;
                 Some(eth_signer.address())
@@ -882,13 +898,33 @@ fn main() {
                     .then(|| n42::queue_prune::spawn_thread(queue.clone()))
                     .flatten();
                 let prune_feed_lean = pruner.is_some() && n42::queue_prune::feed_lean();
+                let backfill_provider = node.provider.clone();
                 tokio::spawn(async move {
+                    // Heights a lagged receiver skipped are read back and
+                    // pruned ahead of the notification that shows them
+                    // (R3-P4).
+                    let mut watch = n42::queue_prune::GapWatch::default();
                     loop {
                         match canonical.recv().await {
                             Ok(notification) => {
                                 let behind = canonical.len();
                                 if behind > 8 {
                                     warn!(target: "reth::cli", behind, "canonical subscriber lag: queue pruner");
+                                }
+                                if let Some(gap) = watch.before(&notification) {
+                                    let provider = backfill_provider.clone();
+                                    let read = tokio::task::spawn_blocking(move || {
+                                        n42::queue_prune::backfill(gap, |range| {
+                                            reth_provider::BlockReader::recovered_block_range(&provider, range)
+                                        })
+                                    })
+                                    .await
+                                    .unwrap_or_default();
+                                    if !read.is_empty() {
+                                        n42::queue_prune::forward(&mut pruner, n42::queue_prune::PruneFeed::Lean(read), |feed| {
+                                            n42::queue_prune::prune_feed_inline(&queue, &feed)
+                                        });
+                                    }
                                 }
                                 match pruner {
                                     Some(_) => {
@@ -923,8 +959,11 @@ fn main() {
                                         loop {
                                             match canonical.try_recv() {
                                                 Ok(next) => batch.push(next),
+                                                // Ends the fold: the stretch is read
+                                                // back at the next notification.
                                                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                                                     warn!(target: "n42.tx_queue", skipped, "queue pruning fell behind canonical notifications");
+                                                    break;
                                                 }
                                                 Err(_) => break,
                                             }
@@ -946,10 +985,14 @@ fn main() {
                                                     Ok(Ok(next)) => batch.push(next),
                                                     Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                                                         warn!(target: "n42.tx_queue", skipped, "queue pruning fell behind canonical notifications");
+                                                        break;
                                                     }
                                                     Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => break,
                                                 }
                                             }
+                                        }
+                                        for later in &batch[1..] {
+                                            let _ = watch.before(later);
                                         }
                                         let notifications: Vec<_> = batch.iter().collect();
                                         n42::queue_prune::prune_notifications_lean(&queue, &notifications, first_at.elapsed());
@@ -1022,7 +1065,7 @@ fn main() {
             let mining_mode = if hotstuff_chain {
                 info!(target: "reth::cli", "chain declares a HotStuff-2 validator set; APoS mining is off");
                 consensus_client::miner::MiningMode::NoMining
-            } else if let Some(_) = consensus_signer_private_key {
+            } else if consensus_signer_private_key.is_some() {
                 let block_time = node_config_dev
                     .dev
                     .block_time

@@ -40,13 +40,13 @@ use revm::{
     },
     database_interface::DBErrorMarker,
     inspector::NoOpInspector,
-    primitives::{hardfork::SpecId, HashMap, TxKind},
+    primitives::{hardfork::SpecId, TxKind},
     state::{Account, AccountInfo, EvmState, TransactionId},
     Inspector,
 };
 
 /// The gas of a call with no calldata: the whole cost of a qualifying transfer.
-const TRANSFER_GAS: u64 = 21_000;
+pub(crate) const TRANSFER_GAS: u64 = 21_000;
 
 /// How many transfers have taken this path in this process.
 static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -698,12 +698,11 @@ where
         if self.fast && self.inspecting {
             REJECTED[11].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if self.fast && !self.inspecting {
-            if let Some(done) = self.transfer(&tx).map_err(EVMError::Database)? {
+        if self.fast && !self.inspecting
+            && let Some(done) = self.transfer(&tx).map_err(EVMError::Database)? {
                 HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(done);
             }
-        }
         self.inner.transact_raw(tx)
     }
 

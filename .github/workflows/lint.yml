@@ -23,3 +23,5 @@ jobs:
         #run: cargo clippy --workspace --all-targets -- -D warnings
         #run: cargo clippy --workspace --lib --bins --all-features
         run: cargo clippy --workspace --lib --bins --examples
+      - name: Run Clippy on the N42 crates with -D warnings
+        run: scripts/clippy-n42.sh

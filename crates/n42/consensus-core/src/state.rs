@@ -35,25 +35,25 @@ pub trait StateTransition {
 
 /// Calculate epoch from slot
 #[inline]
-pub fn slot_to_epoch(slot: Slot) -> Epoch {
+pub const fn slot_to_epoch(slot: Slot) -> Epoch {
     slot / SLOTS_PER_EPOCH
 }
 
 /// Calculate the first slot of an epoch
 #[inline]
-pub fn epoch_start_slot(epoch: Epoch) -> Slot {
+pub const fn epoch_start_slot(epoch: Epoch) -> Slot {
     epoch * SLOTS_PER_EPOCH
 }
 
 /// Check if a slot is at an epoch boundary
 #[inline]
-pub fn is_epoch_boundary(slot: Slot) -> bool {
-    slot % SLOTS_PER_EPOCH == 0
+pub const fn is_epoch_boundary(slot: Slot) -> bool {
+    slot.is_multiple_of(SLOTS_PER_EPOCH)
 }
 
 /// Calculate the number of slots until the next epoch
 #[inline]
-pub fn slots_until_next_epoch(slot: Slot) -> Slot {
+pub const fn slots_until_next_epoch(slot: Slot) -> Slot {
     SLOTS_PER_EPOCH - (slot % SLOTS_PER_EPOCH)
 }
 

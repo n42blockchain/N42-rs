@@ -34,7 +34,7 @@ fn payload(requests: Option<Vec<Bytes>>, bal: Option<Bytes>) -> N42BuiltPayload 
         B256::repeat_byte(0x61),
     )));
     let block = n42_tx_types::Block {
-        header: Header { number: 17, ..Default::default() },
+        header: n42_header::N42Header::from(alloy_consensus::Header { number: 17, ..Default::default() }),
         body: n42_tx_types::BlockBody { transactions: vec![envelope], ommers: Vec::new(), withdrawals: None },
     };
     let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(

@@ -39,6 +39,9 @@ pub enum ElCall {
     BodyDropped(B256),
     /// A check-only request ([`ExecutionLayer::check_only`]).
     CheckOnly(B256),
+    /// A layout claim ([`ExecutionLayer::claim_layout`]): the block and its
+    /// sender's source.
+    ClaimLayout(B256, Option<crate::raw_engine::ClaimSource>),
 }
 
 /// Behaviour a test wants from the execution layer.
@@ -318,6 +321,11 @@ impl ExecutionLayer for MockExecutionLayer {
         self.behaviour.lock().expect("mock behaviour lock").check_only.is_some()
     }
 
+    async fn claim_layout(&self, body: crate::ForeignBody) -> bool {
+        self.record(ElCall::ClaimLayout(body.block_hash, body.source));
+        true
+    }
+
     async fn check_only(&self, block_hash: B256, _header_rlp: alloy_primitives::Bytes) -> bool {
         self.record(ElCall::CheckOnly(block_hash));
         let answer = self.behaviour.lock().expect("mock behaviour lock").check_only;
@@ -338,6 +346,7 @@ impl ExecutionLayer for MockExecutionLayer {
         if matches!(behaviour.new_payload_status, PayloadStatusEnum::Valid)
             && let Ok(block) = payload.clone().into_block_raw()
         {
+            let block = n42_h2_consensus::header_engine::block_with_payload_root(block, &payload.payload);
             let number = block.header.number;
             self.state
                 .lock()
@@ -442,6 +451,7 @@ impl ExecutionLayer for MockExecutionLayer {
         let mut built = Self::built_block_on(number, parent);
         built.elided = self.behaviour.lock().expect("mock behaviour lock").elide_builds;
         if let Ok(block) = built.execution_data.clone().into_block_raw() {
+            let block = n42_h2_consensus::header_engine::block_with_payload_root(block, &built.execution_data.payload);
             self.state
                 .lock()
                 .expect("mock state lock")

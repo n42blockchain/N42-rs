@@ -24,19 +24,21 @@
 //! N42-26 uses a different function here (`keccak256(data || topic)`, no
 //! genesis hash). This crate deliberately implements gov5's.
 
-use alloy_primitives::{keccak256, B256};
+use alloy_primitives::{Keccak256, B256};
 use libp2p::gossipsub::{Message, MessageId};
 
 /// Length of a gov5 message ID in bytes.
 pub const MESSAGE_ID_LEN: usize = 20;
 
-/// Computes gov5's `MsgID` over explicit parts.
+/// Computes gov5's `MsgID` over explicit parts. Hashed in place: every
+/// copy of a gossiped block used to be copied whole first (audit 2026-10
+/// round 3, R3-N6).
 pub fn gov5_message_id_parts(genesis_hash: B256, topic: &str, data: &[u8]) -> [u8; MESSAGE_ID_LEN] {
-    let mut combined = Vec::with_capacity(B256::len_bytes() + topic.len() + data.len());
-    combined.extend_from_slice(genesis_hash.as_slice());
-    combined.extend_from_slice(topic.as_bytes());
-    combined.extend_from_slice(data);
-    let digest = keccak256(&combined);
+    let mut hasher = Keccak256::new();
+    hasher.update(genesis_hash.as_slice());
+    hasher.update(topic.as_bytes());
+    hasher.update(data);
+    let digest = hasher.finalize();
     let mut out = [0u8; MESSAGE_ID_LEN];
     out.copy_from_slice(&digest[..MESSAGE_ID_LEN]);
     out
@@ -121,7 +123,7 @@ mod tests {
         // "fixes" this to SHA-256 per the comment, the fixture test above fails
         // and this one names why.
         let empty = gov5_message_id_parts(B256::ZERO, "/n42/h2/4/ssz_snappy", &[]);
-        let expected = keccak256(
+        let expected = alloy_primitives::keccak256(
             [B256::ZERO.as_slice(), b"/n42/h2/4/ssz_snappy".as_slice()].concat(),
         );
         assert_eq!(empty, expected[..MESSAGE_ID_LEN]);

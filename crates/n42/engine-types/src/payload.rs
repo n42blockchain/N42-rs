@@ -7,7 +7,6 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 */
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![allow(clippy::useless_let_if_seq)]
 
@@ -17,7 +16,7 @@ use reth_basic_payload_builder::{
     is_better_payload, BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder,
     PayloadConfig,
 };
-use reth_chainspec::{ChainSpec, ChainSpecProvider, EthChainSpec, EthereumHardforks};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use n42_tx_types::{N42Primitives as EthPrimitives, N42TxEnvelope as TransactionSigned};
 use alloy_consensus::transaction::TxHashRef as _;
@@ -25,7 +24,7 @@ use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome},
     ConfigureEvm, Evm, NextBlockEnvAttributes,
 };
-use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig};
+use reth_evm_ethereum::EthBlockAssembler;
 use crate::engine_types::N42BuiltPayload as EthBuiltPayload;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
@@ -54,17 +53,14 @@ use reth_chain_state::CanonStateSubscriptions;
 use n42_consensus_traits::SignerManager;
 use n42_qmdb_reth::{changes_from_execution, QmdbNodeState};
 use reth_trie::updates::TrieUpdates;
-use reth_consensus::{ConsensusError, FullConsensus};
+use reth_consensus::FullConsensus;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use reth_node_api::PayloadBuilderFor;
-use reth_node_api::PrimitivesTy;
 use reth_node_builder::{
-    components::{ConsensusBuilder, PayloadBuilderBuilder, PayloadServiceBuilder},
+    components::{ConsensusBuilder, PayloadServiceBuilder},
     node::{FullNodeTypes, NodeTypes},
     BuilderContext,
 };
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
-use std::future::Future;
 
 // Historical catch-up never enters the payload builder. Until a qualified
 // live PEVM builder exists, every invocation here is the live sequential path.
@@ -84,10 +80,12 @@ use reth_node_builder::{PayloadBuilderConfig, PayloadTypes};
 /// Note: In v1.5.0, consensus is built separately and shared via NodeComponents.
 /// The actual consensus instance will be passed through the N42PayloadServiceBuilder.
 #[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // wrapper kept for the stock payload builder; not constructed today
 pub struct EthereumPayloadBuilderWrapper;
 
 impl EthereumPayloadBuilderWrapper {
     /// Create a new wrapper.
+    #[allow(dead_code)] // constructor of the wrapper above; not used today
     pub fn new() -> Self {
         Self
     }
@@ -95,7 +93,6 @@ impl EthereumPayloadBuilderWrapper {
 // wrapper
 
 // reth/crates/ethereum/payload/src/config.rs
-use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M;
 use reth_primitives_traits::constants::GAS_LIMIT_BOUND_DIVISOR;
 
 /*
@@ -146,6 +143,7 @@ impl EthereumBuilderConfig {
 
 /// Calculate the gas limit for the next block based on parent and desired gas limits.
 /// Ref: <https://github.com/ethereum/go-ethereum/blob/88cbfab332c96edfbe99d161d9df6a40721bd786/core/block_validator.go#L166>
+#[allow(dead_code)] // gas-limit helper kept for the stock builder; not used today
 pub fn calculate_block_gas_limit(parent_gas_limit: u64, desired_gas_limit: u64) -> u64 {
     let delta = (parent_gas_limit / GAS_LIMIT_BOUND_DIVISOR).saturating_sub(1);
     let min_gas_limit = parent_gas_limit - delta;
@@ -177,7 +175,7 @@ pub fn gas_limit_over_carried(computed: u64, parent_gas_limit: u64, carried_gas_
 /// entry when this node built it (`note_built`).
 fn carried_fields_for_seal(
     genesis: &alloy_genesis::Genesis,
-    parent: &reth_primitives_traits::SealedHeader,
+    parent: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
     parent_built: Option<B256>,
     depth: u64,
 ) -> Option<crate::executed_fields::ExecutedFields> {
@@ -193,7 +191,7 @@ fn carried_fields_for_seal(
 /// "no_built" when there was no builder hash to wait under.
 fn carried_fields_for_seal_traced(
     genesis: &alloy_genesis::Genesis,
-    parent: &reth_primitives_traits::SealedHeader,
+    parent: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
     parent_built: Option<B256>,
     depth: u64,
 ) -> (Option<crate::executed_fields::ExecutedFields>, &'static str) {
@@ -211,7 +209,7 @@ fn carried_fields_for_seal_traced(
 
 fn carried_fields_for_seal_untraced(
     genesis: &alloy_genesis::Genesis,
-    parent: &reth_primitives_traits::SealedHeader,
+    parent: &reth_primitives_traits::SealedHeader<n42_header::N42Header>,
     parent_built: Option<B256>,
     depth: u64,
 ) -> Option<crate::executed_fields::ExecutedFields> {
@@ -293,7 +291,7 @@ where
     EvmConfig: ConfigureEvm<
         Primitives = EthPrimitives,
         NextBlockEnvCtx = NextBlockEnvAttributes,
-        BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
+        BlockAssembler = crate::assembler::N42HeaderAssembler<Client::ChainSpec>,
         BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
     >,
     Client: StateProviderFactory
@@ -373,7 +371,7 @@ where
 
     fn build_empty_payload(
         &self,
-        config: PayloadConfig<Self::Attributes>,
+        config: PayloadConfig<Self::Attributes, n42_header::N42Header>,
     ) -> Result<EthBuiltPayload, PayloadBuilderError> {
         // upstream added execution_cache and state_root_handle; this path shares
         // neither with the engine, so both are None.
@@ -439,7 +437,7 @@ where
     EvmConfig: ConfigureEvm<
             Primitives = EthPrimitives,
             NextBlockEnvCtx = NextBlockEnvAttributes,
-            BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
+            BlockAssembler = crate::assembler::N42HeaderAssembler<Client::ChainSpec>,
             BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
         > + Send
         + Sync
@@ -694,7 +692,7 @@ pub fn seal_first() -> bool {
 /// parent's. Off by default.
 pub fn seal_at_exec() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_SEAL_AT_EXEC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_SEAL_AT_EXEC", false))
 }
 
 /// `N42_SHARDS_READY_FIRST=1` (docs/SEALED_AT_FLOOR.md candidate 1): on a
@@ -709,7 +707,7 @@ pub fn seal_at_exec() -> bool {
 pub fn shards_ready_first() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("N42_SHARDS_READY_FIRST").is_ok_and(|v| v == "1");
+        let on = n42_env::flag("N42_SHARDS_READY_FIRST", false);
         tracing::info!(target: "payload_builder", shards_ready_first = on, "N42_SHARDS_READY_FIRST");
         on
     })
@@ -729,7 +727,7 @@ pub fn seal_on_counters() -> bool {
     *ON.get_or_init(|| {
         ["N42_SEAL_ON_COUNTERS", "N42_SEAL_ON_COUNTS"]
             .iter()
-            .any(|name| std::env::var(name).is_ok_and(|v| v.trim() == "1"))
+            .any(|name| n42_env::flag(name, false))
     })
 }
 
@@ -744,7 +742,7 @@ pub fn seal_on_counters() -> bool {
 /// the same call on the same input either way. Off by default.
 pub fn freeze_after_seal() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FREEZE_AFTER_SEAL").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FREEZE_AFTER_SEAL", false))
 }
 
 /// `N42_ROOT_OPS_AHEAD=1` (`docs/SHARED_EXECUTION_SCOPE.md` 15): with the
@@ -758,7 +756,7 @@ pub fn freeze_after_seal() -> bool {
 /// Off by default.
 pub fn root_ops_ahead() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROOT_OPS_AHEAD").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROOT_OPS_AHEAD", false))
 }
 
 /// `N42_ROOT_OPS_BEFORE_GATE=1` (`docs/ROOT_FIELDS_RACE.md` option B): on
@@ -771,7 +769,7 @@ pub fn root_ops_ahead() -> bool {
 /// waits for the gate. The same operations and root either way. Off by default.
 pub fn root_ops_before_gate() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROOT_OPS_BEFORE_GATE").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_ROOT_OPS_BEFORE_GATE", false))
 }
 
 /// The shards' operations encoded ahead ([`root_ops_ahead`]), and when they
@@ -836,7 +834,7 @@ fn spawn_freeze(shards: crate::output_shards::OutputShards) -> Result<LateFreeze
 /// take the parallel step, the state is opened where it always was.
 pub fn state_after_pull() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_STATE_AFTER_PULL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_STATE_AFTER_PULL", false))
 }
 
 /// The builder's database over the parent's state: the provider in `slot`,
@@ -1036,7 +1034,7 @@ fn cumulative_gas(
 /// leader's serial seal chain.
 fn receipts_on_build_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_RECEIPTS_ON_BUILD_POOL").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_RECEIPTS_ON_BUILD_POOL", false))
 }
 
 /// The pool a block's receipts are built on: the build pool
@@ -1079,7 +1077,7 @@ fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
 /// only 8.7 -> 8.0 ms (10.200): the serial walks are the suspect.
 fn receipts_fused() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_RECEIPTS_FUSED").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_RECEIPTS_FUSED", false))
 }
 
 /// Where a receipts job's time went, us: the slots' references, the
@@ -1388,9 +1386,9 @@ fn after_parallel_step(
     AfterParallelStep::Serial
 }
 
-/// Thread-local: how long this thread's build waited in its selector for the
-/// parent's queue hand-off (`BuildOnOwnRequest::before_pull`), microseconds;
-/// reset at the build's selection and reported as `start_handoff_ms`.
+// Thread-local: how long this thread's build waited in its selector for the
+// parent's queue hand-off (`BuildOnOwnRequest::before_pull`), microseconds;
+// reset at the build's selection and reported as `start_handoff_ms`.
 thread_local! {
     static HANDOFF_WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -1469,6 +1467,7 @@ fn say_once_a_second(last: &std::sync::atomic::AtomicU64) -> bool {
 /// and configuration, this function creates a transaction payload. Returns
 /// a result indicating success with the payload or an error in case of failure.
 #[inline]
+#[allow(clippy::too_many_arguments)] // hot-path builder entry; the argument list is kept
 pub fn default_n42_payload<EvmConfig, Client, Pool, F, Cons>(
     evm_config: EvmConfig,
     client: Client,
@@ -1489,7 +1488,7 @@ where
     EvmConfig: ConfigureEvm<
         Primitives = EthPrimitives,
         NextBlockEnvCtx = NextBlockEnvAttributes,
-        BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
+        BlockAssembler = crate::assembler::N42HeaderAssembler<Client::ChainSpec>,
         BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
     >,
     Client: StateProviderFactory
@@ -1648,7 +1647,8 @@ where
     // trie, and collected from here afterwards.
     let qmdb_root: Arc<std::sync::Mutex<Option<Result<n42_qmdb_reth::PreparedBlock, String>>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let mut assembler = crate::assembler::N42BlockAssembler::new(EthBlockAssembler::new(chain_spec.clone()), hotstuff);
+    let mut assembler = crate::assembler::N42BlockAssembler::new(EthBlockAssembler::new(chain_spec.clone()), hotstuff)
+        .with_mobile_registry_root(attributes.mobile_registry_root);
     if let Some(state) = &qmdb {
         assembler = assembler.with_qmdb_root(crate::assembler::QmdbRootJob {
             state: state.clone(),
@@ -1753,7 +1753,7 @@ where
         crate::frame_blocks::note_beneficiary(group_env.block_env.beneficiary);
         install_plan_ahead_body(&queue);
     }
-    let mut best_txs = best_txs(BestTransactionsAttributes::new(
+    let best_txs = best_txs(BestTransactionsAttributes::new(
         base_fee,
         builder
             .evm_mut()
@@ -1906,7 +1906,7 @@ where
 
     let start_prepare_at = std::time::Instant::now();
     let mut header = cons
-        .prepare(&parent_header)
+        .prepare(&n42_header::seal_to_alloy(&parent_header))
         .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
     if hotstuff {
         header.beneficiary = coinbase;
@@ -2340,7 +2340,7 @@ where
             seal_header_ms = (seal_at.elapsed().as_millis() as u64).saturating_sub(root_ms + fields_ms);
             let step_at = std::time::Instant::now();
             let body = alloy_consensus::BlockBody { transactions, ommers: Vec::new(), withdrawals };
-            let sealed_block = SealedBlock::seal_parts(header.clone(), body);
+            let sealed_block = SealedBlock::seal_parts(n42_header::N42Header::from(header.clone()), body);
             let block_hash = SealedBlock::hash(&sealed_block);
             let recovered: Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>> =
                 Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(sealed_block, senders));
@@ -2649,6 +2649,7 @@ where
                         Some(&mut before_batches),
                         counted_tips,
                         prepared_exec,
+                        deferred_now,
                     )
                 } else {
                     crate::parallel_transfer::execute_for_build_counted(
@@ -2661,6 +2662,7 @@ where
                         None,
                         counted_tips,
                         prepared_exec,
+                        deferred_now,
                     )
                 };
                 let exec_done = std::time::Instant::now();
@@ -3337,8 +3339,8 @@ where
                     par_graft_build_us = graft.sharded_build_us;
                     par_graft_merge_us = graft.sharded_merge_us;
                     let db = builder.executor.evm_mut().db_mut();
-                    if !keep_cache {
-                        if let Some(withdrawals) = attributes.withdrawals.as_ref() {
+                    if !keep_cache
+                        && let Some(withdrawals) = attributes.withdrawals.as_ref() {
                             for withdrawal in withdrawals {
                                 let grafted = db
                                     .bundle_state
@@ -3366,7 +3368,6 @@ where
                                 }
                             }
                         }
-                    }
                     let fees = graft.beneficiary_delta;
                     par_committed = graft.committed;
                     par_reverts = graft.reverts;
@@ -5098,6 +5099,30 @@ where
         return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
     }
 
+    // Audit R3-E1: under deferred execution a follower votes for the block
+    // before executing it and checks that it is includable instead
+    // (`bin/n42/src/follower_import.rs` `check_includable_laid_out`; gov5
+    // the same, docs/PHASE_D_DEFERRED_EXECUTION.md 2.4): the transactions'
+    // gas limits within the block's, and each sender's summed worst-case
+    // cost (`frame_scan::tx_cost`) within its balance in the parent's
+    // post-state. The loop admits by that rule there, by reth's (the gas
+    // used, what executes) otherwise. Everything executed before the loop is
+    // the parallel step's: plain transfers whose gas limit is
+    // MIN_TRANSACTION_GAS, the gas each used (`transfer_key`), so their gas
+    // limits are `cumulative_gas_used`.
+    //
+    // The rest of the follower's rule holds by execution: the executor takes
+    // a transaction only at its sender's in-block nonce (so a sender's
+    // transactions run on from the parent's nonce, the pool yielding each
+    // sender's in nonce order), and only with its fee cap at or over the
+    // base fee and its tip at or under the cap (revm's checks, none disabled
+    // here).
+    let mut gas_budget = crate::includability::GasBudget::new(block_gas_limit, deferred_now);
+    gas_budget.admit(cumulative_gas_used);
+    let mut sender_ledger = deferred_now.then(crate::includability::SenderLedger::new);
+    // Whether the parallel step put transactions in the block: a sender of
+    // theirs met again here has a worst case the ledger has not counted.
+    let built_before_loop = tx_count > 0;
     loop {
         // Once the block cannot fit even the smallest transaction there is
         // nothing left to take: every further candidate would only be
@@ -5106,7 +5131,7 @@ where
         // nothing is taken from the queue and left neither built nor returned.
         // Closed as well after a parallel step that skipped a block's worth
         // (`AfterParallelStep::Finish`): what was taken goes back below.
-        if serial_closed || block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
+        if serial_closed || gas_budget.left(cumulative_gas_used) < MIN_TRANSACTION_GAS {
             break;
         }
         // The pool/execution split is timed with the cycle counter, not the
@@ -5156,11 +5181,10 @@ where
                         if !cached.accounts.contains_key(&sender) {
                             wanted.push(sender);
                         }
-                        if let Some(to) = pool_tx.to() {
-                            if !cached.accounts.contains_key(&to) {
+                        if let Some(to) = pool_tx.to()
+                            && !cached.accounts.contains_key(&to) {
                                 wanted.push(to);
                             }
-                        }
                     }
                     wanted.sort_unstable();
                     wanted.dedup();
@@ -5196,7 +5220,7 @@ where
         if tx_count == 0 { build_stage.at(3); }
         debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
         // ensure we still have capacity for this transaction
-        if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+        if !gas_budget.fits(pool_tx.gas_limit(), cumulative_gas_used) {
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
             // continue
@@ -5226,14 +5250,12 @@ where
         // ~0 stale transactions a block, the executor refuses a stale one
         // anyway, and the read cost ~1 us on every transaction (round 36).
         // Kept behind N42_BUILDER_STALE_CHECK=1 for the bookend.
-        if stale_check() {
-            if let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender()) {
-                if pool_tx.nonce() < account.nonce {
+        if stale_check()
+            && let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender())
+                && pool_tx.nonce() < account.nonce {
                     stale_txs += 1;
                     continue;
                 }
-            }
-        }
 
         // convert tx to a signed transaction
         let tx = pool_tx.to_consensus();
@@ -5261,6 +5283,52 @@ where
                 continue;
             }
         }
+
+        // Audit R3-E1: the sender's worst case within its parent balance
+        // (deferred execution only). The account is read below the block's
+        // state, from the parent's post-state the build executes on, once per
+        // sender; the admission is committed only once the transaction is in.
+        let admitted = match sender_ledger.as_mut() {
+            None => None,
+            Some(ledger) => {
+                use crate::includability::{Admission, Opening};
+                let sender = pool_tx.sender();
+                let nonce = pool_tx.nonce();
+                let verdict = ledger.admit(sender, crate::frame_scan::tx_cost(tx.inner()), || {
+                    let db = builder.evm_mut().db_mut();
+                    let read = |err: &dyn std::fmt::Display| std::io::Error::other(format!("account {sender}: {err}"));
+                    let parent = db.database.basic(sender).map_err(|err| read(&err))?.unwrap_or_default();
+                    // A nonce past the parent's after the parallel step: the
+                    // sender's transfers are in the block when its in-block
+                    // nonce moved (a gap otherwise, which execution refuses).
+                    let unseen_earlier = built_before_loop
+                        && nonce > parent.nonce
+                        && db.basic(sender).map_err(|err| read(&err))?.map_or(0, |now| now.nonce) != parent.nonce;
+                    Ok::<_, std::io::Error>(Opening { balance: parent.balance, unseen_earlier })
+                });
+                match verdict {
+                    Ok(Admission::Admit(admitted)) => Some(admitted),
+                    Ok(Admission::OverBalance { balance, cost }) => {
+                        trace!(target: "payload_builder", tx = ?tx.hash(), %balance, %cost, "skipping a transaction whose sender's worst case exceeds its balance");
+                        refuse!(
+                            &pool_tx,
+                            InvalidPoolTransactionError::Consensus(InvalidTransactionError::InsufficientFunds(
+                                reth_primitives_traits::GotExpected { got: balance, expected: cost }.into(),
+                            ))
+                        );
+                        continue;
+                    }
+                    Ok(Admission::Unseen) => {
+                        refuse!(
+                            &pool_tx,
+                            InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
+                        );
+                        continue;
+                    }
+                    Err(err) => return Err(PayloadBuilderError::other(err)),
+                }
+            }
+        };
 
         // What the bookkeeping after execution needs, taken before the
         // transaction is moved into the executor (it used to be cloned).
@@ -5341,6 +5409,10 @@ where
         let tx_gas_used = gas_used.tx_gas_used();
         total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
         cumulative_gas_used += tx_gas_used;
+        gas_budget.admit(pool_tx.gas_limit());
+        if let Some(admitted) = admitted {
+            admitted.commit();
+        }
     }
 
     debug!(target: "payload_builder", tx_count, ?cumulative_gas_used, ?total_fees, "payload builder finished processing transactions");
@@ -5551,7 +5623,7 @@ where
     // Keep the recovered senders: EthBuiltPayload now takes a RecoveredBlock, and
     // re-recovering them from signatures here would be pure waste.
     let senders = block.senders().to_vec();
-    let sealed_block = SealedBlock::seal_parts(header, block.into_block().body);
+    let sealed_block = SealedBlock::seal_parts(n42_header::N42Header::from(header), block.into_block().body);
     let block_hash = SealedBlock::hash(&sealed_block);
     // Under the sealed hash, for the next header: the child's header is
     // assembled from and checked against exactly this.
@@ -5744,7 +5816,7 @@ impl<CB> N42PayloadServiceBuilder<CB> {
 impl<Node, Pool, EvmConfig, CB> PayloadServiceBuilder<Node, Pool, EvmConfig>
     for N42PayloadServiceBuilder<CB>
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = n42_header::N42ChainSpec, Primitives = EthPrimitives>>,
     <Node::Types as NodeTypes>::Payload: PayloadTypes<
         BuiltPayload = EthBuiltPayload,
         PayloadAttributes = EthPayloadAttributes,
@@ -6242,14 +6314,14 @@ mod plan_body_tests {
             assert!(made.slots.iter().all(|slot| slot.get().is_none()), "empty slots");
 
             // Executed on the prepared partition and slots, and fresh.
-            let header = alloy_consensus::Header {
+            let header = n42_header::N42Header::from(alloy_consensus::Header {
                 number: 20_000_000,
                 beneficiary,
                 gas_limit: 5_000_000_000,
                 base_fee_per_gas: Some(base_fee),
                 timestamp: 1_800_000_000,
                 ..Default::default()
-            };
+            });
             let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(
                 reth_chainspec::MAINNET.clone(),
                 crate::fast_transfer::N42EvmFactory::with_fast_transfers(true),
@@ -6291,7 +6363,7 @@ mod plan_body_tests {
 mod depth_two_tests {
     use super::*;
     use reth_primitives_traits::SealedHeader;
-    use alloy_consensus::Header;
+    use n42_header::N42Header as Header;
 
     /// T9 of docs/DEFERRED_DEPTH_2_DESIGN.md: the limit step never goes below
     /// the carried `gasUsed`, and never further than the parent allows.
@@ -6343,11 +6415,11 @@ mod depth_two_tests {
         crate::executed_fields::remember(gp_built, fields(0xd4));
         // The parent was built on the grandparent's sealed hash.
         let parent = SealedHeader::new(
-            Header { number: 12, timestamp: 12, parent_hash: gp_sealed, ..Default::default() },
+            n42_header::N42Header::from(alloy_consensus::Header { number: 12, timestamp: 12, parent_hash: gp_sealed, ..Default::default() }),
             alloy_primitives::keccak256(b"depth-two-tests-0xd5"),
         );
         let no_alias = SealedHeader::new(
-            Header { number: 12, timestamp: 12, parent_hash: alloy_primitives::keccak256(b"depth-two-tests-0xd6"), ..Default::default() },
+            n42_header::N42Header::from(alloy_consensus::Header { number: 12, timestamp: 12, parent_hash: alloy_primitives::keccak256(b"depth-two-tests-0xd6"), ..Default::default() }),
             alloy_primitives::keccak256(b"depth-two-tests-0xd7"),
         );
         // With nothing under the sealed hash the build waits, then fails.
@@ -6367,13 +6439,13 @@ mod depth_two_tests {
         // other tests left running may have pushed the entry out meanwhile.
         crate::executed_fields::remember(gp_built, fields(0xd4));
         let on_resealed = SealedHeader::new(
-            Header { number: 12, timestamp: 13, parent_hash: gp_resealed, ..Default::default() },
+            n42_header::N42Header::from(alloy_consensus::Header { number: 12, timestamp: 13, parent_hash: gp_resealed, ..Default::default() }),
             alloy_primitives::keccak256(b"depth-two-tests-0xd8"),
         );
         assert_eq!(carried_fields_for_seal(&genesis, &on_resealed, Some(on_resealed.hash()), 2), Some(fields(0xd4)));
         // At the chain start (parent 1) the genesis result is the parent's own header.
         let block1 = SealedHeader::new(
-            Header { number: 1, timestamp: 1, state_root: alloy_primitives::keccak256(b"depth-two-tests-0xd9"), ..Default::default() },
+            n42_header::N42Header::from(alloy_consensus::Header { number: 1, timestamp: 1, state_root: alloy_primitives::keccak256(b"depth-two-tests-0xd9"), ..Default::default() }),
             alloy_primitives::keccak256(b"depth-two-tests-0xda"),
         );
         assert_eq!(
@@ -6386,7 +6458,7 @@ mod depth_two_tests {
 #[cfg(test)]
 mod hand_out_early_tests {
     use super::{hand_out_early, EthBuiltPayload};
-    use alloy_consensus::Header;
+    use n42_header::N42Header as Header;
     use alloy_primitives::{Address, U256};
     use reth_primitives_traits::{RecoveredBlock, SealedBlock};
     use std::sync::Arc;
@@ -6397,7 +6469,7 @@ mod hand_out_early_tests {
             alloy_primitives::Signature::test_signature(),
         ));
         let block = n42_tx_types::Block {
-            header: Header { number: 7, extra_data: b"sealed".as_slice().into(), ..Default::default() },
+            header: n42_header::N42Header::from(alloy_consensus::Header { number: 7, extra_data: b"sealed".as_slice().into(), ..Default::default() }),
             body: alloy_consensus::BlockBody { transactions: vec![tx], ommers: Vec::new(), withdrawals: None },
         };
         Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::with_last_byte(1)]))
@@ -6423,5 +6495,257 @@ mod hand_out_early_tests {
         assert_eq!(kept.fees(), U256::from(3));
         // The hand-off's move then succeeds: the last holder unwraps it.
         assert!(Arc::try_unwrap(recovered).is_ok());
+    }
+}
+
+/// Audit R3-E1: under deferred execution the builder admits only what the
+/// follower's includability check (`bin/n42/src/follower_import.rs`,
+/// `check_includable_laid_out`) accepts; before the fork, reth's rule.
+#[cfg(test)]
+mod includability_tests {
+    use super::*;
+    use alloy_consensus::{Signed, TxEip1559};
+    use n42_header::N42Header as Header;
+    use alloy_primitives::{Address, Bytes, Signature, TxKind};
+    use reth_basic_payload_builder::PayloadConfig;
+    use reth_chainspec::{ChainSpec, ChainSpecBuilder};
+    use reth_primitives_traits::{Recovered, RecoveredBlock, SealedHeader};
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_transaction_pool::{
+        error::InvalidPoolTransactionError,
+        identifier::{SenderId, TransactionId},
+        noop::NoopTransactionPool,
+        TransactionOrigin,
+    };
+    use std::collections::{HashMap, VecDeque};
+
+    type Pooled = crate::N42PooledTransaction;
+    type Candidate = Arc<ValidPoolTransaction<Pooled>>;
+
+    const GAS_LIMIT: u64 = 1_000_000;
+    const BASE_FEE: u64 = 1_000_000_000;
+    const TIMESTAMP: u64 = 1_800_000_000;
+
+    /// The pool's best transactions, in the order given: a refusal drops the
+    /// sender's later transactions, as reth's iterator does.
+    struct Listed {
+        txs: VecDeque<Candidate>,
+        refused: Vec<Address>,
+    }
+
+    impl Iterator for Listed {
+        type Item = Candidate;
+        fn next(&mut self) -> Option<Candidate> {
+            loop {
+                let tx = self.txs.pop_front()?;
+                if !self.refused.contains(&tx.sender()) {
+                    return Some(tx);
+                }
+            }
+        }
+    }
+
+    impl BestTransactions for Listed {
+        fn mark_invalid(&mut self, transaction: &Candidate, _kind: InvalidPoolTransactionError) {
+            self.refused.push(transaction.sender());
+        }
+        fn no_updates(&mut self) {}
+        fn skip_blobs(&mut self) {}
+        fn set_skip_blobs(&mut self, _skip_blobs: bool) {}
+    }
+
+    fn address(i: u64) -> Address {
+        let mut a = [0u8; 20];
+        a[12..].copy_from_slice(&i.to_be_bytes());
+        Address::from(a)
+    }
+
+    /// A transfer of `sender` at `nonce`: `gas_limit`, fee cap 10 gwei, tip
+    /// 1 gwei (2 gwei effective at the 1 gwei base fee), value 1.
+    fn transfer(sender: u64, nonce: u64, gas_limit: u64) -> Candidate {
+        let inner = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: 10_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(address(1_000_000 + sender * 1_000 + nonce)),
+            value: U256::from(1),
+            input: Bytes::new(),
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
+        let envelope = TransactionSigned::from(reth_ethereum_primitives::TransactionSigned::from(signed));
+        let encoded = alloy_eips::eip2718::Encodable2718::encode_2718_len(&envelope);
+        Arc::new(ValidPoolTransaction {
+            transaction: Pooled::new(Recovered::new_unchecked(envelope, address(sender)), encoded),
+            transaction_id: TransactionId::new(SenderId::from(sender), nonce),
+            propagate: false,
+            timestamp: std::time::Instant::now(),
+            origin: TransactionOrigin::External,
+            authority_ids: None,
+        })
+    }
+
+    fn chain(deferred: bool) -> Arc<ChainSpec> {
+        let mut genesis = alloy_genesis::Genesis::default();
+        if deferred {
+            genesis
+                .config
+                .extra_fields
+                .insert(reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(), serde_json::json!(TIMESTAMP));
+        }
+        Arc::new(ChainSpecBuilder::mainnet().genesis(genesis).prague_activated().build())
+    }
+
+    /// The block built over `accounts` from `txs`, the first past the fork
+    /// (deferred execution from `TIMESTAMP`) when `deferred`.
+    fn build(deferred: bool, accounts: &[(Address, u64, U256)], txs: Vec<Candidate>) -> RecoveredBlock<n42_tx_types::Block> {
+        let spec = chain(deferred);
+        let client = MockEthProvider::default().with_chain_spec((*spec).clone());
+        for (address, nonce, balance) in accounts {
+            client.add_account(*address, ExtendedAccount::new(*nonce, *balance));
+        }
+        // Far above any height another test marks decided (the process-wide
+        // `canonical_head`, which would decline the build), and before the
+        // fork, so the header carries the parent's own fields.
+        let parent = n42_header::N42Header::from(alloy_consensus::Header {
+            number: 1_000_000_000,
+            gas_limit: GAS_LIMIT,
+            gas_used: GAS_LIMIT / 2,
+            base_fee_per_gas: Some(BASE_FEE),
+            timestamp: TIMESTAMP - 4,
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            parent_beacon_block_root: Some(B256::ZERO),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+            ..Default::default()
+        });
+        let attributes = EthPayloadAttributes {
+            timestamp: TIMESTAMP,
+            prev_randao: B256::ZERO,
+            suggested_fee_recipient: address(7),
+            withdrawals: Some(Vec::new()),
+            parent_beacon_block_root: Some(B256::ZERO),
+            slot_number: None,
+            target_gas_limit: None,
+            mobile_registry_root: None,
+        };
+        let config = PayloadConfig {
+            parent_header: Arc::new(SealedHeader::seal_slow(parent)),
+            parent_block_info: None,
+            attributes,
+            payload_id: Default::default(),
+        };
+        let args = BuildArguments::new(Default::default(), None, None, config, Default::default(), None);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(
+            spec.clone(),
+            crate::fast_transfer::N42EvmFactory::with_fast_transfers(false),
+        );
+        let listed = Listed { txs: txs.into(), refused: Vec::new() };
+        let outcome = default_n42_payload(
+            evm_config,
+            client,
+            NoopTransactionPool::<Pooled>::new(),
+            EthereumBuilderConfig::new().with_gas_limit(GAS_LIMIT),
+            args,
+            move |_| Box::new(listed) as BestTransactionsIter<NoopTransactionPool<Pooled>>,
+            Arc::new(crate::hotstuff_consensus::HotStuffConsensus::new(Arc::new(n42_header::N42ChainSpec::from(spec)))),
+            None,
+            None,
+            None,
+        )
+        .expect("the build");
+        let payload = outcome.into_payload().expect("a payload");
+        payload.recovered_block().clone()
+    }
+
+    /// The follower's verdict, recomputed over a built block (the follower's
+    /// own functions live in `bin/n42`): the gas limits' sum within the
+    /// header's, and per sender in block order nonces on from the parent's,
+    /// fee cap over the base fee, tip under the cap, and the summed
+    /// worst-case cost within the parent's balance.
+    fn follower_verdict(block: &RecoveredBlock<n42_tx_types::Block>, accounts: &[(Address, u64, U256)]) -> Result<(), String> {
+        let header = block.header();
+        let base_fee = u128::from(header.base_fee_per_gas.unwrap_or(0));
+        let gas: u64 = block.body().transactions.iter().map(|tx| tx.gas_limit()).sum();
+        if gas > header.gas_limit {
+            return Err(format!("gas limits sum to {gas}, over the block's {}", header.gas_limit));
+        }
+        let mut ledger: HashMap<Address, (u64, U256)> = HashMap::new();
+        for (tx, sender) in block.body().transactions.iter().zip(block.senders()) {
+            let (nonce, balance) = accounts.iter().find(|(a, _, _)| a == sender).map_or((0, U256::ZERO), |(_, n, b)| (*n, *b));
+            let entry = ledger.entry(*sender).or_insert((nonce, U256::ZERO));
+            if tx.nonce() != entry.0 {
+                return Err(format!("{sender}: nonce {}, expected {}", tx.nonce(), entry.0));
+            }
+            if tx.max_fee_per_gas() < base_fee || tx.max_priority_fee_per_gas().is_some_and(|tip| tip > tx.max_fee_per_gas()) {
+                return Err(format!("{sender}: fees"));
+            }
+            entry.0 += 1;
+            entry.1 += crate::frame_scan::tx_cost(tx);
+            if entry.1 > balance {
+                return Err(format!("{sender}: cost {} over a balance of {balance}", entry.1));
+            }
+        }
+        Ok(())
+    }
+
+    const RICH: U256 = U256::from_limbs([0, 1, 0, 0]);
+
+    /// Thirty transfers of 60,000 gas limit that use 21,000 each: the gas
+    /// used fits a 1,000,000 block, the gas limits do not.
+    fn headroom_case() -> (Vec<(Address, u64, U256)>, Vec<Candidate>) {
+        let accounts: Vec<_> = (1..=30).map(|s| (address(s), 0, RICH)).collect();
+        let txs = (1..=30).map(|s| transfer(s, 0, 60_000)).collect();
+        (accounts, txs)
+    }
+
+    #[test]
+    fn a_deferred_build_keeps_the_gas_limits_within_the_block() {
+        let (accounts, txs) = headroom_case();
+        let block = build(true, &accounts, txs);
+        let gas: u64 = block.body().transactions.iter().map(|tx| tx.gas_limit()).sum();
+        assert!(gas <= block.header().gas_limit, "gas limits {gas} over {}", block.header().gas_limit);
+        assert_eq!(block.body().transactions.len(), (GAS_LIMIT / 60_000) as usize, "as many as the limits allow");
+        follower_verdict(&block, &accounts).expect("the follower accepts the block");
+    }
+
+    #[test]
+    fn a_build_before_the_fork_budgets_by_gas_used() {
+        let (accounts, txs) = headroom_case();
+        let block = build(false, &accounts, txs);
+        assert_eq!(block.body().transactions.len(), 30, "reth's rule: every transaction executes within the gas");
+    }
+
+    /// The worst-case cost of one transfer: 21,000 x 10 gwei + 1.
+    fn worst() -> U256 {
+        U256::from(21_000u64 * 10_000_000_000 + 1)
+    }
+
+    /// Sender 1 can pay two transfers at the effective price, and each at
+    /// its fee cap on its own, but not both at the fee cap; sender 2 is rich.
+    fn balance_case() -> (Vec<(Address, u64, U256)>, Vec<Candidate>) {
+        let accounts = vec![(address(1), 0, worst() * U256::from(2) - U256::from(1)), (address(2), 0, RICH)];
+        let txs = vec![transfer(1, 0, 21_000), transfer(1, 1, 21_000), transfer(2, 0, 21_000), transfer(2, 1, 21_000)];
+        (accounts, txs)
+    }
+
+    #[test]
+    fn a_deferred_build_keeps_each_senders_worst_case_within_its_balance() {
+        let (accounts, txs) = balance_case();
+        let block = build(true, &accounts, txs);
+        let of = |s: u64| block.senders().iter().filter(|a| **a == address(s)).count();
+        assert_eq!(of(1), 1, "the second transfer could cost more than sender 1 has");
+        assert_eq!(of(2), 2, "the other sender's transfers are still in");
+        follower_verdict(&block, &accounts).expect("the follower accepts the block");
+    }
+
+    #[test]
+    fn a_build_before_the_fork_admits_what_executes() {
+        let (accounts, txs) = balance_case();
+        let block = build(false, &accounts, txs);
+        assert_eq!(block.body().transactions.len(), 4, "reth's rule: both of sender 1's transfers execute");
     }
 }

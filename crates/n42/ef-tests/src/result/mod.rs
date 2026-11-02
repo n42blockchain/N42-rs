@@ -24,17 +24,17 @@ pub enum TestStatus {
 
 impl TestStatus {
     /// Check if the test passed
-    pub fn is_passed(&self) -> bool {
+    pub const fn is_passed(&self) -> bool {
         matches!(self, Self::Passed)
     }
 
     /// Check if the test failed
-    pub fn is_failed(&self) -> bool {
+    pub const fn is_failed(&self) -> bool {
         matches!(self, Self::Failed)
     }
 
     /// Check if the test was skipped
-    pub fn is_skipped(&self) -> bool {
+    pub const fn is_skipped(&self) -> bool {
         matches!(self, Self::Skipped)
     }
 }
@@ -77,7 +77,7 @@ pub struct TestResult {
 
 impl TestResult {
     /// Create a passed test result
-    pub fn passed(name: String, fork: String, duration: Duration) -> Self {
+    pub const fn passed(name: String, fork: String, duration: Duration) -> Self {
         Self {
             name,
             fork,
@@ -93,7 +93,7 @@ impl TestResult {
     }
 
     /// Create a failed test result
-    pub fn failed(name: String, fork: String, duration: Duration, error: String) -> Self {
+    pub const fn failed(name: String, fork: String, duration: Duration, error: String) -> Self {
         Self {
             name,
             fork,
@@ -109,7 +109,7 @@ impl TestResult {
     }
 
     /// Create a skipped test result
-    pub fn skipped(name: String, fork: String, reason: String) -> Self {
+    pub const fn skipped(name: String, fork: String, reason: String) -> Self {
         Self {
             name,
             fork,
@@ -133,21 +133,21 @@ impl TestResult {
     }
 
     /// Set the expected and actual state roots
-    pub fn with_state_roots(mut self, expected: B256, actual: B256) -> Self {
+    pub const fn with_state_roots(mut self, expected: B256, actual: B256) -> Self {
         self.expected_state_root = Some(expected);
         self.actual_state_root = Some(actual);
         self
     }
 
     /// Set the expected and actual logs hashes
-    pub fn with_logs_hashes(mut self, expected: B256, actual: B256) -> Self {
+    pub const fn with_logs_hashes(mut self, expected: B256, actual: B256) -> Self {
         self.expected_logs_hash = Some(expected);
         self.actual_logs_hash = Some(actual);
         self
     }
 
     /// Set the variant index
-    pub fn with_variant(mut self, index: usize) -> Self {
+    pub const fn with_variant(mut self, index: usize) -> Self {
         self.variant_index = Some(index);
         self
     }
@@ -206,14 +206,14 @@ mod duration_ms {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;
 
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         duration.as_millis().serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -229,7 +229,7 @@ impl TestSummary {
     }
 
     /// Total number of tests
-    pub fn total(&self) -> usize {
+    pub const fn total(&self) -> usize {
         self.passed + self.failed + self.skipped
     }
 
@@ -254,7 +254,7 @@ impl TestSummary {
     }
 
     /// Merge another summary into this one
-    pub fn merge(&mut self, other: &TestSummary) {
+    pub fn merge(&mut self, other: &Self) {
         self.passed += other.passed;
         self.failed += other.failed;
         self.skipped += other.skipped;

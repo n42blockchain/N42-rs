@@ -22,7 +22,7 @@ use reth_rpc_eth_types::{receipt::EthReceiptConverter, EthApiError};
 pub struct N42RpcTypes;
 
 impl RpcTypes for N42RpcTypes {
-    type Header = alloy_rpc_types_eth::Header;
+    type Header = alloy_rpc_types_eth::Header<n42_header::N42Header>;
     type Receipt = TransactionReceipt<N42RpcReceipt>;
     type Log = Log;
     type TransactionResponse = alloy_rpc_types_eth::Transaction<N42TxEnvelope>;

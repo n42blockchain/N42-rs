@@ -26,6 +26,7 @@ fn attributes_for(context: &ProposalContext) -> PayloadAttributes {
         parent_beacon_block_root: Some(B256::ZERO),
         target_gas_limit: None,
         slot_number: None,
+        mobile_registry_root: None,
     }
 }
 
@@ -47,6 +48,8 @@ async fn a_commit_whose_checkpoint_cannot_be_written_is_not_finalised() {
     let mut events = Vec::new();
     within(svc.handle_output(committed(3, hash), &mut events)).await.expect("a refused commit is not fatal");
     assert_eq!(writes.load(Ordering::SeqCst), 1, "the checkpoint was attempted");
+    // Audit 2026-10 B-7: voting goes on, so the refusal is counted.
+    assert_eq!(svc.checkpoint_failures, 1, "the failure is counted");
     assert!(events.is_empty(), "no Committed event for an undurable commit");
     assert!(rig.el.calls().is_empty(), "finality is never announced to the execution layer");
     assert_eq!(svc.driver.finalized(), ID.genesis_hash, "nothing was finalised");
@@ -136,8 +139,10 @@ async fn an_execution_that_is_not_a_verdict_asks_for_the_body_and_an_invalid_one
     assert_eq!(events.len(), before, "nothing asked for a body already held");
     assert!(rig.svc.body_wait.is_empty());
 
-    // SYNCING is not a verdict either.
+    // SYNCING is not a verdict either: the block is executed again from the
+    // payload held, not asked of the fleet (audit 2026-10 round 2, R2-R3)...
     rig.svc.driver.cache_payload(built.hash, built.execution_data.clone());
+    rig.svc.driver.set_import_retry_backoff(vec![Duration::ZERO]);
     rig.el.set_behaviour(MockBehaviour { new_payload_status: PayloadStatusEnum::Syncing, ..Default::default() });
     rig.svc.body_grace = Duration::ZERO;
     rig.svc.awaiting_bodies.clear();
@@ -145,6 +150,11 @@ async fn an_execution_that_is_not_a_verdict_asks_for_the_body_and_an_invalid_one
     events.clear();
     within(rig.svc.handle_output(EngineOutput::ExecuteBlock(built.hash), &mut events)).await.expect("ok");
     assert!(!rig.svc.imported.contains(&built.hash), "never counted as imported");
+    assert!(events.is_empty() && rig.svc.awaiting_bodies.is_empty(), "executed again, not asked for: {events:?}");
+    // ...and once the pauses run out, asked for at once with no grace.
+    for action in within(rig.svc.driver.retry_failed_imports()).await {
+        rig.svc.apply_driver_action(action, &mut events).expect("ok");
+    }
     assert!(rig.svc.awaiting_bodies.contains(&built.hash), "with no grace the ask is immediate");
     assert_eq!(events, vec![ServiceEvent::PayloadMissing { block_hash: built.hash }]);
     // Asked again at once: rate limited, no second event.
@@ -1002,6 +1012,24 @@ async fn a_vote_log_that_keeps_failing_stops_the_validator_with_a_fatal_error() 
     assert_eq!(recorder.value("n42_h2_fatal{reason=vote_log}"), Some(1.0));
     // Reported once: the fault was taken.
     svc.check_local_faults().expect("nothing new");
+}
+
+/// Audit 2026-10 A-1: the batch paths drop the engine's `Fatal` for a vote
+/// log that keeps failing (at debug), while the engine has halted voting.
+/// The halt itself is what the service sees: it ends with the same fatal
+/// fault as on the direct path, and the halted gauge is set, once.
+#[tokio::test]
+async fn a_vote_log_halt_reported_only_by_the_engine_still_stops_the_validator() {
+    let recorder = Captured::default();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let rig = node(1, 0, None).await;
+    let mut svc = rig.svc;
+    svc.engine.halt_voting("vote_log");
+    let err = svc.check_local_faults().expect_err("the halt ends the step");
+    assert!(matches!(err, ServiceError::Fatal { reason: "vote_log", .. }), "{err:?}");
+    assert_eq!(recorder.value("n42_h2_voting_halted{reason=vote_log}"), Some(1.0));
+    assert_eq!(recorder.value("n42_h2_fatal{reason=vote_log}"), Some(1.0));
+    svc.check_local_faults().expect("reported once");
 }
 
 #[tokio::test]

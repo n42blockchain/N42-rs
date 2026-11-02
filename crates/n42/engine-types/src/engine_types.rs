@@ -134,12 +134,12 @@ impl N42BuiltPayload {
             BlobSidecars::Eip7594(sidecars) => BlobsBundleV2::from(sidecars),
             BlobSidecars::Eip4844(_) => return Err(BuiltPayloadConversionError::UnexpectedEip4844Sidecars),
         };
+        let block_hash = block.hash();
+        let block = Arc::unwrap_or_clone(block).into_block();
+        let mut execution_payload = ExecutionPayloadV4::from_block_unchecked_with_bal(block_hash, &block, block_access_list);
+        execution_payload.mobile_registry_root = block.header.mobile_registry_root;
         Ok(ExecutionPayloadEnvelopeV6 {
-            execution_payload: ExecutionPayloadV4::from_block_unchecked_with_bal(
-                block.hash(),
-                &Arc::unwrap_or_clone(block).into_block(),
-                block_access_list,
-            ),
+            execution_payload,
             block_value: fees,
             should_override_builder: false,
             blobs_bundle,
@@ -152,8 +152,7 @@ impl N42BuiltPayload {
         let Self { block, requests, block_access_list, .. } = self;
         let block_hash = block.hash();
         let block = Arc::unwrap_or_clone(block).into_block();
-        let (payload, sidecar) =
-            ExecutionPayload::from_block_unchecked_with_extras(block_hash, &block, block_access_list);
+        let (payload, sidecar) = payload_with_header_tail(block_hash, &block, block_access_list);
         let sidecar = if let Some(requests) = requests {
             block.header.parent_beacon_block_root.map_or(sidecar, |parent_beacon_block_root| {
                 ExecutionPayloadSidecar::v4(
@@ -265,10 +264,25 @@ impl PayloadTypes for N42EngineTypes {
         block: SealedBlock<<<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>,
         bal: Option<Bytes>,
     ) -> Self::ExecutionData {
-        let (payload, sidecar) =
-            ExecutionPayload::from_block_unchecked_with_extras(block.hash(), &block.into_block(), bal);
+        let block_hash = block.hash();
+        let (payload, sidecar) = payload_with_header_tail(block_hash, &block.into_block(), bal);
         ExecutionData { payload, sidecar }
     }
+}
+
+/// alloy's payload conversion with the header's slot number and registry
+/// root carried ([`n42_header::engine::payload_from_block`]). A root on a
+/// pre-Cancun header has no payload field; that header is not one this node
+/// builds or accepts, so the payload goes out without it and says so.
+fn payload_with_header_tail(
+    block_hash: alloy_primitives::B256,
+    block: &Block,
+    bal: Option<Bytes>,
+) -> (ExecutionPayload, ExecutionPayloadSidecar) {
+    n42_header::engine::payload_from_block(block_hash, block, bal.clone()).unwrap_or_else(|err| {
+        tracing::error!(target: "n42::engine", %err, "payload without the header's registry root");
+        ExecutionPayload::from_block_unchecked_with_extras(block_hash, block, bal)
+    })
 }
 
 impl EngineTypes for N42EngineTypes {
@@ -315,7 +329,7 @@ mod tests {
         let body = BlockBody { transactions, ommers: Vec::new(), withdrawals: Some(Vec::new().into()) };
         let transactions = body.transactions.len();
         let senders = vec![Address::repeat_byte(1); transactions];
-        Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(Block { header, body }), senders))
+        Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(Block { header: header.into(), body }), senders))
     }
 
     fn payload(transactions: usize) -> N42BuiltPayload {
@@ -456,10 +470,39 @@ mod tests {
         assert_eq!(data.payload.block_hash(), hash);
         assert_eq!(data.payload.transactions().len(), 2);
         // The beacon root travels in the sidecar, so the whole of `ExecutionData` decodes back.
-        let rebuilt: Block = data.try_into_block::<N42TxEnvelope>().expect("decodes back");
+        let payload = data.payload.clone();
+        let rebuilt: Block = n42_header::engine::block_with_payload_root(
+            data.try_into_block::<N42TxEnvelope>().expect("decodes back"),
+            &payload,
+        );
         assert_eq!(rebuilt.header.hash_slow(), hash, "the header survives the round trip");
         assert_eq!(rebuilt.body.transactions.len(), 2);
         assert_eq!(alloy_consensus::Transaction::nonce(&rebuilt.body.transactions[1]), 1);
+    }
+
+    /// gov5's header tail (slot number, registry root, no access-list hash)
+    /// survives the node's payload conversion and comes back under the same
+    /// hash.
+    #[test]
+    fn block_to_payload_carries_the_slot_and_the_registry_root() {
+        let recovered = block(1);
+        let mut header = recovered.sealed_block().header().clone();
+        header.slot_number = Some(header.number);
+        header.mobile_registry_root = Some(B256::repeat_byte(0x24));
+        let body = recovered.sealed_block().body().clone();
+        let sealed = SealedBlock::seal_slow(Block { header, body });
+        let hash = sealed.hash();
+        let data = <N42EngineTypes as PayloadTypes>::block_to_payload(sealed, None);
+        let v4 = data.payload.as_v4().expect("a slot number needs a V4 payload");
+        assert_eq!(v4.mobile_registry_root, Some(B256::repeat_byte(0x24)));
+        assert_eq!(v4.slot_number, 12);
+        let payload = data.payload.clone();
+        let rebuilt: Block = n42_header::engine::block_with_payload_root(
+            data.try_into_block::<N42TxEnvelope>().expect("decodes back"),
+            &payload,
+        );
+        assert_eq!(rebuilt.header.block_access_list_hash, None);
+        assert_eq!(rebuilt.header.hash_slow(), hash, "the 24-element header survives");
     }
 
     #[test]

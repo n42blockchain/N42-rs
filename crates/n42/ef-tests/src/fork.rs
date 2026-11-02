@@ -51,7 +51,7 @@ pub enum ForkSpec {
 }
 
 impl ForkSpec {
-    /// Parse a fork name string into a ForkSpec
+    /// Parse a fork name string into a `ForkSpec`
     pub fn from_name(name: &str) -> EfTestResult<Self> {
         let normalized = name.to_lowercase();
 
@@ -100,7 +100,7 @@ impl ForkSpec {
     }
 
     /// Get the fork name as a string
-    pub fn name(&self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::Frontier => "Frontier",
             Self::Homestead => "Homestead",
@@ -125,7 +125,7 @@ impl ForkSpec {
     }
 
     /// Check if this fork is supported for testing
-    pub fn is_supported(&self) -> bool {
+    pub const fn is_supported(&self) -> bool {
         // All forks up to Cancun are supported, Prague/Osaka may have partial support
         match self {
             Self::Osaka => false, // Future fork, not yet supported
@@ -133,8 +133,8 @@ impl ForkSpec {
         }
     }
 
-    /// Check if this fork uses PoS (post-merge)
-    pub fn is_pos(&self) -> bool {
+    /// Check if this fork uses `PoS` (post-merge)
+    pub const fn is_pos(&self) -> bool {
         matches!(
             self,
             Self::Paris | Self::Shanghai | Self::Cancun | Self::Prague | Self::Osaka
@@ -142,7 +142,7 @@ impl ForkSpec {
     }
 
     /// Check if this fork has EIP-1559
-    pub fn has_eip1559(&self) -> bool {
+    pub const fn has_eip1559(&self) -> bool {
         matches!(
             self,
             Self::London
@@ -157,11 +157,12 @@ impl ForkSpec {
     }
 
     /// Check if this fork has EIP-4844 (blob transactions)
-    pub fn has_blob_txs(&self) -> bool {
+    pub const fn has_blob_txs(&self) -> bool {
         matches!(self, Self::Cancun | Self::Prague | Self::Osaka)
     }
 
-    /// Convert to a ChainSpec with all forks up to and including this one enabled at block 0
+    /// Convert to a `ChainSpec` with all forks up to and including this one enabled at block 0
+    #[allow(clippy::match_same_arms)] // one arm per fork keeps the fork table readable
     pub fn to_chain_spec(&self, chain_id: u64) -> Arc<ChainSpec> {
         let mut builder = ChainSpecBuilder::default()
             .chain(chain_id.into())
@@ -191,7 +192,7 @@ impl ForkSpec {
     }
 
     /// Get the corresponding Hardfork enum value
-    pub fn to_hardfork(&self) -> EthereumHardfork {
+    pub const fn to_hardfork(&self) -> EthereumHardfork {
         match self {
             Self::Frontier => EthereumHardfork::Frontier,
             Self::Homestead | Self::DaoFork => EthereumHardfork::Homestead,

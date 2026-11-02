@@ -202,7 +202,10 @@ impl H2V4Observer {
             TransportEvent::Rejected { from, reason } => ObserverEvent::Rejected { from, reason },
             // A block body is fleet traffic, not finality: an observer watches
             // for Decide and does not execute blocks.
-            TransportEvent::Block { from, .. } | TransportEvent::Transactions { from, .. } => {
+            TransportEvent::Block { from, .. }
+            | TransportEvent::Transactions { from, .. }
+            | TransportEvent::MobilePacket { from, .. }
+            | TransportEvent::MobileRegistration { from, .. } => {
                 ObserverEvent::NonDecide { from }
             }
             // A body pushed straight at this node is a body like any other; an

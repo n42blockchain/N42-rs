@@ -7,7 +7,7 @@
 //! still pushing while the road runs.
 
 use super::*;
-use alloy_consensus::Header;
+use n42_header::N42Header as Header;
 use alloy_primitives::{Bytes, U256};
 use n42_engine_types::N42PooledTransaction;
 use reth_revm::revm::database::{CacheDB, EmptyDB};
@@ -142,7 +142,7 @@ fn bench_block_by_description() {
     let (senders_n, per, space) = (env("BENCH_SENDERS", 380), env("BENCH_PER", 429), env("BENCH_SPACE", 2_000_000));
     let (txs, senders) = fixture(1 << 32, senders_n, per, space, 64);
     let count = txs.len();
-    let header = Header {
+    let header = Header::from(alloy_consensus::Header {
         number: 20_000_000,
         beneficiary: addr(1),
         gas_limit: 10_000_000_000,
@@ -155,7 +155,7 @@ fn bench_block_by_description() {
         requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
         transactions_root: alloy_consensus::proofs::calculate_transaction_root(&txs),
         ..Default::default()
-    };
+    });
     let announced = header.hash_slow();
     let raw: Vec<Bytes> = txs.par_iter().map(|tx| Bytes::from(tx.encoded_2718())).collect();
     let body = n42_h2_consensus::encode_block_rlp_raw(&header, &raw, &[], None);
@@ -231,7 +231,7 @@ fn bench_block_by_description() {
     }
     let db = SharedDb(Arc::new(db));
     let evm_config = n42_engine_types::N42EvmConfig::new_with_evm_factory(
-        reth_chainspec::MAINNET.clone(),
+        Arc::new(n42_header::N42ChainSpec::from(reth_chainspec::MAINNET.clone())),
         n42_engine_types::fast_transfer::N42EvmFactory::with_fast_transfers(true),
     );
     let exec = |block: &RecoveredBlock<Block>| -> (f64, u64, u64) {

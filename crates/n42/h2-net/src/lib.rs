@@ -39,7 +39,7 @@ pub use libp2p::PeerId;
 pub use rpc::{
     BlockChunk, BlockReply, BlockTxnsReply, BlockTxnsRequest, RangeReply, RangeRequest,
     BLOCK_BY_HASH_PROTOCOL, BLOCK_PUSH_PROTOCOL, BLOCK_TXNS_PROTOCOL, BODIES_BY_RANGE_PROTOCOL,
-    MAX_RANGE_BLOCKS, MAX_RANGE_READ_BYTES, MAX_RANGE_REPLY_BYTES, VOTE_PROTOCOL, VoteRequest, vote_hello_message,
+    MAX_BLOCK_TXNS_BYTES, MAX_RANGE_BLOCKS, MAX_RANGE_READ_BYTES, MAX_RANGE_REPLY_BYTES, VOTE_PROTOCOL, VoteRequest, vote_hello_message,
 };
 pub use config::{gov5_gossipsub_config, max_gossip_size, max_gossip_wire_size};
 pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};
@@ -47,8 +47,9 @@ pub use observer::{H2V4Observer, ObserverConfig, ObserverError, ObserverEvent};
 pub use status::{Status, StatusError, STATUS_PROTOCOL};
 pub use topic::{h2_v4_topic, H2_V4_TOPIC, H2_V4_TOPIC_BASE};
 pub use transport::{
-    BlockRequestChannel, BlockTxnsChannel, H2V4Transport, RangeRequestChannel, PublishError, TransportConfig, TransportError,
-    TransportEvent,
+    BlockRequestChannel, BlockTxnsChannel, H2V4Transport, RangeRequestChannel, PublishError, ServeGuard, TransportConfig,
+    TransportError, TransportEvent, MAX_CONNECTIONS_PER_PEER, MobileTopic, MOBILEVERIFY_PACKET_KIND,
+    MOBILEVERIFY_REGISTRATION_KIND,
 };
 pub use pump::{INBOUND_CAPACITY, PUBLISH_CAPACITY, RETRY_CAPACITY};
 pub use tx_gossip::{decode_tx_batch, encode_tx_batch, TxGossipError, TX_BATCH_MAX_BYTES, TX_BATCH_MAX_TXS};

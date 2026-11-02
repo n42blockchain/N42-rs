@@ -26,7 +26,7 @@ const GENESIS: B256 = B256::ZERO;
 /// hashes to the block's hash, as a real body's does.
 fn body_of(block: &BuiltBlock) -> ForeignBody {
     let raw = block.execution_data.clone().into_block_raw().expect("the mock's payload is a block");
-    let rlp = n42_h2_consensus::encode_block_rlp_raw(&raw.header, &[], &[], None);
+    let rlp = n42_h2_consensus::encode_block_rlp_raw(&n42_h2_consensus::N42Header::from(raw.header.clone()), &[], &[], None);
     ForeignBody {
         block_hash: block.hash,
         number: block.number,
@@ -34,6 +34,7 @@ fn body_of(block: &BuiltBlock) -> ForeignBody {
         profile: n42_h2_consensus::N42HeaderProfile::Ethereum,
         rlp: rlp.into(),
         compact: false,
+        source: None,
     }
 }
 

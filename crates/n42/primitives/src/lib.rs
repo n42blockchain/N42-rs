@@ -12,12 +12,14 @@ pub use snapshot::Vote;
 mod validator;
 pub use validator::*;
 
+/// Beacon-chain types and the beacon state transition.
 pub mod beacon;
 /// Database codecs for the beacon types.
 pub mod db_codec;
 pub use beacon::*;
 
 mod activation_queue;
+/// Overflow-checked arithmetic.
 pub mod safe_arith;
 pub use safe_arith::{ArithError, SafeArith, SafeArithIter};
 
@@ -26,11 +28,15 @@ pub use committee_cache::CommitteeCache;
 
 mod attestation_duty;
 mod beacon_committee;
+/// The swap-or-not committee shuffle.
 pub mod shuffle_list;
 
 #[cfg(test)]
 mod test_util;
 
+/// 256-bit hash.
 pub type Hash256 = alloy_primitives::B256;
+/// Slot number.
 pub type Slot = u64;
+/// Index of a committee within a slot.
 pub type CommitteeIndex = u64;

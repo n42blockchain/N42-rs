@@ -26,5 +26,6 @@ pub(crate) fn n42_payload_attributes(
         // root missing for active Cancun block"
         parent_beacon_block_root: Some(B256::ZERO),
         //parent_beacon_block_root: None,
+        mobile_registry_root: None,
     }
 }

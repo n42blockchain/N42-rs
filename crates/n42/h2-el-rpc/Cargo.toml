@@ -12,6 +12,7 @@ description = "Engine API client implementing the HotStuff-2 execution-layer sea
 [dependencies]
 n42-env.workspace = true
 n42-h2-execution.workspace = true
+n42-header = { workspace = true, features = ["engine"] }
 n42-tx-types.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true

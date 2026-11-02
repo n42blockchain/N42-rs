@@ -798,6 +798,51 @@ execution layer's last import and asks the fleet for that block when it
 lacks it, and a member whose peers are ahead at connect pulls the gap
 however small.
 
+### Mobile verification (`/mobileverify`, 2026-11-02)
+
+A Rust member serves gov5's phone surface ("mining v3") when `h2_validator` runs with
+`--mobileverify.http <addr>`. The byte contracts (StreamPacket V2, header `Marshal`, the
+registry accumulator, the certificate JSON) are in `docs/MOBILEVERIFY_V3_PARITY.md` and are
+pinned by gov5's `cross_client_v1` fixtures in `crates/n42/mobileverify/testdata/`. These are the
+rules a Rust member has to match:
+
+- **Two gossip topics**, `/n42/<fork digest>/mobileverify_packet/ssz_snappy` and
+  `/n42/<fork digest>/mobileverify_registration/ssz_snappy`. They use the same digest as the
+  other topics. The payloads are **raw**, despite the suffix. A packet message is the
+  StreamPacket V2 bytes, and a registration is `pubkey(48) ‖ pop(96)`. `h2-net` joins them only
+  with `TransportConfig::with_mobileverify`. A member checks a relayed packet's header hash
+  against its block hash before caching it, and a relayed registration's proof of possession
+  before admitting it. It republishes neither: gossipsub forwards them.
+- **The routes** are gov5's `httpserver.go`, route for route: `register`, `packet/<hash>`,
+  `receipt`, `cert/<hash>`, `magnet/<hash>` (always 404: no torrent seeding), `alarms`,
+  `snapshot`, `health` and `latest`. Status codes, error bodies, body limits and the per-IP
+  register limit match gov5's, and success JSON is Go's encoder output (sorted keys, trailing
+  newline). The surface adds two things: `503 busy` when the pairing pool is saturated, and a
+  loopback-only `PUT /mobileverify/packet`.
+- **The registry is committed every 45 s** (`--mobileverify.collect-window-sec`) on each node's
+  own timer, as in gov5, and logged as `registry epoch committed`. The committed set is written
+  to `<datadir>/mobileverify/registry.bin` (tmp file then rename) and imported at start. Index
+  assignment can differ between nodes when a registration straddles an epoch boundary. gov5 has
+  the same property.
+- **The registry root goes into a header only under the MobileAnchor gate**, which needs
+  `mobileAnchorTime` and Glamsterdam both active (`mobile_registry_root_in_header_at`). The
+  leader names the root in the forked `PayloadAttributes.mobile_registry_root`. The assembler
+  stamps it under the gate, refuses a gated build without one, and ignores it off the gate.
+  `docs/HEADER_FIELD_PARITY.md` §7.1 gap 6.
+- **Packets come from two sources.** A gov5 leader publishes one for each block it builds, and
+  the Rust member relays and caches it. For Rust-built blocks, gov5's
+  `cmd/mobileverify-packetd` follows a Rust execution layer over JSON-RPC (`debug_getRawBlock`,
+  so the EL serves `--http.api ...,debug`), re-executes each block with gov5's read recorder and
+  `PUT`s the packet to the local member. That member publishes it on `mobileverify_packet`, as
+  gov5's `PublishLocal` does, so one sidecar serves the fleet. Receipts are pinned to committed
+  heads and to any hash-checked header a packet carries, and the packet cache holds a window of
+  256 blocks (`--mobileverify.packet-window`).
+- **Certificates are per serving node**: only the node a device submits to holds the cert.
+
+Verified on mixed and all-Rust devnets (`MOBILEVERIFY=1 [PACKETD=<bin>] scripts/devnet-fleet.sh`):
+5/5 gov5-led blocks certified at a Rust member, and 20/20 with the sidecar on empty and loaded
+blocks (`docs/MOBILEVERIFY_V3_PARITY.md`, "Stage 2/3 verification").
+
 ## Live cross-client attach: how far it got
 
 There is no gov5 fleet on this Linux host — the deployment docs point at a

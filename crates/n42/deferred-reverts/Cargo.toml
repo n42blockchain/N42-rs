@@ -10,6 +10,7 @@ description = "Reverts of an own block completed after its import was answered (
 
 [dependencies]
 revm-database = { workspace = true, features = ["std"] }
+n42-env.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

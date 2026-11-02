@@ -2872,6 +2872,11 @@ that measurement, `docs/N42_26_PORT.md`). And the memory plateau rests on eighty
 blocks of flat sampling after a ten-hour climb, which is good evidence and not
 proof.
 
+### A known flake: one refused funding transaction kills the round
+
+Four legs died in funding with "18749 submitted, 1 rejected" then "funding did not mine within 120s": loop351 SMPABAb (2026-10-10), LWaMEMF and LZ2MEMF (2026-10-24), VXaMEMF (2026-10-30). Each time one faucet transfer was refused as `-32602 invalid value: string "0x02f888…", expected a valid hex string`, although the logged string decodes cleanly (const-hex 1.19.3 at every alignment), and its nonce hole stalled the rest.
+`tx_flood` now logs every refused funding transaction with its nonce and resends it up to three times (`fix/tx-flood-fund-resubmit`); the cause of the refusal itself is still open.
+
 ## Throughput
 
 `scripts/fleet7-bench.sh` runs a round; `scripts/fleet7-measure.py` measures a

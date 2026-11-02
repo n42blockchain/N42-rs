@@ -740,7 +740,7 @@ fn validate_header_enforces_difficulty_values() {
 fn validate_header_range_is_a_noop_for_any_input() {
     let env = Env::new(3, 4);
     let e = env.engine(0);
-    assert!(e.validate_header_range(&[]).is_ok());
+    assert!(e.validate_header_range(&[] as &[SealedHeader]).is_ok());
     assert!(e
         .validate_header_range(&[env.genesis, SealedHeader::seal_slow(base_header(1))])
         .is_ok());

@@ -4,16 +4,15 @@
 //! Transaction tests validate that transactions are correctly decoded and
 //! that intrinsic gas calculations match expected values.
 
-use crate::error::{EfTestError, EfTestResult};
+use crate::error::EfTestResult;
 use crate::fork::ForkSpec;
 use crate::models::TransactionTest;
 use crate::result::TestResult;
 
 use alloy_consensus::{Transaction, TxEnvelope};
-use alloy_primitives::{Address, Bytes, U256};
-use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp::Decodable;
 use std::time::Instant;
-use tracing::{debug, trace};
+use tracing::trace;
 
 /// Check if an EIP-7702 transaction should be rejected based on strict validation rules
 /// Returns the exception name if the transaction violates EIP-7702 rules
@@ -38,12 +37,13 @@ fn is_invalid_eip7702_transaction(tx: &TxEnvelope, has_extra_bytes: bool) -> Opt
 #[derive(Debug, Clone)]
 pub struct TransactionTestExecutor {
     /// Fork specification
+    #[allow(dead_code)] // fork is kept for the executor's configuration; not read today
     fork: ForkSpec,
 }
 
 impl TransactionTestExecutor {
     /// Create a new transaction test executor for the given fork
-    pub fn new(fork: &ForkSpec) -> Self {
+    pub const fn new(fork: &ForkSpec) -> Self {
         Self { fork: *fork }
     }
 
@@ -65,7 +65,7 @@ impl TransactionTestExecutor {
 
         // Try to decode the transaction
         let tx_bytes = test.txbytes.as_ref();
-        let mut buf = &tx_bytes[..];
+        let mut buf = tx_bytes;
         let decode_result = TxEnvelope::decode(&mut buf);
 
         // Check if there are any unconsumed bytes after decoding
@@ -94,27 +94,25 @@ impl TransactionTestExecutor {
                                 fork.to_string(),
                                 duration,
                             ));
-                        } else {
-                            // Expected a different error
-                            return Ok(TestResult::failed(
-                                test_name.to_string(),
-                                fork.to_string(),
-                                duration,
-                                format!(
-                                    "Expected exception '{}' but got '{}'",
-                                    expected_exc, violation
-                                ),
-                            ));
                         }
-                    } else {
-                        // Did not expect an error but found EIP-7702 violation
+                        // Expected a different error
                         return Ok(TestResult::failed(
                             test_name.to_string(),
                             fork.to_string(),
                             duration,
-                            format!("Transaction violates EIP-7702 rules: {}", violation),
+                            format!(
+                                "Expected exception '{}' but got '{}'",
+                                expected_exc, violation
+                            ),
                         ));
                     }
+                    // Did not expect an error but found EIP-7702 violation
+                    return Ok(TestResult::failed(
+                        test_name.to_string(),
+                        fork.to_string(),
+                        duration,
+                        format!("Transaction violates EIP-7702 rules: {}", violation),
+                    ));
                 }
 
                 if expected.expects_error() {

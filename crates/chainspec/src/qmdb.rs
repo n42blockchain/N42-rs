@@ -103,6 +103,48 @@ pub fn deferred_execution_active_at(genesis: &Genesis, timestamp: u64) -> bool {
     deferred_execution_time(genesis).is_some_and(|at| timestamp >= at)
 }
 
+/// Genesis `config` key: gov5's Amsterdam fork time (`params.ChainConfig.GlamsterdamTime`).
+/// From it a native header carries EIP-7843's `slotNumber` (element 23), equal
+/// to the block number (`docs/HEADER_FIELD_PARITY.md` section 4).
+pub const GLAMSTERDAM_TIME_KEY: &str = "glamsterdamTime";
+
+/// Genesis `config` key: gov5's MobileAnchor fork time
+/// (`params.ChainConfig.MobileAnchorTime`). With Glamsterdam also active a
+/// native header carries `mobileRegistryRoot` (element 24).
+pub const MOBILE_ANCHOR_TIME_KEY: &str = "mobileAnchorTime";
+
+/// The time from which headers carry the slot number: gov5's
+/// `glamsterdamTime`, or reth's `amsterdamTime` for a genesis that names the
+/// fork the Ethereum way; the earlier of the two when both are set. `None`
+/// means never.
+pub fn glamsterdam_time(genesis: &Genesis) -> Option<u64> {
+    let gov5 = genesis.config.extra_fields.get_deserialized::<u64>(GLAMSTERDAM_TIME_KEY).and_then(Result::ok);
+    match (gov5, genesis.config.amsterdam_time) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Whether a header with `timestamp` must carry the slot number (and, before
+/// it, must not): gov5's `IsGlamsterdam`.
+pub fn glamsterdam_active_at(genesis: &Genesis, timestamp: u64) -> bool {
+    glamsterdam_time(genesis).is_some_and(|at| timestamp >= at)
+}
+
+/// gov5's `mobileAnchorTime`, if the genesis declares one.
+pub fn mobile_anchor_time(genesis: &Genesis) -> Option<u64> {
+    genesis.config.extra_fields.get_deserialized::<u64>(MOBILE_ANCHOR_TIME_KEY).and_then(Result::ok)
+}
+
+/// Whether a header with `timestamp` must carry `mobileRegistryRoot` (and
+/// otherwise must not): gov5's `IsMobileRegistryRootInHeader`, MobileAnchor
+/// and Glamsterdam both active. A `mobileAnchorTime` earlier than Glamsterdam
+/// takes effect at Glamsterdam, so a header never carries the root without
+/// the slot.
+pub fn mobile_registry_root_in_header_at(genesis: &Genesis, timestamp: u64) -> bool {
+    mobile_anchor_time(genesis).is_some_and(|at| timestamp >= at) && glamsterdam_active_at(genesis, timestamp)
+}
+
 /// Genesis `config` key: how many blocks behind a header the execution result
 /// it carries is (`docs/DEFERRED_DEPTH_2_DESIGN.md`). Absent means 1: a
 /// header carries its parent's result. At 2 it carries its parent's
@@ -246,6 +288,63 @@ pub fn genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header {
             .expect("a genesis allocation always has a QMDB root");
     }
     header
+}
+
+#[cfg(test)]
+mod header_field_gate_tests {
+    use super::*;
+
+    fn genesis(config: &str) -> Genesis {
+        serde_json::from_str(&format!(r#"{{"config":{{"chainId":1{config}}},"alloc":{{}}}}"#)).expect("parses")
+    }
+
+    #[test]
+    fn no_fork_time_means_never() {
+        let g = genesis("");
+        assert_eq!(glamsterdam_time(&g), None);
+        assert!(!glamsterdam_active_at(&g, u64::MAX));
+        assert!(!mobile_registry_root_in_header_at(&g, u64::MAX));
+    }
+
+    #[test]
+    fn the_root_needs_both_forks() {
+        // MobileAnchor first: the root waits for Glamsterdam.
+        let g = genesis(r#","mobileAnchorTime":50,"glamsterdamTime":100"#);
+        assert!(!glamsterdam_active_at(&g, 99));
+        assert!(glamsterdam_active_at(&g, 100));
+        assert!(!mobile_registry_root_in_header_at(&g, 60));
+        assert!(!mobile_registry_root_in_header_at(&g, 99));
+        assert!(mobile_registry_root_in_header_at(&g, 100));
+        // Glamsterdam first: the slot alone until MobileAnchor.
+        let g = genesis(r#","mobileAnchorTime":200,"glamsterdamTime":100"#);
+        assert!(glamsterdam_active_at(&g, 150));
+        assert!(!mobile_registry_root_in_header_at(&g, 150));
+        assert!(mobile_registry_root_in_header_at(&g, 200));
+        // MobileAnchor without Glamsterdam: never.
+        let g = genesis(r#","mobileAnchorTime":0"#);
+        assert!(!mobile_registry_root_in_header_at(&g, u64::MAX));
+    }
+
+    #[test]
+    fn reths_amsterdam_time_counts_and_the_earlier_wins() {
+        assert_eq!(glamsterdam_time(&genesis(r#","amsterdamTime":7"#)), Some(7));
+        assert_eq!(glamsterdam_time(&genesis(r#","amsterdamTime":7,"glamsterdamTime":5"#)), Some(5));
+        assert_eq!(glamsterdam_time(&genesis(r#","amsterdamTime":3,"glamsterdamTime":5"#)), Some(3));
+    }
+
+    #[test]
+    fn chain_94_carries_the_root_from_its_glamsterdam() {
+        let g: Genesis = serde_json::from_str(include_str!("../res/genesis/gov5/mainnet_qmdb_staggered.json"))
+            .expect("chain 94 parses");
+        let glamsterdam = glamsterdam_time(&g).expect("chain 94 schedules glamsterdamTime");
+        assert!(mobile_anchor_time(&g).is_some_and(|t| t < glamsterdam));
+        assert!(!mobile_registry_root_in_header_at(&g, glamsterdam - 1));
+        assert!(mobile_registry_root_in_header_at(&g, glamsterdam));
+        // The native devnet schedules neither.
+        let devnet: Genesis = serde_json::from_str(include_str!("../res/genesis/n42_devnet.json")).expect("parses");
+        assert_eq!(glamsterdam_time(&devnet), None);
+        assert_eq!(mobile_anchor_time(&devnet), None);
+    }
 }
 
 #[cfg(test)]

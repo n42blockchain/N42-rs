@@ -103,7 +103,7 @@ async fn node_in_with_vote_log(
 /// A block of the mock's shape and the gov5 RLP it travels as.
 fn block(number: u64, parent: B256) -> (B256, Header, alloy_primitives::Bytes) {
     let built = MockExecutionLayer::built_block_on(number, parent);
-    let header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+    let header = n42_h2_consensus::N42Header::from(built.execution_data.clone().into_block_raw().expect("raw block").header);
     let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
     (header.hash_slow(), header, alloy_primitives::Bytes::from(rlp))
 }
@@ -166,9 +166,9 @@ fn a_fill_is_the_named_transactions_of_a_body_and_names_a_missing_index() {
     let body = n42_h2_net::encode_block_rlp_raw(&header, &txs, &[], None);
     let hash = header.hash_slow();
 
-    let request = n42_h2_net::BlockTxnsRequest { hash, indices: vec![2, 0] };
+    let request = n42_h2_net::BlockTxnsRequest { hash, indices: vec![0, 2] };
     let fill = fill_from_body(&body, HeaderProfile::Ethereum, &request).expect("both positions exist");
-    assert_eq!(fill, vec![txs[2].clone(), txs[0].clone()], "answered in the order asked");
+    assert_eq!(fill, vec![txs[0].clone(), txs[2].clone()], "answered in the order asked");
 
     let request = n42_h2_net::BlockTxnsRequest { hash, indices: vec![1, 3] };
     let err = fill_from_body(&body, HeaderProfile::Ethereum, &request).expect_err("index 3 is past the end");
@@ -189,16 +189,43 @@ async fn a_range_is_served_from_the_start_until_the_first_missing_block() {
         use n42_h2_execution::ExecutionLayer;
         within(el.new_payload(built.execution_data)).await.expect("accepted");
     }
-    let served = within(serve_range(&el, n42_h2_net::RangeRequest { start: 2, count: 10, step: 1 })).await;
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1 << 20));
+    let served = within(serve_range(&el, n42_h2_net::RangeRequest { start: 2, count: 10, step: 1 }, &budget)).await.rlps;
     assert_eq!(served.len(), 2, "blocks 2 and 3, then block 4 is missing");
     for (rlp, number) in served.iter().zip([2u64, 3]) {
         let (_, header) = n42_h2_consensus::decode_block_body_header(rlp, HeaderProfile::Ethereum).expect("a body");
         assert_eq!(header.number, number);
     }
-    let none = within(serve_range(&el, n42_h2_net::RangeRequest { start: 50, count: 5, step: 1 })).await;
-    assert!(none.is_empty(), "nothing past the head");
-    let capped = within(serve_range(&el, n42_h2_net::RangeRequest { start: 1, count: 1, step: 1 })).await;
-    assert_eq!(capped.len(), 1, "count bounds the answer");
+    let none = within(serve_range(&el, n42_h2_net::RangeRequest { start: 50, count: 5, step: 1 }, &budget)).await;
+    assert!(none.rlps.is_empty() && !none.short_of_budget, "nothing past the head");
+    let capped = within(serve_range(&el, n42_h2_net::RangeRequest { start: 1, count: 1, step: 1 }, &budget)).await;
+    assert_eq!(capped.rlps.len(), 1, "count bounds the answer");
+}
+
+/// Audit 2026-10 B-4: range replies draw on one byte budget for every peer,
+/// held until the reply is dropped (by the transport, once sent). A reply
+/// the budget cannot cover in full is cut short; one it cannot start is
+/// empty and says so, for the caller to answer "server busy".
+#[tokio::test]
+async fn range_replies_draw_on_one_byte_budget_held_until_dropped() {
+    use n42_h2_execution::ExecutionLayer;
+    let el = MockExecutionLayer::new();
+    let mut parent = B256::ZERO;
+    for number in 1..=3 {
+        let built = MockExecutionLayer::built_block_on(number, parent);
+        parent = built.hash;
+        within(el.new_payload(built.execution_data)).await.expect("accepted");
+    }
+    // One KiB: one small block's worth.
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let request = n42_h2_net::RangeRequest { start: 1, count: 3, step: 1 };
+    let first = within(serve_range(&el, request, &budget)).await;
+    assert_eq!((first.rlps.len(), first.short_of_budget), (1, true), "cut short where the budget ends");
+    assert_eq!(budget.available_permits(), 0, "held while the reply is");
+    let second = within(serve_range(&el, request, &budget)).await;
+    assert!(second.rlps.is_empty() && second.short_of_budget, "nothing left to start another");
+    drop(first);
+    assert_eq!(budget.available_permits(), 1, "given back with the reply");
 }
 
 #[test]
@@ -364,7 +391,7 @@ async fn remembered_blocks_are_bounded_and_carry_their_number_and_stamp() {
     assert_eq!(rig.svc.block_seen[&hash], first_seen, "and keeps its first arrival");
 
     for i in 0..REMEMBERED_TIMESTAMPS as u64 {
-        let h = Header { number: 100 + i, ..Default::default() };
+        let h = Header::from(alloy_consensus::Header { number: 100 + i, ..Default::default() });
         rig.svc.remember_block(B256::left_padding_from(&(i + 1000).to_be_bytes()), &h);
     }
     assert_eq!(rig.svc.timestamp_order.len(), REMEMBERED_TIMESTAMPS);
@@ -465,7 +492,7 @@ async fn rig_at_genesis_with_a_layer_at_five() -> Rig {
         within(rig.el.new_payload(built.execution_data)).await.expect("accepted");
     }
     // The genesis header is always known to a real node.
-    let genesis = Header { number: 0, ..Default::default() };
+    let genesis = Header::from(alloy_consensus::Header { number: 0, ..Default::default() });
     rig.svc.block_headers.insert(ID.genesis_hash, genesis);
     rig
 }
@@ -518,7 +545,7 @@ async fn a_block_held_too_long_reads_the_layer_and_is_released() {
 #[tokio::test]
 async fn a_lagging_layer_still_holds_a_far_ahead_block_after_the_forced_read() {
     let mut rig = node(1, 0, None).await;
-    let genesis = Header { number: 0, ..Default::default() };
+    let genesis = Header::from(alloy_consensus::Header { number: 0, ..Default::default() });
     rig.svc.block_headers.insert(ID.genesis_hash, genesis);
     let (hash, _, rlp) = block(4, B256::repeat_byte(9));
     rig.svc.handle_direct_body(rlp.into());
@@ -540,7 +567,7 @@ async fn the_held_list_is_bounded_and_drops_the_oldest() {
     rig.svc.note_imported(parent.number);
     let mut hashes = Vec::new();
     for i in 0..(MAX_HELD_BODIES as u64 + 2) {
-        let header = Header { number: 500 + i, parent_hash: B256::repeat_byte(1), ..Default::default() };
+        let header = Header::from(alloy_consensus::Header { number: 500 + i, parent_hash: B256::repeat_byte(1), ..Default::default() });
         let hash = B256::left_padding_from(&(i + 1).to_be_bytes());
         rig.svc.remember_block(hash, &header);
         hashes.push(hash);
@@ -551,7 +578,7 @@ async fn the_held_list_is_bounded_and_drops_the_oldest() {
     }
     // The bound on remembered headers dropped the early ones; give them back.
     for (i, hash) in hashes.iter().enumerate() {
-        let header = Header { number: 500 + i as u64, parent_hash: B256::repeat_byte(1), ..Default::default() };
+        let header = Header::from(alloy_consensus::Header { number: 500 + i as u64, parent_hash: B256::repeat_byte(1), ..Default::default() });
         rig.svc.block_headers.insert(*hash, header);
     }
     let mut events = Vec::new();
@@ -861,6 +888,77 @@ async fn a_pushed_body_is_imported_once_whoever_sends_it() {
     assert_eq!(rig.svc.received_bodies, vec![hash], "the copy that follows is recognised");
 }
 
+/// Audit 2026-10 round 3 (R3-P5): the validator told the mobile service a
+/// committed block's view as its number and no receipts root, so a phone's
+/// receipt could never be attested. The held header gives both; under
+/// deferred execution a header carries its parent's execution, so no root
+/// is offered for it rather than the wrong one.
+#[tokio::test]
+async fn a_committed_block_gives_phones_its_number_and_receipts_root() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, header, _) = block(12, B256::repeat_byte(4));
+    assert_eq!(rig.svc.mobile_commit_facts(&hash), None, "a block this node holds no header for");
+    rig.svc.remember_block(hash, &header);
+    assert_eq!(rig.svc.mobile_commit_facts(&hash), Some((12, Some(header.receipts_root))));
+
+    rig.svc.driver.set_deferred_execution_time(Some(header.timestamp));
+    assert_eq!(rig.svc.mobile_commit_facts(&hash), Some((12, None)), "its own receipts are in its child's header");
+}
+
+/// Audit 2026-10 B-3: only the first body nobody asked for at a height is
+/// imported at once. A sibling is kept, not imported, until consensus asks
+/// for it; one consensus already waits for is imported whatever came first.
+#[tokio::test]
+async fn a_second_unsolicited_body_at_a_height_waits_until_consensus_asks_for_it() {
+    let mut rig = node(1, 0, None).await;
+    let (first, _, first_rlp) = block(11, B256::repeat_byte(4));
+    let (sibling, _, sibling_rlp) = block(11, B256::repeat_byte(5));
+    let (wanted, _, wanted_rlp) = block(11, B256::repeat_byte(6));
+    rig.svc.awaiting_bodies.insert(wanted);
+    for rlp in [&first_rlp, &sibling_rlp, &wanted_rlp] {
+        let data = compress_block_rlp(rlp).expect("snappy");
+        rig.svc.handle_transport_event(TransportEvent::Block { from: None, data }).expect("ok");
+    }
+    assert_eq!(rig.svc.ready_bodies, vec![first, wanted], "the sibling nobody asked for is not imported");
+    assert!(rig.svc.body_store.contains_key(&sibling) && rig.svc.driver.has_payload(&sibling), "but it is kept");
+    assert_eq!(rig.svc.received_bodies, vec![first, sibling, wanted]);
+}
+
+/// Audit 2026-10 round 2 (R2-I1): a body nobody asked for is imported at
+/// once only in the window just above the execution layer's tip. Below it the
+/// height is settled, and far above it the body would only be held; either
+/// way it waits for a proposal to name it. A height below every remembered one
+/// is not "first" either: it used to be inserted, read as first and evicted,
+/// so a stream of low heights took one import each.
+#[tokio::test]
+async fn an_unsolicited_body_outside_the_tips_window_waits_for_a_proposal() {
+    let mut rig = node(1, 0, None).await;
+    let gossip = |rig: &mut Rig, rlp: &alloy_primitives::Bytes| {
+        let data = compress_block_rlp(rlp).expect("snappy");
+        rig.svc.handle_transport_event(TransportEvent::Block { from: None, data }).expect("ok");
+    };
+    // No tip known yet: the remembered heights are full and a lower one comes.
+    for number in 1000..1256u64 {
+        rig.svc.unsolicited_heights.insert(number, B256::with_last_byte(1));
+    }
+    let (low, _, low_rlp) = block(5, B256::repeat_byte(3));
+    gossip(&mut rig, &low_rlp);
+    assert!(!rig.svc.ready_bodies.contains(&low), "below every remembered height");
+
+    rig.svc.unsolicited_heights.clear();
+    rig.svc.note_imported(10);
+    let (below, _, below_rlp) = block(8, B256::repeat_byte(4));
+    let (next, _, next_rlp) = block(11, B256::repeat_byte(5));
+    let (far, _, far_rlp) = block(40, B256::repeat_byte(6));
+    let (wanted, _, wanted_rlp) = block(7, B256::repeat_byte(7));
+    rig.svc.awaiting_bodies.insert(wanted);
+    for rlp in [&below_rlp, &next_rlp, &far_rlp, &wanted_rlp] {
+        gossip(&mut rig, rlp);
+    }
+    assert_eq!(rig.svc.ready_bodies, vec![next, wanted], "only the window, and what consensus waits for");
+    assert!(rig.svc.body_store.contains_key(&below) && rig.svc.body_store.contains_key(&far), "the rest is kept");
+}
+
 #[tokio::test]
 async fn a_gossiped_block_is_decoded_cached_and_raises_the_senders_height() {
     let mut rig = node(1, 0, None).await;
@@ -921,6 +1019,40 @@ async fn blocks_the_execution_layer_already_has_are_answered_without_asking_it_a
     assert!(events.is_empty());
 }
 
+/// Audit 2026-10 round 2 (R2-R1): a block the pull already imported is
+/// proposed afterwards. The engine is told it is imported straight away, and
+/// it must also learn the block's parent first: without it the import-gated
+/// vote is withheld (A-2's unknown-parent rule).
+#[tokio::test]
+async fn a_proposed_block_the_pull_imported_has_its_parent_recorded() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, header, _) = block(1, ID.genesis_hash);
+    rig.svc.block_headers.insert(hash, header);
+    rig.svc.remember_imported(hash);
+    let mut events = Vec::new();
+    within(rig.svc.handle_output(EngineOutput::ExecuteBlock(hash), &mut events)).await.expect("ok");
+    assert!(rig.svc.engine.knows_parent(&hash), "the parent of a block imported by the pull");
+}
+
+/// Audit 2026-10 round 2 (R2-I3): a body filed under a block's hash is not
+/// proven by it -- the hash covers the header, not the transactions. A body
+/// the execution layer rejected is forgotten, so the honest copy that comes
+/// next is taken and imported rather than dropped as a duplicate.
+#[tokio::test]
+async fn a_rejected_body_is_forgotten_so_the_next_copy_is_taken() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, _, rlp) = block(4, B256::repeat_byte(2));
+    let (_, _, fresh) = rig.svc.accept_body_once(rlp.clone()).expect("a readable body");
+    assert!(fresh);
+    let mut events = Vec::new();
+    rig.svc
+        .apply_driver_action(DriverAction::Rejected { block_hash: hash, reason: "transactions root mismatch".into() }, &mut events)
+        .expect("applied");
+    assert!(!rig.svc.body_store.contains_key(&hash), "the rejected bytes are not served or kept");
+    let (_, _, fresh) = rig.svc.accept_body_once(rlp).expect("the next copy");
+    assert!(fresh, "the next copy is imported");
+}
+
 #[path = "service_loop_tests.rs"]
 mod loop_tests;
 
@@ -938,14 +1070,14 @@ mod mesh_tests;
 /// payload a whole answer gives and the one an elided answer gives.
 fn whole_and_elided() -> (alloy_rpc_types_engine::ExecutionData, alloy_rpc_types_engine::ExecutionData, Header, Vec<B256>) {
     let withdrawals = vec![alloy_eips::eip4895::Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(3), amount: 1_000_000_000 }];
-    let header = Header {
+    let header = Header::from(alloy_consensus::Header {
         number: 9,
         base_fee_per_gas: Some(7),
         gas_limit: 30_000_000,
         withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
         ..Default::default()
-    };
-    let block = alloy_consensus::Block::<alloy_consensus::TxEnvelope> {
+    });
+    let block = alloy_consensus::Block::<alloy_consensus::TxEnvelope, Header> {
         header: header.clone(),
         body: alloy_consensus::BlockBody {
             transactions: Vec::new(),
@@ -1012,7 +1144,7 @@ async fn a_block_taken_elided_is_served_from_the_execution_layer_on_demand() {
         .await
         .expect("a job")
         .expect("built");
-    let header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+    let header = n42_h2_consensus::N42Header::from(built.execution_data.clone().into_block_raw().expect("raw block").header);
     let hash = header.hash_slow();
     assert!(rig.svc.elided_body(hash).await.is_none(), "a block not taken elided is not fetched this way");
 
@@ -1025,6 +1157,20 @@ async fn a_block_taken_elided_is_served_from_the_execution_layer_on_demand() {
     // A fill is served from it like any stored body.
     let request = n42_h2_net::BlockTxnsRequest { hash, indices: Vec::new() };
     assert_eq!(fill_from_body(&body, HeaderProfile::Ethereum, &request).expect("served"), Vec::<alloy_primitives::Bytes>::new());
+}
+
+/// Audit 2026-10 B-2: a queued request for a block taken elided is answered
+/// from the body store when an earlier request already fetched it -- the
+/// first fetch moves the block out of `elided_own`, and the requests behind
+/// it in the same drain used to fall through to a whole-block lookup on the
+/// loop -- and a block held nowhere costs no further lookup.
+#[tokio::test]
+async fn a_queued_request_is_answered_from_the_store_before_the_execution_layer() {
+    let mut rig = node(1, 0, None).await;
+    let (hash, _, rlp) = block(4, B256::repeat_byte(2));
+    assert!(rig.svc.queued_body(hash).await.is_none(), "held nowhere");
+    rig.svc.remember_body(hash, rlp.clone());
+    assert_eq!(rig.svc.queued_body(hash).await, Some(rlp), "from the store, not the layer");
 }
 
 #[tokio::test]
@@ -1172,7 +1318,7 @@ async fn check_ahead_unheld_hands_a_far_ahead_block_to_the_driver_up_to_the_queu
         let mut hashes = Vec::new();
         for number in 1..=4 {
             let built = MockExecutionLayer::built_block_on(number, parent);
-            let header = built.execution_data.clone().into_block_raw().expect("raw block").header;
+            let header = n42_h2_consensus::N42Header::from(built.execution_data.clone().into_block_raw().expect("raw block").header);
             let rlp = n42_h2_net::encode_block_rlp_raw(&header, &[], &[], None);
             rig.svc.remember_block(built.hash, &header);
             rig.svc.driver.cache_payload(built.hash, built.execution_data.clone());
@@ -1183,6 +1329,7 @@ async fn check_ahead_unheld_hands_a_far_ahead_block_to_the_driver_up_to_the_queu
                 profile: n42_h2_consensus::N42HeaderProfile::Ethereum,
                 rlp: rlp.into(),
                 compact: false,
+                source: None,
             });
             parent = built.hash;
             hashes.push(built.hash);
@@ -1270,4 +1417,84 @@ async fn awaited_and_held_blocks_are_bounded_aged_out_and_dropped_with_their_evi
     assert!(!rig.svc.body_store.contains_key(&held_stale));
     assert_eq!(rig.svc.held_bodies, vec![held_fresh], "the evicted body is no longer held");
     assert!(!rig.svc.held_since.contains_key(&held_stale));
+}
+
+/// Audit 2026-10 R2-I6: fill and block-by-hash replies draw on their own
+/// byte budget, held until the reply is dropped (by the transport, once
+/// sent); a reply the budget cannot cover now is refused, not queued.
+#[test]
+fn fill_and_block_replies_draw_on_a_byte_budget_held_until_dropped() {
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(30 << 10));
+    let body = reply_permit(&budget, 26 << 20).expect("one 26 MB body fits");
+    assert_eq!(budget.available_permits(), 4 << 10, "held while the reply is");
+    assert!(reply_permit(&budget, 26 << 20).is_none(), "a second does not, while the first is held");
+    let small = reply_permit(&budget, 100).expect("a small fill still fits");
+    drop(body);
+    assert_eq!(budget.available_permits(), (30 << 10) - 1, "given back with the reply");
+    drop(small);
+    let whole = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_FILL_SERVE_BYTES >> 10));
+    assert!(reply_permit(&whole, usize::MAX).is_some(), "a reply larger than the budget takes all of it, once");
+}
+
+/// Audit 2026-10 round 3 (R3-G2): the fill budget was one pool, so a single
+/// peer asking for large bodies faster than libp2p sent them held all of it
+/// and every other peer's fill was refused. Each peer draws on a share.
+#[test]
+fn one_peer_cannot_hold_the_whole_fill_budget() {
+    let mut budget = FillBudget::new(64 << 10);
+    let (greedy, other) = (PeerId::random(), PeerId::random());
+    let first = budget.permit(greedy, 6 << 20).expect("one body within the peer's share");
+    assert!(budget.permit(greedy, 6 << 20).is_none(), "a second passes the share, though the pool has room");
+    let served = budget.permit(other, 6 << 20).expect("another peer is still served");
+    drop(first);
+    assert!(budget.permit(greedy, 6 << 20).is_some(), "given back with the reply");
+    drop(served);
+    assert!(budget.permit(other, usize::MAX).is_some(), "a reply larger than a share takes all of it, once");
+    budget.forget(&greedy);
+    assert!(!budget.per_peer.contains_key(&greedy), "a gone peer's share is dropped");
+}
+
+/// Audit 2026-10 round 2 (R2-R5): while pulled blocks wait for a proof
+/// (`unproven_from`), the height last read from the execution layer still
+/// answers "is any peer past what is held": no peer is past the unproven
+/// start, so the layer is not read again on every drain.
+#[tokio::test]
+async fn no_peer_past_the_unproven_start_reads_the_layer_once_not_every_drain() {
+    let mut rig = node(1, 0, None).await;
+    // A sentinel: the mock layer is empty, so a read would set it to 0.
+    rig.svc.imported_height = Some(10);
+    rig.svc.unproven_checked = true;
+    rig.svc.unproven_from = Some(8);
+    rig.svc.peer_heights.insert(PeerId::random(), 5);
+    let mut events = Vec::new();
+    within(rig.svc.consider_catch_up(&mut events)).await;
+    assert_eq!(rig.svc.imported_height, Some(10), "no peer past block 7: the layer is not read");
+    assert!(rig.svc.catch_up.is_none());
+}
+
+/// Audit 2026-10 round 3 (R3-N2): a peer could name one large transaction a
+/// million times; the reply was copied out in full before any byte limit
+/// applied (a 24 KB transaction asked 2^20 times is 24 GiB). The positions
+/// must be in block order with none repeated -- as this node asks for them
+/// -- and the reply is refused before copying once it would pass the
+/// reader's own limit.
+#[test]
+fn a_fill_request_cannot_name_more_than_a_reply_may_carry() {
+    let (_, header, _) = block(1, B256::ZERO);
+    let big = alloy_primitives::Bytes::from(vec![0x02; 1 << 20]);
+    let txs: Vec<_> = (0..40).map(|_| big.clone()).collect();
+    let body = n42_h2_net::encode_block_rlp_raw(&header, &txs, &[], None);
+    let hash = header.hash_slow();
+    // Lengths only: a failure must not print megabytes of reply.
+    let ask = |indices: Vec<u32>| {
+        fill_from_body(&body, HeaderProfile::Ethereum, &n42_h2_net::BlockTxnsRequest { hash, indices }).map(|txs| txs.len())
+    };
+
+    let err = ask(vec![1; 10_000]).expect_err("a repeated position");
+    assert!(err.contains("ascending"), "{err}");
+    let err = ask(vec![2, 1]).expect_err("out of block order");
+    assert!(err.contains("ascending"), "{err}");
+    let err = ask((0..40).collect()).expect_err("40 MiB is past the reply limit");
+    assert!(err.contains("exceed"), "{err}");
+    assert_eq!(ask((0..20).collect()).expect("20 MiB fits"), 20);
 }

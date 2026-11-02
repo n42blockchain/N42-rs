@@ -146,6 +146,20 @@ bytes and keeps slots: a second relocated file of slot-numbered records, atomic 
 retargeting, a slot-resolving read view, epoch-deferred `PUNCH_HOLE`. Stage 0 (growth metrics)
 is the first landing; stages 1-4 each need a bench pair.
 
+Stage 0 landed 2026-10-27 (`design/qmdb-entry-metrics`). Stages 2 and 1 were built 2026-10-28/29
+(`design/qmdb-compact-stage2` 62265d47c: `compact_twigs`, `entries.relocated`, `Offsets` bit 63,
+checkpoint version 2 with `relocated_len`; `design/qmdb-compact-stage1` 7e379dc62: fallible offsets
+growth) and audited in the 5M audit's round E (E-2 version-1 checkpoints until something is relocated,
+E-3 a relocated group whose kills the checkpoint does not hold is skipped on open, E-6 a read error
+that is not a torn tail fails the open, E-7 the clamp counts the pending block's undo). Both branches
+reached the remote on 2026-10-30 and were merged into main through `integ/qmdb-compact-stage12`
+(7ce44bdb4, one trivial `forest.rs` conflict with the D-3/D-4 persistence fixes) after 19 suites /
+571 tests of the five QMDB crates, a check of `bin/n42` and `h2-node`, and a `roll --kill` field check
+in entry-file mode on that tree (kills at heights 7, 28, 50; every node restored from its checkpoint
+and entry files and committed again, no fault line). No bench pair was run for these two stages: no
+production caller schedules a compaction yet, and the block path only gains one `relocated_len()`
+read per checkpoint; the pair comes with stage 3, which schedules it and punches the prefix.
+
 ### 6.3 QMDB durability ordered against MDBX
 
 QMDB's delta log follows canonical notifications asynchronously while MDBX persistence is a
@@ -215,9 +229,9 @@ further behind than the epoch history) is unchecked and only the parent link is,
 
 ### 6.7 Lint baseline
 
-CI runs `cargo clippy --workspace --lib --bins --examples` without `-D warnings`. A warning
-baseline per crate, then `-D warnings` on `crates/n42/*`, is the cheap next step once the
-hardening branches are in.
+CI runs `cargo clippy --workspace --lib --bins --examples` without `-D warnings`, and since the
+per-crate step below also runs `scripts/clippy-n42.sh`: `-D warnings` on every N42-owned crate
+(`crates/n42/*` except the two alloy forks, and `bin/n42`).
 
 Baseline on the merged tree (`c07716826`, 2026-10-26 23:29 UTC, the CI command): exit 0,
 0 errors, 1,497 warnings. The bulk is the pre-existing APoS/beacon code: `crates/n42/primitives`
@@ -229,7 +243,34 @@ carry 126 of them (`engine-types` 44, `h2-node` 25, `qmdb-reth` 18, `tx-queue` 1
 `collapsible_if` 28, `doc_markdown` 10, `type_complexity` 9, `missing_const_for_fn` 9, plus three
 uses of revm's deprecated `ExecutionResult::gas_used` (now `tx_gas_used`) that the v2.8.1 bump
 surfaced. No warning is an error class (no `unused_must_use`, no `rust_2018_idioms`). The log is
-`ci/clippy-c07716826.log` under the audit notes; the per-crate `-D warnings` step stays deferred.
+`ci/clippy-c07716826.log` under the audit notes.
+
+The per-crate `-D warnings` step is done (branch `chore/clippy-n42-crates`, merged into main as
+d07ec6584 on 2026-10-30 after a level X22 pair, stage fx VL: win1 4.993/4.849M against main's
+5.027/5.007M, rounds 450.8/446.1M against 445.0/449.8M, gates clean). The N42-owned
+crates went from 1,040 distinct warnings (the same crates in the 1,504-warning baseline of
+`ci/clippy-4e43be3ac.log`; the rest of that baseline is the vendored reth forks, the alloy forks and
+`vendor/dependency-repairs`, which track upstream and are out of scope) to 0. `scripts/clippy-n42.sh`
+runs `cargo clippy --no-deps -p <each N42 crate> --lib --bins --examples -- -D warnings` and a new
+step in `.github/workflows/lint.yml` runs it after the unchanged workspace clippy step; `--no-deps`
+keeps the denied lints off the vendored path dependencies. How the warnings were cleared:
+
+- style lints (`collapsible_if`, `doc_markdown`, `use_self`, `or_fun_call`, redundant borrows and
+  clones, `unused_imports`, `missing_const_for_fn`, `derive_partial_eq_without_eq`) were fixed as
+  clippy suggests, without touching a signature or a data path;
+- `missing_docs` (about 290 items, 194 of them in `primitives/src/beacon.rs`) got real one-line
+  doc comments, including the crate- and module-level ones;
+- what a fix would have changed carries an `#[allow]` with a one-line reason on the item: dead
+  code that is kept (`dead_code`), the `gas_used` calls whose replacement `tx_gas_used` has a
+  different meaning after EIP-8037 (`deprecated`, `engine-types/src/parallel_transfer.rs`,
+  ef-tests), the type-complexity / argument-count / `&mut self` lints on hot-path items in
+  `engine-types`, `tx-queue`, `tx-ingest`, `qmdb-reth`, `h2-node` and `bin/n42`
+  (`type_complexity`, `too_many_arguments`, `needless_pass_by_ref_mut`, `match_same_arms`,
+  `large_enum_variant`, `useless_let_if_seq`), the public snake_case constants of the beacon
+  module (`non_upper_case_globals`) and the public `&Vec` argument of `Beacon::gen_beacon_block`
+  (`ptr_arg`); `unused_crate_dependencies` is switched from warn to allow in the four libs whose
+  dependencies are shared with their bins, tests and examples (`consensus-core`,
+  `consensus-traits`, `ef-tests`, `bin/n42`).
 
 ### 6.8 QMDB health gauges
 
@@ -476,7 +517,7 @@ new knobs through `n42_env`. `design/integration-2026-10-next` adds the 6.1 comp
   section 6.7. The seven new ones are style lints in the items' code (`collapsible_if` in
   `h2-node/src/service.rs`, `qmdb-reth/src/node_state.rs` and `state_reader.rs`; one
   `match_same_arms` and one `use_self` in `node_state.rs`; one `use_self` in `tx-queue/src/road.rs`;
-  one `doc_markdown` in `service.rs`), to be cleared with the per-crate `-D warnings` step.
+  one `doc_markdown` in `service.rs`), cleared by the per-crate `-D warnings` step of section 6.7.
 - Pending at the time of writing, run automatically after the above: the 6.3 field check (`fleet7.sh
   up --fresh` on the integration binaries at 200 tx/s, `roll 1/2/3 --kill`, the forest's recovery
   and fault lines) and the 6.4 bench pairs (loop351 stage fm: `N42_ROAD_TAKEN_BOUND=1
@@ -586,3 +627,30 @@ persistence defaults 8/6, entry-file fold archive) + the validator's persistence
   checkpoint replays from the archive in both storage modes; the profile report's withdrawal line states
   how many knobs remain in force; the seven clippy nits named in 6.x are fixed. Unit tests on the merged
   head: `n42-qmdb-reth` 104, `n42-env` 23, `n42-tx-queue` 133 passed.
+- **Power fault closed (2026-10-29).** A fourth silent cut at 10-28 17:54 UTC, again at a load step
+  (a `cargo test` run's multi-threaded test binaries, 87 W to 337 W within a minute, no BMC event),
+  settled the diagnosis: the motherboard's standby LEDs stayed lit through every cut, so the wall supply
+  never dropped and the PSU's main rails tripped. The user replaced the PSU on 2026-10-29. The first
+  verification after it ran main `b91411e27` (the 5M audit merge, `docs/audit/2026-10-5m/HANDOFF.md`)
+  through the whole chain at 32 jobs -- 71 test suites, `cargo check --workspace`, clippy 1500 against the
+  1504 baseline, the x22 probe, the three devnet shapes with a gov5 member (same block hashes on both
+  clients), the `roll --kill` field check in file mode -- with the guard never above the pre-fault
+  readings. The X22 bench pair (stage `fv`, 01:22-01:51 UTC: audited main against `native-qc`, two
+  alternating pairs, 600M replay set) read win1 5.047 / 5.040M against 5.060 / 5.040M and round totals
+  451.1M against 454.6M (-0.8%), every leg with clean gates, so the audit's hot-path changes cost nothing
+  visible at the 5M shape; peak under the new supply 349 W, Tctl 54 C. Details in the handoff document.
+- **Second Linux pass and the 10-30 A/B (2026-10-30, 03:05-05:50 UTC).** The same chain ran green again on
+  main `a2407baf8` (72 suites, both checks, natives, the x22 probe byte for byte, the three devnet shapes with
+  the same hashes and no header-QC refusal in any validator log, `roll --kill`, clippy 1500). The Windows
+  session then pushed main `5a0d895c3` (tx-queue R3-P2/P3/P4, R3-N4's decode-before-forward, the R2-C9
+  two-phase header vote, R2-C1, R3-G4 and the mobile remainders); the Linux side merged its R3-E1/E3 branch
+  onto it (`6f0913d92`: the builder admits by the sum of gas limits and a per-sender worst-case ledger, the
+  follower's rule), ran 50 suites of the ten touched crates, and paired the natives against `b91411e27` in
+  bench stage `fw`: win1 4.960 / 4.945M against 4.960 / 5.033M (-0.9%), round totals 449.0M against 452.1M
+  (-0.7%), clean gates, R3-P2's bounds never hit (`refused=0`, `frames_refused=0`, no `Lagged` read-back).
+  The same binaries then ran five devnet shapes with a gov5 member -- the three rejoin shapes and two on a
+  genesis copy with `twoPhaseVoteGate: true` (gov5 late, 160 blocks; gov5 present from the start, 133 blocks)
+  -- every one with the same block hash on both clients and no gov5 error, the Rust validators reporting
+  `vote gate : two-phase` and the gov5 member's stored chainspec carrying the flag. The branch merged into
+  main as `134b9c215`; `docs/audit/2026-10-5m/LEFTOVERS.md` section C is closed except R3-E2. Peak under load
+  433 W at the 32-job test build, Tctl 58 C, VRM 62 C; no cut.

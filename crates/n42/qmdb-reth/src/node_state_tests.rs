@@ -479,6 +479,36 @@ fn fold_archives(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Audit 2026-10 D-9: a file-mode restart below the checkpoint sets aside
+/// the future checkpoint and logs as a `rollback-*` archive, as heap mode
+/// does, rather than deleting them; and the archive search for a later
+/// restart does not take that archive for a way back.
+#[test]
+fn a_file_mode_restart_below_the_checkpoint_keeps_a_rollback_archive() {
+    let (chain, dir, roots) = folded_at_ten("file-rollback-archive", true);
+    let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    restarted.initialize((7, hash_of(7))).expect("a database head below the fold head");
+    let rollbacks: Vec<String> = std::fs::read_dir(dir.join("recovery-archive"))
+        .expect("the archives")
+        .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("rollback-"))
+        .collect();
+    assert_eq!(rollbacks.len(), 1, "{rollbacks:?}");
+    assert!(rollbacks[0].starts_with(&format!("rollback-{:020}-{:x}-", 7, hash_of(7))), "{rollbacks:?}");
+    let archive = dir.join("recovery-archive").join(&rollbacks[0]);
+    assert!(archive.join("forest.ckpt").exists() && archive.join("forest.log").exists());
+    let mut head = hash_of(7);
+    for number in 8..=12 {
+        (head, _) = advance(&restarted, number, head);
+    }
+    drop(restarted);
+    let again = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    again.initialize((12, head)).expect("the head reached again");
+    assert_eq!(again.state_root(), roots[12]);
+    drop(again);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A SIGKILL after a fold but before the database reached the fold head:
 /// the restart at the database's head comes from the fold's archive, and
 /// the node then follows the blocks again and restarts at the new head.
@@ -510,6 +540,36 @@ fn a_restart_below_a_fold_head_restores_from_the_fold_archive_in_both_storage_mo
         at_twelve.initialize((12, hash_of(12))).expect("the head reached again");
         assert_eq!(at_twelve.state_root(), roots[12], "entry_file={entry_file}");
         drop(at_twelve);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Audit 2026-10 D-6: the live-forest rewrite hard-links the log into its
+/// archive and then removes the live name. When that removal fails, the
+/// next head's append must not empty the archive's log through the shared
+/// inode: a restart below the checkpoint still replays from the archive.
+#[test]
+fn a_failed_log_removal_after_a_sync_checkpoint_leaves_the_archive_whole() {
+    for entry_file in [false, true] {
+        let (state, chain, dir, mut head, _) = node_at(&format!("sync-archive-unlink-{entry_file}"), entry_file, 10);
+        fail_next_log_removal();
+        state.checkpoint(Some(hash_of(10)), &mut state.cursor()).expect("rewrite at 10");
+        let archives = fold_archives(&dir);
+        assert_eq!(archives.len(), 1, "entry_file={entry_file}: {archives:?}");
+        let archived_log = dir.join("recovery-archive").join(&archives[0]).join("forest.log");
+        let archived_len = std::fs::metadata(&archived_log).expect("the archived log").len();
+        assert!(archived_len > 0);
+        for number in 11..=12 {
+            (head, _) = advance(&state, number, head);
+        }
+        assert_eq!(std::fs::metadata(&archived_log).expect("the archived log").len(), archived_len, "entry_file={entry_file}");
+        let root7 = state.root_of(&hash_of(7)).expect("root");
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+        restarted.initialize((7, hash_of(7))).expect("a database head below the rewritten checkpoint");
+        assert_eq!(restarted.state_root(), root7, "entry_file={entry_file}");
+        drop(restarted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -584,7 +644,8 @@ fn a_fold_archive_retires_once_the_durable_head_passes_its_fold_head() {
         assert_eq!(fold_archives(&dir).len(), 1, "entry_file={entry_file}: durable at 11 keeps the fold at 10");
 
         seal_the_log(&state);
-        durable.store(12, std::sync::atomic::Ordering::Relaxed);
+        // Past the fold head by the unwind margin (audit 2026-10 D-7).
+        durable.store(12 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
         state.compact((14, head));
         let archives = fold_archives(&dir);
         assert_eq!(archives.len(), 1, "entry_file={entry_file}: {archives:?}");
@@ -1217,6 +1278,237 @@ fn a_branch_switch_during_a_lease_waits_and_takes_the_owed_trim_first() {
 // The restart's root check
 // ---------------------------------------------------------------------------
 
+/// Audit 2026-10 D-5: a move made between the persistence's two holds of
+/// the forest -- a build on another parent -- is not wiped with the moves
+/// the block deltas already carried. A later branch switch measures its
+/// delta from that bookkeeping, and a restart must land on the same tree.
+#[test]
+fn a_move_between_the_persistence_holds_reaches_the_next_delta() {
+    let (state, chain, dir, head3, _) = node_at("move-between-holds", true, 3);
+    let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+    state.insert(hash_of(4), 4, prepared).expect("insert 4");
+    // A sibling of 4 with an account of its own: it leaves account 7 where
+    // block 3 put it, a slot block 4 retired.
+    let mut sibling_changes = BlockChanges::new();
+    sibling_changes.set_account(
+        Address::repeat_byte(0x99),
+        AccountState { nonce: 1, balance: U256::from(9u64), code_hash: B256::ZERO },
+    );
+    let sibling = B256::repeat_byte(0x44);
+    let built = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (state, built, changes) = (state.clone(), Arc::clone(&built), sibling_changes.clone());
+        set_between_persist_holds(Box::new(move || {
+            *built.lock().unwrap() = Some(state.compute(head3, &changes).expect("compute the sibling"));
+        }));
+    }
+    state.on_canonical(hash_of(4)).expect("canonical 4");
+    let prepared = built.lock().unwrap().take().expect("the hook ran between the holds");
+    state.insert(sibling, 4, prepared).expect("insert the sibling");
+    state.on_canonical(sibling).expect("switch to the sibling");
+    let root = state.state_root();
+    drop(state);
+
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    restarted.initialize((4, sibling)).expect("the log replays onto the sibling's tree");
+    assert_eq!(restarted.state_root(), root);
+}
+
+/// Audit 2026-10 round 2 (R2-Q1): a delta append that fails after the
+/// block deltas were taken out of the forest falls back to measuring the
+/// difference from the move bookkeeping. That bookkeeping must still name
+/// the flips of every block not yet in the log -- including a block computed
+/// before the previous persistence, whose bookkeeping that persistence
+/// cleared -- or the restart lands on another tree.
+#[test]
+fn a_failed_delta_append_loses_no_flip() {
+    for (entry_file, nth) in [(true, 1), (true, 2), (false, 1), (false, 2)] {
+        let (state, chain, dir, head3, _) = node_at(&format!("failed-append-{entry_file}-{nth}"), entry_file, 3);
+        let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+        state.insert(hash_of(4), 4, prepared).expect("insert 4");
+        let prepared = state.compute(hash_of(4), &changes_for(5)).expect("compute 5");
+        state.insert(hash_of(5), 5, prepared).expect("insert 5");
+        let prepared = state.compute(hash_of(5), &changes_for(6)).expect("compute 6");
+        state.insert(hash_of(6), 6, prepared).expect("insert 6");
+        // 4 persists while 5 and 6 are already computed on it.
+        state.on_canonical(hash_of(4)).expect("canonical 4");
+        fail_delta_append(nth);
+        state.on_canonical(hash_of(6)).expect_err("the append fails");
+        state.on_canonical(hash_of(6)).expect("the retry persists");
+        let root = state.state_root();
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        restarted.initialize((6, hash_of(6))).expect("the log replays onto block 6's tree");
+        assert_eq!(restarted.state_root(), root, "entry file {entry_file}, append {nth} failed");
+    }
+}
+
+/// Audit 2026-10 round 3 (R3-G1): the same failure, retried at a later
+/// block. The failed append's deltas stayed taken, so the retry could not
+/// take the per-block path and measured from the bookkeeping -- which the
+/// failed persistence had cleared of every block above its target, and
+/// which the give-back refilled only with the target's own flips.
+#[test]
+fn a_failed_append_retried_at_a_later_block_loses_no_flip() {
+    for (entry_file, nth) in [(true, 1), (false, 1)] {
+        let (state, chain, dir, head3, _) = node_at(&format!("failed-append-later-{entry_file}-{nth}"), entry_file, 3);
+        let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+        state.insert(hash_of(4), 4, prepared).expect("insert 4");
+        let prepared = state.compute(hash_of(4), &changes_for(5)).expect("compute 5");
+        state.insert(hash_of(5), 5, prepared).expect("insert 5");
+        let prepared = state.compute(hash_of(5), &changes_for(6)).expect("compute 6");
+        state.insert(hash_of(6), 6, prepared).expect("insert 6");
+        state.on_canonical(hash_of(4)).expect("canonical 4");
+        fail_delta_append(nth);
+        state.on_canonical(hash_of(5)).expect_err("the append fails");
+        state.on_canonical(hash_of(6)).expect("the retry, one block further, persists");
+        let root = state.state_root();
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+        restarted.initialize((6, hash_of(6))).expect("the log replays onto block 6's tree");
+        assert_eq!(restarted.state_root(), root, "entry file {entry_file}");
+    }
+}
+
+/// Audit 2026-10 round 2 (R2-R4): a block computed between the
+/// persistence's two holds (the next build) keeps its own move bookkeeping,
+/// and only its own: what the persisted deltas carried is not kept with it.
+#[test]
+fn a_build_between_the_persistence_holds_keeps_only_its_own_bookkeeping() {
+    let dirty = |state: &QmdbNodeState| state.lock_as("root_of").as_ref().expect("initialised").dirty_slot_count();
+    let (reference, _, _, _, _) = node_at("build-between-holds-reference", true, 4);
+    let prepared = reference.compute(hash_of(4), &changes_for(5)).expect("compute 5");
+    reference.insert(hash_of(5), 5, prepared).expect("insert 5");
+    let own = dirty(&reference);
+    assert!(own > 0, "block 5 retires a slot");
+
+    let (state, _, _, head3, _) = node_at("build-between-holds", true, 3);
+    let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+    state.insert(hash_of(4), 4, prepared).expect("insert 4");
+    {
+        let state = state.clone();
+        set_between_persist_holds(Box::new(move || {
+            let prepared = state.compute(hash_of(4), &changes_for(5)).expect("compute 5");
+            state.insert(hash_of(5), 5, prepared).expect("insert 5");
+        }));
+    }
+    state.on_canonical(hash_of(4)).expect("canonical 4");
+    assert_eq!(dirty(&state), own, "block 4's bookkeeping went with its delta");
+}
+
+/// Audit 2026-10 round 2 (R2-Q4): reverting a block the log does not hold
+/// yet -- the next build, replaced by a sibling -- cuts nothing persisted,
+/// and does not fsync the entry file under the forest's lock; a cut below
+/// the persisted head still does (D-4).
+#[test]
+fn only_a_cut_below_the_logged_slots_syncs_the_entry_file() {
+    let syncs = |state: &QmdbNodeState| state.lock_as("root_of").as_ref().expect("initialised").cut_syncs();
+    let (state, _, _, head3, _) = node_at("cut-syncs", true, 3);
+    let prepared = state.compute(head3, &changes_for(4)).expect("compute 4");
+    state.insert(hash_of(4), 4, prepared).expect("insert 4");
+    state.with_forest("test", |forest| Ok(forest.flush_entries_for_sync()?.is_some())).expect("flush");
+    state.compute(head3, &wide_changes(44)).expect("a sibling of 4");
+    assert_eq!(syncs(&state), 0, "block 4 was never logged");
+
+    state.compute(hash_of(1), &wide_changes(45)).expect("a block on 1");
+    assert_eq!(syncs(&state), 1, "the cut went below the logged head 3");
+}
+
+/// Audit 2026-10 round 2 (R2-Q3): with `N42_QMDB_CHECKPOINT_SYNC=1` a
+/// compaction still runs when a restart finds a sealed segment; the
+/// synchronous rewrite must not write the checkpoint beside it.
+#[test]
+fn the_synchronous_checkpoint_waits_for_a_running_compaction() {
+    let (state, _, _, _, _) = node_at("sync-ckpt-compacting", true, 3);
+    let before = std::fs::read(state.ckpt_path()).expect("the checkpoint");
+    let mut cursor = *state.cursor();
+    cursor.compacting = true;
+    force_checkpoint_sync();
+    state.rewrite_checkpoint(None, &mut cursor).expect("the rewrite");
+    assert_eq!(std::fs::read(state.ckpt_path()).expect("the checkpoint"), before, "the checkpoint was rewritten mid-compaction");
+}
+
+/// Audit 2026-10 round 2 (R2-Q5): the historical root a restart rebuilds
+/// for the deferred parent (it goes into the next header) is checked against
+/// the root recorded when that block was persisted, as the head's is.
+#[test]
+fn a_rebuilt_historical_root_is_checked_against_its_record() {
+    for entry_file in [true, false] {
+        let (state, _, _, _, _) = node_at(&format!("historical-root-record-{entry_file}"), entry_file, 3);
+        let root = state.persisted_state_root(2, hash_of(2)).expect("block 2's root");
+        HeadRoots::write(&state.head_roots_path(), &[(2, hash_of(2), B256::repeat_byte(0xee))]).expect("a wrong record");
+        let err = state.persisted_state_root(2, hash_of(2)).expect_err("the record disagrees");
+        assert!(
+            matches!(err, NodeStateError::RestoredRootMismatch { number: 2, restored, .. } if restored == root),
+            "entry file {entry_file}: {err}"
+        );
+    }
+}
+
+/// Audit 2026-10 D-4: a move below the persisted head rewrites the entry
+/// file's slots before any delta says so. A process that dies there leaves
+/// the log on the old branch and the entries on the new one; the restart
+/// refuses that datadir rather than build a tree on it.
+#[test]
+fn a_crash_after_a_cut_below_the_persisted_head_is_refused_at_restart() {
+    let (state, chain, dir, head, root) = node_at("cut-below-persisted", true, 3);
+    let entries = state.entry_file_path();
+    let persisted_len = std::fs::metadata(&entries).expect("the entry file").len();
+    // A block on block 1: the tree goes back below the persisted head 3.
+    let prepared = state.compute(hash_of(1), &wide_changes(77)).expect("compute");
+    state.insert(B256::repeat_byte(0x77), 2, prepared).expect("insert the side block");
+    let cut_len = std::fs::metadata(&entries).expect("the entry file").len();
+    assert_ne!(cut_len, persisted_len, "the side block rewrote the entry file");
+    drop(state);
+
+    let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    restarted.expect_head_root((3, head), root);
+    let err = restarted.initialize((3, head)).expect_err("the cut datadir is refused");
+    assert!(
+        matches!(err, NodeStateError::RestoredRootMismatch { .. } | NodeStateError::State(StateError::EntryFile(_))),
+        "{err}"
+    );
+}
+
+/// Audit 2026-10 D-3: with no record of its head (lost in a power cut), a
+/// restart on a chain whose headers carry their own root checks the tree
+/// against the head header's root instead of starting unchecked.
+#[test]
+fn a_restart_without_a_record_checks_the_head_header_root() {
+    let (state, chain, dir, head, root) = node_at("restart-header-root", true, 3);
+    let entries = state.entry_file_path();
+    let roots = state.head_roots_path();
+    drop(state);
+    std::fs::remove_file(&roots).expect("drop the record");
+
+    let checked = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    checked.expect_head_root((3, head), root);
+    checked.initialize((3, head)).expect("the header root matches");
+    assert_eq!(checked.unchecked_restart(), None, "checked against the header");
+    drop(checked);
+
+    let good = std::fs::read(&entries).expect("the entry file");
+    let mut bytes = good.clone();
+    *bytes.last_mut().expect("a record") ^= 0xff;
+    std::fs::write(&entries, &bytes).expect("corrupt one record");
+    std::fs::remove_file(&roots).ok();
+    let corrupt = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    corrupt.expect_head_root((3, head), root);
+    let err = corrupt.initialize((3, head)).expect_err("a corrupt entry file is refused");
+    assert!(matches!(err, NodeStateError::RestoredRootMismatch { number: 3, recorded, .. } if recorded == root), "{err}");
+    drop(corrupt);
+
+    // A header root for another block is no check of this one.
+    std::fs::write(&entries, &good).expect("restore the record");
+    std::fs::remove_file(&roots).ok();
+    let other = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    other.expect_head_root((2, head), B256::repeat_byte(9));
+    other.initialize((3, head)).expect("not this head's root: unchecked");
+    assert!(other.unchecked_restart().is_some());
+}
+
 /// A restart compares the rebuilt tree's root with the one recorded when its
 /// head was persisted: a clean restart passes, one over a corrupt entry file
 /// fails by name, and a datadir with no record restarts unchecked.
@@ -1486,6 +1778,22 @@ fn the_persist_hook_waits_for_a_late_canonical_notification() {
     late.join().expect("follower thread");
     drop(state);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Audit 2026-10 round 2 (R2-Q2): a persisted block below the forest's
+/// head settles only if it is the canonical chain's block at its height. A
+/// sibling the database is about to commit is not in the log, and the
+/// batch is refused rather than committed beside it.
+#[test]
+fn the_persist_hook_refuses_a_block_off_the_canonical_chain() {
+    let (state, _, _, _, _) = node_at("hook-off-chain", true, 4);
+    let sibling = B256::repeat_byte(0x33);
+    let prepared = state.compute(hash_of(2), &wide_changes(33)).expect("a sibling of 3");
+    state.insert(sibling, 3, prepared).expect("insert the sibling");
+    let wait = std::time::Duration::from_millis(20);
+    let err = state.settle_through(3, sibling, wait).expect_err("the sibling is not logged");
+    assert!(matches!(&err, NodeStateError::PersistUnsettled { number: 3, forest_head: Some(4), .. }), "{err}");
+    state.settle_through(3, hash_of(3), std::time::Duration::ZERO).expect("block 3 is logged");
 }
 
 /// No canonical notification for the persisted block ever arrives: past the

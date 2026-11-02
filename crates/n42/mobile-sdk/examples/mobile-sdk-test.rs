@@ -1,9 +1,10 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! Command line tool that drives the mobile SDK against a node (used by the end-to-end script).
 use ::rand::RngCore;
 use blst::min_pk::SecretKey;
-use clap::{Command, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
@@ -24,10 +25,11 @@ use std::str::FromStr;
 use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
 use tokio::time::sleep;
-use tracing::{debug, info, Level};
+use tracing::{debug, info};
 use tracing_appender::non_blocking;
 use tracing_subscriber::{fmt, EnvFilter};
 
+#[allow(non_upper_case_globals)] // example constant keeps its original name
 const _32eth_hex_in_wei: &str = "0x1bc16d674ec800000";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +64,7 @@ enum Commands {
         #[command(flatten)]
         common: CommonArgs,
 
-        /// Optional validator_private_key [default: random if not supplied].
+        /// Optional `validator_private_key` [default: random if not supplied].
         #[arg(short, long)]
         validator_private_key: Option<String>,
         #[arg(short, long)]
@@ -70,11 +72,11 @@ enum Commands {
         #[arg(short, long)]
         deposit_private_key: String,
 
-        /// Optional deposit_value_wei_in_hex [default: 32ETH if not supplied].
+        /// Optional `deposit_value_wei_in_hex` [default: 32ETH if not supplied].
         #[arg(long, default_value = _32eth_hex_in_wei)] // 32 ETH in wei in hex
         deposit_value_wei_in_hex: U256,
 
-        /// Optional deposit_contract_address [default: devnet deposit contract address].
+        /// Optional `deposit_contract_address` [default: devnet deposit contract address].
         #[arg(long, default_value_t = DEVNET_DEPOSIT_CONTRACT_ADDRESS.to_string())]
         deposit_contract_address: String,
     },
@@ -109,7 +111,7 @@ enum Commands {
         #[arg(short, long)]
         deposit_private_key: String,
 
-        /// Optional deposit_contract_address [default: devnet deposit contract address].
+        /// Optional `deposit_contract_address` [default: devnet deposit contract address].
         #[arg(long, default_value_t = DEVNET_DEPOSIT_CONTRACT_ADDRESS.to_string())]
         deposit_contract_address: String,
 
@@ -216,7 +218,7 @@ async fn main() -> eyre::Result<()> {
         }
         Commands::ValidateForValidators {
             validator_credentials_file,
-            common,
+            common: _,
             ws_rpc_url,
         } => {
             let validator_credentials =
@@ -306,7 +308,7 @@ async fn deposit(
 
     let unsigned_tx = create_deposit_unsigned_tx(
         deposit_contract_address,
-        &hex::encode(&sk.to_bytes()),
+        &hex::encode(sk.to_bytes()),
         withdrawal_address,
         deposit_value_wei_in_hex,
     )?;
@@ -363,7 +365,7 @@ async fn deposit_multiple(
             .map_err(|e| eyre::eyre!("invalid validator_private_key: {:?}", e))?;
         let mut unsigned_tx = create_deposit_unsigned_tx(
             deposit_contract_address,
-            &hex::encode(&sk.to_bytes()),
+            &hex::encode(sk.to_bytes()),
             withdrawal_address,
             deposit_value_wei_in_hex,
         )?;

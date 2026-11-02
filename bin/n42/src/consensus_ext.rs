@@ -20,7 +20,7 @@ use n42_primitives::{
     Snapshot, ValidatorInfo,
 };
 use pubsub_mem::{subscribe, RouterMsg};
-use reth_consensus::{ConsensusError, FullConsensus};
+use reth_consensus::FullConsensus;
 use n42_tx_types::N42Primitives as EthPrimitives;
 use reth_node_core::primitives::AlloyBlockHeader;
 use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
@@ -42,7 +42,7 @@ pub trait ConsensusExtApi {
     #[method(name = "discard")]
     fn discard(&self, address: Address) -> RpcResult<()>;
 
-    /// GetSnapshot in the clique consensus.
+    /// `GetSnapshot` in the clique consensus.
     #[method(name = "get_snapshot")]
     fn get_snapshot(&self, number: u64) -> RpcResult<Snapshot>;
 
@@ -52,8 +52,11 @@ pub trait ConsensusExtApi {
 }
 
 /// The type that implements the `consensus` rpc namespace trait
+#[derive(Debug)]
 pub struct ConsensusExt<Cons, Provider> {
+    /// Consensus engine the namespace reads from.
     pub consensus: Cons,
+    /// Provider used to read chain data.
     pub provider: Provider,
 }
 
@@ -63,11 +66,13 @@ where
     Provider: HeaderProvider + Clone + Send + Sync + 'static,
 {
     fn propose(&self, address: Address, auth: bool) -> RpcResult<()> {
-        Ok(self.consensus.propose(address, auth).unwrap_or_default())
+        let _: () = self.consensus.propose(address, auth).unwrap_or_default();
+        Ok(())
     }
 
     fn discard(&self, address: Address) -> RpcResult<()> {
-        Ok(self.consensus.discard(address).unwrap_or_default())
+        let _: () = self.consensus.discard(address).unwrap_or_default();
+        Ok(())
     }
 
     fn get_snapshot(&self, number: u64) -> RpcResult<Snapshot> {
@@ -94,9 +99,11 @@ where
 #[cfg_attr(test, rpc(server, client, namespace = "consensusBeaconExt"))]
 pub trait ConsensusBeaconExtApi {
     #[subscription(name = "subscribeToVerificationRequest", item = String)]
+    /// Subscribes a validator to the stream of blocks that await its verification.
     fn subscribe_to_verification_request(&self, pubkey: BLSPubkey) -> SubscriptionResult;
 
     #[method(name = "submitVerification")]
+    /// Submits a validator's BLS verification of a block.
     fn submit_verification(
         &self,
         pubkey: String,
@@ -105,44 +112,49 @@ pub trait ConsensusBeaconExtApi {
         block_hash: B256,
     ) -> RpcResult<()>;
 
-    /// get_beacon_block_hash_by_eth1_hash
+    /// `get_beacon_block_hash_by_eth1_hash`
     #[method(name = "get_beacon_block_hash_by_eth1_hash")]
     fn get_beacon_block_hash_by_eth1_hash(&self, eth1_hash: B256) -> RpcResult<Option<B256>>;
 
-    /// get_beacon_block_by_hash
+    /// `get_beacon_block_by_hash`
     #[method(name = "get_beacon_block_by_hash")]
     fn get_beacon_block_by_hash(&self, beacon_block_hash: B256) -> RpcResult<Option<BeaconBlock>>;
 
-    /// get_beacon_block_by_number
+    /// `get_beacon_block_by_number`
     #[method(name = "get_beacon_block_by_number")]
     fn get_beacon_block_by_number(&self, block_id: BlockId) -> RpcResult<Option<BeaconBlock>>;
 
-    /// get_beacon_state_by_beacon_block_hash
+    /// `get_beacon_state_by_beacon_block_hash`
     #[method(name = "get_beacon_state_by_beacon_block_hash")]
     fn get_beacon_state_by_beacon_block_hash(
         &self,
         beacon_block_hash: B256,
     ) -> RpcResult<Option<BeaconState>>;
 
-    /// get_beacon_state_by_number
+    /// `get_beacon_state_by_number`
     #[method(name = "get_beacon_state_by_number")]
     fn get_beacon_state_by_number(&self, state_id: BlockId) -> RpcResult<Option<BeaconState>>;
 
-    /// get_beacon_validator_by_pubkey
+    /// `get_beacon_validator_by_pubkey`
     #[method(name = "get_beacon_validator_by_pubkey")]
     fn get_beacon_validator_by_pubkey(&self, pubkey: BLSPubkey)
         -> RpcResult<Option<ValidatorInfo>>;
 
-    /// get_total_effective_balance
+    /// `get_total_effective_balance`
     #[method(name = "get_total_effective_balance")]
     fn get_total_effective_balance(&self) -> RpcResult<u64>;
 }
 
 /// The type that implements the `consensusBeaconRpc` rpc namespace trait
+#[derive(Debug)]
 pub struct ConsensusBeaconExt<Cons, Provider> {
+    /// Consensus engine the namespace reads from.
     pub consensus: Cons,
+    /// Provider used to read chain data and the beacon tables.
     pub provider: Provider,
+    /// Channel that carries submitted verification results to the miner.
     pub verification_tx: mpsc::Sender<BlockVerifyResult>,
+    /// Channel that routes unverified blocks to the subscribed validators.
     pub router_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
 }
 
@@ -159,7 +171,7 @@ where
         let router_tx_clone = self.router_tx.clone();
 
         tokio::spawn(async move {
-            let (_id, mut rx) = match subscribe(router_tx_clone, hex::encode(&pubkey)).await {
+            let (id, mut rx) = match subscribe(router_tx_clone.clone(), hex::encode(pubkey)).await {
                 Ok(v) => v,
                 Err(err) => {
                     debug!(target: "reth::cli", ?pubkey, ?err, "subscribe_to_verification_request failed");
@@ -169,7 +181,20 @@ where
             debug!(target: "reth::cli", ?pubkey, "subscribe_to_verification_request New client subscribed");
             if let Ok(sink) = pending.accept().await {
                 let subscription_id = sink.subscription_id();
-                while let Some(event) = rx.recv().await {
+                // A client that goes away is noticed without an event: a key
+                // nothing is published for would otherwise hold this task and
+                // its router entry for good (audit 2026-10 round 3, R3-P8).
+                loop {
+                    let event = tokio::select! {
+                        _ = sink.closed() => {
+                            debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
+                            break;
+                        }
+                        event = rx.recv() => match event {
+                            Some(event) => event,
+                            None => break,
+                        },
+                    };
                     let data_to_be_verified = event.payload;
                     debug!(target: "reth::cli", ?pubkey, "start broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
                     if sink.is_closed() {
@@ -194,6 +219,7 @@ where
                     debug!(target: "reth::cli", ?pubkey, "finish broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
                 }
             }
+            let _ = router_tx_clone.send(RouterMsg::Disconnect { id }).await;
         });
         Ok(())
     }
@@ -380,7 +406,7 @@ where
             None => {
                 return Err(ErrorObjectOwned::owned(
                     INTERNAL_ERROR_CODE,
-                    format!("beacon state not found"),
+                    "beacon state not found".to_string(),
                     None::<()>,
                 ));
             }
@@ -472,6 +498,42 @@ mod tests {
             ConsensusBeaconExt { consensus: NoopConsensus::default(), provider, verification_tx, router_tx },
             verification_rx,
         )
+    }
+
+    /// Audit 2026-10 round 3 (R3-P8): a subscription to a key nothing is
+    /// published for waited on the router forever, so a client that went
+    /// away left its task and its router entry behind. Its end is noticed
+    /// without an event, and the router is told.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_subscription_leaves_the_router_without_an_event() {
+        let (verification_tx, _verification_rx) = mpsc::channel(2);
+        let (router_tx, mut router_rx) = mpsc::channel(8);
+        let ext = ConsensusBeaconExt { consensus: NoopConsensus::default(), provider: provider(), verification_tx, router_tx };
+        let module = ext.into_rpc();
+        // The subscription is accepted only once the router answers, so it
+        // is opened beside the router's side of the exchange.
+        let subscribing = tokio::spawn(async move {
+            module
+                .subscribe_unbounded("consensusBeaconExt_subscribeToVerificationRequest", [BLSPubkey::repeat_byte(1)])
+                .await
+                .expect("subscribed")
+        });
+        async fn within(rx: &mut mpsc::Receiver<RouterMsg<UnverifiedBlock>>) -> RouterMsg<UnverifiedBlock> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.expect("in time").expect("a message")
+        }
+        match within(&mut router_rx).await {
+            RouterMsg::Subscribe { reply, .. } => reply.send(7).await.expect("reply"),
+            _ => panic!("the subscription is registered first"),
+        }
+        let sub = tokio::time::timeout(std::time::Duration::from_secs(5), subscribing)
+            .await
+            .expect("accepted in time")
+            .expect("the subscribing task");
+        drop(sub);
+        match within(&mut router_rx).await {
+            RouterMsg::Disconnect { id } => assert_eq!(id, 7),
+            _ => panic!("then dropped from the router"),
+        }
     }
 
     /// A full or closed verification channel is an RPC error, never a

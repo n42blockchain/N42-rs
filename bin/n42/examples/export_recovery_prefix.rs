@@ -1,5 +1,5 @@
 //! Read-only canonical block export for validated recovery into a separate EL.
-//! Usage: export_recovery_prefix DATADIR GENESIS LAST_BLOCK NEW_OUTPUT_DIRECTORY
+//! Usage: `export_recovery_prefix` DATADIR GENESIS `LAST_BLOCK` `NEW_OUTPUT_DIRECTORY`
 //! Export is not execution validation and never changes QMDB or vote watermarks.
 
 use alloy_consensus::proofs::calculate_transaction_root;
@@ -36,7 +36,7 @@ fn main() -> Result<()> {
         "output must be outside the source datadir"
     );
     let genesis: Genesis = serde_json::from_slice(&fs::read(&genesis_path)?)?;
-    let chain = Arc::new(reth_chainspec::ChainSpec::from(genesis));
+    let chain = Arc::new(n42_header::N42ChainSpec::from(reth_chainspec::ChainSpec::from(genesis)));
     let factory = N42Node::provider_factory_builder().open_read_only(
         chain,
         datadir.clone(),

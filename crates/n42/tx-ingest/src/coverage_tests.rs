@@ -398,6 +398,40 @@ fn an_attested_frame_admits_0x50_on_its_key_and_counts_them() {
     assert_eq!(load(&STATS.altsig_txs), before.1, "no signature work");
 }
 
+/// Audit 2026-10 C-2: an attestation vouches for a frame's signatures, not
+/// for its keys' shape. A 0x50 whose algorithm, key length or key is one the
+/// verified path would refuse is dropped, not cached under the sender its
+/// bytes hash to.
+#[test]
+fn an_attested_frame_still_drops_a_0x50_with_a_misshapen_key() {
+    let _g = counter_lock();
+    n42_tx_types::set_alt_sig_enabled(true);
+    let reshaped = |nonce: u64, alg_type: u8, pubkey: Vec<u8>| {
+        let (mut tx, signature, _) = alt_tx(69, nonce).into_parts();
+        tx.alg_type = alg_type;
+        tx.pubkey = Bytes::from(pubkey);
+        AltSigTx::new(tx, signature)
+    };
+    let mut identity = vec![0u8; 32];
+    identity[0] = 1;
+    let bad = vec![
+        reshaped(70_700, ALG_ED25519 + 1, alt_tx(69, 0).tx().pubkey.to_vec()),
+        reshaped(70_701, ALG_ED25519, vec![7u8; 31]),
+        reshaped(70_702, ALG_ED25519, identity),
+    ];
+    let hashes: Vec<B256> = bad.iter().map(|tx| *tx.hash()).collect();
+    let before = (load(&STATS.attested_txs), load(&STATS.dropped_altsig));
+
+    let out = recover(bad.into_iter().map(N42PooledTxEnvelope::AltSig).collect(), Vec::new(), None, true);
+
+    assert!(out.is_empty(), "{} admitted", out.len());
+    for hash in &hashes {
+        assert_eq!(AltSigSenderCache::global().get(hash), None);
+    }
+    assert_eq!(load(&STATS.attested_txs), before.0);
+    assert_eq!(load(&STATS.dropped_altsig) - before.1, 3);
+}
+
 #[test]
 fn shard_mode_ignores_the_shard_without_claims() {
     let _g = counter_lock();
@@ -571,6 +605,26 @@ fn frame_of_refuses_a_recovered_set_that_is_not_the_frames() {
     assert_eq!(frame.members.iter().map(|(_, nonce)| *nonce).collect::<Vec<_>>(), vec![70_700, 70_701]);
     // An empty frame is never described.
     assert_eq!(frame_of::<N42PooledTransaction>(0, Vec::new(), None, &[]), None);
+}
+
+/// Audit 2026-10 round 2 (R2-X3): the queue's frame index names frames
+/// admitted whole. A frame the pool refused (here every transaction: the
+/// no-op pool takes none) is not noted, or refused frames would fill the
+/// index's bounded slots and evict the frames that were admitted.
+#[tokio::test]
+async fn a_frame_the_pool_refused_is_not_indexed() {
+    let _g = counter_lock();
+    n42_tx_types::set_alt_sig_enabled(true);
+    let pooled = vec![alt(71, 71_000), alt(71, 71_001)];
+    let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
+    let recovered = recover(pooled, Vec::new(), None, false);
+    let frame = frame_of(2, hashes, None, &recovered).expect("whole frame");
+    let queue: n42_tx_queue::TxQueue<N42PooledTransaction> = n42_tx_queue::TxQueue::new();
+    let mut setup = Setup::from_env(false);
+    setup.queue = Some(queue.clone());
+    setup.direct = false;
+    admit_decoded(&Pool::new(), &setup, recovered, Some(frame), std::time::Instant::now()).await;
+    assert_eq!(queue.frames_indexed(), 0, "a refused frame is not in the index");
 }
 
 #[test]
@@ -870,11 +924,33 @@ mod wire {
         refused(handle, client, "transaction of 0 bytes").await;
     }
 
+    /// Audit 2026-10 round 2 (R2-X2): a frame is read whole before anything in
+    /// it is checked, so what the open connections can make the node hold is
+    /// bounded: no transaction larger than a pool would take, and every
+    /// connection's frame together within 4 GiB.
+    #[test]
+    fn what_the_connections_can_hold_is_bounded() {
+        assert!(MAX_TX_BYTES as usize <= 256 * 1024, "a transaction no pool takes is not read");
+        assert!(MAX_FRAME_BYTES * MAX_CONNECTIONS <= 4 << 30, "{} bytes across the connections", MAX_FRAME_BYTES * MAX_CONNECTIONS);
+        assert!(MAX_FRAME_BYTES >= MAX_FRAME_TXS as usize * 1024, "a full frame of ordinary transactions still fits");
+    }
+
     #[tokio::test]
     async fn an_oversized_transaction_closes_the_connection() {
+        // Past the blob cap, refused from the length alone.
+        let (mut client, handle) = connect().await;
+        client.write_all(&1u32.to_le_bytes()).await.unwrap();
+        let past_blobs = MAX_BLOB_TX_BYTES as u32 + 1;
+        client.write_all(&past_blobs.to_le_bytes()).await.unwrap();
+        refused(handle, client, &format!("transaction of {past_blobs} bytes")).await;
+        // Past 256 KiB and not a blob transaction: refused once its type is
+        // read (audit 2026-10 round 3, R3-G6).
         let (mut client, handle) = connect().await;
         client.write_all(&1u32.to_le_bytes()).await.unwrap();
         client.write_all(&(MAX_TX_BYTES + 1).to_le_bytes()).await.unwrap();
+        let mut body = vec![0u8; MAX_TX_BYTES as usize + 1];
+        body[0] = 0x02;
+        client.write_all(&body).await.unwrap();
         refused(handle, client, &format!("transaction of {} bytes", MAX_TX_BYTES + 1)).await;
     }
 

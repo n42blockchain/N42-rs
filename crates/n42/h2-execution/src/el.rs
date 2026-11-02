@@ -90,7 +90,7 @@ pub struct BuiltBlock {
     /// payload again to get it back is a clone and a full RLP walk of the whole
     /// block -- 648 ms at the 163,000-transaction tier, on a path where sealing
     /// itself is 150 ms.
-    pub header: Option<alloy_consensus::Header>,
+    pub header: Option<n42_h2_consensus::N42Header>,
     /// Every transaction's hash, in block order, when the execution layer
     /// sent them (`N42_COMPACT_BODY`). Empty otherwise.
     ///
@@ -227,10 +227,10 @@ pub struct ChainAhead {
 /// exactly that reason. `None` declines -- no chain this time.
 pub type ChainSealer = std::sync::Arc<
     dyn Fn(
-            &alloy_consensus::Header,
+            &n42_h2_consensus::N42Header,
             &PayloadAttributes,
             u64,
-        ) -> Option<(alloy_consensus::Header, PayloadAttributes)>
+        ) -> Option<(n42_h2_consensus::N42Header, PayloadAttributes)>
         + Send
         + Sync,
 >;
@@ -241,7 +241,7 @@ pub type ChainSealer = std::sync::Arc<
 #[derive(Debug, Clone)]
 pub struct ChainBlock {
     /// The header.
-    pub header: alloy_consensus::Header,
+    pub header: n42_h2_consensus::N42Header,
     /// The transactions' EIP-2718 bytes, in order. Bytes rather than a typed
     /// envelope: a block may carry transaction types this crate does not
     /// model (N42's 0x50), and every consumer wants the bytes anyway.
@@ -279,6 +279,11 @@ pub struct ForeignBody {
     /// a refusal means asking peers for the whole body rather than falling
     /// back to `NEW_PAYLOAD`.
     pub compact: bool,
+    /// Who sent a compact body ([`crate::raw_engine::claim_source_of`] of
+    /// the peer), when known: the execution layer files the frame layout a
+    /// description claims under it (audit 2026-10 round 2, R2-X4). `None`
+    /// for a full body or a sender not known.
+    pub source: Option<crate::raw_engine::ClaimSource>,
 }
 
 /// Whether a check-only answer ([`ExecutionLayer::check_only`]) vouches for
@@ -343,7 +348,7 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// hash, which finds it once the own import has landed.
     async fn own_block_body(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_h2_consensus::N42Header,
     ) -> Result<Option<ChainBlock>, ElError> {
         self.block_by_hash(header.hash_slow()).await
     }
@@ -354,7 +359,7 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// default cannot.
     async fn import_own_block_by_header(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_h2_consensus::N42Header,
     ) -> Option<PayloadStatus> {
         let _ = header;
         None
@@ -406,7 +411,7 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// payload.
     async fn import_own_block(
         &self,
-        header: Option<&alloy_consensus::Header>,
+        header: Option<&n42_h2_consensus::N42Header>,
         payload: ExecutionData,
     ) -> Result<PayloadStatus, ElError> {
         let _ = header;
@@ -421,7 +426,7 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// nothing.
     async fn build_on_own_block(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
     ) -> Option<Result<BuiltBlock, ElError>> {
         let _ = (header, attrs);
@@ -439,7 +444,7 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// entirely, which is what an execution layer without the chain does.
     async fn build_on_own_block_chaining(
         &self,
-        header: &alloy_consensus::Header,
+        header: &n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
         chain: Option<ChainAhead>,
     ) -> Option<Result<BuiltBlock, ElError>> {
@@ -574,6 +579,18 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// default vouches for nothing.
     async fn check_only(&self, block_hash: B256, header_rlp: alloy_primitives::Bytes) -> bool {
         let _ = (block_hash, header_rlp);
+        false
+    }
+
+    /// A claim and nothing else ([`crate::raw_engine::request::CLAIM_LAYOUT`]):
+    /// `body` is another peer's compact frame description of a block whose
+    /// first compact body this layer already has, with its sender in
+    /// [`ForeignBody::source`]. The layer files the frame layout it claims
+    /// under that source for the whole-body fallback to try (audit 2026-10
+    /// round 2, R2-X4); nothing is imported. `true` when it was filed. The
+    /// default files nothing.
+    async fn claim_layout(&self, body: ForeignBody) -> bool {
+        let _ = body;
         false
     }
 

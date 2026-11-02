@@ -40,10 +40,12 @@
 //! answers with `-38006 Too deep reorg`. Without it the node runs stateless and
 //! must not be restarted into a fleet it was already voting in.
 //!
-//! `--mobile <addr>` opens the `mobile_*` endpoint phones talk to: it serves
-//! each commit as the `Decide` a fleet member would verify, and collects the
-//! verification receipts phones send back. It has no TLS, auth, or rate limiting
-//! — put it behind something that does before exposing it.
+//! `--mobileverify.http <addr>` serves gov5's `/mobileverify` phone surface
+//! (`docs/MOBILEVERIFY_V3_PARITY.md`): registration, packets relayed from the
+//! fleet's `mobileverify_packet` topic, receipts, certificates. It joins the
+//! two mobile-verification gossip topics, commits the registry every
+//! `--mobileverify.collect-window-sec` and keeps it in
+//! `<datadir>/mobileverify/registry.bin`. Plain HTTP, as gov5's is.
 //!
 //! The BLS key must be the one at `--index` in `validators.json`; the node
 //! checks this at startup, because a mismatch turns it into a silent observer:
@@ -52,7 +54,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256};
@@ -64,7 +66,6 @@ use n42_h2_net::{H2V4Transport, TransportConfig};
 use n42_h2_node::{ConsensusStore, H2Service, ServiceEvent};
 use n42_h2_primitives::bls::BlsSecretKey;
 use n42_h2_primitives::consensus::H2V4ChainIdentity;
-use n42_mobile_service::MobileService;
 
 /// Exit code of a validator stopped by a fatal local fault
 /// (`ServiceError::Fatal`), distinct from the 1 of any other error.
@@ -87,6 +88,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: the first statement of `main`: no thread this program starts
     // exists yet, so nothing reads or writes the environment concurrently.
     unsafe { n42_env::profile::apply_or_exit("h2_validator") };
+    // The vote knobs that give up a safety property start only when the
+    // operator says this is a benchmark (audit 2026-10 round 2, R2-C3).
+    if let Some(refusal) = n42_h2_node::persistence::unsafe_vote_knob_refusal(|name| std::env::var(name).ok()) {
+        eprintln!("h2_validator: {refusal}");
+        std::process::exit(2);
+    }
     // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
     // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
     // memory drove 5.8M direct-compaction stalls that tore the page cache
@@ -127,7 +134,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: Vec<String> = Vec::new();
     let mut fault_tolerance: Option<u32> = None;
     let mut propose = false;
-    let mut mobile_addr: Option<String> = None;
+    let mut mobile_http: Option<std::net::SocketAddr> = None;
+    let mut mobile_pow_bits: u32 = 0;
+    let mut mobile_packet_window: u64 = 256;
+    let mut mobile_collect_window_sec: u64 = 45;
+    let mut mobile_cert_blocks: usize = 512;
     let mut datadir: Option<String> = None;
     let mut node_key: Option<String> = None;
     let mut worker_threads: Option<usize> = None;
@@ -181,7 +192,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 worker_threads =
                     Some(args.next().ok_or("--worker-threads needs a value")?.parse()?)
             }
-            "--mobile" => mobile_addr = Some(args.next().ok_or("--mobile needs an address")?),
+            "--mobileverify.http" => {
+                mobile_http = Some(args.next().ok_or("--mobileverify.http needs an address")?.parse()?)
+            }
+            "--mobileverify.pow-bits" => {
+                mobile_pow_bits = args.next().ok_or("--mobileverify.pow-bits needs a number")?.parse()?
+            }
+            "--mobileverify.packet-window" => {
+                mobile_packet_window = args.next().ok_or("--mobileverify.packet-window needs a number")?.parse()?
+            }
+            "--mobileverify.collect-window-sec" => {
+                mobile_collect_window_sec =
+                    args.next().ok_or("--mobileverify.collect-window-sec needs a number")?.parse()?
+            }
+            "--mobileverify.cert-blocks" => {
+                mobile_cert_blocks = args.next().ok_or("--mobileverify.cert-blocks needs a number")?.parse()?
+            }
             "--propose" => propose = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -287,7 +313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let validator_set = ValidatorSet::try_new(&validators, f)?;
     let validator_count = validators.len();
 
-    let mut config = TransportConfig::new(identity);
+    let mut config = TransportConfig::new(identity).with_mobileverify(mobile_http.is_some());
     config.idle_connection_timeout = Duration::from_secs(600);
     for addr in &peers {
         config = config.with_peer(addr.parse()?);
@@ -302,7 +328,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The chain's period is the pacing unless a benchmark overrides it, which
     // gov5 spells the same way. Warn rather than merely document: a fleet whose
     // timestamps have left the wall clock is not one to leave running.
-    let period_ms = block_interval_ms.unwrap_or(period_secs.saturating_mul(1000)).max(1);
+    let period_ms = block_interval_ms.unwrap_or_else(|| period_secs.saturating_mul(1000)).max(1);
     if period_ms < period_secs.saturating_mul(1000) {
         eprintln!(
             "note: --block-interval-ms {period_ms} paces faster than the chain's {period_secs}s \
@@ -355,20 +381,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("leader tenure: {leader_tenure} views, so a leader builds its next block while the fleet imports this one");
         }
 
-        // Phones verify the Decide, not this node's word for it, so the endpoint
-        // needs the chain identity the envelopes are bound to.
-        let mobile = mobile_addr.as_ref().map(|addr| {
-            let service = Arc::new(Mutex::new(MobileService::new(identity, 1)));
-            let served = Arc::clone(&service);
-            let bind_to = addr.clone();
-            std::thread::spawn(move || {
-                if let Err(error) = n42_mobile_service::serve(bind_to.as_str(), served) {
-                    eprintln!("mobile endpoint stopped: {error}");
-                }
-            });
-            println!("mobile       : {addr}");
-            service
-        });
+        // gov5's phone surface, its epoch committer and its gossip relay.
+        let (mobile, mobile_gossip) = if let Some(http) = mobile_http {
+            let (surface, channels) = n42_h2_node::mobile::MobileVerify::start(n42_h2_node::mobile::MobileVerifyConfig {
+                http,
+                pow_bits: mobile_pow_bits,
+                packet_window: mobile_packet_window,
+                collect_window: Duration::from_secs(mobile_collect_window_sec.max(1)),
+                cert_blocks: mobile_cert_blocks,
+                datadir: datadir.as_ref().map(std::path::PathBuf::from),
+                self_reporter: entry.address.0.0,
+            })
+            .await?;
+            println!("mobileverify : http://{http}/mobileverify (epoch {mobile_collect_window_sec} s, packet window {mobile_packet_window})");
+            (Some(Arc::new(surface)), Some(channels))
+        } else {
+            (None, None)
+        };
 
         let (output_tx, output_rx) = tokio::sync::mpsc::channel::<EngineOutput>(256);
         let store = datadir
@@ -455,6 +484,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("signing      : H2-v4");
         }
         engine.set_leader_tenure(leader_tenure);
+        if hotstuff_config.as_ref().is_some_and(|config| config.two_phase_vote_gate) {
+            engine.set_two_phase_vote_gate(true);
+            println!("vote gate    : two-phase (commit vote waits for the import)");
+        }
         // Bench only: a vote before the import bounds what deferred execution
         // (docs/PHASE_D_DEFERRED_EXECUTION.md) would give the cycle.
         if std::env::var("N42_VOTE_BEFORE_IMPORT").is_ok_and(|v| v == "1") {
@@ -544,6 +577,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if gov5_profile {
             service = service.with_gov5_h2_profile(seal_key);
         }
+        if let Some(channels) = mobile_gossip {
+            service = service.with_mobile_gossip(channels.inbound, channels.outbound);
+        }
         if let Some(rpc) = &el_rpc {
             service = service.with_transaction_source(rpc.parse()?);
             println!("transaction source: {rpc}");
@@ -625,6 +661,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // switch, because measured there it was a loss (see the service).
             service = service
                 .with_build_ahead(n42_env::flag("N42_BUILD_AHEAD", false) || leader_tenure > 1);
+            // The leader names its committed registry root; the builder stamps
+            // it where the chain's schedule carries `mobileRegistryRoot`.
+            let registry_root = mobile.clone();
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -659,6 +698,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // one at all.
                     context.head_header.as_ref().map(|header| header.number + 1),
                 )
+                .map(|mut attributes| {
+                    attributes.mobile_registry_root = registry_root.as_ref().map(|mobile| mobile.registry_root());
+                    attributes
+                })
             });
         }
 
@@ -683,16 +726,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         commit_qc,
                     } => {
                         println!("COMMIT view={view} block={block_hash}");
+                        let _ = commit_qc;
                         if let Some(mobile) = &mobile {
-                            let mut guard = mobile
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            // Block number is not carried on the consensus event;
-                            // the view is what a phone indexes finality by here.
-                            if let Err(error) =
-                                guard.record_commit(view, block_hash, view, *commit_qc, None)
-                            {
-                                eprintln!("could not publish the commit to phones: {error}");
+                            // The number comes from the header this node holds;
+                            // a block it holds none for is not offered to phones.
+                            match service.mobile_commit_facts(&block_hash) {
+                                Some((number, _)) => mobile.on_commit(number, block_hash),
+                                None => tracing::debug!(target: "n42::mobileverify", %block_hash, "committed block without a header here; not offered"),
                             }
                         }
                     }
@@ -744,6 +784,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// block — it produces a chain whose own clock advances twelve times faster
 /// than the wall clock. gov5 does exactly this when they benchmark, and their
 /// verification never compares a timestamp to the local clock.
+#[allow(clippy::too_many_arguments)] // example helper; the argument list is kept
 fn block_attributes(
     fee_recipient: Address,
     withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
@@ -827,6 +868,8 @@ fn block_attributes(
         // told, and it is what the adapter puts on the payload that comes back,
         // so the two agree by construction.
         slot_number,
+        // Named by the caller from the mobile-verification registry.
+        mobile_registry_root: None,
     })
 }
 
@@ -891,7 +934,13 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --body-port-offset <n>    plain TCP body channel on each member's libp2p port + n (default 1000; 0 = off)
   --listen <multiaddr>      address to listen on (repeatable)
   --propose                 build blocks when leader (default: vote only)
-  --mobile <addr>           serve the mobile_* endpoint here (e.g. 127.0.0.1:9545)
+  --mobileverify.http <addr>
+                            serve gov5's /mobileverify phone surface here (e.g. 127.0.0.1:21010)
+                            and relay the mobile-verification gossip topics
+  --mobileverify.pow-bits <n>            registration proof of work (default 0 = off)
+  --mobileverify.packet-window <n>       blocks of packets served (default 256)
+  --mobileverify.collect-window-sec <n>  registry epoch-commit interval (default 45)
+  --mobileverify.cert-blocks <n>         blocks of certificates kept (default 512)
   --datadir <path>          persist consensus state here (required to restart safely)
   --node-key <0x…|path>     libp2p secp256k1 identity; without it, <datadir>/network-key
   --direct-block-push       hand each block body straight to every member as

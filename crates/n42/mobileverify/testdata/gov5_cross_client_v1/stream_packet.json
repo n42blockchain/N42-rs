@@ -1,0 +1,77 @@
+{
+  "_doc": "StreamPacket V2 (cmd/evmsdk/stream_packet.go): \"N2\" (0x4e 0x32) || version 0x01 || flags (0x01 iff bytecodes) || block_hash32 || header_len u32 LE || header (block.Header.Marshal, header.json) || tx_count u32 LE || {tx_len u32 LE || tx (protobuf, transactions.json)}* || read_log_len u32 LE || read_log (read_log.json) || bytecode_count u32 LE || {code_hash32 || code_len u32 LE || code}*, bytecodes sorted by hash. empty_block_88 = session_e2e_test.go's executablePacket (the header carries no chain, so the bytes are the same for mainnet and mainnet_qmdb_staggered; it verifies under both). transfer = one EIP-1559 value transfer (from set) under mainnet_qmdb_staggered at block 14300000 / time 1790000000 (Cancun+Prague): the read log opens with the block-start system calls (EIP-4788 beacon roots, EIP-2935 history storage; both stubbed as nonce-1 contracts with code 0x60006000f3), recorded by the producer's ReadLogRecorder in Go IntraBlockState order. execute_and_verify_v2 = evmsdk.ExecuteAndVerifyV2 under each chain config, with the receipts root it computed (equal to the header's).",
+  "packets": [
+    {
+      "name": "empty_block_88",
+      "packet": "4e3201002bc3eb740d242f72e7896e67e81c3ff55e7d8165032cde9d2c93f1fa7d88b301540100000a0e0a0a088080808080808080011200120d0a0b08808080808080c0f7be011a0e0a0a088080808080808080021200222d0a1508a6abb1def1e287f45610eef08396e9bcd1c1ff01121408c0dbb2cbb983b8a45b10a1e88e9bdef68bb1012a2f0a1608bcc6dcb798c091e9c50110c0879ce6adb69fbf9201121508bbce88d4bccaad80e50110f0c896ecc580b6fd7b32040a0012003a060a0012021058408087a70e5080e2cfaa06620a0a001206108094ebdc037a3c0a1c0a0c0a040a00120012040a001200120c0a040a00120012040a001200121c0a0c0a040a00120012040a001200120c0a040a00120012040a0012008201040a001200a2012f0a1508faba9df68dbd93e61d109aa8b3b6fbacedc2ab0112160893e8a9a4b9a39189d30110c7a6d286d4dfd0d0f0014e343248001dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d493472b01000000000000040000000000000000000000",
+      "decoded": {
+        "flags": "00",
+        "block_hash": "2bc3eb740d242f72e7896e67e81c3ff55e7d8165032cde9d2c93f1fa7d88b301",
+        "block_number": 88,
+        "header_bytes": "0a0e0a0a088080808080808080011200120d0a0b08808080808080c0f7be011a0e0a0a088080808080808080021200222d0a1508a6abb1def1e287f45610eef08396e9bcd1c1ff01121408c0dbb2cbb983b8a45b10a1e88e9bdef68bb1012a2f0a1608bcc6dcb798c091e9c50110c0879ce6adb69fbf9201121508bbce88d4bccaad80e50110f0c896ecc580b6fd7b32040a0012003a060a0012021058408087a70e5080e2cfaa06620a0a001206108094ebdc037a3c0a1c0a0c0a040a00120012040a001200120c0a040a00120012040a001200121c0a0c0a040a00120012040a001200120c0a040a00120012040a0012008201040a001200a2012f0a1508faba9df68dbd93e61d109aa8b3b6fbacedc2ab0112160893e8a9a4b9a39189d30110c7a6d286d4dfd0d0f0014e343248001dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d493472b010000",
+        "tx_count": 0,
+        "transactions": [],
+        "read_log_bytes": "00000000",
+        "read_log_entry_count": 0,
+        "read_log_entries": [],
+        "bytecode_count": 0,
+        "bytecodes": []
+      },
+      "execute_and_verify_v2": [
+        {
+          "chain": "mainnet",
+          "verified": true,
+          "computed_receipts_root": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "tx_count": 0
+        },
+        {
+          "chain": "mainnet_qmdb_staggered",
+          "verified": true,
+          "computed_receipts_root": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "tx_count": 0
+        }
+      ]
+    },
+    {
+      "name": "transfer",
+      "packet": "4e3201013ad289109e332b00158636af13917ec852210b3768da879ef204daddecd3f3d3770100000a060a001202100112060a0010effd021a060a0012021002222d0a1508a6abb1def1e287f45610eef08396e9bcd1c1ff01121408c0dbb2cbb983b8a45b10a1e88e9bdef68bb1012a300a160886fd98fea5d680e39e0110e69ecbeac392aeffa501121608f4fefc90809db6a7b20110f598a2d7ffe3c9bbf00132040a0012003a090a00120510e0e6e806408087a70e4888a4015080f7c4d506620a0a001206108094ebdc037a3c0a1c0a0c0a040a00120012040a001200120c0a040a00120012040a001200121c0a0c0a040a00120012040a001200120c0a040a00120012040a0012008201040a001200a2012f0a1508faba9df68dbd93e61d109aa8b3b6fbacedc2ab0112160893e8a9a4b9a39189d30110c7a6d286d4dfd0d0f001b2010f0a0b088080808080808080be0112004e343248021dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347be000000000000000000000000000000000000000000000000000000000000002e01000001000000c3000000080210c1041a0a0a0012061080c8afa0252088a4012a0a0a0012061080c8afa02532060a00120210013a060a001202100152060a0010fe9f305a1d0a1508e1a2a3b5e5de98c59d0110b39fa78fd79fa5895c10cfb495a40e605e722e0a1508b1b8d599e8e1d4efa90110ccddb7fa94b5d49d3512150898fcfe9dd3f8c0bcae0110dcb8808bfe88c2d9577a2e0a1508fdd2b994aa9da89f4e10d1ebcd8ef78aeddca00112150881c7f4a5a986adcb830110f4a4b98ddae9e18c778201060a001202100159000000080000002301d003426e799329b8dca093f3bbab55a5e4e9f3c40160fc942068eef712ae88ad80802301d003426e799329b8dca093f3bbab55a5e4e9f3c40160fc942068eef712ae88ad80150241080de0b6b3a7640000000001000000d003426e799329b8dca093f3bbab55a5e4e9f3c40160fc942068eef712ae88ad0500000060006000f3",
+      "decoded": {
+        "flags": "01",
+        "block_hash": "3ad289109e332b00158636af13917ec852210b3768da879ef204daddecd3f3d3",
+        "block_number": 14300000,
+        "header_bytes": "0a060a001202100112060a0010effd021a060a0012021002222d0a1508a6abb1def1e287f45610eef08396e9bcd1c1ff01121408c0dbb2cbb983b8a45b10a1e88e9bdef68bb1012a300a160886fd98fea5d680e39e0110e69ecbeac392aeffa501121608f4fefc90809db6a7b20110f598a2d7ffe3c9bbf00132040a0012003a090a00120510e0e6e806408087a70e4888a4015080f7c4d506620a0a001206108094ebdc037a3c0a1c0a0c0a040a00120012040a001200120c0a040a00120012040a001200121c0a0c0a040a00120012040a001200120c0a040a00120012040a0012008201040a001200a2012f0a1508faba9df68dbd93e61d109aa8b3b6fbacedc2ab0112160893e8a9a4b9a39189d30110c7a6d286d4dfd0d0f001b2010f0a0b088080808080808080be0112004e343248021dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347be000000000000000000000000000000000000000000000000000000000000002e010000",
+        "tx_count": 1,
+        "transactions": [
+          "080210c1041a0a0a0012061080c8afa0252088a4012a0a0a0012061080c8afa02532060a00120210013a060a001202100152060a0010fe9f305a1d0a1508e1a2a3b5e5de98c59d0110b39fa78fd79fa5895c10cfb495a40e605e722e0a1508b1b8d599e8e1d4efa90110ccddb7fa94b5d49d3512150898fcfe9dd3f8c0bcae0110dcb8808bfe88c2d9577a2e0a1508fdd2b994aa9da89f4e10d1ebcd8ef78aeddca00112150881c7f4a5a986adcb830110f4a4b98ddae9e18c778201060a0012021001"
+        ],
+        "read_log_bytes": "080000002301d003426e799329b8dca093f3bbab55a5e4e9f3c40160fc942068eef712ae88ad80802301d003426e799329b8dca093f3bbab55a5e4e9f3c40160fc942068eef712ae88ad80150241080de0b6b3a76400000000",
+        "read_log_entry_count": 8,
+        "read_log_entries": [
+          "account nonce=1 balance=0x0 code_hash=d003426e799329b8dca093f3bbab55a5e4e9f3c40160fc942068eef712ae88ad",
+          "storage 0x0",
+          "storage 0x0",
+          "account nonce=1 balance=0x0 code_hash=d003426e799329b8dca093f3bbab55a5e4e9f3c40160fc942068eef712ae88ad",
+          "storage 0x0",
+          "account nonce=577 balance=0xde0b6b3a7640000 code_hash=c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "account_not_found",
+          "account_not_found"
+        ],
+        "bytecode_count": 1,
+        "bytecodes": [
+          {
+            "hash": "d003426e799329b8dca093f3bbab55a5e4e9f3c40160fc942068eef712ae88ad",
+            "code": "60006000f3"
+          }
+        ]
+      },
+      "execute_and_verify_v2": [
+        {
+          "chain": "mainnet_qmdb_staggered",
+          "verified": true,
+          "computed_receipts_root": "9ec602b25fc63e86a5feb8943d52cf66b24ed8e8021f3f74f077271ffae88c75",
+          "tx_count": 1
+        }
+      ]
+    }
+  ]
+}

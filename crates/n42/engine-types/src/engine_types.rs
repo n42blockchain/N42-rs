@@ -230,6 +230,91 @@ impl TryFrom<N42BuiltPayload> for ExecutionPayloadEnvelopeV5 {
     }
 }
 
+/// A pre-Amsterdam `getPayload` envelope (V3, V4, V5) with the header's gov5
+/// tail inside `executionPayload`: `slotNumber` and `mobileRegistryRoot`.
+///
+/// Those versions type the payload as `ExecutionPayloadV3`, which has neither
+/// field, so a HotStuff header that carries them (gov5's Glamsterdam and
+/// MobileAnchor, which on an N42-native chain change the header alone) came
+/// back without them and its block hash could not be reproduced from the
+/// payload. The fields are absent when the header has none, so the JSON is
+/// alloy's, byte for byte, everywhere else. The validator's client reads them
+/// beside the payload (`n42-h2-el-rpc`, `PayloadMaybeWithBal`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithHeaderTail<E> {
+    /// alloy's envelope.
+    pub envelope: E,
+    /// The header's slot number, if it has one.
+    pub slot_number: Option<u64>,
+    /// The header's registry root, if it has one.
+    pub mobile_registry_root: Option<alloy_primitives::B256>,
+}
+
+impl<E> WithHeaderTail<E> {
+    fn of(value: &N42BuiltPayload, envelope: E) -> Self {
+        let header = value.block().header();
+        Self { envelope, slot_number: header.slot_number, mobile_registry_root: header.mobile_registry_root }
+    }
+}
+
+impl<E: serde::Serialize> serde::Serialize for WithHeaderTail<E> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error as _;
+        let mut value = serde_json::to_value(&self.envelope).map_err(S::Error::custom)?;
+        if let Some(payload) = value.get_mut("executionPayload").and_then(serde_json::Value::as_object_mut) {
+            if let Some(slot) = self.slot_number {
+                payload.insert("slotNumber".to_owned(), serde_json::Value::String(format!("{slot:#x}")));
+            }
+            if let Some(root) = self.mobile_registry_root {
+                payload.insert("mobileRegistryRoot".to_owned(), serde_json::Value::String(root.to_string()));
+            }
+        }
+        serde::Serialize::serialize(&value, serializer)
+    }
+}
+
+impl<'de, E: serde::de::DeserializeOwned> serde::Deserialize<'de> for WithHeaderTail<E> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        let (mut slot_number, mut mobile_registry_root) = (None, None);
+        if let Some(payload) = value.get_mut("executionPayload").and_then(serde_json::Value::as_object_mut) {
+            if let Some(slot) = payload.remove("slotNumber") {
+                slot_number = Some(serde_json::from_value::<alloy_primitives::U64>(slot).map_err(D::Error::custom)?.to());
+            }
+            if let Some(root) = payload.remove("mobileRegistryRoot") {
+                mobile_registry_root = Some(serde_json::from_value(root).map_err(D::Error::custom)?);
+            }
+        }
+        let envelope = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self { envelope, slot_number, mobile_registry_root })
+    }
+}
+
+impl TryFrom<N42BuiltPayload> for WithHeaderTail<ExecutionPayloadEnvelopeV3> {
+    type Error = BuiltPayloadConversionError;
+    fn try_from(value: N42BuiltPayload) -> Result<Self, Self::Error> {
+        let tail = WithHeaderTail::of(&value, ());
+        Ok(Self { envelope: value.try_into_v3()?, slot_number: tail.slot_number, mobile_registry_root: tail.mobile_registry_root })
+    }
+}
+
+impl TryFrom<N42BuiltPayload> for WithHeaderTail<ExecutionPayloadEnvelopeV4> {
+    type Error = BuiltPayloadConversionError;
+    fn try_from(value: N42BuiltPayload) -> Result<Self, Self::Error> {
+        let tail = WithHeaderTail::of(&value, ());
+        Ok(Self { envelope: value.try_into_v4()?, slot_number: tail.slot_number, mobile_registry_root: tail.mobile_registry_root })
+    }
+}
+
+impl TryFrom<N42BuiltPayload> for WithHeaderTail<ExecutionPayloadEnvelopeV5> {
+    type Error = BuiltPayloadConversionError;
+    fn try_from(value: N42BuiltPayload) -> Result<Self, Self::Error> {
+        let tail = WithHeaderTail::of(&value, ());
+        Ok(Self { envelope: value.try_into_v5()?, slot_number: tail.slot_number, mobile_registry_root: tail.mobile_registry_root })
+    }
+}
+
 impl TryFrom<N42BuiltPayload> for ExecutionPayloadEnvelopeV6 {
     type Error = BuiltPayloadConversionError;
     fn try_from(value: N42BuiltPayload) -> Result<Self, Self::Error> {
@@ -288,9 +373,9 @@ fn payload_with_header_tail(
 impl EngineTypes for N42EngineTypes {
     type ExecutionPayloadEnvelopeV1 = ExecutionPayloadV1;
     type ExecutionPayloadEnvelopeV2 = ExecutionPayloadEnvelopeV2;
-    type ExecutionPayloadEnvelopeV3 = ExecutionPayloadEnvelopeV3;
-    type ExecutionPayloadEnvelopeV4 = ExecutionPayloadEnvelopeV4;
-    type ExecutionPayloadEnvelopeV5 = ExecutionPayloadEnvelopeV5;
+    type ExecutionPayloadEnvelopeV3 = WithHeaderTail<ExecutionPayloadEnvelopeV3>;
+    type ExecutionPayloadEnvelopeV4 = WithHeaderTail<ExecutionPayloadEnvelopeV4>;
+    type ExecutionPayloadEnvelopeV5 = WithHeaderTail<ExecutionPayloadEnvelopeV5>;
     type ExecutionPayloadEnvelopeV6 = ExecutionPayloadEnvelopeV6;
 }
 
@@ -503,6 +588,35 @@ mod tests {
         );
         assert_eq!(rebuilt.header.block_access_list_hash, None);
         assert_eq!(rebuilt.header.hash_slow(), hash, "the 24-element header survives");
+    }
+
+    /// A pre-Amsterdam `getPayload` envelope carries the header's slot number
+    /// and registry root inside `executionPayload`, reads back to the same
+    /// envelope, and is alloy's JSON exactly when the header has neither.
+    #[test]
+    fn pre_amsterdam_envelopes_carry_the_header_tail() {
+        let recovered = block(1);
+        let mut header = recovered.sealed_block().header().clone();
+        header.slot_number = Some(header.number);
+        header.mobile_registry_root = Some(B256::repeat_byte(0x24));
+        let body = recovered.sealed_block().body().clone();
+        let sealed = SealedBlock::seal_slow(Block { header, body });
+        let tailed = RecoveredBlock::new_sealed(sealed, recovered.senders().to_vec());
+        let built = N42BuiltPayload::new(Arc::new(tailed), U256::from(5), Some(requests()), None);
+
+        let v5 = WithHeaderTail::<ExecutionPayloadEnvelopeV5>::try_from(built.clone()).expect("v5");
+        let json = serde_json::to_value(&v5).unwrap();
+        assert_eq!(json["executionPayload"]["slotNumber"], "0xc");
+        assert_eq!(json["executionPayload"]["mobileRegistryRoot"], serde_json::json!(B256::repeat_byte(0x24)));
+        let back: WithHeaderTail<ExecutionPayloadEnvelopeV5> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, v5);
+        let v4 = WithHeaderTail::<ExecutionPayloadEnvelopeV4>::try_from(built).expect("v4");
+        assert_eq!(serde_json::to_value(&v4).unwrap()["executionPayload"]["slotNumber"], "0xc");
+
+        let plain = N42BuiltPayload::new(block(1), U256::from(5), Some(requests()), None);
+        let ours = serde_json::to_value(WithHeaderTail::<ExecutionPayloadEnvelopeV5>::try_from(plain.clone()).unwrap()).unwrap();
+        let alloys = serde_json::to_value(plain.try_into_v5().unwrap()).unwrap();
+        assert_eq!(ours, alloys, "no tail, no change");
     }
 
     #[test]

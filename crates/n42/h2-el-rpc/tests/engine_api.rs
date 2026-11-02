@@ -476,6 +476,69 @@ async fn an_osaka_envelope_is_read_and_re_imported_with_its_requests() {
     assert_eq!(new_payload_call(&built.execution_data).unwrap().0, "engine_newPayloadV4");
 }
 
+/// gov5's Glamsterdam and MobileAnchor on a pre-Amsterdam chain: the node's
+/// `getPayloadV5` envelope carries the header's slot number and registry
+/// root beside its V3 payload (`n42_engine_types::WithHeaderTail`), and the
+/// block comes back as the V4 payload a gov5 header with that tail converts
+/// to (`n42_header::engine::payload_from_block`) -- the shape followers'
+/// `newPayload` reproduces the sealed hash from.
+#[tokio::test]
+async fn a_pre_amsterdam_envelope_carries_the_gov5_header_tail() {
+    let root = B256::repeat_byte(0x24);
+    let inner = payload_v1();
+    let header = alloy_consensus::Header {
+        parent_hash: inner.parent_hash,
+        state_root: inner.state_root,
+        receipts_root: inner.receipts_root,
+        number: inner.block_number,
+        gas_limit: inner.gas_limit,
+        timestamp: inner.timestamp,
+        base_fee_per_gas: Some(7),
+        withdrawals_root: Some(alloy_consensus::constants::EMPTY_WITHDRAWALS),
+        blob_gas_used: Some(0),
+        excess_blob_gas: Some(0),
+        // A build this client did not start is collected under the zero root.
+        parent_beacon_block_root: Some(B256::ZERO),
+        requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+        slot_number: Some(inner.block_number),
+        ..Default::default()
+    };
+    let sealed = n42_header::N42Header::new(header, Some(root));
+    let hash = alloy_primitives::Sealable::hash_slow(&sealed);
+    let block: alloy_consensus::Block<alloy_consensus::TxEnvelope, n42_header::N42Header> = alloy_consensus::Block {
+        header: sealed.clone(),
+        body: alloy_consensus::BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: Some(Default::default()) },
+    };
+    let (expected, _) = n42_header::engine::payload_from_block(hash, &block, None).unwrap();
+    assert!(matches!(expected, ExecutionPayload::V4(_)), "a tail without an access list is promoted");
+
+    // What the node's getPayloadV5 sends: the V3 payload, the tail beside it.
+    let mut payload = serde_json::to_value(expected.as_v3().unwrap()).unwrap();
+    payload["slotNumber"] = json!(format!("{:#x}", inner.block_number));
+    payload["mobileRegistryRoot"] = json!(root);
+    let recorder = Recorder::with_answers(vec![Ok(json!({
+        "executionPayload": payload,
+        "blockValue": "0x0",
+        "blobsBundle": {"commitments": [], "proofs": [], "blobs": []},
+        "shouldOverrideBuilder": false,
+        "executionRequests": [],
+    }))]);
+    let client = EngineApiClient::new(SharedRecorder(recorder.clone()));
+    let built = client
+        .resolve_payload(PayloadId::new([6; 8]), ResolveKind::WaitForPending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(built.hash, hash);
+    assert_eq!(built.execution_data.payload, expected, "the payload the sealed header converts to");
+    assert!(n42_header::engine::tail_matches(&built.execution_data.payload, &sealed));
+    let rebuilt = n42_header::engine::block_with_payload_root(
+        built.execution_data.clone().try_into_block::<alloy_consensus::TxEnvelope>().unwrap(),
+        &built.execution_data.payload,
+    );
+    assert_eq!(alloy_primitives::Sealable::hash_slow(&rebuilt.header), hash, "the sealed hash reproduces");
+}
+
 /// The `eth_` lookups that serve peers: a block by number or hash comes
 /// back as the consensus header and transactions, and the head number as a
 /// number — asked of the auth endpoint, since the spec puts these methods

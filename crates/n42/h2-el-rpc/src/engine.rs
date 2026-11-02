@@ -1316,6 +1316,11 @@ struct PayloadMaybeWithBal {
     /// gov5's registry root (header element 24), a V4 field like the list.
     #[serde(default, rename = "mobileRegistryRoot")]
     mobile_registry_root: Option<B256>,
+    /// The header's slot number when the envelope's version has no field for
+    /// it: the node's pre-Amsterdam envelopes carry gov5's Glamsterdam tail
+    /// here (`n42_engine_types::WithHeaderTail`).
+    #[serde(default, rename = "slotNumber")]
+    slot_number: Option<alloy_primitives::U64>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -1372,12 +1377,22 @@ pub fn built_block_from_envelope(
     // variant is what carries the list to `newPayload`, and `newPayload` is
     // where reth decides between rayon workers and a `while` loop.
     let mobile_registry_root = envelope.execution_payload.mobile_registry_root;
-    if mobile_registry_root.is_some() && envelope.execution_payload.block_access_list.is_none() {
-        // A V4 field on a payload without the other V4 fields: refused rather
-        // than dropped, since without it the block does not reproduce.
-        return Err(ElError::new("getPayload: a mobileRegistryRoot without a V4 payload"));
+    let tail_slot = envelope.execution_payload.slot_number.map(|slot| slot.to::<u64>());
+    // A gov5 header with a slot or a root and no access list (Glamsterdam on an
+    // N42-native chain, which changes the header alone): a V4 payload with an
+    // empty list, as `n42_header::engine::put_header_tail` promotes one, so the
+    // block reproduces on `newPayload`.
+    let block_access_list = match envelope.execution_payload.block_access_list {
+        Some(list) => Some(list),
+        None if tail_slot.is_some() || mobile_registry_root.is_some() => Some(alloy_primitives::Bytes::new()),
+        None => None,
+    };
+    if let Some(slot) = tail_slot
+        && slot != number
+    {
+        return Err(ElError::new(format!("getPayload: slot number {slot} on block {number}")));
     }
-    let payload = match envelope.execution_payload.block_access_list {
+    let payload = match block_access_list {
         Some(block_access_list) => ExecutionPayload::V4(ExecutionPayloadV4 {
             payload_inner: envelope.execution_payload.payload,
             block_access_list,

@@ -892,8 +892,16 @@ where
             && v4.block_access_list.is_empty()
         {
             let timestamp = v4.payload_inner.payload_inner.payload_inner.timestamp;
-            if !self.chain_spec.is_amsterdam_active_at_timestamp(timestamp)
-                && crate::hotstuff_consensus::header_tail_rules(self.chain_spec.genesis(), timestamp).slot_number
+            // Under Amsterdam an empty list is a missing one. The payload's
+            // `block_access_list()` reads empty bytes as no list (the gov5
+            // tail above needs that); before it did, the tree refused such a
+            // payload as undecodable, and it is still refused, here.
+            if self.chain_spec.is_amsterdam_active_at_timestamp(timestamp) {
+                return Err(EngineObjectValidationError::Payload(
+                    reth_payload_primitives::VersionSpecificValidationError::NoBlockAccessListPostAmsterdam,
+                ));
+            }
+            if crate::hotstuff_consensus::header_tail_rules(self.chain_spec.genesis(), timestamp).slot_number
             {
                 let v3 = ExecutionData {
                     payload: alloy_rpc_types_engine::ExecutionPayload::V3(v4.payload_inner.clone()),
@@ -1697,6 +1705,10 @@ mod tests {
         let hash = block.header.hash_slow();
         let payload = n42_header::engine::execution_data_from_block(hash, &block, None).unwrap();
         assert!(payload.payload.as_v4().is_some_and(|v4| v4.block_access_list.is_empty()));
+        // The engine tree decodes whatever list this hands it; empty bytes
+        // are no RLP list and refused the block (round mv4e), so they read
+        // as no list at all.
+        assert_eq!(reth_payload_primitives::ExecutionPayload::block_access_list(&payload), None);
 
         let mut genesis = MAINNET.genesis().clone();
         for key in [reth_chainspec::qmdb::GLAMSTERDAM_TIME_KEY, reth_chainspec::qmdb::MOBILE_ANCHOR_TIME_KEY] {
@@ -1713,6 +1725,14 @@ mod tests {
         };
         check(gated.clone()).expect("the scheduled tail passes");
         assert!(check(ungated).is_err(), "and nowhere else");
+        // Under reth's Amsterdam the empty list stays a refusal, gate or not.
+        let amsterdam = Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().amsterdam_activated().build());
+        assert!(matches!(
+            check(amsterdam),
+            Err(EngineObjectValidationError::Payload(
+                reth_payload_primitives::VersionSpecificValidationError::NoBlockAccessListPostAmsterdam
+            ))
+        ));
 
         let sealed = convert(&N42EngineValidator::new(gated, N42HeaderProfile::Gov5H2), payload).unwrap();
         assert_eq!(sealed.hash(), hash);

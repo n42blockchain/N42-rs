@@ -1,7 +1,7 @@
 # Mobile verification v3 (`/mobileverify`) parity for the Rust node
 
-Status: specification 2026-11-01; stages 0-2 implemented (see the table in section 4 and
-"Stage 2 verification" at the end).
+Status: specification 2026-11-01; stages 0-3 implemented (see the table in section 4 and
+"Stage 2 verification" / "Stage 3 verification" at the end).
 
 gov5's phone app (n42appv2, "mining v3", `docs/mobile-app-mobileverify-plan.md` in N42-gov5)
 runs the Go SDK's `MobileVerifyMiner` loop against one HTTP surface on a fleet node:
@@ -369,7 +369,7 @@ one complete StreamPacket for an empty block under `mainnet_qmdb_staggered`.
 | 0 | gov5 branch `test/mobileverify-cross-client-fixtures` | the Go fixture writer of §3.4, `internal/mobileverify/testdata/cross_client_v1/*.json` | `go test ./internal/mobileverify/... -run Fixture` writes them; copied to n42-rs with SHAs | done (gov5 76bc53c5, 961e4601) |
 | 1 | n42-rs crate `crates/n42/mobileverify` | registry + gov5 BMT accumulator + snapshot export; PoP/PoW; mask; collector + cohort coordinator (single node, majority bucket, alarms); cert JSON; packet cache + window; StreamPacket V2 decoder with the gov5 header/tx protobuf codecs (encode too, for the sidecar path's validation); HTTP router on hyper 1.x with the exact routes, bodies, status codes and limits of §1.2 | unit tests against the stage-0 fixtures; an `httptest`-style test per route | done (635ce8538..8bc262b2f; hardening merged af7ba3771) |
 | 2 | `n42-h2-node` | `--mobileverify.http`, head from commits, epoch commit every 45 s, gossip relay of packets and registrations (`h2-net` topics), registry root → payload attributes → assembler, anchor log; `--mobile` retired | mixed devnet: gov5 `cmd/mobileverify-device` pointed at the **Rust** member registers, verifies gov5-produced packets, gets certified | done (c36733319, 7a4f44fa8, 05657d113, f5bc78235, d3efa4651, 98dafeb94; gov5 harness 448db194); verified on a mixed devnet, see "Stage 2 verification" |
-| 3 | gov5 `cmd/mobileverify-packetd` + Rust loopback ingest | the sidecar builder of §3.2 | all-Rust devnet on chain 94's genesis: `cmd/mobileverify-device` against a Rust node, 20/20 certified (gov5's own regression bar) | open |
+| 3 | gov5 `cmd/mobileverify-packetd` + Rust loopback ingest | the sidecar builder of §3.2 | all-Rust devnet on chain 94's genesis: `cmd/mobileverify-device` against a Rust node, 20/20 certified (gov5's own regression bar) | done on `n42_devnet.json` (n42-rs 5071b8553, 4bc0bed0d; gov5 `feat/mobileverify-packetd` a9cce626, harness fcd7aa4b); not yet run on chain 94's genesis, see "Stage 3 verification" |
 | 4 | docs | `N42_26_PORT.md` "Joining a Go fleet" rules, `N42_CUSTOMIZATIONS.md`, this document's status | — | open |
 
 Open for the owner: the reward model (gov5 item 8), TLS exposure (item 4), an `n42_devnet`
@@ -429,3 +429,56 @@ Open after stage 2:
   builds that differ only in the root would share an id. The leader sets the root once per slot.
 - Stage 3 needs from the Rust side: a hook that publishes a packet ingested through the loopback
   `PUT` on `mobileverify_packet` (gov5 `PublishLocal`); the loopback ingest itself exists.
+  (Done in stage 3: `Service::set_on_ingest`.)
+
+## Stage 3 verification
+
+Runs `mv3a` and `mv3b`, 2026-11-02: all-Rust devnet (four Rust validators, one QMDB execution
+layer) on `n42_devnet.json`, 420 s each, n42-rs `feat/mobileverify-v3` at 4bc0bed0d (debug build).
+gov5's `cmd/mobileverify-packetd` (`feat/mobileverify-packetd` a9cce626) runs beside validator 0.
+The device harness is `test/mobileverify-device-genesis` fcd7aa4b, aimed at validator **1**, so
+every packet it verifies came to that node over `mobileverify_packet` from validator 0's ingest
+hook:
+
+```bash
+DEVNET_BIN=/data/n42-build/mobile-target/debug MOBILEVERIFY=1 \
+  PACKETD=<gov5 worktree>/build/mobileverify-packetd scripts/devnet-fleet.sh mv3a 420
+# packetd -rpc http://127.0.0.1:18545 -mv http://127.0.0.1:21010 -genesis $GENESIS -out $F/packets
+mobileverify-device -mv http://127.0.0.1:21011 -rpc http://127.0.0.1:18545 \
+  -genesis crates/chainspec/res/genesis/n42_devnet.json -devices 2 -blocks 20 -commit-wait 150s -settle 30s
+```
+
+| Run | Load | Device SUMMARY | Certs on validator 1 | packetd |
+|---|---|---|---|---|
+| `mv3a` | none (empty blocks) | `devices=2 blocks=20 skipped=0 failures=0 certified(all devices)=20/20` | 20, `signers` 2 each | 139 packets (blocks 1-139), 5.4 / 6.5 / 8.7 ms min / p50 / max, all `src=raw-block` |
+| `mv3b` | two `send_tx` senders, 2 tx/s each (1,202 sent, 0 rejected) | `devices=2 blocks=20 skipped=0 failures=0 certified(all devices)=20/20` | 20, `signers` 2 each | 139 packets carrying 1,202 transactions (12-14 per block), 7.2 / 8.3 / 12.3 ms |
+
+What this establishes:
+
+- **The Rust header round-trips through gov5's decoder.** `debug_getRawBlock` from the reth
+  execution layer decoded on the Go side and hashed to the RPC hash on every block
+  (`src=raw-block` throughout; no fallback was used). The only packetd error in either run is
+  block 0 ("has no parent state"), which is expected.
+- **Re-execution matches.** The devices recomputed each block's receipts root from the sidecar's
+  packet and it equalled the header's, including the blocks with 12-14 transfers (the withdrawal
+  reward of `devBlockReward` is in every block).
+- **One sidecar serves the fleet.** Validator 1 cached every packet about 1 ms after validator 0's
+  ingest. Both members' `/latest` answered `packet: true`. Registry 2 and the same accumulator on
+  both members.
+- Fleet health was unaffected: 139-140 commits on every validator, no view timeouts, EL errors 0.
+
+The first attempt (`mv3a-race`, kept under `audit-notes/devnet/`) failed 0/20 with
+`404 packet not in window`. Its packets were all built and relayed. The harness had asked for
+each packet the moment the block showed on the RPC, which is about a second before a
+sidecar-built packet lands (packetd polls once a second). gov5's leader caches its packet before
+the commit, so the harness had never had to wait. fcd7aa4b makes it wait up to `-packet-wait`
+(3 s) for every block, as the app waits for the `packet` flag of `/latest`.
+
+Left for stage 3:
+
+- A run on chain 94's genesis (`crates/chainspec/res/genesis/gov5/`, with its README's
+  `--fork-time` step). The device took its ChainConfig from `n42_devnet.json` here, so the
+  devnet sufficed for the device and the sidecar.
+- Sidecar latency is set by its 1 s head poll. A phone that reads `/latest` before the packet has
+  landed sees `packet: false` for up to a second.
+

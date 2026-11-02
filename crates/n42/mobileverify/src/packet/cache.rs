@@ -45,6 +45,9 @@ pub enum PacketValidationError {
         /// The local head.
         head: u64,
     },
+    /// No committed head yet, so no window to check the number against.
+    #[error("mobileverify: no local head to check the packet number against")]
+    NoHead,
 }
 
 /// Decodes `data`, decodes its header and checks that the header hashes to
@@ -167,14 +170,19 @@ impl PacketCache {
 
     /// Validates a gossiped packet and caches it if it fits the window and
     /// the per-height bound. Returns `(hash, number, newly_inserted)`.
+    ///
+    /// Refused while `head` is `None` (a node before its first commit): gov5
+    /// has a head from its database by then, while here an unchecked number
+    /// near `u64::MAX` would pin `max_num` and end eviction for good.
     pub fn validate_incoming(
         &self,
         data: Bytes,
         head: Option<u64>,
     ) -> Result<(B256, u64, bool), PacketValidationError> {
         let (hash, number) = validate_packet_bytes(&data)?;
-        if !self.accepts_peer_number(number, head) {
-            return Err(PacketValidationError::OutsideWindow { number, head: head.unwrap_or(0) });
+        let Some(head) = head else { return Err(PacketValidationError::NoHead) };
+        if !self.accepts_peer_number(number, Some(head)) {
+            return Err(PacketValidationError::OutsideWindow { number, head });
         }
         let new = self.put_peer(hash, number, data);
         Ok((hash, number, new))
@@ -223,6 +231,21 @@ mod tests {
         }
         assert_eq!(c.len(), 8);
         assert!(c.put(B256::repeat_byte(0x99), 7, Bytes::from_static(b"x")));
+    }
+
+    /// Without a local head there is no window to judge a peer's number by:
+    /// one packet numbered near `u64::MAX` would pin `max_num`, after which no
+    /// new maximum ever comes and nothing is evicted again.
+    #[test]
+    fn a_peer_packet_cannot_pin_the_window_before_the_head_is_known() {
+        let c = PacketCache::new(4);
+        let (pkt, _) = packet(u64::MAX);
+        assert_eq!(c.validate_incoming(Bytes::from(pkt.encode()), None), Err(PacketValidationError::NoHead));
+        assert!(c.is_empty());
+        for n in 0..10u64 {
+            c.put(B256::from(U256Ext::from(n)), n, Bytes::from_static(b"x"));
+        }
+        assert_eq!(c.len(), 5, "eviction still runs");
     }
 
     #[test]

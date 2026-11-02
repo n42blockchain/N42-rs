@@ -153,7 +153,7 @@ impl MobileVerify {
             match std::fs::read(path) {
                 Ok(data) => match registry.import_committed(&data) {
                     Ok(root) => info!(
-                        target: "mobileverify",
+                        target: "n42::mobileverify",
                         count = registry.index_bound(), %root, path = %path.display(),
                         "restored the committed registry"
                     ),
@@ -185,7 +185,7 @@ impl MobileVerify {
             registry.set_on_register(Arc::new(move |pubkey, pop| {
                 let payload = n42_mobileverify::topics::registration_payload(pubkey, pop).to_vec();
                 if out_tx.try_send((MobileTopic::Registration, payload)).is_err() {
-                    debug!(target: "mobileverify", "registration gossip queue full; not relayed");
+                    debug!(target: "n42::mobileverify", "registration gossip queue full; not relayed");
                 }
             }));
         }
@@ -208,7 +208,7 @@ impl MobileVerify {
         tokio::spawn(relay(in_rx, registry.clone(), packets, head.clone()));
 
         info!(
-            target: "mobileverify",
+            target: "n42::mobileverify",
             http = %cfg.http, window = cfg.packet_window, pow_bits = cfg.pow_bits,
             epoch_s = cfg.collect_window.as_secs(), "mobile verification surface enabled"
         );
@@ -248,11 +248,11 @@ async fn commit_epochs(registry: Arc<Registry>, every: Duration, snapshot: Optio
         if added == 0 {
             continue;
         }
-        info!(target: "mobileverify", added, count = registry.index_bound(), %root, "registry epoch committed");
+        info!(target: "n42::mobileverify", added, count = registry.index_bound(), %root, "registry epoch committed");
         if let Some(path) = &snapshot
             && let Err(err) = write_snapshot(path, &registry.export_committed())
         {
-            warn!(target: "mobileverify", path = %path.display(), %err, "could not persist the registry snapshot");
+            warn!(target: "n42::mobileverify", path = %path.display(), %err, "could not persist the registry snapshot");
         }
     }
 }
@@ -289,23 +289,23 @@ async fn relay(
                 match packets.validate_incoming(Bytes::from(data), at) {
                     Ok((hash, number, new)) => {
                         head.remember(number, hash);
-                        debug!(target: "mobileverify", %hash, number, new, "relayed packet cached");
+                        debug!(target: "n42::mobileverify", %hash, number, new, "relayed packet cached");
                     }
-                    Err(err) => debug!(target: "mobileverify", %err, "dropped a gossiped packet"),
+                    Err(err) => debug!(target: "n42::mobileverify", %err, "dropped a gossiped packet"),
                 }
             }
             MobileTopic::Registration => {
                 let Some((pubkey, pop)) = n42_mobileverify::topics::parse_registration_payload(&data) else {
-                    debug!(target: "mobileverify", len = data.len(), "dropped a malformed registration");
+                    debug!(target: "n42::mobileverify", len = data.len(), "dropped a malformed registration");
                     continue;
                 };
                 // A proof of possession takes a pairing: off the runtime's
                 // async workers.
                 let registry = registry.clone();
                 match tokio::task::spawn_blocking(move || registry.adopt_pending(&pubkey, &pop)).await {
-                    Ok(Ok(new)) => debug!(target: "mobileverify", new, "gossiped registration admitted"),
-                    Ok(Err(err)) => debug!(target: "mobileverify", %err, "dropped a gossiped registration"),
-                    Err(err) => debug!(target: "mobileverify", %err, "registration check did not finish"),
+                    Ok(Ok(new)) => debug!(target: "n42::mobileverify", new, "gossiped registration admitted"),
+                    Ok(Err(err)) => debug!(target: "n42::mobileverify", %err, "dropped a gossiped registration"),
+                    Err(err) => debug!(target: "n42::mobileverify", %err, "registration check did not finish"),
                 }
             }
         }

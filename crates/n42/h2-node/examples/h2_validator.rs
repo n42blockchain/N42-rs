@@ -733,7 +733,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // a block it holds none for is not offered to phones.
                             match service.mobile_commit_facts(&block_hash) {
                                 Some((number, _)) => mobile.on_commit(number, block_hash),
-                                None => tracing::debug!(target: "mobileverify", %block_hash, "committed block without a header here; not offered"),
+                                None => tracing::debug!(target: "n42::mobileverify", %block_hash, "committed block without a header here; not offered"),
                             }
                         }
                     }

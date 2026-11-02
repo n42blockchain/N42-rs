@@ -8,7 +8,7 @@
 //! This crate provides:
 //! - Fusaka hardfork configuration and constants
 //! - BLS12-381 precompile support verification (EIP-2537)
-//! - PeerDAS support verification (EIP-7594)
+//! - `PeerDAS` support verification (EIP-7594)
 //! - Comprehensive test coverage for Fusaka features
 //!
 //! # Fusaka EIPs
@@ -18,11 +18,11 @@
 //! - EIP-7685: General purpose execution layer requests
 //! - EIP-6110: Supply validator deposits on chain
 //! - EIP-7002: Execution layer triggerable exits
-//! - EIP-7251: Increase the MAX_EFFECTIVE_BALANCE
+//! - EIP-7251: Increase the `MAX_EFFECTIVE_BALANCE`
 //!
 //! ## Consensus Layer (Osaka)
 //! - EIP-2537: BLS12-381 curve operations precompiles
-//! - EIP-7594: PeerDAS - Peer Data Availability Sampling
+//! - EIP-7594: `PeerDAS` - Peer Data Availability Sampling
 //!
 //! # BLS12-381 Precompile Addresses (EIP-2537)
 //!

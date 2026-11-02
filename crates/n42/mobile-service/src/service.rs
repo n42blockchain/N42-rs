@@ -45,6 +45,11 @@ use tracing::{debug, warn};
 
 /// How many recent blocks keep their attestation state.
 ///
+/// The verifiers a registry holds. Registration is open and the registry
+/// never forgets a key, so this is what one caller could otherwise grow it
+/// to (audit 2026-10 round 3, R3-P6).
+pub const MAX_VERIFIERS: usize = 100_000;
+
 /// A phone verifies near the head; a block nobody attested within this window is
 /// not going to be attested. Bounded because this is fed by untrusted input.
 const DEFAULT_TRACKED_BLOCKS: usize = 256;
@@ -191,6 +196,18 @@ impl MobileService {
         self.registry.register(pubkey)
     }
 
+    /// [`Self::register_verifier`] for a key from the network: none past
+    /// [`MAX_VERIFIERS`], though a known key still gets its index.
+    pub fn try_register_verifier(&mut self, pubkey: [u8; 48]) -> Option<u32> {
+        if let Some(index) = self.registry.index_of(&pubkey) {
+            return Some(index);
+        }
+        if self.registry.len() as usize >= MAX_VERIFIERS {
+            return None;
+        }
+        Some(self.registry.register(pubkey))
+    }
+
     /// The registry, for verifying an attestation this service produced.
     pub const fn registry(&self) -> &VerifierRegistry {
         &self.registry
@@ -285,7 +302,10 @@ impl MobileService {
         Ok(SubmitOutcome {
             accepted: added,
             valid_receipts: status.map_or(0, |s| s.valid_count),
-            attested: status.is_some_and(n42_mobile_verify::BlockVerificationStatus::is_attested),
+            // Without the block's receipts root every receipt counts as
+            // valid, whatever root it reports: not an attestation (audit
+            // 2026-10 round 3, R3-P5).
+            attested: status.is_some_and(|status| status.expected_receipts_root.is_some() && status.is_attested()),
         })
     }
 

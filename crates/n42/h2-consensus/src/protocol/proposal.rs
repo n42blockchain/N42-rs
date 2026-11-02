@@ -142,10 +142,6 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let justify_qc = self.round_state.locked_qc().clone();
-        let piggybacked_qc = self.previous_prepare_qc.take();
-        let chained = piggybacked_qc.is_some();
-
         // Include any pending validator changes so all nodes apply the same
         // changes at CommitQC time (consensus-safe commit-then-activate).
         let validator_changes = self.epoch_manager.pending_changes_for_proposal();
@@ -155,6 +151,44 @@ impl ConsensusEngine {
         {
             return Err(ConsensusError::H2V4ValidatorChangesUnsupported);
         }
+
+        // Leader self-vote: GossipSub does not deliver messages back to the sender,
+        // so the leader must add its own vote directly to the collector. Record the
+        // vote in last_voted_view *before* signing — same crash-safety invariant as
+        // send_vote(): we err on the side of not voting rather than double-voting.
+        if !self.round_state.may_vote_in(view) {
+            tracing::warn!(
+                target: "n42::cl::proposal",
+                view,
+                last_voted = self.round_state.last_voted_view(),
+                "leader already voted in this view; aborting proposal"
+            );
+            return Ok(());
+        }
+        let previous = self.round_state.record_vote(view);
+        // Persist the leader self-vote with the same crash-safety contract as
+        // send_vote(); a fsync failure aborts the proposal.
+        // A failed log write must not leave the watermark advanced: the
+        // retry after the disk recovers would otherwise be refused. It comes
+        // before any other change, so the view is still waiting for this
+        // proposal, which the next event retries (audit 2026-10 R2-C7).
+        let logged = self
+            .vote_log
+            .record_vote(view, self.round_state.locked_qc())
+            .inspect_err(|_| self.round_state.rollback_vote(previous));
+        if logged.is_err() {
+            self.vote_log_retry = Some(super::state_machine::VoteLogRetry::OwnBlock {
+                view,
+                block_hash,
+                tx_root_hash,
+            });
+        }
+        self.note_vote_log(logged)?;
+
+        let justify_qc = self.round_state.locked_qc().clone();
+        let piggybacked_qc = self.previous_prepare_qc.take();
+        let chained = piggybacked_qc.is_some();
+
         let changes_hash = match validator_changes.as_ref() {
             Some(changes) => crate::EpochManager::hash_changes(changes),
             None => B256::ZERO,
@@ -217,31 +251,12 @@ impl ConsensusEngine {
             block_hash,
             view_set_len,
         ));
+        // The proposal this view took is this one: a peer relaying it back
+        // is a repeat, dropped once the view is voted or timed out (audit
+        // 2026-10 R2-C4, A-3 for the leader).
+        self.processed_proposal = Some(B256::from(*blake3::hash(&prop_msg).as_bytes()));
         self.round_state.enter_voting();
 
-        // Leader self-vote: GossipSub does not deliver messages back to the sender,
-        // so the leader must add its own vote directly to the collector. Record the
-        // vote in last_voted_view *before* signing — same crash-safety invariant as
-        // send_vote(): we err on the side of not voting rather than double-voting.
-        if !self.round_state.may_vote_in(view) {
-            tracing::warn!(
-                target: "n42::cl::proposal",
-                view,
-                last_voted = self.round_state.last_voted_view(),
-                "leader already voted in this view; aborting proposal"
-            );
-            return Ok(());
-        }
-        let previous = self.round_state.record_vote(view);
-        // Persist the leader self-vote with the same crash-safety contract as
-        // send_vote(); a fsync failure aborts the proposal.
-        // A failed log write must not leave the watermark advanced: the
-        // retry after the disk recovers would otherwise be refused.
-        let logged = self
-            .vote_log
-            .record_vote(view, self.round_state.locked_qc())
-            .inspect_err(|_| self.round_state.rollback_vote(previous));
-        self.note_vote_log(logged)?;
         // Reuse the vote_msg computed above (same view + block_hash).
         let leader_vote_sig = self.signing_profile.sign(&self.secret_key, &vote_msg);
         if let Some(ref mut collector) = self.vote_collector {
@@ -311,6 +326,18 @@ impl ConsensusEngine {
         // sets for the same block are also equivocation. Record only after BLS
         // verification so a forged first message cannot poison the tracker.
         let proposal_commitment = B256::from(*blake3::hash(&prop_msg).as_bytes());
+        // A repeat of the proposal this view already took, once this node
+        // has voted in the view or timed out of it, changes nothing:
+        // processing it again put a timed-out view back into voting (the
+        // next timeout then counted as a first one) and re-armed the pending
+        // vote (audit 2026-10 A-3). Before that it is still taken: it is how
+        // a vote whose log write failed is retried.
+        if self.processed_proposal == Some(proposal_commitment)
+            && (self.round_state.phase() == Phase::TimedOut || !self.round_state.may_vote_in(view))
+        {
+            tracing::debug!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, "a repeat of the proposal already taken; dropped");
+            return Ok(());
+        }
         // edition-2021: N42-26 writes this as a let-chain; filtering the
         // Option keeps the guard and the body identical.
         if let Some((previous_commitment, previous_block_hash)) = self
@@ -344,7 +371,8 @@ impl ConsensusEngine {
 
         // Verify the justify_qc's aggregate BLS signature to prevent a Byzantine leader
         // from injecting a forged QC that manipulates honest nodes' locked_qc.
-        // Genesis QC (view 0) is exempt — it has no real aggregate signatures.
+        // The genesis QC (view 0) is exempt — it has no real aggregate
+        // signature — and is the only QC allowed to name view 0.
         // Uses verify_qc_any_domain_or_known because justify_qc may be either a
         // prepare QC or commit QC. Exact locally persisted QCs remain usable after
         // restart even when their validator-changes signing-domain cache is empty.
@@ -357,6 +385,11 @@ impl ConsensusEngine {
                     );
                     e
                 })?;
+        } else if !crate::wire_bridge::is_engine_genesis_qc(&proposal.justify_qc) {
+            return Err(ConsensusError::InvalidQC {
+                view: 0,
+                reason: "a view-0 justify QC that is not the genesis QC".to_string(),
+            });
         }
 
         if !self.round_state.is_safe_to_vote(&proposal.justify_qc) {
@@ -427,6 +460,7 @@ impl ConsensusEngine {
             self.pending_tx_roots.insert(proposal.block_hash, tx_root);
         }
 
+        self.processed_proposal = Some(proposal_commitment);
         self.round_state.enter_voting();
         self.view_timing.proposal_received = Some(std::time::Instant::now());
 
@@ -449,7 +483,7 @@ impl ConsensusEngine {
                 }
                 tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: block already execution-validated");
                 self.send_vote(view, proposal.block_hash)?;
-            } else {
+            } else if !self.try_header_vote()? {
                 tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: waiting for execution validation");
             }
             return Ok(());
@@ -472,6 +506,35 @@ impl ConsensusEngine {
         self.send_vote(view, proposal.block_hash)?;
 
         Ok(())
+    }
+
+    /// gov5's header vote (`tryHeaderVote`), under the two-phase gate only:
+    /// Round 1 for the pending proposal once its header is known -- a real,
+    /// non-zero parent recorded -- and extends its justify QC's block. The
+    /// commit vote stays the execution attestation (held until the import,
+    /// [`Self::process_prepare_qc`]). Returns whether it voted.
+    pub(super) fn try_header_vote(&mut self) -> ConsensusResult<bool> {
+        if !self.two_phase_vote_gate || !self.signing_profile.is_gov5() || self.vote_before_import {
+            return Ok(false);
+        }
+        let current = self.round_state.current_view();
+        let Some((view, block_hash)) = self
+            .pending_proposal
+            .as_ref()
+            .filter(|pending| pending.view == current && self.round_state.may_vote_in(pending.view))
+            .map(|pending| (pending.view, pending.block_hash))
+        else {
+            return Ok(false);
+        };
+        if !self.imported_parents.get(&block_hash).is_some_and(|parent| *parent != B256::ZERO) {
+            return Ok(false);
+        }
+        if !self.extends_justify(block_hash) {
+            return Ok(false);
+        }
+        tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "header vote: block header known and extends its justify QC's block, voting");
+        self.send_vote(view, block_hash)?;
+        Ok(true)
     }
 
     /// Processes a PrepareQC from the leader: validates the QC and sends a CommitVote.
@@ -520,6 +583,14 @@ impl ConsensusEngine {
             tracing::warn!(target: "n42::cl::proposal", view,
                 last_commit_voted = self.round_state.last_commit_voted_view(),
                 "suppressed duplicate commit vote (already commit-voted in this view)");
+            return Ok(());
+        }
+        // gov5's two-phase gate: the commit vote is the execution
+        // attestation, held until the block is imported here (audit 2026-10
+        // R2-C9). `on_block_imported` re-enters with the held PrepareQC.
+        if self.two_phase_vote_gate && !self.imported_blocks.contains(&pqc.block_hash) {
+            tracing::info!(target: "n42::interop::h2v4", view, block_hash = %pqc.block_hash, "two-phase vote: holding the commit vote until the block imports");
+            self.held_prepare_qc = Some(pqc);
             return Ok(());
         }
         // Persist before signing for the same crash-safety reason as R1.
@@ -604,6 +675,7 @@ impl ConsensusEngine {
 
         tracing::info!(target: "n42::cl::proposal", view, %block_hash, voter = self.my_index, target_leader = leader, "sending vote to leader");
         self.view_timing.vote_sent = Some(std::time::Instant::now());
+        self.last_vote = Some(vote.clone());
         self.emit(EngineOutput::SendToValidator(
             leader,
             ConsensusMessage::Vote(vote),
@@ -630,6 +702,14 @@ impl ConsensusEngine {
             }
             self.imported_block_fifo.push_back(block_hash);
         }
+
+        // The commit vote the two-phase gate held for this block.
+        if self.held_prepare_qc.as_ref().is_some_and(|held| held.block_hash == block_hash)
+            && let Some(held) = self.held_prepare_qc.take()
+                && held.view == self.round_state.current_view() {
+                    tracing::info!(target: "n42::interop::h2v4", view = held.view, %block_hash, "two-phase vote: block imported, casting the held commit vote");
+                    self.process_prepare_qc(held)?;
+                }
 
         // edition-2021: N42-26 writes this as a let-chain. Resolving the
         // pending view first also ends the borrow of `self` before `send_vote`.
@@ -684,8 +764,12 @@ impl ConsensusEngine {
     /// refuses exactly this (`extendsJustify`); it wedges instead when a
     /// Rust quorum does not.
     ///
-    /// A genesis justify (no block) and an unknown parent pass, as they do in
-    /// gov5: the rule refuses what it can see, and never a vote it cannot judge.
+    /// A genesis justify (no block) passes. An unknown parent abstains: gov5's
+    /// rule passes it too, but gov5 only reaches the rule with the parent
+    /// known (`tryHeaderVote` needs its `importedParents` entry), so neither
+    /// client votes on a parent it cannot judge (audit 2026-10 A-2). The
+    /// service records the parent of every block it imports or checks with a
+    /// header, before the event that releases the vote.
     fn extends_justify(&self, block_hash: B256) -> bool {
         let Some(pending) = self.pending_proposal.as_ref() else {
             return true;
@@ -694,7 +778,11 @@ impl ConsensusEngine {
             return true;
         }
         let Some(parent) = self.imported_parents.get(&block_hash).copied() else {
-            return true;
+            tracing::debug!(target: "n42::interop::h2v4",
+                view = pending.view, %block_hash,
+                "import-gated vote withheld: the block's parent is not known here"
+            );
+            return false;
         };
         // A zero parent is no parent: gov5 reads it as unknown, and so do
         // the harness's mock blocks.

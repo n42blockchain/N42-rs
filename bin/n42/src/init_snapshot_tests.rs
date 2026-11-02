@@ -266,7 +266,7 @@ fn write_state_v2_stores_hashed_accounts_code_and_storage() {
         Ok(String::new()),
         Ok(account_line(bob, 5, Some(&code), &[(1, 11), (2, 22)])),
     ];
-    let (accounts, slots) = write_state_v2(&factory, 1, lines.into_iter()).expect("written");
+    let (accounts, slots) = write_state_v2(&factory, 1, lines.into_iter(), |_, _| Ok(())).expect("written");
     assert_eq!((accounts, slots), (2, 2));
 
     let provider = factory.provider().unwrap();
@@ -293,7 +293,7 @@ fn write_state_v2_names_a_bad_line_and_rejects_invalid_bytecode() {
     let failure = |lines: Vec<std::io::Result<String>>| {
         let scratch = Scratch::new();
         let factory = open_factory!(scratch);
-        write_state_v2(&factory, 1, lines.into_iter()).unwrap_err()
+        write_state_v2(&factory, 1, lines.into_iter(), |_, _| Ok(())).unwrap_err()
     };
     let err = failure(vec![Ok("{".to_owned())]);
     assert!(format!("{err:#}").contains("account line"), "{err:#}");
@@ -322,11 +322,97 @@ fn write_state_v2_commits_in_chunks_without_losing_accounts() {
     };
     let (first, second) = (Address::repeat_byte(0xC1), Address::repeat_byte(0xC2));
     let (accounts, slots) =
-        write_state_v2(&factory, 1, vec![Ok(big(first)), Ok(big(second))].into_iter()).expect("written");
+        write_state_v2(&factory, 1, vec![Ok(big(first)), Ok(big(second))].into_iter(), |_, _| Ok(())).expect("written");
     assert_eq!((accounts, slots), (2, 120_000));
     let provider = factory.provider().unwrap();
     for address in [first, second] {
         assert!(provider.tx_ref().get::<tables::HashedAccounts>(keccak256(address)).unwrap().is_some());
     }
     assert_eq!(provider.tx_ref().entries::<tables::HashedStorages>().unwrap(), 120_000);
+}
+
+/// The portable snapshot of a tree holding `alice` (nonce 1, 1,000 wei),
+/// `bob` (nonce 1, 5 wei, `code`, slots 1 = 11 and 2 = 22) and an EIP-161
+/// empty account gov5's dump leaves out, at block 1 under `header`.
+fn write_snapshot_files(scratch: &Scratch, alice: Address, bob: Address, code: &[u8]) -> Header {
+    use n42_twig_core::qmdb_compat::{
+        encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbPortableSnapshot,
+        QmdbSlotEntry, QmdbSlotSnapshot,
+    };
+    let mut tree = QmdbCompatTree::new();
+    let account = |balance: u64, code_hash: B256| {
+        encode_gov5_account_value(1, &U256::from(balance).to_be_bytes::<32>(), &code_hash.0)
+    };
+    tree.set(gov5_account_key(&alice.0 .0), account(1_000, alloy_primitives::KECCAK256_EMPTY)).unwrap();
+    tree.set(gov5_account_key(&bob.0 .0), account(5, keccak256(code))).unwrap();
+    for (slot, value) in [(1u8, 11u8), (2, 22)] {
+        let key = gov5_storage_key(&bob.0 .0, &B256::with_last_byte(slot).0);
+        tree.set(key, B256::with_last_byte(value).to_vec()).unwrap();
+    }
+    tree.set(gov5_account_key(&Address::repeat_byte(0xEE).0 .0), vec![0]).unwrap();
+    let header = Header { number: 1, state_root: B256::from(tree.root()), ..Default::default() };
+    fs::write(scratch.path("header.rlp"), header_rlp(&header)).unwrap();
+    let snapshot = tree.snapshot();
+    let chain = init_args(scratch, Some("qmdb")).env.chain;
+    let portable = QmdbPortableSnapshot {
+        chain_id: chain.chain().id(),
+        genesis_hash: chain.genesis_hash().0,
+        block_number: 1,
+        block_hash: header.hash_slow().0,
+        root: tree.root(),
+        slots: QmdbSlotSnapshot {
+            next_slot: snapshot.next_slot,
+            entries: snapshot
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(slot, entry)| QmdbSlotEntry {
+                    slot: slot as u64,
+                    key: entry.key,
+                    value: entry.value.clone(),
+                    active: entry.active,
+                })
+                .collect(),
+        },
+    };
+    fs::write(scratch.path("snapshot.bin"), portable.encode().unwrap()).unwrap();
+    header
+}
+
+/// Audit 2026-10 round 3 (R3-P1): the dump's own first line was the only
+/// check on it -- every account and slot went into the tables the node
+/// executes on without being compared with the portable snapshot, so a
+/// tampered or incomplete dump beside an honest header and snapshot made a
+/// node that runs on the wrong state. Each row must be the snapshot's leaf,
+/// and every live leaf but a retained empty account must be in the dump.
+#[test]
+fn init_refuses_a_dump_the_snapshot_does_not_authenticate() {
+    let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
+    let code = [0x60u8, 0x00, 0x60, 0x00];
+    let run = |lines: &[String]| {
+        let scratch = Scratch::new();
+        let header = write_snapshot_files(&scratch, alice, bob, &code);
+        let mut dump = root_line(header.state_root);
+        for line in lines {
+            dump.push_str(line);
+            dump.push('\n');
+        }
+        fs::write(scratch.path("state.jsonl"), dump).unwrap();
+        run_init(&scratch)
+    };
+    let honest_bob = account_line(bob, 5, Some(&code), &[(1, 11), (2, 22)]);
+    run(&[account_line(alice, 1_000, None, &[]), honest_bob.clone()]).expect("the honest dump");
+
+    let err = run(&[account_line(alice, 1_001, None, &[]), honest_bob.clone()]).unwrap_err();
+    assert!(format!("{err:#}").contains("not authenticated"), "inflated balance: {err:#}");
+    let err = run(&[account_line(alice, 1_000, None, &[]), account_line(bob, 5, Some(&code), &[(1, 11), (2, 23)])])
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("not authenticated"), "changed slot: {err:#}");
+    let err = run(&[account_line(alice, 1_000, None, &[]), account_line(bob, 5, Some(&code), &[(1, 11)])]).unwrap_err();
+    assert!(format!("{err:#}").contains("incomplete"), "missing slot: {err:#}");
+    let err = run(std::slice::from_ref(&honest_bob)).unwrap_err();
+    assert!(format!("{err:#}").contains("incomplete"), "missing account: {err:#}");
+    // A repeated row cannot stand in for a missing one.
+    let err = run(&[honest_bob.clone(), honest_bob]).unwrap_err();
+    assert!(format!("{err:#}").contains("ascending"), "repeated account: {err:#}");
 }

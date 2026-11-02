@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
-use reth_consensus::{Consensus, FullConsensus, HeaderValidator};
+use reth_consensus::{FullConsensus};
 use n42_tx_types::{Block, N42Primitives as EthPrimitives, N42TxEnvelope as TransactionSigned};
 use reth_primitives_traits::transaction::TxHashRef as _;
 use reth_evm::{execute::Executor, ConfigureEvm};
@@ -30,6 +30,9 @@ use reth_provider::HashedPostStateProvider;
 use reth_revm::cached::CachedReads;
 use reth_trie::updates::TrieUpdates;
 use std::sync::{Condvar, Mutex};
+
+/// A sealed header of the node's header type.
+type SealedN42Header = reth_primitives_traits::SealedHeader<n42_header::N42Header>;
 
 /// The read cache carried from one direct import to the next: the previous
 /// block's post-state (its senders above all -- every sender of the next
@@ -63,6 +66,7 @@ pub static HANDOFF_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub const HANDOFF_STAGES: [&str; 8] = ["idle", "lookup", "handoff", "payload", "new-payload", "-", "-", "-"];
 
 /// Sets [`HANDOFF_STAGE`] while alive, clears it on drop.
+#[derive(Debug)]
 pub struct HandoffStage(pub u64);
 
 impl HandoffStage {
@@ -338,7 +342,7 @@ type ParentOutput = Arc<reth_provider::BlockExecutionOutput<n42_tx_types::Receip
 /// The last blocks imported here, published as soon as their execution ends
 /// and before the engine takes them (`N42_CHECK_ON_PARENT_OUTPUT`,
 /// `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`).
-static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, reth_primitives_traits::SealedHeader, ParentOutput)>> =
+static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, SealedN42Header, ParentOutput)>> =
     Mutex::new(std::collections::VecDeque::new());
 
 /// How many published outputs are kept: the check reads only the parent's.
@@ -440,7 +444,7 @@ fn publish_parent_outputs() -> bool {
 }
 
 /// Publishes a block's execution output for its child's check.
-fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::SealedHeader, output: ParentOutput) {
+fn publish_parent_output(block_hash: B256, header: SealedN42Header, output: ParentOutput) {
     {
         let mut outputs = PARENT_OUTPUTS.lock().unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("PARENT_OUTPUTS", p));
         outputs.retain(|(hash, _, _)| *hash != block_hash);
@@ -464,7 +468,7 @@ fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::Seale
 ///
 /// [`ShardLayer`]: n42_engine_types::output_shards::ShardLayer
 type KeptShards =
-    (B256, reth_primitives_traits::SealedHeader, Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput);
+    (B256, SealedN42Header, Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput);
 static FOLLOWER_SHARDS: Mutex<std::collections::VecDeque<KeptShards>> = Mutex::new(std::collections::VecDeque::new());
 
 /// How many blocks' shards are kept: the child reads its parent's, and under
@@ -491,7 +495,7 @@ fn check_on_shards() -> bool {
 /// and wakes a child waiting for them.
 fn keep_follower_shards(
     block_hash: B256,
-    header: reth_primitives_traits::SealedHeader,
+    header: SealedN42Header,
     shards: Arc<n42_engine_types::output_shards::FrozenShards>,
     residual: ParentOutput,
 ) {
@@ -508,7 +512,7 @@ fn keep_follower_shards(
 
 /// The header, shards and residual kept for `block_hash`, if it was executed
 /// here on the build path and the shards are read ([`check_on_shards`]).
-fn follower_shards_of(block_hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentLayer)> {
+fn follower_shards_of(block_hash: B256) -> Option<(SealedN42Header, ParentLayer)> {
     if !check_on_shards() {
         return None;
     }
@@ -584,7 +588,7 @@ pub const fn parent_read_name(code: u64) -> &'static str {
 /// [`ShardLayer`]: n42_engine_types::output_shards::ShardLayer
 fn open_on_layers(
     historical: reth_provider::StateProviderBox,
-    layers: &[(reth_primitives_traits::SealedHeader, ParentLayer)],
+    layers: &[(SealedN42Header, ParentLayer)],
 ) -> reth_provider::StateProviderBox {
     use n42_engine_types::direct_build::{executed_from_output, overlay_on_executed};
     let mut state = historical;
@@ -624,13 +628,13 @@ fn open_on_layers(
 fn wait_for_parent_layer(
     parent_hash: B256,
     parent_in: impl Fn() -> bool,
-) -> Option<(reth_primitives_traits::SealedHeader, ParentLayer)> {
+) -> Option<(SealedN42Header, ParentLayer)> {
     wait_for_layer_within(parent_hash, parent_in, PARENT_WAIT, layer_of)
 }
 
 /// A block's layer for its descendant's check and execution: its shards when
 /// held, else its published output.
-fn layer_of(hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentLayer)> {
+fn layer_of(hash: B256) -> Option<(SealedN42Header, ParentLayer)> {
     follower_shards_of(hash).or_else(|| published_output(hash).map(|(header, output)| (header, ParentLayer::Merged(output))))
 }
 
@@ -640,7 +644,7 @@ fn wait_for_output_within(
     parent_hash: B256,
     parent_in: impl Fn() -> bool,
     wait: std::time::Duration,
-) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
+) -> Option<(SealedN42Header, ParentOutput)> {
     wait_for_layer_within(parent_hash, parent_in, wait, published_output)
 }
 
@@ -701,7 +705,7 @@ fn wait_for_parent_fields(parent_hash: B256) -> Result<(), String> {
 /// at every depth.
 fn wait_for_ancestor_fields(
     genesis: &alloy_genesis::Genesis,
-    parent: &reth_primitives_traits::SealedHeader,
+    parent: &SealedN42Header,
     depth: u64,
 ) -> Result<(), String> {
     if depth <= 1 {
@@ -722,8 +726,8 @@ fn wait_for_ancestor_fields(
 /// closure because the vote road calls it from a thread of its own.
 fn validate_against_parent(
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
-    header: &reth_primitives_traits::SealedHeader,
-    parent: &reth_primitives_traits::SealedHeader,
+    header: &SealedN42Header,
+    parent: &SealedN42Header,
 ) -> Result<(), String> {
     consensus.validate_header_against_parent(header, parent).map_err(|err| format!("header against parent: {err}"))
 }
@@ -768,7 +772,7 @@ fn two_roads<T>(
     };
     let (voted, executed, exec_ms) = std::thread::scope(|scope| {
         let run_vote = &run_vote;
-        match std::thread::Builder::new().name("vote-road".into()).spawn_scoped(scope, move || run_vote()) {
+        match std::thread::Builder::new().name("vote-road".into()).spawn_scoped(scope, run_vote) {
             Ok(voted) => {
                 let executed = execute();
                 let exec_ms = roads_at.elapsed().as_millis() as u64;
@@ -846,9 +850,9 @@ fn parent_in<Provider>(
     parent_hash: B256,
     genesis: &alloy_genesis::Genesis,
     deferred: bool,
-) -> Result<Option<reth_primitives_traits::SealedHeader>, String>
+) -> Result<Option<SealedN42Header>, String>
 where
-    Provider: HeaderProvider<Header = alloy_consensus::Header>,
+    Provider: HeaderProvider<Header = n42_header::N42Header>,
 {
     let Some(parent) = provider.sealed_header_by_hash(parent_hash).map_err(|err| format!("parent header: {err}"))? else {
         return Ok(None);
@@ -871,9 +875,9 @@ fn wait_for_parent<Provider>(
     parent_hash: B256,
     genesis: &alloy_genesis::Genesis,
     deferred: bool,
-) -> Result<reth_primitives_traits::SealedHeader, String>
+) -> Result<SealedN42Header, String>
 where
-    Provider: HeaderProvider<Header = alloy_consensus::Header>,
+    Provider: HeaderProvider<Header = n42_header::N42Header>,
 {
     let deadline = std::time::Instant::now() + PARENT_WAIT;
     let (count, landed) = &IMPORT_LANDED;
@@ -905,7 +909,7 @@ where
 }
 
 /// The includability of a block's transactions on its parent's post-state
-/// (docs/PHASE_D_DEFERRED_EXECUTION.md, section 8.4): what a follower's
+/// (`docs/PHASE_D_DEFERRED_EXECUTION.md`, section 8.4): what a follower's
 /// vote attests under deferred execution, since the block's execution is
 /// checked only by the next header. Per sender, one account read: the
 /// nonces contiguous from the account's, the balance covering every
@@ -1324,7 +1328,7 @@ fn fold_runs(scans: Vec<ChunkScan>) -> Vec<(Address, SenderTotal)> {
 /// check chunked the block by frame instead of by a plain 32nd (a different
 /// chunking folds the senders into the map in a different order). Both paths
 /// call this, so both settle on the same sender.
-fn fault_order(fault: &Fault) -> (usize, &str) {
+const fn fault_order(fault: &Fault) -> (usize, &str) {
     (fault.index, fault.message.as_str())
 }
 
@@ -1421,7 +1425,7 @@ fn decline_on_output(number: u64, why: &'static str) {
 }
 
 /// The published output of a block imported here, if it is still kept.
-fn published_output(hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
+fn published_output(hash: B256) -> Option<(SealedN42Header, ParentOutput)> {
     PARENT_OUTPUTS
         .lock()
         .unwrap_or_else(|p| n42_engine_types::built_executions::recover_poisoned("PARENT_OUTPUTS", p))
@@ -1494,7 +1498,7 @@ struct Ancestry {
     ///
     /// Each is the block's shards under its residual when it was executed here
     /// on the build path and they are still kept, else its merged output.
-    outputs: Vec<(reth_primitives_traits::SealedHeader, ParentLayer)>,
+    outputs: Vec<(SealedN42Header, ParentLayer)>,
     /// The nearest ancestor in the engine, whose state a read none of the
     /// bundles answers falls through to.
     anchor: B256,
@@ -1516,14 +1520,14 @@ impl Ancestry {
 /// and the wait is the honest answer.
 fn ancestry_of<Provider>(
     provider: &Provider,
-    parent: &reth_primitives_traits::SealedHeader,
+    parent: &SealedN42Header,
     layer: &ParentLayer,
     genesis: &alloy_genesis::Genesis,
     deferred: bool,
     number: u64,
 ) -> Option<Ancestry>
 where
-    Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
+    Provider: StateProviderFactory + HeaderProvider<Header = n42_header::N42Header> + Sync,
 {
     let mut outputs = vec![(parent.clone(), layer.clone())];
     let mut anchor = parent.parent_hash;
@@ -1577,7 +1581,7 @@ where
 fn overlay_parent(
     ancestry: &Ancestry,
     number: u64,
-) -> Option<(B256, Vec<(reth_primitives_traits::SealedHeader, ParentLayer)>)> {
+) -> Option<(B256, Vec<(SealedN42Header, ParentLayer)>)> {
     if hashed_state_enabled() {
         // A setting, not a property of this block, so it is said once: with
         // the pass on every block would otherwise print a refusal, and the
@@ -1701,7 +1705,7 @@ impl ExecSplit {
 /// hand-off -- waits for it where it reads it ([`LateBlock`]).
 pub fn copy_aside() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_COPY_ASIDE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_COPY_ASIDE", false))
 }
 
 /// The owned block a [`DescribedAside`] is made into beside the import, and
@@ -1714,7 +1718,7 @@ pub type MadeAside = Result<(RecoveredBlock<Block>, u64), String>;
 #[derive(Debug)]
 pub struct DescribedAside {
     /// The header, sealed by the hash the description checked it against.
-    pub header: reth_primitives_traits::SealedHeader,
+    pub header: SealedN42Header,
     /// The withdrawals the body lists (`None` before Shanghai).
     pub withdrawals: Option<Vec<alloy_eips::eip4895::Withdrawal>>,
     /// The transactions, held by reference, in block order.
@@ -1978,7 +1982,7 @@ impl RoadPhases {
 /// includability, timed by part: (header us, includability us).
 #[allow(clippy::too_many_arguments)]
 fn timed_check<Provider>(
-    against: Option<(&(dyn FullConsensus<EthPrimitives> + Send + Sync), &reth_primitives_traits::SealedHeader, &reth_primitives_traits::SealedHeader)>,
+    against: Option<(&(dyn FullConsensus<EthPrimitives> + Send + Sync), &SealedN42Header, &SealedN42Header)>,
     provider: &Provider,
     parent_hash: B256,
     parent_output: Option<ParentBundles<'_>>,
@@ -2173,7 +2177,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     road: VoteRoad,
 ) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; IMPORT_TIMES]), String>
 where
-    Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
+    Provider: StateProviderFactory + HeaderProvider<Header = n42_header::N42Header> + Sync,
     Evm: ConfigureEvm<
         Primitives = EthPrimitives,
         BlockExecutorFactory = n42_engine_types::parallel_transfer::FastExecutorFactory,
@@ -2566,9 +2570,7 @@ where
     let mut roads_at = None;
     // `N42_FOLLOWER_EXEC_EARLY=1` took this block: the check runs on the vote road.
     let mut early_check = false;
-    if !deferred {
-        against_parent()?;
-    } else {
+    if deferred {
         // What the vote attests: the header's execution fields are this
         // node's result for the parent, and every transaction is includable
         // on the parent's post-state.
@@ -2682,6 +2684,8 @@ where
                 );
             }
         }
+    } else {
+        against_parent()?;
     }
 
     // The parent in the engine, for a block whose execution reads it there.
@@ -3720,7 +3724,7 @@ fn carry_async() -> bool {
 /// Whether the QMDB root and the hashed post-state run together on the worker
 /// pool (default; `N42_ROOT_HASHED_PARALLEL=0` runs them one after the other).
 /// They read the same bundle and neither needs the other: the pair measured
-/// 94 -> 81 ms and was adopted (docs/FLEET7_STATUS.md), but the default had
+/// 94 -> 81 ms and was adopted (`docs/FLEET7_STATUS.md`), but the default had
 /// stayed off and no launcher set it. In parallel the pair is reported as
 /// `root_ms` with `hashed_ms` zero.
 fn root_hashed_parallel() -> bool {
@@ -3738,7 +3742,7 @@ fn root_hashed_parallel() -> bool {
 /// execution's batches, queued on the worker pool, do not hold the vote.
 fn exec_early() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_EARLY").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_EXEC_EARLY", false))
 }
 
 /// A small pool of its own, sized by `var` (default `default`), or `None` if
@@ -3780,7 +3784,7 @@ fn on_check_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 /// bundle, filed under the same hash; only where and when it runs moves.
 fn fields_early() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_FIELDS_EARLY").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_FIELDS_EARLY", false))
 }
 
 /// Runs the early QMDB root's hashing on its own pool
@@ -3814,7 +3818,7 @@ fn on_root_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 /// `N42_FOLLOWER_ROOT_ON_BUILD_POOL=1` ([`on_root_pool`]), read once.
 fn root_on_build_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_ROOT_ON_BUILD_POOL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_ROOT_ON_BUILD_POOL", false))
 }
 
 /// Milliseconds from `from` to `to`, zero if `to` is earlier.
@@ -3825,7 +3829,7 @@ fn ms_between(from: std::time::Instant, to: std::time::Instant) -> u64 {
 /// `N42_FOLLOWER_PARALLEL`, read once.
 fn follower_parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARALLEL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARALLEL", false))
 }
 
 /// Whether the parallel state commit is on (default; `N42_PARALLEL_STATE_COMMIT=0` turns it off): the QMDB leaf operations are
@@ -4080,7 +4084,7 @@ mod parent_output_tests {
             Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
             Vec::new(),
         );
-        let header = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        let header = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::default());
         let output = Arc::new(reth_provider::BlockExecutionOutput { result: Default::default(), state: bundle });
         publish_parent_output(parent_hash, header, output);
 
@@ -4111,7 +4115,7 @@ mod parent_output_tests {
     fn the_execution_starts_before_the_parents_fields_exist() {
         let _one_at_a_time = publishing();
         let parent_hash = B256::with_last_byte(0x61);
-        let header = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        let header = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::default());
         let output = Arc::new(reth_provider::BlockExecutionOutput {
             result: Default::default(),
             state: BundleState::default(),
@@ -4202,22 +4206,22 @@ mod parent_output_tests {
 
         // The chain's state at the great-grandparent, the only block of the
         // three the engine holds.
-        let provider = MockEthProvider::default();
+        let provider = MockEthProvider::<n42_tx_types::N42Primitives>::new();
         provider.add_account(moved_by_both, ExtendedAccount::new(1, U256::from(100)));
         provider.add_account(moved_by_the_grandparent, ExtendedAccount::new(5, U256::from(50)));
         provider.add_account(untouched, ExtendedAccount::new(9, U256::from(9)));
-        let anchor = alloy_consensus::Header { number: 10, ..Default::default() };
+        let anchor = n42_header::N42Header::from(alloy_consensus::Header { number: 10, ..Default::default() });
         let anchor = reth_primitives_traits::SealedHeader::seal_slow(anchor);
         provider.add_header(anchor.hash(), anchor.header().clone());
 
         let account = |nonce: u64, balance: u64| AccountInfo { nonce, balance: U256::from(balance), ..Default::default() };
         let publish = |number: u64, parent: B256, changes: Vec<(Address, AccountInfo)>| {
-            let header = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+            let header = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
                 number,
                 parent_hash: parent,
                 extra_data: number.to_be_bytes().to_vec().into(),
                 ..Default::default()
-            });
+            }));
             let bundle = BundleState::new(
                 changes.into_iter().map(|(address, info)| (address, None, Some(info), Default::default())),
                 Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
@@ -4270,16 +4274,16 @@ mod parent_output_tests {
         use reth_provider::test_utils::MockEthProvider;
 
         // A chain of headers none of which the provider knows, each published.
-        let provider = MockEthProvider::default();
+        let provider = MockEthProvider::<n42_tx_types::N42Primitives>::new();
         let mut parent_hash = B256::with_last_byte(0x91);
         let mut last = None;
         for number in 1..=(PARENT_OUTPUTS_KEPT as u64 + 1) {
-            let header = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+            let header = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header {
                 number,
                 parent_hash,
                 extra_data: b"deep".to_vec().into(),
                 ..Default::default()
-            });
+            }));
             let output = Arc::new(reth_provider::BlockExecutionOutput {
                 result: Default::default(),
                 state: BundleState::default(),
@@ -4491,7 +4495,7 @@ mod tests {
 
     /// A block from transactions already paired with their senders.
     fn seal(txs: Vec<TransactionSigned>, senders: Vec<Address>, beneficiary: Address) -> RecoveredBlock<Block> {
-        let header = Header {
+        let header = n42_header::N42Header::from(alloy_consensus::Header {
             number: 20_000_000,
             beneficiary,
             gas_limit: 10_000_000_000,
@@ -4503,7 +4507,7 @@ mod tests {
             excess_blob_gas: Some(0),
             requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
-        };
+        });
         let body = n42_tx_types::BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(Vec::new().into()) };
         // Unhashed: the check never asks the block for its hash, and
         // hashing a body of 162,000 transactions dominates the fixtures.
@@ -4546,8 +4550,8 @@ mod tests {
     }
 
     /// A provider whose state holds `accounts`.
-    fn provider(accounts: &[(Address, Account)]) -> MockEthProvider {
-        let mock = MockEthProvider::default();
+    fn provider(accounts: &[(Address, Account)]) -> MockEthProvider<n42_tx_types::N42Primitives> {
+        let mock = MockEthProvider::<n42_tx_types::N42Primitives>::new();
         mock.extend_accounts(
             accounts.iter().map(|(address, account)| (*address, ExtendedAccount::new(account.nonce, account.balance))),
         );
@@ -4625,7 +4629,7 @@ mod tests {
             senders.iter().map(|s| (*s, Account { nonce: 2, balance: rich, bytecode_hash: None })).collect();
         let state = provider(&below);
         let anchor = B256::random();
-        let header = reth_primitives_traits::SealedHeader::seal_slow(Header { number: 7, ..Default::default() });
+        let header = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { number: 7, ..Default::default() }));
         let verdict = |layer: &ParentLayer| {
             check_includable(&state, anchor, Some(ParentBundles { stack: &[layer], anchor }), &block, CHAIN_ID, SpecId::OSAKA)
         };
@@ -5367,7 +5371,7 @@ mod tests {
     /// the parent's output. `state` is reused across cases: building one
     /// holds a clone of the mainnet chain spec, which dominates a run of
     /// hundreds of small cases.
-    fn verdicts(state: &MockEthProvider, case: &Case) -> [(Result<(), String>, Result<(), String>); 2] {
+    fn verdicts(state: &MockEthProvider<n42_tx_types::N42Primitives>, case: &Case) -> [(Result<(), String>, Result<(), String>); 2] {
         {
             let mut accounts = state.accounts.lock();
             accounts.clear();

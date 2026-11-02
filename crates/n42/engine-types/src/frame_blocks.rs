@@ -264,7 +264,7 @@ pub fn frame_walk_refuse_indexed() -> bool {
 /// ([`note_whole_take`]). Off by default.
 pub fn plan_ahead_body() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_PLAN_AHEAD_BODY").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_PLAN_AHEAD_BODY", false))
 }
 
 /// Whether the build asks for the plan's prepared body: the switch and every
@@ -408,7 +408,7 @@ std::thread_local! {
 /// through the puller thread. Off by default.
 pub fn pull_by_frames() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_PULL_BY_FRAMES").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_PULL_BY_FRAMES", false))
 }
 
 /// Says whether the build about to select on this thread can take its
@@ -624,11 +624,43 @@ pub fn take_plan() -> Option<FramePlan> {
 /// The frame layouts of the blocks this node built last, by transactions
 /// root: what the execution layer hands its validator with the block, for
 /// the frame description.
-static LAYOUTS: Mutex<VecDeque<(B256, Vec<(B256, u32)>)>> = Mutex::new(VecDeque::new());
+/// Frame layouts by transactions root, oldest first, [`LAYOUTS_KEPT`] at most.
+type LayoutTable = Mutex<VecDeque<(B256, Vec<(B256, u32)>)>>;
+
+static LAYOUTS: LayoutTable = Mutex::new(VecDeque::new());
 const LAYOUTS_KEPT: usize = 64;
 
 fn remember_layout(root: B256, layout: Vec<(B256, u32)>) {
-    let mut kept = LAYOUTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    file_layout(&LAYOUTS, root, layout);
+}
+
+/// Who claimed a layout: a stable 8-byte identifier of the peer whose
+/// description carried it (the validator derives it from the peer's libp2p
+/// id), or [`OWN_CLAIM_SOURCE`] for this node's own validator.
+pub type ClaimSource = [u8; 8];
+
+/// The reserved [`ClaimSource`] of this node's own claims: never evicted by
+/// a foreign claim for the same root.
+pub const OWN_CLAIM_SOURCE: ClaimSource = [0; 8];
+
+/// One claimed layout: the root it was claimed for, who claimed it (`None`
+/// for a caller that did not say), and the layout.
+#[derive(Debug)]
+struct Claim {
+    root: B256,
+    source: Option<ClaimSource>,
+    layout: Vec<(B256, u32)>,
+}
+
+/// Layouts a peer's description *claimed* for a root, unchecked (see
+/// [`remember_claimed`]), oldest first. Kept apart from [`LAYOUTS`]: only
+/// [`root_for_body`], which checks a layout against the body's own hashes,
+/// reads them, never the description of a block this node seals from.
+static CLAIMED_LAYOUTS: Mutex<VecDeque<Claim>> = Mutex::new(VecDeque::new());
+
+/// Files `layout` under `root` in `table`, keeping the first filing.
+fn file_layout(table: &LayoutTable, root: B256, layout: Vec<(B256, u32)>) {
+    let mut kept = table.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if kept.iter().any(|(known, _)| *known == root) {
         return;
     }
@@ -636,6 +668,64 @@ fn remember_layout(root: B256, layout: Vec<(B256, u32)>) {
     while kept.len() > LAYOUTS_KEPT {
         kept.pop_front();
     }
+}
+
+/// Claims kept per root, one per source. The layout is not in the header, so
+/// a peer can claim a wrong one for a real root; keeping only the first let
+/// a wrong claim that arrived first keep the right one out (audit 2026-10
+/// round 2, R2-X4), and keeping a few distinct ones FIFO still let one peer
+/// that sent several wrong layouts after the right one evict it. Keyed by
+/// source: a source that claims again replaces its own claim, and only a
+/// claim from a source not yet holding one evicts, the oldest foreign one
+/// first; [`OWN_CLAIM_SOURCE`]'s is never evicted by a foreign claim. Four,
+/// the validator's forwarding bound per block hash (`n42_h2_node`'s
+/// `CLAIMS_PER_BLOCK`): the first compact body and three distinct ones from
+/// other peers.
+pub const CLAIMS_PER_ROOT: usize = 4;
+
+/// Files a claimed `layout` under `root` for `source`, beside other
+/// sources' claims for it.
+fn file_claim(root: B256, source: Option<ClaimSource>, layout: Vec<(B256, u32)>) {
+    let mut kept = CLAIMED_LAYOUTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The same layout once is enough, whoever claimed it: each kept layout
+    // costs a frame tree on the whole-body fallback.
+    if kept.iter().any(|claim| claim.root == root && claim.layout == layout) {
+        return;
+    }
+    if let Some(source) = source
+        && let Some(own) = kept.iter_mut().find(|claim| claim.root == root && claim.source == Some(source))
+    {
+        own.layout = layout;
+        return;
+    }
+    if kept.iter().filter(|claim| claim.root == root).count() >= CLAIMS_PER_ROOT {
+        let evictable = |claim: &Claim| claim.root == root && claim.source != Some(OWN_CLAIM_SOURCE);
+        match kept.iter().position(evictable) {
+            Some(oldest) => {
+                kept.remove(oldest);
+            }
+            // Only this node's own claims are held for the root: a foreign
+            // one never displaces them.
+            None if source != Some(OWN_CLAIM_SOURCE) => return,
+            None => {}
+        }
+    }
+    kept.push_back(Claim { root, source, layout });
+    while kept.len() > LAYOUTS_KEPT * CLAIMS_PER_ROOT {
+        kept.pop_front();
+    }
+}
+
+/// The layouts descriptions claimed for `root`, newest first.
+fn claimed_layouts(root: &B256) -> Vec<Vec<(B256, u32)>> {
+    CLAIMED_LAYOUTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .rev()
+        .filter(|claim| claim.root == *root)
+        .map(|claim| claim.layout.clone())
+        .collect()
 }
 
 /// The frame layout of a block this node built, by its transactions root.
@@ -655,6 +745,11 @@ static BLOCK_ROOTS: Mutex<VecDeque<(B256, B256)>> = Mutex::new(VecDeque::new());
 /// frame index.
 pub fn remember_verified(block: B256, root: B256, layout: &[(B256, u32)]) {
     remember_layout(root, layout.to_vec());
+    remember_block_root(block, root);
+}
+
+/// Records `root` as block `block`'s transactions root, keeping the first.
+fn remember_block_root(block: B256, root: B256) {
     let mut kept = BLOCK_ROOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if kept.iter().any(|(known, _)| *known == block) {
         return;
@@ -675,12 +770,23 @@ pub fn remember_verified(block: B256, root: B256, layout: &[(B256, u32)]) {
 /// 14,000 transactions not held after a view change, every node refusing the
 /// block). Safe unchecked: [`root_for_body`] uses a claim only when the frame
 /// tree over the body's own hashes reproduces it, and the block hash is
-/// confirmed after that; a verified record made first is kept.
+/// confirmed after that; a verified record made first is kept. The layout
+/// goes to its own table, never the one this node describes the blocks it
+/// seals from (audit 2026-10 C-1).
 pub fn remember_claimed(block: B256, root: B256, layout: &[(B256, u32)]) {
+    remember_claimed_from(block, root, layout, None);
+}
+
+/// [`remember_claimed`], with who claimed it (`None`: not said). One claim
+/// per source per root is kept ([`CLAIMS_PER_ROOT`] sources at most), so a
+/// source sending several layouts replaces only its own (audit 2026-10
+/// round 2, R2-X4).
+pub fn remember_claimed_from(block: B256, root: B256, layout: &[(B256, u32)], source: Option<ClaimSource>) {
     if layout.is_empty() {
         return;
     }
-    remember_verified(block, root, layout);
+    file_claim(root, source, layout.to_vec());
+    remember_block_root(block, root);
 }
 
 /// The transactions root [`remember_verified`] recorded for `block`.
@@ -1105,18 +1211,25 @@ pub fn root_for_body_counted(claimed: Option<B256>, hashes: &[B256], mpt: impl F
         *duplicate.get_or_insert_with(|| !known_distinct_body(root, hashes.len()) && body_has_duplicate(hashes))
     };
     let queue = n42_tx_queue::global::<crate::N42PooledTransaction>();
-    if let Some(claimed) = claimed
-        && let Some(layout) = layout_by_root(&claimed)
-    {
-        let layout: Vec<(B256, usize)> = layout.iter().map(|(id, count)| (*id, *count as usize)).collect();
-        let known = queue.as_ref().map_or_else(|| vec![None; layout.len()], |queue| queue.frames_held(&layout, hashes));
-        let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
-        if let Some(tree) = frame_tree_root_known(&counts, &known, hashes.len(), |i| hashes[i])
-            && tree.root == claimed
-            && !refuses(claimed)
-        {
-            CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
-            return BodyRoot { root: claimed, frame: true, indexed: tree.indexed, hashed: tree.hashed };
+    if let Some(claimed) = claimed {
+        // This node's own layout for the root, else every distinct claim
+        // (R2-X4); the first that reproduces the root over the body is it.
+        let layouts = match layout_by_root(&claimed) {
+            Some(own) => vec![own],
+            None => claimed_layouts(&claimed),
+        };
+        for layout in layouts {
+            let layout: Vec<(B256, usize)> = layout.iter().map(|(id, count)| (*id, *count as usize)).collect();
+            let known =
+                queue.as_ref().map_or_else(|| vec![None; layout.len()], |queue| queue.frames_held(&layout, hashes));
+            let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
+            if let Some(tree) = frame_tree_root_known(&counts, &known, hashes.len(), |i| hashes[i])
+                && tree.root == claimed
+                && !refuses(claimed)
+            {
+                CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
+                return BodyRoot { root: claimed, frame: true, indexed: tree.indexed, hashed: tree.hashed };
+            }
         }
     }
     let indexed = queue.and_then(|queue| queue.frame_layout_of(hashes)).and_then(|layout| {
@@ -1171,6 +1284,96 @@ mod claimed_root_tests {
         let bare = B256::repeat_byte(0x79);
         remember_claimed(bare, root, &[]);
         assert_eq!(root_of_block(&bare), None);
+    }
+
+    /// Audit 2026-10 round 2 (R2-X4): the layout is not in the header, so a
+    /// peer can claim a wrong one for a real root. The first claim used to
+    /// be the only one kept, and a wrong claim that arrived first kept the
+    /// right one out: the whole body then fell back to the MPT root and was
+    /// refused. Every distinct claim for a root is kept (a few at most) and
+    /// each is tried.
+    #[test]
+    fn a_wrong_layout_claimed_first_does_not_keep_the_right_one_out() {
+        let hashes: Vec<B256> = (0..7u8).map(|i| B256::repeat_byte(0x50 + i)).collect();
+        let counts = [3usize, 2, 2];
+        let root = root_of_hashes(&hashes, &counts).expect("the layout covers the body");
+        let right: Vec<(B256, u32)> =
+            counts.iter().zip(0u8..).map(|(count, k)| (B256::repeat_byte(0xb0 + k), *count as u32)).collect();
+        let wrong = vec![(B256::repeat_byte(0xbe), 4u32), (B256::repeat_byte(0xbf), 3)];
+        let mpt = B256::repeat_byte(0x12);
+        let block = B256::repeat_byte(0x7a);
+        remember_claimed(block, root, &wrong);
+        remember_claimed(block, root, &right);
+        assert_eq!(root_for_body(root_of_block(&block), &hashes, || mpt), (root, true));
+    }
+
+    /// A body of seven hashes, its frame-tree root under `[3, 2, 2]`, the
+    /// right layout and `n` distinct wrong ones.
+    fn claim_case(seed: u8, n: u8) -> (Vec<B256>, B256, Vec<(B256, u32)>, Vec<Vec<(B256, u32)>>) {
+        let hashes: Vec<B256> = (0..7u8).map(|i| B256::repeat_byte(seed.wrapping_add(i))).collect();
+        let counts = [3usize, 2, 2];
+        let root = root_of_hashes(&hashes, &counts).expect("the layout covers the body");
+        let right: Vec<(B256, u32)> =
+            counts.iter().zip(0u8..).map(|(count, k)| (B256::repeat_byte(seed ^ (0xa0 + k)), *count as u32)).collect();
+        let wrong = (0..n).map(|k| vec![(B256::repeat_byte(seed ^ (0xc0 + k)), 4u32), (B256::repeat_byte(seed ^ 0xee), 3)]).collect();
+        (hashes, root, right, wrong)
+    }
+
+    /// R2-X4 remainder: claims are keyed by who claimed them. One peer that
+    /// claims four wrong layouts after another peer's right one replaces
+    /// only its own claim each time, and the right one is still found.
+    #[test]
+    fn one_peers_wrong_layouts_do_not_evict_another_peers_right_one() {
+        let (hashes, root, right, wrong) = claim_case(0x10, CLAIMS_PER_ROOT as u8);
+        let (block, mpt) = (B256::repeat_byte(0x7b), B256::repeat_byte(0x13));
+        remember_claimed_from(block, root, &right, Some([1; 8]));
+        for layout in &wrong {
+            remember_claimed_from(block, root, layout, Some([2; 8]));
+        }
+        assert_eq!(claimed_layouts(&root).len(), 2, "one claim per source");
+        assert_eq!(claimed_layouts(&root)[0], wrong[wrong.len() - 1], "the re-claim replaced its own slot");
+        assert_eq!(root_for_body(root_of_block(&block), &hashes, || mpt), (root, true));
+    }
+
+    /// Sources are bounded per root, the oldest foreign one out first; this
+    /// node's own claim is never evicted by a foreign one.
+    #[test]
+    fn foreign_sources_are_bounded_and_the_own_claim_survives_them() {
+        let (hashes, root, right, wrong) = claim_case(0x20, 2 * CLAIMS_PER_ROOT as u8);
+        let (block, mpt) = (B256::repeat_byte(0x7c), B256::repeat_byte(0x14));
+        remember_claimed_from(block, root, &right, Some(OWN_CLAIM_SOURCE));
+        for (k, layout) in wrong.iter().enumerate() {
+            remember_claimed_from(block, root, layout, Some([0x30 + k as u8; 8]));
+        }
+        let kept = claimed_layouts(&root);
+        assert_eq!(kept.len(), CLAIMS_PER_ROOT);
+        assert!(kept.contains(&right), "the own claim is held");
+        assert_eq!(kept[0], wrong[wrong.len() - 1], "the newest foreign claim is in");
+        assert!(!kept.contains(&wrong[0]), "the oldest foreign one went");
+        assert_eq!(root_for_body(root_of_block(&block), &hashes, || mpt), (root, true));
+
+        // Without the own claim, foreign sources evict one another FIFO.
+        let (hashes, root, right, wrong) = claim_case(0x88, CLAIMS_PER_ROOT as u8);
+        let block = B256::repeat_byte(0x7d);
+        remember_claimed_from(block, root, &right, Some([9; 8]));
+        for (k, layout) in wrong.iter().enumerate() {
+            remember_claimed_from(block, root, layout, Some([0x50 + k as u8; 8]));
+        }
+        assert!(!claimed_layouts(&root).contains(&right), "four new sources evict the oldest");
+        assert_eq!(root_for_body(root_of_block(&block), &hashes, || mpt), (mpt, false));
+    }
+
+    /// A layout this node built or verified ([`LAYOUTS`]) is read before any
+    /// claim, whatever peers claimed for the root.
+    #[test]
+    fn a_verified_layout_is_used_whatever_peers_claim() {
+        let (hashes, root, right, wrong) = claim_case(0x98, 2 * CLAIMS_PER_ROOT as u8);
+        let (block, mpt) = (B256::repeat_byte(0x7e), B256::repeat_byte(0x15));
+        remember_verified(block, root, &right);
+        for (k, layout) in wrong.iter().enumerate() {
+            remember_claimed_from(block, root, layout, Some([0x70 + k as u8; 8]));
+        }
+        assert_eq!(root_for_body(Some(root), &hashes, || mpt), (root, true));
     }
 }
 
@@ -1474,5 +1677,21 @@ mod frame_root_tests {
         remember_verified(B256::repeat_byte(0x72), B256::repeat_byte(0x74), &[(B256::repeat_byte(3), 1)]);
         assert_eq!(root_of_block(&B256::repeat_byte(0x72)), Some(root));
         assert_eq!(layout_by_root(&B256::repeat_byte(0x75)), None);
+    }
+
+    /// Audit 2026-10 C-1: a peer's description claims a layout for a root
+    /// before anything checks it. The claim must not become the layout this
+    /// node describes its own block by when it later seals that root: a
+    /// Byzantine leader's wrong layout would otherwise make every honest
+    /// leader's description of the same body fail at its followers.
+    #[test]
+    fn a_claimed_layout_never_describes_a_block_this_node_seals() {
+        let root = B256::repeat_byte(0x81);
+        remember_claimed(B256::repeat_byte(0x83), root, &[(B256::repeat_byte(0x82), 7)]);
+        assert_eq!(layout_by_root(&root), None, "a claim is not this node's description");
+        let sealed = vec![(B256::repeat_byte(0x84), 7u32)];
+        remember_layout(root, sealed.clone());
+        assert_eq!(layout_by_root(&root), Some(sealed));
+        assert_eq!(root_of_block(&B256::repeat_byte(0x83)), Some(root), "the claim still roots the whole body");
     }
 }

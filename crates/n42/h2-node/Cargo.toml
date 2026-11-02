@@ -17,6 +17,9 @@ n42-h2-execution.workspace = true
 n42-h2-net.workspace = true
 n42-h2-primitives.workspace = true
 n42-h2-wire.workspace = true
+n42-mobileverify.workspace = true
+bytes = { workspace = true, features = ["std"] }
+parking_lot.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-eips.workspace = true
 alloy-consensus.workspace = true
@@ -44,7 +47,6 @@ hex.workspace = true
 libp2p = { workspace = true, default-features = false, features = ["secp256k1"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 n42-h2-el-rpc.workspace = true
-n42-mobile-service.workspace = true
 n42-qmdb-reth.workspace = true
 reth-cli.workspace = true
 url.workspace = true

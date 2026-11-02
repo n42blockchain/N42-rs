@@ -26,7 +26,10 @@ pub use attestation::{
     AggregatedAttestation, AttestationBuilder, AttestationError, VerifierRegistry,
 };
 pub use code_cache::{CacheSyncMessage, CodeCache, HotContractTracker};
-pub use receipt::{sign_receipt, ReceiptError, VerificationReceipt};
+pub use receipt::{
+    proof_of_possession, sign_receipt, verify_proof_of_possession, ReceiptError, VerificationReceipt, POP_DST,
+    RECEIPT_DST,
+};
 pub use verification::{BlockVerificationStatus, ReceiptAggregator};
 
 /// Derives an ETH address via `keccak256(pubkey_bytes)[12..]`.

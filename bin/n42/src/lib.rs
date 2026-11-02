@@ -27,7 +27,8 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+// Dependencies are shared with this package's tests, bins and examples, so the lib alone does not use all.
+#![cfg_attr(not(test), allow(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 // The library's tests run on the node's allocator: the benches below time
@@ -40,6 +41,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 pub mod cli;
 
 pub mod answer_at_insert;
+/// The RPC namespaces served on the public and authenticated transports.
 pub mod consensus_ext;
 pub mod engine_ext;
 pub mod follower_import;
@@ -122,6 +124,7 @@ pub mod providers {
 ///
 /// Was `reth_primitives::*`, which reth 2.4.1 deletes; these are the two crates
 /// its contents actually came from.
+#[allow(ambiguous_glob_reexports)] // both upstream crates export the same names; the first glob wins as before
 pub mod primitives {
     pub use reth_ethereum_primitives::*;
     pub use reth_primitives_traits::*;
@@ -206,9 +209,8 @@ pub mod rpc {
     }
 }
 
-/// Ress subprotocol installation.
+// /// Ress subprotocol installation.
 // pub mod ress; // Disabled: ress protocol deps not yet available
-
 // re-export for convenience
 #[doc(inline)]
 pub use reth_cli_runner::{CliContext, CliRunner};

@@ -6,7 +6,7 @@
 //! scripted direct import and the real build registry behind them.
 
 use super::*;
-use alloy_consensus::Header;
+use n42_header::N42Header as Header;
 use alloy_primitives::{Address, U256};
 use alloy_rpc_types_engine::{
     ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV1, PayloadStatus, PayloadStatusEnum,
@@ -112,7 +112,7 @@ async fn execution_layer(script: Script) -> El {
             }
         });
     }
-    let chain_spec = reth_chainspec::MAINNET.clone();
+    let chain_spec = std::sync::Arc::new(n42_header::N42ChainSpec::from(reth_chainspec::MAINNET.clone()));
     let profile = n42_engine_types::engine_validator::header_profile_for(&chain_spec);
     let import_foreign = script.direct_import.then(|| {
         let seen = Arc::clone(&seen);
@@ -164,7 +164,7 @@ async fn execution_layer(script: Script) -> El {
 
 /// A block header the Ethereum profile converts back from its payload.
 fn header(number: u64, tag: u8) -> Header {
-    Header {
+    n42_header::N42Header::from(alloy_consensus::Header {
         number,
         parent_hash: B256::repeat_byte(tag),
         beneficiary: Address::repeat_byte(4),
@@ -177,7 +177,7 @@ fn header(number: u64, tag: u8) -> Header {
         gas_limit: 30_000_000,
         base_fee_per_gas: Some(7),
         ..Default::default()
-    }
+    })
 }
 
 /// The block's payload, under the hash the engine's conversion gives it.
@@ -357,7 +357,7 @@ async fn a_handover_on_one_execution_layer_keeps_the_build_chain() {
     // The outgoing leader built N-1 and N, chained.
     let before = header(305, 0x35);
     file_build(&before);
-    let last = Header { parent_hash: before.hash_slow(), ..header(306, 0x36) };
+    let last = n42_header::N42Header::from(alloy_consensus::Header { parent_hash: before.hash_slow(), ..header(306, 0x36).inner });
     file_build(&last);
     for block in [&before, &last] {
         // The incoming leader's follower request first, the outgoing
@@ -485,10 +485,10 @@ enum Road {
 /// consensus sealed it (gov5's: the rewards commitment, zero ommers hash, the
 /// view in the extra data) -- the seal the recognition used to miss.
 fn own_block(number: u64, tag: u8) -> (Header, Header) {
-    let built = Header {
+    let built = n42_header::N42Header::from(alloy_consensus::Header {
         withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
-        ..header(number, tag)
-    };
+        ..header(number, tag).inner
+    });
     let sealed = n42_h2_consensus::gov5_h2_header_for_view(built.clone(), &[], number + 7, None).expect("sealed");
     assert_ne!(built.withdrawals_root, sealed.withdrawals_root, "the seal moves the withdrawals root");
     (built, sealed)
@@ -645,7 +645,7 @@ async fn a_check_only_request_vouches_for_a_kept_build_and_nothing_else() {
     let status = raw_engine::decode_payload_status(&buf).expect("status");
     assert!(n42_h2_execution::vouches_for(sealed.hash_slow(), &status), "{status:?}");
 
-    let sibling = Header { state_root: B256::repeat_byte(0xEE), ..sealed.clone() };
+    let sibling = n42_header::N42Header::from(alloy_consensus::Header { state_root: B256::repeat_byte(0xEE), ..sealed.inner.clone() });
     send(&mut client, request::CHECK_ONLY, &alloy_rlp::encode(&sibling)).await;
     assert_eq!(hear_one(&mut client).await.0, raw_engine::reply::ERROR, "a sibling of the build");
     send(&mut client, request::CHECK_ONLY, &alloy_rlp::encode(header(612, 0xB5))).await;
@@ -686,7 +686,7 @@ fn instant_reuse() -> OwnBlockReuse {
             let _ = insert.done.send(true);
         }
     });
-    let chain_spec = reth_chainspec::MAINNET.clone();
+    let chain_spec = std::sync::Arc::new(n42_header::N42ChainSpec::from(reth_chainspec::MAINNET.clone()));
     let profile = n42_engine_types::engine_validator::header_profile_for(&chain_spec);
     OwnBlockReuse {
         validator: Arc::new(n42_engine_types::engine_validator::N42EngineValidator::new(chain_spec, profile)),

@@ -98,8 +98,9 @@ pub const X22: &[Knob] = &[
     k("N42_HANDOFF_NO_CLONE", "1"),
     // X4.
     k("N42_HANDOFF_MOVE_BODY", "1"),
-    // X5.
-    k("N42_CANON_NOTIFY_LEAN", "1"),
+    // X5's `N42_CANON_NOTIFY_LEAN` is bench-only (canonical notifications
+    // without execution outcomes starve logs, receipts and pool upkeep) and
+    // stays with the launcher.
     // X6.
     k("N42_QUEUE_OFFLOCK", "1"),
     // X7.
@@ -224,8 +225,11 @@ pub const X22: &[Knob] = &[
     k("N42_ALTSIG_SENDER_CACHE", "4194304"),
     k("N42_BUILD_THROTTLE_SOFT", "48"),
     k("N42_BUILD_THROTTLE_HARD", "80"),
-    // X22 base: votes and the local GossipSub queue bounds.
-    k("N42_VOTE_TRANSPORT", "direct"),
+    // X22 base: votes and the local GossipSub queue bounds. Direct votes
+    // skip the mesh, which a mixed fleet with gov5 members runs on
+    // (`h2-node/src/direct_votes.rs`): only on a frame-block chain, which
+    // no gov5 member can follow (audit 2026-10 E-5).
+    kf("N42_VOTE_TRANSPORT", "direct"),
     k("N42_VOTE_AGGREGATE_VERIFY", "1"),
     k("N42_GOSSIP_HANDLER_QUEUE", "64"),
     k("N42_GOSSIP_MAX_IHAVE", "500"),
@@ -382,7 +386,8 @@ pub unsafe fn reconcile(features: ChainFeatures) -> Option<Withdrawn> {
 /// feature, each ending with how many of the profile's knobs remain in force.
 fn withdrawal_lines(binary: &str, withdrawn: &Withdrawn) -> Vec<String> {
     let mut lines = Vec::new();
-    for requirement in [Requires::FrameBlocks] {
+    {
+        let requirement = Requires::FrameBlocks;
         let names: Vec<&str> =
             withdrawn.knobs.iter().filter(|knob| knob.requires == Some(requirement)).map(|knob| knob.name).collect();
         if !names.is_empty() {
@@ -453,6 +458,49 @@ pub unsafe fn apply_or_exit(binary: &str) -> Option<Applied> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Audit 2026-10 E-10: a profile switch (value `1`) is read with
+    /// [`crate::flag`] everywhere, so `true` and `1` mean the same for every
+    /// knob of one profile. Scans the workspace's own sources for a read of
+    /// one compared with a string instead.
+    #[test]
+    fn every_profile_switch_is_read_as_a_flag() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let switches: Vec<&str> = X22.iter().filter(|knob| knob.value == "1").map(|knob| knob.name).collect();
+        let mut files = Vec::new();
+        let mut dirs = vec![root.join("crates/n42"), root.join("bin/n42")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if !path.ends_with("target") {
+                        dirs.push(path);
+                    }
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let mut offenders = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for name in &switches {
+                let quoted = format!("\"{name}\"");
+                let mut from = 0;
+                while let Some(at) = text[from..].find(&quoted) {
+                    let start = from + at;
+                    let statement = &text[start..text[start..].find(';').map_or(text.len(), |end| start + end)];
+                    if statement.contains("== \"1\"") {
+                        offenders.push(format!("{}: {name}", path.display()));
+                    }
+                    from = start + quoted.len();
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "profile switches read with == \"1\":
+{}", offenders.join("
+"));
+    }
     use super::*;
     use crate::test_env::{lock, set, unset};
     use std::collections::{BTreeSet, HashSet};
@@ -555,7 +603,8 @@ mod tests {
         assert_eq!(unsafe { apply() }, Ok(None));
     }
 
-    const FRAME_GATED: [&str; 12] = [
+    // Audit 2026-10 E-5: N42_VOTE_TRANSPORT=direct is gated too.
+    const FRAME_GATED: [&str; 13] = [
         "N42_PLAN_AHEAD_WAIT_MS",
         "N42_FRAME_ROAD",
         "N42_ROAD_RESEED_AT_FLUSH",
@@ -568,6 +617,7 @@ mod tests {
         "N42_FOLLOWER_FRAME_SCAN",
         "N42_ROAD_TAKEN_BOUND",
         "N42_ROAD_RETIRE_INDEX",
+        "N42_VOTE_TRANSPORT",
     ];
 
     #[test]

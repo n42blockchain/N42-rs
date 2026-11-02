@@ -125,6 +125,20 @@ impl PublishError {
     }
 }
 
+/// gov5's `GossipMobilePacketMessage` (`internal/p2p/topics.go`).
+pub const MOBILEVERIFY_PACKET_KIND: &str = "mobileverify_packet";
+/// gov5's `GossipMobileRegistrationMessage`.
+pub const MOBILEVERIFY_REGISTRATION_KIND: &str = "mobileverify_registration";
+
+/// One of the two mobile-verification topics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileTopic {
+    /// `mobileverify_packet`: `StreamPacket` V2 bytes.
+    Packet,
+    /// `mobileverify_registration`: `pubkey48 ‖ pop96`.
+    Registration,
+}
+
 /// How a transport is wired to a fleet.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
@@ -140,6 +154,11 @@ pub struct TransportConfig {
     pub bootstrap_peers: Vec<Multiaddr>,
     /// Idle connection timeout. gov5 keeps fleet connections long-lived.
     pub idle_connection_timeout: Duration,
+    /// Joins gov5's two mobile-verification topics,
+    /// `/n42/<fork digest>/mobileverify_{packet,registration}/ssz_snappy`
+    /// (raw payloads despite the suffix). Off by default: a node that serves
+    /// no phones neither subscribes nor relays them.
+    pub mobileverify: bool,
 }
 
 impl TransportConfig {
@@ -150,7 +169,14 @@ impl TransportConfig {
             listen_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
             idle_connection_timeout: Duration::from_secs(300),
+            mobileverify: false,
         }
+    }
+
+    /// Joins the mobile-verification topics (see [`Self::mobileverify`]).
+    pub const fn with_mobileverify(mut self, on: bool) -> Self {
+        self.mobileverify = on;
+        self
     }
 
     /// Adds a peer to dial on startup.
@@ -168,15 +194,36 @@ impl TransportConfig {
 
 /// Where the answer to a [`TransportEvent::BlockRequest`] goes.
 #[derive(Debug)]
-pub struct BlockRequestChannel(request_response::ResponseChannel<BlockReply>);
+pub struct BlockRequestChannel(request_response::ResponseChannel<BlockReply>, request_response::InboundRequestId);
 
 /// Where the answer to a [`TransportEvent::RangeRequest`] goes.
 #[derive(Debug)]
-pub struct RangeRequestChannel(request_response::ResponseChannel<RangeReply>);
+pub struct RangeRequestChannel(
+    request_response::ResponseChannel<RangeReply>,
+    request_response::InboundRequestId,
+);
+
+/// Whatever a server holds for a reply (a serve slot, a byte budget),
+/// kept by the transport until libp2p has sent the reply or given up on
+/// it, then dropped. See [`H2V4Transport::respond_range_holding`].
+pub struct ServeGuard(#[allow(dead_code)] Box<dyn std::any::Any + Send>);
+
+impl ServeGuard {
+    /// Wraps what is to be held.
+    pub fn new<T: Send + 'static>(held: T) -> Self {
+        Self(Box::new(held))
+    }
+}
+
+impl std::fmt::Debug for ServeGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ServeGuard")
+    }
+}
 
 /// Where an answer to a named-transactions request goes.
 #[derive(Debug)]
-pub struct BlockTxnsChannel(request_response::ResponseChannel<BlockTxnsReply>);
+pub struct BlockTxnsChannel(request_response::ResponseChannel<BlockTxnsReply>, request_response::InboundRequestId);
 
 /// What the transport saw.
 #[derive(Debug)]
@@ -300,6 +347,23 @@ pub enum TransportEvent {
         /// The body, as a chunk.
         chunk: BlockChunk,
     },
+    /// A `StreamPacket` from gov5's `mobileverify_packet` topic, raw as
+    /// received (gov5 gossips it uncompressed). Validated above the
+    /// transport, which needs the head.
+    MobilePacket {
+        /// The peer that delivered it, when authored.
+        from: Option<PeerId>,
+        /// The encoded packet.
+        data: Vec<u8>,
+    },
+    /// A registration from gov5's `mobileverify_registration` topic:
+    /// `pubkey48 ‖ pop96`, raw.
+    MobileRegistration {
+        /// The peer that delivered it, when authored.
+        from: Option<PeerId>,
+        /// The payload.
+        data: Vec<u8>,
+    },
     /// A block body arrived on the chain's block topic, still compressed.
     /// Which header shapes to accept is the consumer's decision — see
     /// [`crate::block_gossip::HeaderProfile`] — so it is not decoded here.
@@ -402,6 +466,26 @@ pub(crate) struct H2Behaviour {
     /// [`crate::rpc::VOTE_PROTOCOL`]. Used only when a node sends on it
     /// (`N42_VOTE_TRANSPORT`); a peer without it fails the request.
     votes: crate::rpc::VoteBehaviour,
+    /// A cap on inbound connections ([`max_inbound_connections`]): peers are
+    /// free to make, and each one may hold serve slots and gossip bodies
+    /// (audit 2026-10 B-3).
+    limits: libp2p::connection_limits::Behaviour,
+}
+
+/// Connections one peer may hold at once, both directions together: two
+/// for a simultaneous dial, and room for a redial while an old connection
+/// winds down. Without it one identity dialling again and again held every
+/// inbound slot (audit 2026-10 round 3, R3-N1).
+pub const MAX_CONNECTIONS_PER_PEER: u32 = 4;
+
+/// Inbound connections this node accepts at most: `N42_H2_MAX_INBOUND`,
+/// default 128 (a seven-member fleet holds six, gov5 caps its peers near 50).
+pub fn max_inbound_connections() -> u32 {
+    max_inbound_from(std::env::var("N42_H2_MAX_INBOUND").ok().as_deref())
+}
+
+fn max_inbound_from(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(128)
 }
 
 /// The swarm and its bookkeeping: what [`H2V4Transport`] polls on the
@@ -415,6 +499,9 @@ pub(crate) struct TransportCore {
     tx_topic: IdentTopic,
     /// gov5's own consensus topic, likewise fork-scoped.
     native_topic: IdentTopic,
+    /// gov5's `mobileverify_packet` and `mobileverify_registration` topics,
+    /// when the node joined them.
+    mobile_topics: Option<(IdentTopic, IdentTopic)>,
     identity: H2V4ChainIdentity,
     mesh_peers: HashSet<PeerId>,
     /// Events produced before the loop starts (dials that failed immediately).
@@ -428,6 +515,16 @@ pub(crate) struct TransportCore {
     txns_requests: HashMap<request_response::OutboundRequestId, BlockTxnsRequest>,
     /// The head height this node advertises in its own status messages.
     advertised_height: u64,
+    /// Peers that completed the status handshake for this chain; only they
+    /// are served ranges (audit 2026-10 B-3).
+    statused: HashSet<PeerId>,
+    /// What each range reply handed to libp2p holds until it is sent
+    /// (audit 2026-10 B-4).
+    range_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
+    /// The same for block-by-hash replies (audit 2026-10 R2-I6).
+    block_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
+    /// The same for named-transactions replies (audit 2026-10 R2-I6).
+    txns_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
 }
 
 impl TransportCore {
@@ -457,6 +554,11 @@ impl TransportCore {
                     .with_agent_version(format!("n42-rs/h2-net/{}", env!("CARGO_PKG_VERSION"))),
             ),
             votes: crate::rpc::vote_behaviour(),
+            limits: libp2p::connection_limits::Behaviour::new(
+                libp2p::connection_limits::ConnectionLimits::default()
+                    .with_max_established_incoming(Some(max_inbound_connections()))
+                    .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER)),
+            ),
         };
 
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -515,6 +617,22 @@ impl TransportCore {
                 topic: tx_topic.to_string(),
                 source,
             })?;
+        // The mobile-verification topics, only for a node that serves phones;
+        // the existing topics and the GossipSub parameters are untouched.
+        let mobile_topics = if config.mobileverify {
+            let packet = fork_scoped_topic(config.identity.genesis_hash, MOBILEVERIFY_PACKET_KIND);
+            let registration = fork_scoped_topic(config.identity.genesis_hash, MOBILEVERIFY_REGISTRATION_KIND);
+            for topic in [&packet, &registration] {
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .subscribe(topic)
+                    .map_err(|source| TransportError::Subscribe { topic: topic.to_string(), source })?;
+            }
+            Some((packet, registration))
+        } else {
+            None
+        };
 
         for addr in &config.listen_addrs {
             swarm
@@ -543,6 +661,7 @@ impl TransportCore {
             block_topic,
             tx_topic,
             native_topic,
+            mobile_topics,
             identity: config.identity,
             mesh_peers: HashSet::new(),
             pending_events: dial_errors,
@@ -550,6 +669,10 @@ impl TransportCore {
             range_requests: HashMap::new(),
             txns_requests: HashMap::new(),
             advertised_height: 0,
+            statused: HashSet::new(),
+            range_guards: HashMap::new(),
+            block_guards: HashMap::new(),
+            txns_guards: HashMap::new(),
         })
     }
 
@@ -672,6 +795,15 @@ impl TransportCore {
         let _ = self.swarm.behaviour_mut().block_txns.send_response(channel.0, reply);
     }
 
+    /// [`Self::respond_block_txns`], holding `guard` until libp2p has sent
+    /// the reply (audit 2026-10 R2-I6).
+    pub fn respond_block_txns_holding(&mut self, channel: BlockTxnsChannel, reply: BlockTxnsReply, guard: ServeGuard) {
+        let id = channel.1;
+        if self.swarm.behaviour_mut().block_txns.send_response(channel.0, reply).is_ok() {
+            self.txns_guards.insert(id, guard);
+        }
+    }
+
     /// Answers a [`TransportEvent::RangeRequest`] with the blocks this node
     /// has, in order — as many as it could find from the start, which is
     /// how gov5 serves a range it only partly holds.
@@ -682,6 +814,22 @@ impl TransportCore {
             .map(|rlp| BlockChunk { fork_digest, rlp: rlp.into() })
             .collect();
         let _ = self.swarm.behaviour_mut().ranges.send_response(channel.0, Ok(chunks));
+    }
+
+    /// [`Self::respond_range`], holding `guard` until libp2p has sent the
+    /// reply (or failed to): what a reply's bytes cost the server is counted
+    /// until they leave it, not only until they are queued.
+    pub fn respond_range_holding(&mut self, channel: RangeRequestChannel, rlps: Vec<Vec<u8>>, guard: ServeGuard) {
+        let id = channel.1;
+        let fork_digest = self.our_status().fork_digest();
+        let chunks = rlps
+            .into_iter()
+            .map(|rlp| BlockChunk { fork_digest, rlp: rlp.into() })
+            .collect();
+        // A connection already gone takes the reply back: nothing to hold.
+        if self.swarm.behaviour_mut().ranges.send_response(channel.0, Ok(chunks)).is_ok() {
+            self.range_guards.insert(id, guard);
+        }
     }
 
     /// Refuses a [`TransportEvent::RangeRequest`] with the protocol's
@@ -742,6 +890,24 @@ impl TransportCore {
         let _ = self.swarm.behaviour_mut().blocks.send_response(channel.0, reply);
     }
 
+    /// [`Self::respond_block`], holding `guard` until libp2p has sent the
+    /// reply (audit 2026-10 R2-I6).
+    pub fn respond_block_holding(
+        &mut self,
+        channel: BlockRequestChannel,
+        rlp: Option<alloy_primitives::Bytes>,
+        guard: ServeGuard,
+    ) {
+        let id = channel.1;
+        let reply = match rlp {
+            Some(rlp) => Ok(BlockChunk { fork_digest: self.our_status().fork_digest(), rlp }),
+            None => Err("block not found".to_owned()),
+        };
+        if self.swarm.behaviour_mut().blocks.send_response(channel.0, reply).is_ok() {
+            self.block_guards.insert(id, guard);
+        }
+    }
+
     /// Publishes a compressed transaction batch on the chain's transaction
     /// topic; see [`crate::tx_gossip`].
     pub fn publish_transactions(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
@@ -750,6 +916,19 @@ impl TransportCore {
             .behaviour_mut()
             .gossipsub
             .publish(self.tx_topic.clone(), data)?)
+    }
+
+    /// Publishes raw bytes on one of the mobile-verification topics;
+    /// refused as a missing subscription when the node did not join them.
+    pub fn publish_mobile(&mut self, topic: MobileTopic, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
+        let Some((packet, registration)) = &self.mobile_topics else {
+            return Err(PublishError::Gossipsub(gossipsub::PublishError::NoPeersSubscribedToTopic));
+        };
+        let topic = match topic {
+            MobileTopic::Packet => packet.clone(),
+            MobileTopic::Registration => registration.clone(),
+        };
+        Ok(self.swarm.behaviour_mut().gossipsub.publish(topic, data)?)
     }
 
     /// Publishes an already-encoded block body on the chain's block topic.
@@ -771,26 +950,7 @@ impl TransportCore {
 
     /// What a request on the vote protocol is, as a transport event.
     fn direct_vote_event(&self, peer: PeerId, request: crate::rpc::VoteRequest) -> TransportEvent {
-        let inner = match request {
-            crate::rpc::VoteRequest::Hello { index, signature } => {
-                return TransportEvent::VoteHello { peer, index, signature };
-            }
-            crate::rpc::VoteRequest::Native(bytes) => match decode_gov5_gossip_message(&bytes) {
-                Ok(decoded) => TransportEvent::Native {
-                    from: Some(peer),
-                    message: Box::new(decoded),
-                },
-                Err(err) => TransportEvent::Rejected {
-                    from: Some(peer),
-                    reason: format!("direct vote: {err}"),
-                },
-            },
-            crate::rpc::VoteRequest::Envelope(bytes) => decode_payload_for(self.identity, Some(peer), &bytes),
-        };
-        TransportEvent::DirectVote {
-            peer,
-            inner: Box::new(inner),
-        }
+        direct_vote_event(self.identity, peer, request)
     }
 
     /// Publishes already-encoded bytes on one of the four topics.
@@ -804,8 +964,21 @@ impl TransportCore {
             crate::pump::PubTopic::Native => self.native_topic.clone(),
             crate::pump::PubTopic::Block => self.block_topic.clone(),
             crate::pump::PubTopic::Tx => self.tx_topic.clone(),
+            crate::pump::PubTopic::Mobile(kind) => return self.publish_mobile(kind, data),
         };
         Ok(self.swarm.behaviour_mut().gossipsub.publish(topic, data)?)
+    }
+
+    /// Which mobile-verification topic `hash` is, if the node joined them.
+    fn mobile_topic_of(&self, hash: &gossipsub::TopicHash) -> Option<MobileTopic> {
+        let (packet, registration) = self.mobile_topics.as_ref()?;
+        if *hash == packet.hash() {
+            Some(MobileTopic::Packet)
+        } else if *hash == registration.hash() {
+            Some(MobileTopic::Registration)
+        } else {
+            None
+        }
     }
 
     /// Drives the swarm until something worth reporting happens.
@@ -820,37 +993,62 @@ impl TransportCore {
             let event = self.swarm.select_next_some().await;
             match event {
                 SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                    propagation_source,
+                    message_id,
                     message,
-                    ..
                 })) => {
-                    if message.topic == self.block_topic.hash() {
-                        return Some(TransportEvent::Block {
-                            from: message.source,
-                            data: message.data,
-                        });
-                    }
-                    if message.topic == self.tx_topic.hash() {
-                        return Some(TransportEvent::Transactions {
-                            from: message.source,
-                            data: message.data,
-                        });
-                    }
-                    if message.topic == self.native_topic.hash() {
-                        return Some(match decode_gov5_gossip_message(&message.data) {
+                    // Forwarded only once decoded (R3-N4): a consensus
+                    // message that does not decode is rejected and goes no
+                    // further, a body or a transaction batch (decoded above
+                    // the transport) is accepted, another topic ignored. A
+                    // refusal names the peer that delivered it, as an
+                    // anonymous message carries no author.
+                    let event = if message.topic == self.block_topic.hash() {
+                        Some(TransportEvent::Block { from: message.source, data: message.data })
+                    } else if message.topic == self.tx_topic.hash() {
+                        Some(TransportEvent::Transactions { from: message.source, data: message.data })
+                    } else if let Some(kind) = self.mobile_topic_of(&message.topic) {
+                        Some(match kind {
+                            MobileTopic::Packet => TransportEvent::MobilePacket { from: message.source, data: message.data },
+                            MobileTopic::Registration => {
+                                TransportEvent::MobileRegistration { from: message.source, data: message.data }
+                            }
+                        })
+                    } else if message.topic == self.native_topic.hash() {
+                        Some(match decode_gov5_gossip_message(&message.data) {
                             Ok(decoded) => TransportEvent::Native {
                                 from: message.source,
                                 message: Box::new(decoded),
                             },
                             Err(err) => TransportEvent::Rejected {
-                                from: message.source,
+                                from: Some(propagation_source),
                                 reason: format!("native message: {err}"),
                             },
-                        });
+                        })
+                    } else if message.topic == self.topic.hash() {
+                        Some(match self.decode_payload(message.source, &message.data) {
+                            TransportEvent::Rejected { reason, .. } => {
+                                TransportEvent::Rejected { from: Some(propagation_source), reason }
+                            }
+                            decoded => decoded,
+                        })
+                    } else {
+                        None
+                    };
+                    let verdict = match &event {
+                        None => gossipsub::MessageAcceptance::Ignore,
+                        Some(TransportEvent::Rejected { .. }) => gossipsub::MessageAcceptance::Reject,
+                        Some(_) => gossipsub::MessageAcceptance::Accept,
+                    };
+                    let _ = self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        verdict,
+                    );
+                    match event {
+                        Some(event) => return Some(event),
+                        None => continue,
                     }
-                    if message.topic != self.topic.hash() {
-                        continue;
-                    }
-                    return Some(self.decode_payload(message.source, &message.data));
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(
                     gossipsub::Event::Subscribed { peer_id, topic },
@@ -886,12 +1084,12 @@ impl TransportCore {
                     request_response::Event::Message { peer, message, .. },
                 )) => match message {
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id, request, channel,
                     } => {
                         return Some(TransportEvent::BlockRequest {
                             peer,
                             hash: request,
-                            channel: BlockRequestChannel(channel),
+                            channel: BlockRequestChannel(channel, request_id),
                         });
                     }
                     request_response::Message::Response {
@@ -923,6 +1121,13 @@ impl TransportCore {
                         });
                     }
                 }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(
+                    request_response::Event::ResponseSent { request_id, .. }
+                    | request_response::Event::InboundFailure { request_id, .. },
+                )) => {
+                    self.block_guards.remove(&request_id);
+                }
+                #[allow(unreachable_patterns)] // event kinds are handled elsewhere; the arm documents them
                 SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Pushes(
                     request_response::Event::Message { peer, message, .. },
@@ -951,12 +1156,22 @@ impl TransportCore {
                     request_response::Event::Message { peer, message, .. },
                 )) => match message {
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id, request, channel,
                     } => {
+                        // gov5 syncs only from peers in its status store; a
+                        // peer that never completed the handshake for this
+                        // chain is not served one either.
+                        if !self.statused.contains(&peer) {
+                            let _ = self.swarm.behaviour_mut().ranges.send_response(
+                                channel,
+                                Err("no status exchanged for this chain".to_owned()),
+                            );
+                            continue;
+                        }
                         return Some(TransportEvent::RangeRequest {
                             peer,
                             request,
-                            channel: RangeRequestChannel(channel),
+                            channel: RangeRequestChannel(channel, request_id),
                         });
                     }
                     request_response::Message::Response {
@@ -988,15 +1203,22 @@ impl TransportCore {
                         });
                     }
                 }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(
+                    request_response::Event::ResponseSent { request_id, .. }
+                    | request_response::Event::InboundFailure { request_id, .. },
+                )) => {
+                    self.range_guards.remove(&request_id);
+                }
+                #[allow(unreachable_patterns)] // event kinds are handled elsewhere; the arm documents them
                 SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(
                     request_response::Event::Message { peer, message, .. },
                 )) => match message {
-                    request_response::Message::Request { request, channel, .. } => {
+                    request_response::Message::Request { request_id, request, channel } => {
                         return Some(TransportEvent::BlockTxnsRequested {
                             peer,
                             request,
-                            channel: BlockTxnsChannel(channel),
+                            channel: BlockTxnsChannel(channel, request_id),
                         });
                     }
                     request_response::Message::Response { request_id, response } => {
@@ -1016,6 +1238,13 @@ impl TransportCore {
                         });
                     }
                 }
+                SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(
+                    request_response::Event::ResponseSent { request_id, .. }
+                    | request_response::Event::InboundFailure { request_id, .. },
+                )) => {
+                    self.txns_guards.remove(&request_id);
+                }
+                #[allow(unreachable_patterns)] // event kinds are handled elsewhere; the arm documents them
                 SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Votes(
                     request_response::Event::Message { peer, message, .. },
@@ -1064,6 +1293,7 @@ impl TransportCore {
                     num_established: 0,
                     ..
                 } => {
+                    self.statused.remove(&peer_id);
                     if self.mesh_peers.remove(&peer_id) {
                         return Some(TransportEvent::PeerDisconnected(peer_id));
                     }
@@ -1119,11 +1349,17 @@ impl TransportCore {
         }
 
         let ours = self.our_status();
+        let fork_matches = their_status.fork_digest() == ours.fork_digest();
+        if fork_matches {
+            self.statused.insert(peer);
+        } else {
+            self.statused.remove(&peer);
+        }
         Some(TransportEvent::StatusExchanged {
             peer,
             genesis_hash: their_status.genesis_hash,
             height: their_status.height(),
-            fork_matches: their_status.fork_digest() == ours.fork_digest(),
+            fork_matches,
         })
     }
 
@@ -1137,6 +1373,49 @@ impl TransportCore {
 }
 
 /// Decodes one v4 gossip payload for the chain `identity`.
+/// What a request on the vote protocol is, as a transport event. Only what
+/// this node sends there reaches the engine -- votes, commit votes and
+/// retransmitted timeouts; any other message is refused, as it is not
+/// de-duplicated the way gossip is (audit 2026-10 round 3, R3-N5).
+pub(crate) fn direct_vote_event(identity: H2V4ChainIdentity, peer: PeerId, request: crate::rpc::VoteRequest) -> TransportEvent {
+    let inner = match request {
+        crate::rpc::VoteRequest::Hello { index, signature } => {
+            return TransportEvent::VoteHello { peer, index, signature };
+        }
+        crate::rpc::VoteRequest::Native(bytes) => match decode_gov5_gossip_message(&bytes) {
+            Ok(decoded) => TransportEvent::Native {
+                from: Some(peer),
+                message: Box::new(decoded),
+            },
+            Err(err) => TransportEvent::Rejected {
+                from: Some(peer),
+                reason: format!("direct vote: {err}"),
+            },
+        },
+        crate::rpc::VoteRequest::Envelope(bytes) => decode_payload_for(identity, Some(peer), &bytes),
+    };
+    let kind = match &inner {
+        TransportEvent::Native { message, .. } => Some(message.kind()),
+        TransportEvent::Envelope { envelope, .. } => Some(envelope.message.kind()),
+        _ => None,
+    };
+    if let Some(kind) = kind.filter(|kind| {
+        !matches!(
+            kind,
+            n42_h2_wire::h2_wire::H2MessageKind::Vote | n42_h2_wire::h2_wire::H2MessageKind::CommitVote | n42_h2_wire::h2_wire::H2MessageKind::Timeout
+        )
+    }) {
+        return TransportEvent::Rejected {
+            from: Some(peer),
+            reason: format!("direct vote: a {kind:?} is not carried on the vote protocol"),
+        };
+    }
+    TransportEvent::DirectVote {
+        peer,
+        inner: Box::new(inner),
+    }
+}
+
 pub(crate) fn decode_payload_for(
     identity: H2V4ChainIdentity,
     from: Option<PeerId>,
@@ -1361,6 +1640,15 @@ impl H2V4Transport {
         }
     }
 
+    /// Answers a named-transactions request, holding `guard` until the reply
+    /// is sent.
+    pub fn respond_block_txns_holding(&mut self, channel: BlockTxnsChannel, reply: BlockTxnsReply, guard: ServeGuard) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_block_txns_holding(channel, reply, guard),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondTxnsHolding(channel, reply, guard)),
+        }
+    }
+
     /// Answers a [`TransportEvent::RangeRequest`] with the blocks this node
     /// has, in order — as many as it could find from the start, which is
     /// how gov5 serves a range it only partly holds.
@@ -1368,6 +1656,15 @@ impl H2V4Transport {
         match &mut self.inner {
             Inner::Inline(core) => core.respond_range(channel, rlps),
             Inner::OffLoop(off) => off.command(crate::pump::Command::RespondRange(channel, rlps)),
+        }
+    }
+
+    /// [`Self::respond_range`], holding `guard` until libp2p has sent the
+    /// reply or given up on it (audit 2026-10 B-4).
+    pub fn respond_range_holding(&mut self, channel: RangeRequestChannel, rlps: Vec<Vec<u8>>, guard: ServeGuard) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_range_holding(channel, rlps, guard),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondRangeHolding(channel, rlps, guard)),
         }
     }
 
@@ -1432,12 +1729,34 @@ impl H2V4Transport {
         }
     }
 
+    /// Answers a block request, holding `guard` until the reply is sent.
+    pub fn respond_block_holding(
+        &mut self,
+        channel: BlockRequestChannel,
+        rlp: Option<alloy_primitives::Bytes>,
+        guard: ServeGuard,
+    ) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.respond_block_holding(channel, rlp, guard),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RespondBlockHolding(channel, rlp, guard)),
+        }
+    }
+
     /// Publishes a compressed transaction batch on the chain's transaction
     /// topic; see [`crate::tx_gossip`].
     pub fn publish_transactions(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
         match &mut self.inner {
             Inner::Inline(core) => core.publish_transactions(data),
             Inner::OffLoop(off) => off.publish(crate::pump::PubTopic::Tx, data),
+        }
+    }
+
+    /// Publishes raw bytes on a mobile-verification topic (the transport
+    /// must have been built with [`TransportConfig::mobileverify`]).
+    pub fn publish_mobile(&mut self, topic: MobileTopic, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
+        match &mut self.inner {
+            Inner::Inline(core) => core.publish_mobile(topic, data),
+            Inner::OffLoop(off) => off.publish(crate::pump::PubTopic::Mobile(topic), data),
         }
     }
 
@@ -1488,5 +1807,75 @@ impl std::fmt::Debug for H2V4Transport {
             .field("off_loop", &self.is_off_loop())
             .field("connected_peers", &self.connected_peers())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Audit 2026-10 round 3 (R3-N5): any peer could send any consensus
+    /// message on the vote protocol, past gossip's de-duplication -- a
+    /// proposal or a decide as often as it liked, each verified again. The
+    /// protocol carries what this node sends on it: votes, commit votes and
+    /// retransmitted timeouts.
+    #[test]
+    fn the_vote_protocol_carries_only_votes_and_timeouts() {
+        use n42_h2_wire::h2_wire::{H2Decide, H2QuorumCertificate, H2Timeout, H2Vote};
+        let identity = super::H2V4ChainIdentity { chain_id: 1, genesis_hash: super::B256::ZERO };
+        let signature = n42_h2_primitives::BlsSecretKey::random().expect("a key").sign(b"m");
+        let qc = H2QuorumCertificate {
+            view: 1,
+            block_hash: super::B256::ZERO,
+            aggregate_signature: signature.to_bytes().to_vec(),
+            signers_bitmap: vec![1, 0, 1],
+        };
+        let vote = super::H2Message::Vote(H2Vote {
+            view: 2,
+            block_hash: super::B256::ZERO,
+            voter: 0,
+            signature: signature.clone(),
+            high_tc: None,
+        });
+        let commit_vote = super::H2Message::CommitVote(H2Vote {
+            view: 2,
+            block_hash: super::B256::ZERO,
+            voter: 0,
+            signature: signature.clone(),
+            high_tc: None,
+        });
+        let timeout = super::H2Message::Timeout(H2Timeout {
+            view: 2,
+            high_qc: qc.clone(),
+            sender: 0,
+            signature,
+            high_tc: None,
+        });
+        let decide = super::H2Message::Decide(H2Decide { view: 2, block_hash: super::B256::ZERO, commit_qc: qc });
+        let peer = super::PeerId::random();
+        let reaches_the_node = |request| {
+            matches!(
+                super::direct_vote_event(identity, peer, request),
+                super::TransportEvent::DirectVote { inner, .. }
+                    if matches!(*inner, super::TransportEvent::Native { .. } | super::TransportEvent::Envelope { .. })
+            )
+        };
+        for (message, allowed) in [(vote, true), (commit_vote, true), (timeout, true), (decide, false)] {
+            let native = super::encode_gov5_gossip_message(&message).expect("encodes");
+            assert_eq!(reaches_the_node(crate::rpc::VoteRequest::Native(native)), allowed, "{:?}", message.kind());
+            let envelope = super::encode_gossip(&super::H2V4Envelope {
+                identity,
+                changes_hash: super::B256::ZERO,
+                message: message.clone(),
+            })
+            .expect("encodes");
+            assert_eq!(reaches_the_node(crate::rpc::VoteRequest::Envelope(envelope)), allowed, "{:?}", message.kind());
+        }
+    }
+
+    #[test]
+    fn the_inbound_cap_defaults_to_128_and_takes_a_positive_override() {
+        assert_eq!(super::max_inbound_from(None), 128);
+        assert_eq!(super::max_inbound_from(Some("32")), 32);
+        assert_eq!(super::max_inbound_from(Some("0")), 128);
+        assert_eq!(super::max_inbound_from(Some("lots")), 128);
     }
 }

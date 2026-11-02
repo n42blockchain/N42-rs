@@ -18,6 +18,25 @@ fn reads_and_reproduces_existing_checkpoint_bytes() {
 }
 
 #[test]
+fn a_version_2_checkpoint_appends_the_relocated_length() {
+    let v1: ForestCheckpoint = deserialize(CHECKPOINT).unwrap();
+    assert_eq!(v1.relocated_len, 0);
+    let v2 = ForestCheckpoint { version: 2, relocated_len: 0x0102_0304, ..v1 };
+    let bytes = serialize(&v2).unwrap();
+    // The version, then the version 1 fields, then the relocated length.
+    assert_eq!(&bytes[..4], &2u32.to_le_bytes());
+    assert_eq!(&bytes[4..CHECKPOINT.len()], &CHECKPOINT[4..]);
+    assert_eq!(&bytes[CHECKPOINT.len()..], &0x0102_0304u64.to_le_bytes());
+    assert_eq!(deserialize::<ForestCheckpoint>(&bytes).unwrap(), v2);
+    // Streamed after a delta, it consumes exactly its own bytes.
+    let mut stream = bytes.clone();
+    stream.extend_from_slice(DELTA);
+    let mut reader = stream.as_slice();
+    let _: ForestCheckpoint = deserialize_from(&mut reader).unwrap();
+    assert_eq!(reader, DELTA);
+}
+
+#[test]
 fn reads_and_reproduces_existing_delta_bytes() {
     let delta: ForestDelta = deserialize(DELTA).unwrap();
     assert_eq!(delta.version, 2);

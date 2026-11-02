@@ -93,6 +93,8 @@ impl ConsensusEngine {
         let local_next_index = next_view_set.index_of_public_key(&self.local_public_key);
 
         let recovery_timeout = timeout.clone();
+        let latest = self.future_timeout_views.entry(timeout.sender).or_insert(timeout.view);
+        *latest = (*latest).max(timeout.view);
         let collector = self
             .future_timeout_collectors
             .entry(timeout.view)
@@ -121,24 +123,33 @@ impl ConsensusEngine {
 
         let quorum_size = view_set.quorum_size();
         if !collector.has_quorum(quorum_size) {
-            // Match gov5's weak synchronizer: f+1 distinct verified reports
-            // include an honest validator. Join that bounded, known view;
-            // this does not install a QC or TC and does not commit a block.
+            // gov5's weak synchronizer (`handleFutureViewTimeout`): once f+1
+            // distinct validators reported future views, at least one is
+            // honest, and the (f+1)-th highest view has f+1 reports at or
+            // above it. Join that bounded view; this installs no QC or TC
+            // and commits nothing. Requiring f+1 reports of one exact view
+            // left validators restarted at scattered views stalled for good
+            // (audit 2026-10 round 2, R2-C1).
             let threshold = view_set.fault_tolerance() as usize + 1;
-            if !collector.has_quorum(threshold)
-                || local_timeout_index.is_none()
-            {
+            if local_timeout_index.is_none() {
                 return Ok(false);
             }
-            let recovery_view = recovery_timeout.view;
-            self.advance_to_view(recovery_view)?;
+            let Some(target) = self.weak_sync_target(current_view, threshold) else {
+                return Ok(false);
+            };
+            self.advance_to_view(target)?;
             // Buffered certificates may already have advanced beyond the
             // target. Do not time out that newer view on this older report.
-            if self.current_view() != recovery_view {
-                return Ok(true);
+            if self.current_view() != target {
+                return Ok(target == recovery_timeout.view);
+            }
+            if target != recovery_timeout.view {
+                // This report is for a later view: the caller buffers it.
+                self.on_timeout()?;
+                return Ok(false);
             }
             self.process_timeout(recovery_timeout)?;
-            if self.current_view() == recovery_view {
+            if self.current_view() == target {
                 self.on_timeout()?;
             }
             return Ok(true);
@@ -156,6 +167,18 @@ impl ConsensusEngine {
         Ok(true)
     }
 
+    /// The (f+1)-th highest future view reported by distinct senders, if
+    /// `threshold` (f+1) senders reported one above `current_view`.
+    fn weak_sync_target(&mut self, current_view: u64, threshold: usize) -> Option<u64> {
+        self.future_timeout_views.retain(|_, view| *view > current_view);
+        if threshold == 0 || self.future_timeout_views.len() < threshold {
+            return None;
+        }
+        let mut views: Vec<u64> = self.future_timeout_views.values().copied().collect();
+        views.sort_unstable_by(|a, b| b.cmp(a));
+        Some(views[threshold - 1])
+    }
+
     /// Whether the future buffer holds a timeout from `sender` for `view`.
     fn future_timeout_buffered(&self, view: u64, sender: u32) -> bool {
         self.future_msg_buffer.iter().any(|(buffered_view, msg)| {
@@ -165,12 +188,9 @@ impl ConsensusEngine {
     }
 
     /// Verifies a QC embedded in a timeout or NewView message.
-    /// Genesis QC (view 0) is exempt only when our own locked_qc is also genesis —
-    /// i.e., the chain has just started and no real QC exists yet.
-    ///
-    /// Allowing any network message to carry a view=0 QC unconditionally would let
-    /// an attacker forge a genesis QC and use it to regress our locked_qc back to
-    /// view 0, violating HotStuff-2's safety monotonicity invariant.
+    /// The genesis QC (view 0, zero block hash, no signers) carries no
+    /// signatures and is accepted as is; any other view-0 QC is refused. It
+    /// never lowers the lock: `update_locked_qc` only moves to a higher view.
     ///
     /// The R2 commit-domain fallback in `verify_qc_any_domain` reads the
     /// cached `changes_hash` for this QC's block; on cache miss it falls back
@@ -181,15 +201,17 @@ impl ConsensusEngine {
         qc: &n42_h2_primitives::consensus::QuorumCertificate,
     ) -> ConsensusResult<()> {
         if qc.view == 0 {
-            // Only accept a genesis QC if our own locked_qc is still at genesis.
-            // Once we have advanced past genesis, any incoming view=0 QC is suspicious.
-            if self.round_state.locked_qc().view == 0 {
-                return Ok(());
+            if !crate::wire_bridge::is_engine_genesis_qc(qc) {
+                return Err(crate::error::ConsensusError::InvalidQC {
+                    view: 0,
+                    reason: "a view-0 QC that is not the genesis QC".to_string(),
+                });
             }
-            return Err(crate::error::ConsensusError::InvalidQC {
-                view: 0,
-                reason: "genesis QC rejected: local locked_qc has already advanced".to_string(),
-            });
+            // The genesis QC is the high QC of a member that has seen no
+            // other (fresh or restarted); gov5 counts its timeout. The lock
+            // only moves to a higher view (`update_locked_qc`), so it cannot
+            // move back to genesis (audit 2026-10 R2-C5).
+            return Ok(());
         }
         self.verify_qc_any_domain_or_known(qc)
     }
@@ -235,6 +257,14 @@ impl ConsensusEngine {
             self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(
                 timeout_msg,
             )))?;
+            // This view's vote again: a vote is sent once, and a leader that
+            // missed it forms no QC. Not to ourselves as the leader (gov5
+            // `timeout.go`; audit 2026-10 round 3, R3-C3).
+            let leader = self.leader_index_for_view(view);
+            if let Some(vote) = self.last_vote.as_ref().filter(|vote| vote.view == view && leader != self.my_index) {
+                let vote = vote.clone();
+                self.emit(EngineOutput::SendToValidator(leader, ConsensusMessage::Vote(vote)))?;
+            }
 
             // Check if quorum was reached while we were waiting (messages may have
             // arrived between repeats). A quorum can advance even without the next leader.
@@ -309,6 +339,18 @@ impl ConsensusEngine {
                 sender = timeout.sender,
                 "ignoring directly-dispatched future timeout without a quorum TC"
             );
+            return Ok(());
+        }
+
+        // A sender already counted for this view: every further copy (two
+        // gossip topics, direct streams, relays) is dropped before its BLS
+        // verification, as the future path above does (audit 2026-10 round 3,
+        // R3-N5). The collector keeps the first verified copy either way.
+        if self
+            .timeout_collector
+            .as_ref()
+            .is_some_and(|collector| collector.view() == view && collector.has_timeout_from(timeout.sender))
+        {
             return Ok(());
         }
 
@@ -467,6 +509,41 @@ impl ConsensusEngine {
         self.emit(EngineOutput::ViewChanged {
             new_view: actual_view,
         })
+    }
+
+    /// gov5's `processEmbeddedTC` (the `SyncInfo` rule): a TC piggybacked on a
+    /// vote, commit vote or timeout is the fleet's proof that its view ended,
+    /// so a node behind it locks on the TC's high QC and moves to the view
+    /// after it without waiting for a NewView it may have missed (audit
+    /// 2026-10 round 2, R2-C1). Only a TC that would move this node is
+    /// verified -- against the set for its exact view, with its high QC --
+    /// and one that does not verify is ignored, not an error: the message
+    /// carrying it is judged on its own. `Ok(true)` when the node moved.
+    pub fn adopt_embedded_tc(&mut self, tc: &TimeoutCertificate) -> ConsensusResult<bool> {
+        let current_view = self.round_state.current_view();
+        let target_view = tc.view.saturating_add(1);
+        if tc.view == 0 || target_view <= current_view {
+            return Ok(false);
+        }
+        let Some(tc_set) = self.epoch_manager.known_validator_set_for_view(tc.view) else {
+            tracing::debug!(target: "n42::cl::timeout", tc_view = tc.view, "piggybacked TC for a view with no known set; ignored");
+            return Ok(false);
+        };
+        if let Err(err) = super::quorum::verify_tc_with_profile(tc, tc_set, self.signing_profile) {
+            tracing::debug!(target: "n42::cl::timeout", tc_view = tc.view, %err, "piggybacked TC does not verify; ignored");
+            return Ok(false);
+        }
+        if let Err(err) = self.verify_embedded_qc(&tc.high_qc) {
+            tracing::debug!(target: "n42::cl::timeout", tc_view = tc.view, %err, "piggybacked TC's high QC does not verify; ignored");
+            return Ok(false);
+        }
+        tracing::info!(target: "n42::cl::timeout", current_view, target_view, "piggybacked TC: catching up to the fleet");
+        self.round_state.update_locked_qc(&tc.high_qc);
+        self.round_state.reset_consecutive_timeouts();
+        self.advance_to_view(target_view)?;
+        let actual_view = self.round_state.current_view();
+        self.emit(EngineOutput::ViewChanged { new_view: actual_view })?;
+        Ok(true)
     }
 
     /// Builds a TC from the current timeout_collector and broadcasts NewView.

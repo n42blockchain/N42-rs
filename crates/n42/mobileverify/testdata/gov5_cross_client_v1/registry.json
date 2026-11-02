@@ -1,0 +1,277 @@
+{
+  "_doc": "Registry accumulator over the four devices of keys.json, committed in three epochs: device 0; devices 1 and 2 together; device 3. Register parks a PoP-verified key as pending; CommitEpoch sorts the pending keys by key_hash = blake3(pubkey48) ascending (bytewise) and appends them, index = append position. BMT (lib/bmt): key = key_hash, value = BE8(index); leaf_bytes = 0x4C || key_hash || BE8(index); leaf_hash = blake3(0x00 || leaf_bytes); internal = blake3(left32 || right32); path = key_hash bits MSB first; empty child = 32 zero bytes; a lone leaf in a subtree is that subtree's hash (no extension nodes), two leaves sharing a prefix get a chain of internals with zero siblings. Every root here was also recomputed from that rule alone. export_committed = ExportCommitted(): magic 0x4d565253 BE4 || version 0x01 || count BE4 || count x (pubkey48 || pop96 || active u8 || lastSeenMs BE8). CommitEpoch stamps lastSeenMs with the node's wall clock (so snapshots differ between nodes); the fixture overwrote it with commit_last_seen_ms. register/health = exact status and body of the gov5 handlers (pending: {committed:false,index:0}; committed: the index). health 'accumulator' is the root with 0x, all zeros when empty.",
+  "key_hashes": [
+    {
+      "device": 0,
+      "key_hash": "593aafdf5af416dc00656d8a32f1657eef57237b236fc7bea095f66a6a74e2f0"
+    },
+    {
+      "device": 1,
+      "key_hash": "b0415ed4c7892fe0df87d657f5f5e9dc1b29443f56ddfb8c2a7e1a9a320a48f3"
+    },
+    {
+      "device": 2,
+      "key_hash": "27e2be0115fbfe6fc05cce4dbbb03d10dd7d8303d42b908811ed77eb123b57b9"
+    },
+    {
+      "device": 3,
+      "key_hash": "832ce0c4465dbad591cbbb4b82d1012a7e2c1d70b2647a98283da597e2314c31"
+    }
+  ],
+  "empty": {
+    "root": "0000000000000000000000000000000000000000000000000000000000000000",
+    "export_committed": "4d5652530100000000",
+    "health": {
+      "status": 200,
+      "body": "{\"accumulator\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"alarms\":0,\"certBlocks\":0,\"openWindows\":0,\"pending\":0,\"registry\":0}\n"
+    }
+  },
+  "steps": [
+    {
+      "step": 0,
+      "registered_devices": [
+        0
+      ],
+      "registrations": [
+        {
+          "device": 0,
+          "register": {
+            "status": 200,
+            "body": "{\"committed\":false,\"index\":0}\n"
+          },
+          "register_again_while_pending": {
+            "status": 200,
+            "body": "{\"committed\":false,\"index\":0}\n"
+          }
+        }
+      ],
+      "health_before_commit": {
+        "status": 200,
+        "body": "{\"accumulator\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"alarms\":0,\"certBlocks\":0,\"openWindows\":0,\"pending\":1,\"registry\":0}\n"
+      },
+      "commit_last_seen_ms": 1784372000000,
+      "committed_now": 1,
+      "indices": [
+        {
+          "device": 0,
+          "index": 0
+        }
+      ],
+      "leaves": [
+        {
+          "device": 0,
+          "index": 0,
+          "leaf_bytes": "4c593aafdf5af416dc00656d8a32f1657eef57237b236fc7bea095f66a6a74e2f00000000000000000",
+          "leaf_hash": "cc07c65c389d35c6e426b671f8d76077544265edd374c82b48dcf2937a9b518e"
+        }
+      ],
+      "root": "cc07c65c389d35c6e426b671f8d76077544265edd374c82b48dcf2937a9b518e",
+      "export_committed": "4d5652530100000001a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e18b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb010000019f74dbf500",
+      "register_after_commit": [
+        {
+          "device": 0,
+          "register": {
+            "status": 200,
+            "body": "{\"committed\":true,\"index\":0}\n"
+          }
+        }
+      ],
+      "health_after_commit": {
+        "status": 200,
+        "body": "{\"accumulator\":\"0xcc07c65c389d35c6e426b671f8d76077544265edd374c82b48dcf2937a9b518e\",\"alarms\":0,\"certBlocks\":0,\"openWindows\":0,\"pending\":0,\"registry\":1}\n"
+      },
+      "snapshot_route": {
+        "status": 200,
+        "x_mobileverify_root": "0xcc07c65c389d35c6e426b671f8d76077544265edd374c82b48dcf2937a9b518e",
+        "body_is": "export_committed"
+      }
+    },
+    {
+      "step": 1,
+      "registered_devices": [
+        1,
+        2
+      ],
+      "registrations": [
+        {
+          "device": 1,
+          "register": {
+            "status": 200,
+            "body": "{\"committed\":false,\"index\":0}\n"
+          },
+          "register_again_while_pending": {
+            "status": 200,
+            "body": "{\"committed\":false,\"index\":0}\n"
+          }
+        },
+        {
+          "device": 2,
+          "register": {
+            "status": 200,
+            "body": "{\"committed\":false,\"index\":0}\n"
+          },
+          "register_again_while_pending": {
+            "status": 200,
+            "body": "{\"committed\":false,\"index\":0}\n"
+          }
+        }
+      ],
+      "health_before_commit": {
+        "status": 200,
+        "body": "{\"accumulator\":\"0xcc07c65c389d35c6e426b671f8d76077544265edd374c82b48dcf2937a9b518e\",\"alarms\":0,\"certBlocks\":0,\"openWindows\":0,\"pending\":2,\"registry\":1}\n"
+      },
+      "commit_last_seen_ms": 1784372045000,
+      "committed_now": 2,
+      "indices": [
+        {
+          "device": 0,
+          "index": 0
+        },
+        {
+          "device": 1,
+          "index": 2
+        },
+        {
+          "device": 2,
+          "index": 1
+        }
+      ],
+      "leaves": [
+        {
+          "device": 0,
+          "index": 0,
+          "leaf_bytes": "4c593aafdf5af416dc00656d8a32f1657eef57237b236fc7bea095f66a6a74e2f00000000000000000",
+          "leaf_hash": "cc07c65c389d35c6e426b671f8d76077544265edd374c82b48dcf2937a9b518e"
+        },
+        {
+          "device": 1,
+          "index": 2,
+          "leaf_bytes": "4cb0415ed4c7892fe0df87d657f5f5e9dc1b29443f56ddfb8c2a7e1a9a320a48f30000000000000002",
+          "leaf_hash": "826cace6eeab5e415eaa92d9957c7246cfc84dde36081bba612e4282fb47abac"
+        },
+        {
+          "device": 2,
+          "index": 1,
+          "leaf_bytes": "4c27e2be0115fbfe6fc05cce4dbbb03d10dd7d8303d42b908811ed77eb123b57b90000000000000001",
+          "leaf_hash": "26e9919c369d428eb0924e2188ed91d817ba3d803ac7025a077a3bf52cbdc6e4"
+        }
+      ],
+      "root": "e816dfafaac91f8fca4480c373bc2158f4a7c858f3a4cf130ae4ad4510335797",
+      "export_committed": "4d5652530100000003a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e18b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb010000019f74dbf500a223fc9333906c0bd5ecb218a4ea9029c33177060ac583d2d1e8e15616b123e73ddfa65981d7dbb4d0f4349263f94a028b309bbc0681e592ae75dcb8a11a754f4eec97912972fa089a7497fb95bc597c116379b2bf51e6a0de59f1583b329b3d026a32113f4a7c82bdd8efc17ce291e9a0fe8f5c18af77e7ebed0f42dab8c9380bc684c904ab139d2d742fb5db6a14cb010000019f74dca4c89199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605a32ad0b022cba3a40b7c73de95a9f13c4a216fd1f50f5f7dc8371cc28471ac69ee6106fb57a015a6de28e6ef56ea7a190f186b10d4ff8a47eb6436bf67f1c059fa84b6f4df081a47092b03a52b4626d33df93e54460c93e71eab7554041321ed010000019f74dca4c8",
+      "register_after_commit": [
+        {
+          "device": 1,
+          "register": {
+            "status": 200,
+            "body": "{\"committed\":true,\"index\":2}\n"
+          }
+        },
+        {
+          "device": 2,
+          "register": {
+            "status": 200,
+            "body": "{\"committed\":true,\"index\":1}\n"
+          }
+        }
+      ],
+      "health_after_commit": {
+        "status": 200,
+        "body": "{\"accumulator\":\"0xe816dfafaac91f8fca4480c373bc2158f4a7c858f3a4cf130ae4ad4510335797\",\"alarms\":0,\"certBlocks\":0,\"openWindows\":0,\"pending\":0,\"registry\":3}\n"
+      },
+      "snapshot_route": {
+        "status": 200,
+        "x_mobileverify_root": "0xe816dfafaac91f8fca4480c373bc2158f4a7c858f3a4cf130ae4ad4510335797",
+        "body_is": "export_committed"
+      }
+    },
+    {
+      "step": 2,
+      "registered_devices": [
+        3
+      ],
+      "registrations": [
+        {
+          "device": 3,
+          "register": {
+            "status": 200,
+            "body": "{\"committed\":false,\"index\":0}\n"
+          },
+          "register_again_while_pending": {
+            "status": 200,
+            "body": "{\"committed\":false,\"index\":0}\n"
+          }
+        }
+      ],
+      "health_before_commit": {
+        "status": 200,
+        "body": "{\"accumulator\":\"0xe816dfafaac91f8fca4480c373bc2158f4a7c858f3a4cf130ae4ad4510335797\",\"alarms\":0,\"certBlocks\":0,\"openWindows\":0,\"pending\":1,\"registry\":3}\n"
+      },
+      "commit_last_seen_ms": 1784372090000,
+      "committed_now": 1,
+      "indices": [
+        {
+          "device": 0,
+          "index": 0
+        },
+        {
+          "device": 1,
+          "index": 2
+        },
+        {
+          "device": 2,
+          "index": 1
+        },
+        {
+          "device": 3,
+          "index": 3
+        }
+      ],
+      "leaves": [
+        {
+          "device": 0,
+          "index": 0,
+          "leaf_bytes": "4c593aafdf5af416dc00656d8a32f1657eef57237b236fc7bea095f66a6a74e2f00000000000000000",
+          "leaf_hash": "cc07c65c389d35c6e426b671f8d76077544265edd374c82b48dcf2937a9b518e"
+        },
+        {
+          "device": 1,
+          "index": 2,
+          "leaf_bytes": "4cb0415ed4c7892fe0df87d657f5f5e9dc1b29443f56ddfb8c2a7e1a9a320a48f30000000000000002",
+          "leaf_hash": "826cace6eeab5e415eaa92d9957c7246cfc84dde36081bba612e4282fb47abac"
+        },
+        {
+          "device": 2,
+          "index": 1,
+          "leaf_bytes": "4c27e2be0115fbfe6fc05cce4dbbb03d10dd7d8303d42b908811ed77eb123b57b90000000000000001",
+          "leaf_hash": "26e9919c369d428eb0924e2188ed91d817ba3d803ac7025a077a3bf52cbdc6e4"
+        },
+        {
+          "device": 3,
+          "index": 3,
+          "leaf_bytes": "4c832ce0c4465dbad591cbbb4b82d1012a7e2c1d70b2647a98283da597e2314c310000000000000003",
+          "leaf_hash": "282fab95fa6facf605fb67bd5282260eea6f47c6c6868a46d48df83df614fd25"
+        }
+      ],
+      "root": "897e81b957fd77837bb29d32009498fe6502b25828aba88f1df490d7039598e5",
+      "export_committed": "4d5652530100000004a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e18b29740418ebd237863a97f940602d22b4a890191aeb531049e6f79bc6d6bfed842b03b3af58f27ff74c844402a09e101237c3b2929f2fb09abad0c0b96188418a30115e83a7874cfadb6842fac24de3af5b614f364f41f5e58c3de4d327eabb010000019f74dbf500a223fc9333906c0bd5ecb218a4ea9029c33177060ac583d2d1e8e15616b123e73ddfa65981d7dbb4d0f4349263f94a028b309bbc0681e592ae75dcb8a11a754f4eec97912972fa089a7497fb95bc597c116379b2bf51e6a0de59f1583b329b3d026a32113f4a7c82bdd8efc17ce291e9a0fe8f5c18af77e7ebed0f42dab8c9380bc684c904ab139d2d742fb5db6a14cb010000019f74dca4c89199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605a32ad0b022cba3a40b7c73de95a9f13c4a216fd1f50f5f7dc8371cc28471ac69ee6106fb57a015a6de28e6ef56ea7a190f186b10d4ff8a47eb6436bf67f1c059fa84b6f4df081a47092b03a52b4626d33df93e54460c93e71eab7554041321ed010000019f74dca4c8ad28c09d369a40c5d6317f8aeb5cfdc85c7a6321db19bd10512f0a0acac684c930f51b8a5b9960d9b001a62294b2df13b01d232efc8e5533b1237a13db4005d9d8de337df901e8bf163aa31033287681f6ce325c782461105cac60fd127798db01d79c31caee896ea6fcfb7e8a49ee4c27514a60f04e80386f4c3965add32dfd032950377ade405a54428f96f6a79f20010000019f74dd5490",
+      "register_after_commit": [
+        {
+          "device": 3,
+          "register": {
+            "status": 200,
+            "body": "{\"committed\":true,\"index\":3}\n"
+          }
+        }
+      ],
+      "health_after_commit": {
+        "status": 200,
+        "body": "{\"accumulator\":\"0x897e81b957fd77837bb29d32009498fe6502b25828aba88f1df490d7039598e5\",\"alarms\":0,\"certBlocks\":0,\"openWindows\":0,\"pending\":0,\"registry\":4}\n"
+      },
+      "snapshot_route": {
+        "status": 200,
+        "x_mobileverify_root": "0x897e81b957fd77837bb29d32009498fe6502b25828aba88f1df490d7039598e5",
+        "body_is": "export_committed"
+      }
+    }
+  ]
+}

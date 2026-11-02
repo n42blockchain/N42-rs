@@ -865,6 +865,7 @@ impl<T: PoolTransaction> FrameIndex<T> {
     }
 
     /// A frame's transactions' hashes, in frame order.
+    #[allow(dead_code)] // accessor kept for the frame index; not used today
     pub(crate) fn hashes_of(&self, id: &B256) -> Option<&[B256]> {
         self.any(id).map(|entry| &entry.hashes[..])
     }

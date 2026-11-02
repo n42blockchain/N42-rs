@@ -1,14 +1,14 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! PeerDAS support (EIP-7594)
+//! `PeerDAS` support (EIP-7594)
 //!
-//! Peer Data Availability Sampling (PeerDAS) is a mechanism for efficiently
+//! Peer Data Availability Sampling (`PeerDAS`) is a mechanism for efficiently
 //! sampling data availability across the network.
 //!
 //! # Overview
 //!
-//! PeerDAS extends the blob transaction model from EIP-4844 with:
+//! `PeerDAS` extends the blob transaction model from EIP-4844 with:
 //! - Extended blobs with additional cell commitments
 //! - Data column-based sampling
 //! - Peer-to-peer data availability verification
@@ -17,7 +17,7 @@ use crate::constants::*;
 use alloy_primitives::B256;
 use thiserror::Error;
 
-/// PeerDAS errors
+/// `PeerDAS` errors
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum PeerDasError {
     /// Invalid column index
@@ -41,7 +41,7 @@ pub enum PeerDasError {
     DataNotAvailable(usize),
 }
 
-/// Result type for PeerDAS operations
+/// Result type for `PeerDAS` operations
 pub type PeerDasResult<T> = Result<T, PeerDasError>;
 
 /// Data column index type
@@ -50,10 +50,10 @@ pub type ColumnIndex = usize;
 /// Cell index type
 pub type CellIndex = usize;
 
-/// Represents a data column in PeerDAS
+/// Represents a data column in `PeerDAS`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataColumn {
-    /// Column index (0 to NUMBER_OF_COLUMNS - 1)
+    /// Column index (0 to `NUMBER_OF_COLUMNS` - 1)
     pub index: ColumnIndex,
     /// Cell data for this column
     pub cells: Vec<Vec<u8>>,
@@ -63,7 +63,7 @@ pub struct DataColumn {
 
 impl DataColumn {
     /// Create a new data column
-    pub fn new(index: ColumnIndex) -> PeerDasResult<Self> {
+    pub const fn new(index: ColumnIndex) -> PeerDasResult<Self> {
         if index >= NUMBER_OF_COLUMNS {
             return Err(PeerDasError::InvalidColumnIndex(index));
         }
@@ -75,7 +75,7 @@ impl DataColumn {
     }
 
     /// Check if the column is valid
-    pub fn is_valid(&self) -> bool {
+    pub const fn is_valid(&self) -> bool {
         self.index < NUMBER_OF_COLUMNS && self.cells.len() == self.proofs.len()
     }
 }
@@ -101,7 +101,7 @@ pub fn custody_columns(node_id: &B256, custody_subnet_count: usize) -> Vec<Colum
 }
 
 /// Calculate the number of samples needed for data availability
-pub fn samples_needed_for_availability(blob_count: usize) -> usize {
+pub const fn samples_needed_for_availability(blob_count: usize) -> usize {
     // Simplified calculation
     // In production, this depends on the security parameters
     if blob_count == 0 {
@@ -112,7 +112,7 @@ pub fn samples_needed_for_availability(blob_count: usize) -> usize {
 }
 
 /// Verify that a column index is valid
-pub fn verify_column_index(index: ColumnIndex) -> PeerDasResult<()> {
+pub const fn verify_column_index(index: ColumnIndex) -> PeerDasResult<()> {
     if index >= NUMBER_OF_COLUMNS {
         return Err(PeerDasError::InvalidColumnIndex(index));
     }
@@ -120,7 +120,7 @@ pub fn verify_column_index(index: ColumnIndex) -> PeerDasResult<()> {
 }
 
 /// Verify that a cell index is valid
-pub fn verify_cell_index(index: CellIndex) -> PeerDasResult<()> {
+pub const fn verify_cell_index(index: CellIndex) -> PeerDasResult<()> {
     if index >= CELLS_PER_EXT_BLOB {
         return Err(PeerDasError::InvalidCellIndex(index));
     }
@@ -166,12 +166,12 @@ impl OsakaBlobParams {
     }
 
     /// Check if a block with the given blob count is valid
-    pub fn is_valid_blob_count(&self, count: u64) -> bool {
+    pub const fn is_valid_blob_count(&self, count: u64) -> bool {
         count <= self.max_blob_count
     }
 
     /// Check if a transaction with the given blob count is valid
-    pub fn is_valid_tx_blob_count(&self, count: u64) -> bool {
+    pub const fn is_valid_tx_blob_count(&self, count: u64) -> bool {
         count <= self.max_blobs_per_tx
     }
 }

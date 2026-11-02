@@ -105,7 +105,7 @@ pub fn frame_tree_root(frame_roots: &[B256]) -> B256 {
 /// body exactly or names an empty frame, i.e. the body is not frame-aligned
 /// by that layout.
 pub fn frame_tree_root_of(tx_hashes: &[B256], layout: &[usize]) -> Option<B256> {
-    if layout.iter().any(|len| *len == 0) || layout.iter().sum::<usize>() != tx_hashes.len() {
+    if layout.contains(&0) || layout.iter().sum::<usize>() != tx_hashes.len() {
         return None;
     }
     let mut at = 0usize;
@@ -123,7 +123,7 @@ pub fn frame_tree_root_of(tx_hashes: &[B256], layout: &[usize]) -> Option<B256> 
 /// on any other.
 pub fn frame_blocks_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FRAME_BLOCKS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FRAME_BLOCKS", false))
 }
 
 // ---------------------------------------------------------------------------

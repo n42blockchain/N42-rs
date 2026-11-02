@@ -93,6 +93,14 @@ pub enum BridgeError {
         /// What the envelope would say.
         envelope: B256,
     },
+    /// A view-0 QC that is not the genesis QC. Nothing is certified at view
+    /// 0 but genesis, and gov5 verifies a view-0 QC like any other, so such
+    /// a QC can only be forged (audit 2026-10 A-6).
+    #[error("{component} is a view-0 QC that is not the genesis QC")]
+    NonGenesisViewZeroQc {
+        /// Which certificate carried it.
+        component: &'static str,
+    },
 }
 
 /// The number of validators a bitmap encodes, or `None` if it is malformed.
@@ -173,7 +181,7 @@ fn encode_bitmap(bits: &BitVec<u8, Msb0>) -> Result<Vec<u8>, BridgeError> {
 /// elsewhere in this crate. Emitting `[0, 0]` is what made every proposal this
 /// node built unpublishable, with the failure surfacing as "non-canonical
 /// bitmap" three layers away from the cause.
-fn is_genesis_qc(qc: &H2QuorumCertificate) -> bool {
+pub(crate) fn is_genesis_qc(qc: &H2QuorumCertificate) -> bool {
     qc.view == 0
         && qc.block_hash == B256::ZERO
         && qc.aggregate_signature.is_empty()
@@ -199,12 +207,22 @@ pub fn qc_to_engine(
     if is_genesis_qc(qc) {
         return Ok(QuorumCertificate::genesis());
     }
+    if qc.view == 0 {
+        return Err(BridgeError::NonGenesisViewZeroQc { component });
+    }
     Ok(QuorumCertificate {
         view: qc.view,
         block_hash: qc.block_hash,
         aggregate_signature: signature_from_wire(&qc.aggregate_signature, component)?,
         signers: decode_bitmap(&qc.signers_bitmap, validator_count, component)?,
     })
+}
+
+/// Whether an engine QC is the genesis QC: view 0, the zero hash, no signer.
+/// Its signature is a placeholder and is never verified, so no other QC may
+/// claim view 0 (audit 2026-10 A-6).
+pub(crate) fn is_engine_genesis_qc(qc: &QuorumCertificate) -> bool {
+    qc.view == 0 && qc.block_hash == B256::ZERO && qc.signers.not_any()
 }
 
 /// Translates an engine QC onto the wire.
@@ -249,6 +267,19 @@ pub fn tc_to_wire(tc: &TimeoutCertificate) -> Result<H2TimeoutCertificate, Bridg
     })
 }
 
+/// The TC a vote, commit vote or timeout carries as gov5's `SyncInfo`
+/// `high_tc`, if any, with its view: the view is enough to decide whether it
+/// is worth translating (see [`ConsensusEngine::adopt_embedded_tc`]).
+///
+/// [`ConsensusEngine::adopt_embedded_tc`]: crate::ConsensusEngine::adopt_embedded_tc
+pub const fn embedded_tc(envelope: &H2V4Envelope) -> Option<&H2TimeoutCertificate> {
+    match &envelope.message {
+        H2Message::Vote(v) | H2Message::CommitVote(v) => v.high_tc.as_ref(),
+        H2Message::Timeout(t) => t.high_tc.as_ref(),
+        _ => None,
+    }
+}
+
 /// Translates an envelope received from the fleet into what the engine consumes.
 ///
 /// `validator_count` is the size of the set the certificates in this message are
@@ -279,8 +310,8 @@ pub fn to_engine(
             // correct instruction on a chain that has no reconfiguration.
             validator_changes: None,
         }),
-        // `high_tc` is dropped here — see the module docs. It is a recovery
-        // accelerator, and this engine recovers without it.
+        // `high_tc` is not part of the engine's message: the node hands it
+        // to `ConsensusEngine::adopt_embedded_tc` first ([`embedded_tc`]).
         H2Message::Vote(v) => ConsensusMessage::Vote(Vote {
             view: v.view,
             block_hash: v.block_hash,
@@ -535,6 +566,25 @@ mod tests {
             ..wire
         };
         assert_eq!(qc_to_engine(&legacy, 4, "test").unwrap().view, 0);
+    }
+
+    /// Audit 2026-10 A-6: only the genesis QC may name view 0. Anything else
+    /// at view 0 (a real signature over an arbitrary hash) used to decode as
+    /// an ordinary QC that the engine then skipped verifying.
+    #[test]
+    fn a_view_zero_qc_that_is_not_the_genesis_qc_is_refused() {
+        // gov5's own commit QC (a canonical bitmap and a real signature),
+        // moved to view 0.
+        let (envelope, validator_count, _) = fixture();
+        let ConsensusMessage::Decide(decide) = to_engine(&envelope, validator_count).unwrap()
+        else {
+            panic!("fixture is a Decide");
+        };
+        let forged = H2QuorumCertificate {
+            view: 0,
+            ..qc_to_wire(&decide.commit_qc).unwrap()
+        };
+        assert!(qc_to_engine(&forged, validator_count, "test").is_err());
     }
 
     #[test]

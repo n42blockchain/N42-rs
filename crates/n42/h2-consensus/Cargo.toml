@@ -21,6 +21,7 @@ alloy-eip7928.workspace = true
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-engine.workspace = true
+n42-header = { workspace = true, features = ["engine"] }
 bitvec = { version = "1.0", features = ["serde"] }
 sha2.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }

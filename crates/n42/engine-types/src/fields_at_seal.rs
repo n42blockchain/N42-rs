@@ -558,7 +558,7 @@ mod tests {
         // block's hash is on that path.
         let mut header = alloy_consensus::Header { number: 2, timestamp: 2, ..Default::default() };
         header.parent_hash = parent_sealed;
-        let won_sealed = reth_primitives_traits::SealedHeader::seal_slow(header);
+        let won_sealed = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(header));
         let found = crate::hotstuff_consensus::parent_executed_fields_or_built(
             chain().genesis(),
             &won_sealed,

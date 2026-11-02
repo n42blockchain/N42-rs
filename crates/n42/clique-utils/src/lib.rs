@@ -3,7 +3,7 @@
 
 //! Clique/APoS header signature recovery and seal hashing.
 //!
-//! This is the signature-recovery core of N42's APoS consensus: recovering the
+//! This is the signature-recovery core of N42's `APoS` consensus: recovering the
 //! signer address from a block header's extra-data seal, and computing the seal
 //! hash that signature covers.
 //!
@@ -19,6 +19,7 @@
 
 extern crate alloc;
 
+/// Error type of the clique utilities.
 pub mod error;
 
 mod clique;

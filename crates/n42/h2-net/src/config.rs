@@ -161,6 +161,10 @@ fn gov5_gossipsub_config_with(
         .max_transmit_size(max_gossip_wire_size())
         .validation_mode(gossipsub::ValidationMode::Anonymous)
         .message_id_fn(gov5_message_id_fn(genesis_hash))
+        // A message is forwarded once this node has decoded it, not on
+        // receipt (audit 2026-10 round 3, R3-N4): the transport reports
+        // every one (`TransportCore::next_event`).
+        .validate_messages()
         .build()
         .map_err(|_| "invalid gossipsub configuration")
 }
@@ -201,6 +205,7 @@ mod tests {
             .max_transmit_size(max_gossip_wire_size())
             .validation_mode(gossipsub::ValidationMode::Anonymous)
             .message_id_fn(gov5_message_id_fn(B256::ZERO))
+            .validate_messages()
             .build()
             .unwrap();
         // Debug prints every field (the id function is a closure and is skipped).

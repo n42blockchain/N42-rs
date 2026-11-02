@@ -2784,6 +2784,7 @@ dependencies = [
  "n42-clique",
  "n42-clique-utils",
  "n42-engine-primitives",
+ "n42-header",
  "n42-primitives",
  "n42-tx-types",
  "nix 0.31.3",
@@ -7163,8 +7164,10 @@ dependencies = [
  "n42-env",
  "n42-h2-consensus",
  "n42-h2-execution",
+ "n42-header",
  "n42-primitives",
  "n42-qmdb-reth",
+ "n42-twig-core",
  "n42-tx-ingest",
  "n42-tx-queue",
  "n42-tx-types",
@@ -7253,6 +7256,7 @@ dependencies = [
  "lazy_static",
  "n42-clique-utils",
  "n42-consensus-traits",
+ "n42-header",
  "n42-primitives",
  "n42-tx-types",
  "num-bigint 0.4.8",
@@ -7339,6 +7343,7 @@ name = "n42-deferred-reverts"
 version = "2.1.5"
 dependencies = [
  "alloy-primitives 1.7.3",
+ "n42-env",
  "revm-database",
  "tracing",
 ]
@@ -7448,6 +7453,7 @@ dependencies = [
  "n42-engine-primitives",
  "n42-env",
  "n42-h2-consensus",
+ "n42-header",
  "n42-primitives",
  "n42-qmdb-reth",
  "n42-sharded-output",
@@ -7541,6 +7547,7 @@ dependencies = [
  "hex",
  "n42-h2-primitives",
  "n42-h2-wire",
+ "n42-header",
  "n42-legacy-codec",
  "serde",
  "serde_json",
@@ -7565,6 +7572,7 @@ dependencies = [
  "n42-env",
  "n42-h2-consensus",
  "n42-h2-execution",
+ "n42-header",
  "n42-tx-types",
  "reqwest",
  "serde",
@@ -7586,6 +7594,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "async-trait",
  "metrics",
+ "n42-env",
  "n42-h2-consensus",
  "n42-h2-primitives",
  "serde_json",
@@ -7628,6 +7637,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "alloy-signer",
  "alloy-signer-local",
+ "bytes",
  "ed25519-dalek 3.0.0",
  "futures",
  "hex",
@@ -7642,9 +7652,10 @@ dependencies = [
  "n42-h2-primitives",
  "n42-h2-wire",
  "n42-legacy-codec",
- "n42-mobile-service",
+ "n42-mobileverify",
  "n42-qmdb-reth",
  "n42-tx-types",
+ "parking_lot 0.12.5",
  "rayon",
  "reqwest",
  "reth-cli",
@@ -7686,6 +7697,30 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snap",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "n42-header"
+version = "2.1.5"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-genesis",
+ "alloy-primitives 1.7.3",
+ "alloy-rlp",
+ "alloy-rpc-types-engine",
+ "bytes",
+ "derive_more 2.1.1",
+ "hex",
+ "reth-chainspec",
+ "reth-codecs 0.8.2",
+ "reth-network-peers",
+ "reth-primitives-traits 0.8.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
 ]
 
@@ -7732,6 +7767,33 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "n42-mobileverify"
+version = "2.1.5"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives 1.7.3",
+ "alloy-rlp",
+ "blake3",
+ "blst",
+ "bytes",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "n42-h2-primitives",
+ "n42-header",
+ "parking_lot 0.12.5",
+ "prost",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 
@@ -7884,6 +7946,7 @@ dependencies = [
  "n42-clique-utils",
  "n42-engine-primitives",
  "n42-engine-types",
+ "n42-header",
  "n42-primitives",
  "n42-qmdb-reth",
  "n42-qmdb-state",
@@ -7929,6 +7992,7 @@ name = "n42-twig-core"
 version = "2.1.5"
 dependencies = [
  "blake3",
+ "crc32fast",
  "hex",
  "libc",
  "memmap2",
@@ -8003,6 +8067,7 @@ dependencies = [
  "hex",
  "merlin",
  "n42-env",
+ "n42-header",
  "rand_core 0.6.4",
  "rayon",
  "reth-codecs 0.8.2",

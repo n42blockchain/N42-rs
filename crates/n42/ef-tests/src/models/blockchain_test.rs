@@ -12,7 +12,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 
 /// A complete blockchain test fixture file contains multiple test cases
-pub type BlockchainTestFile = HashMap<String, BlockchainTest>;
+#[allow(dead_code)] // file-level alias kept for callers of the fixture format; not used today
+pub(super) type BlockchainTestFile = HashMap<String, BlockchainTest>;
 
 /// A single blockchain test case
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +22,7 @@ pub struct BlockchainTest {
     /// Network/fork name
     pub network: String,
 
-    /// Genesis block header (optional for engine_x tests)
+    /// Genesis block header (optional for `engine_x` tests)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_block_header: Option<GenesisBlockHeader>,
 
@@ -29,7 +30,7 @@ pub struct BlockchainTest {
     #[serde(default, deserialize_with = "deserialize_accounts_opt")]
     pub pre: Option<HashMap<Address, Account>>,
 
-    /// Pre-state hash (for engine_x tests)
+    /// Pre-state hash (for `engine_x` tests)
     #[serde(rename = "preHash", default, skip_serializing_if = "Option::is_none")]
     pub pre_hash: Option<String>,
 
@@ -37,7 +38,7 @@ pub struct BlockchainTest {
     #[serde(default, deserialize_with = "deserialize_accounts_opt")]
     pub post_state: Option<HashMap<Address, Account>>,
 
-    /// Post-state hash (for engine_x tests)
+    /// Post-state hash (for `engine_x` tests)
     #[serde(rename = "postStateHash", default, skip_serializing_if = "Option::is_none")]
     pub post_state_hash: Option<String>,
 
@@ -305,6 +306,7 @@ where
 }
 
 /// Deserialize accounts map
+#[allow(dead_code)] // serde helper kept for account maps; not used today
 fn deserialize_accounts<'de, D>(deserializer: D) -> Result<HashMap<Address, Account>, D::Error>
 where
     D: Deserializer<'de>,
@@ -367,7 +369,7 @@ impl BlockchainTest {
     }
 
     /// Get the number of blocks
-    pub fn block_count(&self) -> usize {
+    pub const fn block_count(&self) -> usize {
         self.blocks.len()
     }
 
@@ -379,12 +381,12 @@ impl BlockchainTest {
 
 impl Block {
     /// Check if this block is expected to be invalid
-    pub fn is_invalid(&self) -> bool {
+    pub const fn is_invalid(&self) -> bool {
         self.expect_exception.is_some()
     }
 
     /// Check if this block has withdrawals
-    pub fn has_withdrawals(&self) -> bool {
+    pub const fn has_withdrawals(&self) -> bool {
         self.withdrawals.is_some()
     }
 }
@@ -439,7 +441,7 @@ mod tests {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineNewPayload {
-    /// Execution payload parameters: [payload, blob_versioned_hashes, parent_beacon_block_root]
+    /// Execution payload parameters: [payload, `blob_versioned_hashes`, `parent_beacon_block_root`]
     pub params: serde_json::Value,
     
     /// Engine API newPayload version (e.g., "3" for post-Cancun)

@@ -54,10 +54,17 @@ pub enum ImportReport {
 pub enum ImportVerdict {
     /// The execution layer holds the block.
     Imported,
-    /// The execution layer has not executed it (SYNCING/ACCEPTED): not a
-    /// verdict -- the block is asked for again, as on the awaited path.
+    /// The block cannot be executed from what this node holds (a compact
+    /// body it could not assemble, a held body the layer would not take):
+    /// the block is asked for again.
     NotYet,
-    /// The execution layer refused it, or the import could not run.
+    /// The execution layer has not executed it (SYNCING/ACCEPTED), or the
+    /// exchange failed (a timeout, a dropped connection, a task that died):
+    /// no verdict on the block, which is executed again after a pause from
+    /// what the driver holds (audit 2026-10 round 2, R2-R3).
+    NoVerdict,
+    /// The execution layer called it INVALID, or this driver dropped it (a
+    /// held import whose parent lost its height).
     Invalid(String),
     /// A compact body the execution layer could not assemble: these
     /// positions of the block are transactions it does not hold, and it will
@@ -71,10 +78,20 @@ impl ImportVerdict {
         match outcome {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => Self::Imported,
-                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Self::NotYet,
+                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Self::NoVerdict,
                 PayloadStatusEnum::Invalid { validation_error } => Self::Invalid(validation_error.to_string()),
             },
-            Err(error) => Self::Invalid(error.to_string()),
+            Err(error) if error.0 == HELD_IMPORT_DROPPED => Self::Invalid(error.to_string()),
+            // A timeout (an import that outlasts the raw channel's 8 s in a
+            // page-cache stall), a dropped connection, an answer that could
+            // not be read: nothing about the block. Rejecting it withdrew a
+            // valid block's evidence and dropped its payload; gov5 marks a
+            // block bad only on a deterministic execution failure and
+            // retries every other error (audit 2026-10 B-5).
+            Err(error) => {
+                warn!(target: "n42.h2.el", %error, "the import failed without a verdict; executing it again");
+                Self::NoVerdict
+            }
         }
     }
 }
@@ -96,11 +113,12 @@ impl ReportGuard {
 
 impl Drop for ReportGuard {
     fn drop(&mut self) {
+        // Not executed, rather than INVALID: a local failure says nothing
+        // about the block, and INVALID withdrew the evidence for a block
+        // that may be valid (audit 2026-10 round 2, R2-I7).
         if let Some(report) = self.report.take() {
-            let _ = report.send(ImportReport::Done(
-                self.block_hash,
-                ImportVerdict::Invalid("the import task ended without a verdict".to_string()),
-            ));
+            warn!(target: "n42.h2.el", block = ?self.block_hash, "an import task ended without a verdict; executing it again");
+            let _ = report.send(ImportReport::Done(self.block_hash, ImportVerdict::NoVerdict));
         }
     }
 }
@@ -185,7 +203,7 @@ pub fn vote_before_slot() -> bool {
 /// `N42_IMPORT_ONCE`, where several validator keys share one execution layer.
 pub fn check_before_slot() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_CHECK_BEFORE_SLOT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_CHECK_BEFORE_SLOT", false))
 }
 
 /// Blocks a check-ahead may queue past the in-flight cap before the service's
@@ -270,6 +288,10 @@ impl SlotNote {
 
 /// What the execution layer is told when a held import is dropped, and what
 /// its answer then carries.
+/// Counter: blocks this node built that its own execution layer called
+/// invalid (a builder/executor divergence on the leader).
+pub const METRIC_OWN_BLOCK_REFUSED_TOTAL: &str = "n42_h2_own_block_refused_total";
+
 pub const HELD_IMPORT_DROPPED: &str = "the held import was dropped before its execution";
 
 /// A commit whose forkchoice has not been sent yet
@@ -443,8 +465,8 @@ impl DriverAction {
 /// commits to it (gov5's HotStuff profile) the header has to be finished —
 /// view stamped, seal signed, hash re-formed — before anyone else sees it.
 /// The result is what gets cached, imported, and proposed.
-pub type PayloadNormalizer = dyn Fn(&ExecutionData, Option<&alloy_consensus::Header>, u64)
-        -> Result<(ExecutionData, Option<alloy_consensus::Header>), String>
+pub type PayloadNormalizer = dyn Fn(&ExecutionData, Option<&n42_h2_consensus::N42Header>, u64)
+        -> Result<(ExecutionData, Option<n42_h2_consensus::N42Header>), String>
     + Send
     + Sync;
 
@@ -484,7 +506,7 @@ struct Normalizer(std::sync::Arc<PayloadNormalizer>);
 /// owns the wire format; run in a build ahead's task so the body is ready
 /// when the proposal wants it.
 pub type OwnBodyEncoder =
-    dyn Fn(&ExecutionData, &alloy_consensus::Header) -> Option<alloy_primitives::Bytes> + Send + Sync;
+    dyn Fn(&ExecutionData, &n42_h2_consensus::N42Header) -> Option<alloy_primitives::Bytes> + Send + Sync;
 
 /// A build ahead finished for the view it was expected to be proposed in:
 /// the header sealed, the payload's cache copy made and the body encoded in
@@ -498,7 +520,7 @@ struct Presealed {
     /// The hash of the block as built, before the seal.
     raw_hash: B256,
     execution: ExecutionData,
-    header: Option<alloy_consensus::Header>,
+    header: Option<n42_h2_consensus::N42Header>,
     /// A second copy of `execution`, for the payload cache.
     cached: ExecutionData,
     body: Option<alloy_primitives::Bytes>,
@@ -643,6 +665,18 @@ impl AheadBuild {
 
 /// Takes an own block off [`ExecutionDriver::is_importing_own_block`]'s set
 /// when its import task ends, however it ends.
+/// The pauses before each retry of an own import that ended without a verdict
+/// (an error, SYNCING or ACCEPTED): about eight seconds in all, past the raw
+/// channel's deadline during a page-cache stall or an execution layer's
+/// restart. See [`ExecutionDriver::spawn_import_own_block`].
+pub const OWN_IMPORT_BACKOFF: [std::time::Duration; 5] = [
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+];
+
 struct OwnImportDone {
     importing: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>>,
     hash: B256,
@@ -686,6 +720,19 @@ pub struct ExecutionDriver<E> {
     /// This node's own blocks whose import task has not ended. See
     /// [`Self::is_importing_own_block`].
     own_importing: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>>,
+    /// Own blocks the execution layer called invalid. See
+    /// [`Self::own_blocks_refused`].
+    own_refused: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The pauses before each retry of an own import that ended without a
+    /// verdict. See [`Self::set_own_import_backoff`].
+    own_import_backoff: std::sync::Arc<[std::time::Duration]>,
+    /// The pauses before each new execution of a follower import that ended
+    /// without a verdict. See [`Self::set_import_retry_backoff`].
+    import_retry_backoff: Vec<std::time::Duration>,
+    /// Retries taken so far, by block.
+    import_retries: HashMap<B256, usize>,
+    /// Imports to run again, and when.
+    import_retry_due: Vec<(std::time::Instant, B256)>,
     /// **Bench only** (`N42_VOTE_BEFORE_IMPORT=1`): a follower's import runs
     /// on a task instead of being awaited by the loop, so the loop can vote
     /// on the next proposal while the block executes -- what deferred
@@ -779,6 +826,8 @@ pub struct ExecutionDriver<E> {
     /// The forkchoice the engine answered then made nothing canonical; it
     /// runs again when the block's import lands.
     commits_ahead: std::collections::HashSet<B256>,
+    /// [`Self::commits_ahead`] in the order remembered, for its bound.
+    commits_ahead_order: std::collections::VecDeque<B256>,
     /// Bounds `payloads` so a peer cannot make us buffer without limit.
     max_cached_payloads: usize,
     /// Insertion order, for evicting the oldest cached payload.
@@ -833,7 +882,7 @@ pub struct ExecutionDriver<E> {
 /// takes the `NEW_PAYLOAD` path it always took.
 pub fn body_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BODY_ONCE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BODY_ONCE", false))
 }
 
 /// `N42_COMPACT_BODY`, read once: opt-in, and read on the leader's side,
@@ -850,8 +899,8 @@ pub fn body_once() -> bool {
 pub fn compact_body() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        (std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1")
-            || std::env::var("N42_BLOCK_BY_DESCRIPTION").is_ok_and(|v| v == "1"))
+        (n42_env::flag("N42_COMPACT_BODY", false)
+            || n42_env::flag("N42_BLOCK_BY_DESCRIPTION", false))
             && body_once()
     })
 }
@@ -864,12 +913,15 @@ pub fn compact_body() -> bool {
 /// ([`ExecutionLayer::own_block_body`]) and the payload made whole from it.
 pub async fn import_own<E: ExecutionLayer + ?Sized>(
     el: &E,
-    header: Option<&alloy_consensus::Header>,
-    payload: ExecutionData,
+    header: Option<&n42_h2_consensus::N42Header>,
+    payload: &ExecutionData,
     elided: Option<usize>,
 ) -> Result<alloy_rpc_types_engine::PayloadStatus, ElError> {
+    // Borrowed: an elided block reaches the layer by its header and needs no
+    // copy of the payload, which every attempt used to make first (audit
+    // 2026-10 round 3, R3-G4).
     let Some(tx_count) = elided else {
-        return el.import_own_block(header, payload).await;
+        return el.import_own_block(header, payload.clone()).await;
     };
     let header = header.ok_or_else(|| ElError::new("an elided own block without its sealed header"))?;
     if let Some(status) = el.import_own_block_by_header(header).await {
@@ -879,7 +931,7 @@ pub async fn import_own<E: ExecutionLayer + ?Sized>(
         .own_block_body(header)
         .await?
         .ok_or_else(|| ElError::new(format!("the execution layer no longer holds own block {}", header.number)))?;
-    let whole = crate::el::fill_elided(&payload, &block, tx_count)?;
+    let whole = crate::el::fill_elided(payload, &block, tx_count)?;
     el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, whole).await
 }
 
@@ -897,7 +949,7 @@ pub async fn import_own<E: ExecutionLayer + ?Sized>(
 /// by the sealed header ([`crate::ExecutionLayer::own_block_body`]).
 pub fn take_compact() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_TAKE_COMPACT").is_ok_and(|v| v == "1") && compact_body())
+    *ON.get_or_init(|| n42_env::flag("N42_TAKE_COMPACT", false) && compact_body())
 }
 
 /// `N42_ANSWER_LAYOUT_ONLY`, read once: the proposer tells its execution
@@ -914,7 +966,7 @@ pub fn take_compact() -> bool {
 /// them too.
 pub fn answer_layout_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ANSWER_LAYOUT_ONLY").is_ok_and(|v| v == "1") && take_compact())
+    *ON.get_or_init(|| n42_env::flag("N42_ANSWER_LAYOUT_ONLY", false) && take_compact())
 }
 
 /// `N42_COMMIT_FCU_ASYNC`, read once: opt-in, and only the *default* for a
@@ -923,7 +975,7 @@ pub fn answer_layout_only() -> bool {
 /// for them.
 pub fn commit_fcu_async() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_COMMIT_FCU_ASYNC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_COMMIT_FCU_ASYNC", false))
 }
 
 /// Releases a deferred block's vote: the execution layer said the header
@@ -1000,6 +1052,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             own_imports: own_imports_tx,
             own_imports_rx: Some(own_imports_rx),
             own_importing: Default::default(),
+            own_refused: Default::default(),
+            own_import_backoff: OWN_IMPORT_BACKOFF.into(),
+            import_retry_backoff: OWN_IMPORT_BACKOFF.into(),
+            import_retries: HashMap::new(),
+            import_retry_due: Vec::new(),
             spawn_imports: false,
             deferred_execution_time: None,
             deferred_depth: 1,
@@ -1025,6 +1082,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             pending_commits: std::collections::HashSet::new(),
             imported: std::collections::VecDeque::new(),
             commits_ahead: std::collections::HashSet::new(),
+            commits_ahead_order: std::collections::VecDeque::new(),
             max_cached_payloads: Self::DEFAULT_MAX_CACHED_PAYLOADS,
             payload_order: Vec::new(),
             commit_async: commit_fcu_async(),
@@ -1047,7 +1105,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Installs a [`PayloadNormalizer`] applied to every block this node builds.
     pub fn set_payload_normalizer(
         &mut self,
-        normalizer: impl Fn(&ExecutionData, Option<&alloy_consensus::Header>, u64) -> Result<(ExecutionData, Option<alloy_consensus::Header>), String>
+        normalizer: impl Fn(&ExecutionData, Option<&n42_h2_consensus::N42Header>, u64) -> Result<(ExecutionData, Option<n42_h2_consensus::N42Header>), String>
             + Send
             + Sync
             + 'static,
@@ -1059,7 +1117,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// its block early.
     pub fn set_own_body_encoder(
         &mut self,
-        encoder: impl Fn(&ExecutionData, &alloy_consensus::Header) -> Option<alloy_primitives::Bytes>
+        encoder: impl Fn(&ExecutionData, &n42_h2_consensus::N42Header) -> Option<alloy_primitives::Bytes>
             + Send
             + Sync
             + 'static,
@@ -1224,6 +1282,20 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
     }
 
+    /// Hands the execution layer another peer's compact frame description of
+    /// a block whose first compact body is cached here
+    /// ([`ExecutionLayer::claim_layout`]): only its layout claim, filed under
+    /// its sender, for the whole-body fallback to try (audit 2026-10 round 2,
+    /// R2-X4). Nothing is cached or imported; the answer is not waited for.
+    pub fn forward_claim(&self, body: ForeignBody) {
+        let el = std::sync::Arc::clone(&self.el);
+        tokio::spawn(async move {
+            let block_hash = body.block_hash;
+            let filed = el.claim_layout(body).await;
+            debug!(target: "n42.h2.el", block = ?block_hash, filed, "another peer's layout claim forwarded");
+        });
+    }
+
     /// Installs the decoder the `NEW_PAYLOAD` fallback needs. See
     /// [`BodyDecoder`].
     pub fn set_body_decoder(&mut self, decoder: BodyDecoder) {
@@ -1385,7 +1457,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub async fn prepare_build_on_sealed(
         &mut self,
         parent: B256,
-        header: alloy_consensus::Header,
+        header: n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
     ) -> Result<(), ElError> {
@@ -1400,7 +1472,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub async fn prepare_build_on_sealed_for_view(
         &mut self,
         parent: B256,
-        header: alloy_consensus::Header,
+        header: n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
         view: Option<u64>,
@@ -1412,7 +1484,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     async fn prepare_on_sealed(
         &mut self,
         parent: B256,
-        header: alloy_consensus::Header,
+        header: n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
         view: Option<u64>,
@@ -1497,7 +1569,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub async fn prepare_first_build_on_output(
         &mut self,
         parent: B256,
-        header: alloy_consensus::Header,
+        header: n42_h2_consensus::N42Header,
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
     ) -> Result<&'static str, ElError> {
@@ -1812,12 +1884,30 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let hash = built.hash;
         let elided = built.elided.then_some(built.tx_count);
         let imported = self.own_imports.clone();
+        let refused = std::sync::Arc::clone(&self.own_refused);
+        let backoff = std::sync::Arc::clone(&self.own_import_backoff);
         self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash);
         let done = OwnImportDone { importing: std::sync::Arc::clone(&self.own_importing), hash };
         tokio::spawn(async move {
             let _done = done;
             let started = std::time::Instant::now();
-            match import_own(el.as_ref(), header.as_ref(), payload, elided).await {
+            // An outcome that is not a verdict -- the layer down or past its
+            // deadline, SYNCING, ACCEPTED -- is tried again: the service
+            // already counts the block as imported, and a commit answered
+            // SYNCING waits for this report (`own_block_imported`). Given up
+            // on, the leader stayed on its own block until a restart (audit
+            // 2026-10 round 2, R2-I4).
+            let mut outcome = import_own(el.as_ref(), header.as_ref(), &payload, elided).await;
+            for (attempt, pause) in backoff.iter().enumerate() {
+                let verdict = matches!(&outcome, Ok(status) if status.status.is_valid() || status.status.is_invalid());
+                if verdict {
+                    break;
+                }
+                debug!(target: "n42.h2.el", block = ?hash, attempt = attempt + 1, ?pause, "own import ended without a verdict; trying again");
+                tokio::time::sleep(*pause).await;
+                outcome = import_own(el.as_ref(), header.as_ref(), &payload, elided).await;
+            }
+            match outcome {
                 Ok(status) => {
                     info!(
                         target: "n42.h2.el",
@@ -1828,11 +1918,23 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     );
                     if status.status.is_valid() {
                         let _ = imported.send(hash);
+                    } else if let PayloadStatusEnum::Invalid { validation_error } = &status.status {
+                        // The builder and the executor of one node disagree:
+                        // the block this node proposed is one it would not
+                        // vote for. The follower path decides the vote; this
+                        // is the alarm.
+                        refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics::counter!(METRIC_OWN_BLOCK_REFUSED_TOTAL).increment(1);
+                        error!(
+                            target: "n42.h2.el",
+                            block = ?hash, %validation_error,
+                            "our own execution layer calls the block we built invalid"
+                        );
                     }
                 }
-                Err(err) => warn!(
+                Err(err) => error!(
                     target: "n42.h2.el",
-                    block = ?hash, %err,
+                    block = ?hash, %err, attempts = backoff.len() + 1,
                     "our own execution layer would not take the block we built"
                 ),
             }
@@ -1898,6 +2000,79 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(block_hash)
     }
 
+    /// Own blocks [`Self::spawn_import_own_block`] found the execution layer
+    /// calling invalid since start (also [`METRIC_OWN_BLOCK_REFUSED_TOTAL`]).
+    pub fn own_blocks_refused(&self) -> u64 {
+        self.own_refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The pauses before each retry of an own import that ended without a
+    /// verdict (default [`OWN_IMPORT_BACKOFF`]); one retry per entry.
+    pub fn set_own_import_backoff(&mut self, pauses: Vec<std::time::Duration>) {
+        self.own_import_backoff = pauses.into();
+    }
+
+    /// The pauses before each new execution of a follower import that ended
+    /// without a verdict (default [`OWN_IMPORT_BACKOFF`]); one per entry,
+    /// then the block is asked for again.
+    pub fn set_import_retry_backoff(&mut self, pauses: Vec<std::time::Duration>) {
+        self.import_retry_backoff = pauses;
+    }
+
+    /// An import that ended without a verdict: executed again after the
+    /// next pause, from the payload or body still held -- the body is here,
+    /// so asking the fleet for it would only bring a duplicate nothing
+    /// executes, and a compact body would be given up for a whole one
+    /// (audit 2026-10 round 2, R2-R3). Asked for again once the pauses run
+    /// out.
+    fn schedule_import_retry(&mut self, block_hash: B256) -> DriverAction {
+        let attempt = self.import_retries.entry(block_hash).or_insert(0);
+        match self.import_retry_backoff.get(*attempt) {
+            Some(pause) => {
+                *attempt += 1;
+                debug!(target: "n42.h2.el", block = ?block_hash, attempt = *attempt, ?pause, "import ended without a verdict; executing it again after a pause");
+                self.import_retry_due.push((std::time::Instant::now() + *pause, block_hash));
+                DriverAction::Ignored
+            }
+            None => {
+                self.import_retries.remove(&block_hash);
+                DriverAction::PayloadMissing { block_hash }
+            }
+        }
+    }
+
+    /// Runs the imports whose pause has passed (see
+    /// [`Self::schedule_import_retry`]); the loop applies what they return.
+    pub async fn retry_failed_imports(&mut self) -> Vec<DriverAction> {
+        if self.import_retry_due.is_empty() {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        let (due, later): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.import_retry_due).into_iter().partition(|(at, _)| *at <= now);
+        self.import_retry_due = later;
+        let mut actions = Vec::with_capacity(due.len());
+        for (_, block_hash) in due {
+            if self.imported.contains(&block_hash) {
+                self.import_retries.remove(&block_hash);
+                continue;
+            }
+            let action = self.execute(block_hash).await;
+            // The payload is gone and the fleet is asked: no retry follows
+            // (audit 2026-10 round 3, R3-G5, as the verdicts above).
+            if action.missing_block() == Some(block_hash) {
+                self.import_retries.remove(&block_hash);
+            }
+            actions.push(action);
+        }
+        actions
+    }
+
+    /// Blocks with a retry count held, for diagnostics.
+    pub fn import_retries_held(&self) -> usize {
+        self.import_retries.len()
+    }
+
     /// The channel [`Self::spawn_import_own_block`] reports on, once.
     pub fn take_own_imports(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<B256>> {
         self.own_imports_rx.take()
@@ -1936,6 +2111,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// every block on the import-gated path.
     pub fn set_deferred_execution_time(&mut self, at: Option<u64>) {
         self.deferred_execution_time = at;
+    }
+
+    /// Whether a block of `timestamp` is under deferred execution: its
+    /// header's execution fields are its parent's.
+    pub fn is_deferred_at(&self, timestamp: u64) -> bool {
+        self.deferred_execution_time.is_some_and(|at| timestamp >= at)
     }
 
     /// The chain's `deferredExecutionDepth` (see the field): 1 or 2. Anything
@@ -2296,13 +2477,20 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Remembers a commit to repeat when `block_hash`'s import lands. Bounded:
     /// a block imported by a path the driver does not see (a synced range)
     /// stays in the set until it is bounded away, harmlessly.
+    /// The oldest is the one bounded away: a set's own order is arbitrary
+    /// and could drop the newest commit (round 3, R3-C4).
     fn remember_commit_ahead(&mut self, block_hash: B256) {
-        self.commits_ahead.insert(block_hash);
-        if self.commits_ahead.len() > 64 {
-            let stale: Vec<B256> = self.commits_ahead.iter().copied().take(self.commits_ahead.len() - 64).collect();
-            for hash in stale {
-                self.commits_ahead.remove(&hash);
-            }
+        if self.commits_ahead.insert(block_hash) {
+            self.commits_ahead_order.push_back(block_hash);
+        }
+        while self.commits_ahead.len() > 64 {
+            let Some(oldest) = self.commits_ahead_order.pop_front() else { break };
+            self.commits_ahead.remove(&oldest);
+        }
+        // Entries taken out of the set elsewhere leave their place behind.
+        if self.commits_ahead_order.len() > 256 {
+            let kept = &self.commits_ahead;
+            self.commits_ahead_order.retain(|hash| kept.contains(hash));
         }
     }
 
@@ -2494,9 +2682,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                                 outcome = &mut import => outcome,
                             }
                         }
+                        // The body itself cannot be made into a payload
+                        // here: a verdict on this copy, unlike an exchange
+                        // that failed (see `ImportVerdict::of`).
                         Err(err) => {
                             warn!(target: "n42.h2.el", block = ?block_hash, %err, "a held body could not be sent");
-                            Err(err)
+                            guard.done(ImportVerdict::Invalid(err.to_string()));
+                            return;
                         }
                     }
                 }
@@ -2598,6 +2790,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let mut actions = Vec::with_capacity(2);
         actions.push(match verdict {
             ImportVerdict::Imported => {
+                self.import_retries.remove(&block_hash);
                 self.head = block_hash;
                 self.note_imported(block_hash);
                 if self.pending_commits.remove(&block_hash) || self.commits_ahead.remove(&block_hash) {
@@ -2615,12 +2808,18 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // Not executed: asked for again, as the awaited path does. A
             // commit that waited keeps waiting for the import that follows.
             ImportVerdict::NotYet => DriverAction::PayloadMissing { block_hash },
+            ImportVerdict::NoVerdict => self.schedule_import_retry(block_hash),
             ImportVerdict::NeedTxns(indices) => DriverAction::TransactionsMissing { block_hash, indices },
             ImportVerdict::Invalid(reason) => {
-                // A commit for it can never run; a payload for it is dropped
-                // so a fresh copy is executed again, not this outcome.
+                self.import_retries.remove(&block_hash);
+                // The verdict is on the bytes that were sent (audit 2026-10
+                // R2-I3): a payload for it is dropped so a fresh copy is
+                // executed again, and a commit that waited runs when that
+                // copy imports. Dropped, the block a quorum committed was not
+                // made canonical here until a descendant was (round 3, R3-C4).
                 if self.pending_commits.remove(&block_hash) {
-                    warn!(target: "n42.h2.el", block = ?block_hash, %reason, "a commit waited for an import that failed; dropped");
+                    warn!(target: "n42.h2.el", block = ?block_hash, %reason, "a commit waited for an import that failed; it runs when another copy imports");
+                    self.remember_commit_ahead(block_hash);
                 }
                 self.forget_payload(block_hash);
                 DriverAction::Rejected { block_hash, reason }
@@ -2672,7 +2871,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {
         let started = std::time::Instant::now();
         let status = if built.elided {
-            import_own(self.el.as_ref(), built.header.as_ref(), built.execution_data.clone(), Some(built.tx_count))
+            import_own(self.el.as_ref(), built.header.as_ref(), &built.execution_data, Some(built.tx_count))
                 .await?
         } else {
             self.el
@@ -2805,6 +3004,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         match outcome {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
+                    self.import_retries.remove(&block_hash);
                     self.head = block_hash;
                     self.note_imported(block_hash);
                     if self.pending_commits.remove(&block_hash) || self.commits_ahead.remove(&block_hash) {
@@ -2819,18 +3019,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 // SYNCING/ACCEPTED are not a verdict: the EL has not executed the
                 // block yet, so voting now would be voting blind. Treat it the
                 // same as a missing payload — the caller retries.
-                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => {
-                    DriverAction::PayloadMissing { block_hash }
+                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => self.schedule_import_retry(block_hash),
+                PayloadStatusEnum::Invalid { validation_error } => {
+                    self.import_retries.remove(&block_hash);
+                    DriverAction::Rejected { block_hash, reason: validation_error.to_string() }
                 }
-                PayloadStatusEnum::Invalid { validation_error } => DriverAction::Rejected {
-                    block_hash,
-                    reason: validation_error.to_string(),
-                },
             },
-            Err(error) => DriverAction::Rejected {
-                block_hash,
-                reason: error.to_string(),
-            },
+            // No verdict on the block: executed again, as above.
+            Err(error) => {
+                warn!(target: "n42.h2.el", block = ?block_hash, %error, "the import failed without a verdict; executing it again");
+                self.schedule_import_retry(block_hash)
+            }
         }
     }
 
@@ -3247,5 +3446,23 @@ fn say_slow_commit(
             Err(error) => format!("error: {error}"),
         };
         info!(target: "n42.h2.el", block = ?block_hash, elapsed_ms, ahead_of_import, %outcome, "commit forkchoice");
+    }
+}
+
+/// Audit 2026-10 round 2 (R2-I7): an import task that ends without a verdict
+/// -- a panic, a dropped runtime -- is a local failure, not a verdict on the
+/// block. Reported INVALID, it withdrew the evidence for a block that may be
+/// valid; it is reported as not executed, and the block is asked for again.
+#[cfg(test)]
+mod report_guard_tests {
+    use super::*;
+
+    #[test]
+    fn an_import_task_that_ends_without_a_verdict_reports_no_verdict() {
+        let (report, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        drop(ReportGuard { block_hash: B256::repeat_byte(7), report: Some(report) });
+        let Ok(ImportReport::Done(hash, verdict)) = reports.try_recv() else { panic!("a report") };
+        assert_eq!(hash, B256::repeat_byte(7));
+        assert!(matches!(verdict, ImportVerdict::NoVerdict), "{verdict:?}");
     }
 }

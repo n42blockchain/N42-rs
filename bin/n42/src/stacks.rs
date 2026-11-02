@@ -39,10 +39,10 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 pub fn install() {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = on_signal as usize;
+        action.sa_sigaction = on_signal as *const () as usize;
         action.sa_flags = libc::SA_RESTART;
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut());
+        libc::sigemptyset(&raw mut action.sa_mask);
+        libc::sigaction(libc::SIGUSR2, &raw const action, std::ptr::null_mut());
     }
 }
 

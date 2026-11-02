@@ -29,7 +29,7 @@
 
 use std::time::Instant;
 
-use alloy_consensus::{Header, SignableTransaction, TxEip1559, TxEnvelope};
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
@@ -61,7 +61,7 @@ fn main() {
         .collect();
     let built = build.elapsed();
 
-    let header = Header::default();
+    let header = n42_h2_consensus::N42Header::default();
     let rewards: Vec<(Address, U256)> = vec![
         (Address::with_last_byte(1), U256::from(1_000_000_000_000_000_000u64)),
         (Address::with_last_byte(2), U256::from(1_000_000_000_000_000_000u64)),

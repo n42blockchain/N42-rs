@@ -54,7 +54,7 @@ impl core::error::Error for RecoveryError {}
 ///  Fixed number of extra-data suffix bytes reserved for signer seal
 pub const SIGNATURE_LENGTH: usize = 64 + 1;
 
-/// recover_address extracts the Ethereum account address from a signed header.
+/// `recover_address` extracts the Ethereum account address from a signed header.
 pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
     // Retrieve the signature from the header extra-data
     if header.extra_data.len() < SIGNATURE_LENGTH {
@@ -228,7 +228,7 @@ where
     keccak256(alloy_rlp::encode(&sig_header))
 }
 
-/// SealHash returns the hash of a block prior to it being sealed.
+/// `SealHash` returns the hash of a block prior to it being sealed.
 pub fn seal_hash(header: &Header) -> B256 {
     struct LocalHeader {
         parent_hash: B256,

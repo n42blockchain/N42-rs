@@ -3,7 +3,7 @@
 
 use crate::*;
 
-#[derive(Default, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct BeaconCommittee<'a> {
     pub slot: Slot,
     pub index: CommitteeIndex,
@@ -20,7 +20,7 @@ impl BeaconCommittee<'_> {
     }
 }
 
-#[derive(arbitrary::Arbitrary, Default, Clone, Debug, PartialEq)]
+#[derive(arbitrary::Arbitrary, Default, Clone, Debug, PartialEq, Eq)]
 pub struct OwnedBeaconCommittee {
     pub slot: Slot,
     pub index: CommitteeIndex,

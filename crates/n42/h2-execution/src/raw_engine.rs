@@ -128,7 +128,45 @@ pub mod request {
     /// road, in its slot. Between a validator and its own execution layer
     /// only; nothing on the peer wire changes.
     pub const CHECK_ONLY: u8 = 10;
+    /// [`FOREIGN_BODY`]'s frame ([`super::encode_foreign_body_from`]) with a
+    /// *compact frame description* in it and, as a rule, its sender's
+    /// [`super::ClaimSource`]: a description of a block whose first compact
+    /// body is already with the execution layer, sent by another peer with a
+    /// different frame layout. Only the claim is taken -- the block's root
+    /// and layout, filed under the source (audit 2026-10 round 2, R2-X4), for
+    /// the whole-body fallback to try -- nothing is assembled, checked or
+    /// imported. One frame back: [`super::reply::VALUE`] with no bytes when
+    /// the claim was filed, [`super::reply::ERROR`] with the reason when not.
+    /// Between a validator and its own execution layer only; nothing on the
+    /// peer wire changes.
+    pub const CLAIM_LAYOUT: u8 = 11;
 }
+
+/// Who sent a compact body, as the validator names the peer to its
+/// execution layer: the first eight bytes of the keccak of the peer's libp2p
+/// id ([`claim_source_of`]). The execution layer keys the frame layouts
+/// descriptions claim by it, one per source per root.
+/// [`OWN_CLAIM_SOURCE`] is reserved for the node's own validator.
+pub type ClaimSource = [u8; 8];
+
+/// The reserved [`ClaimSource`] of the node's own claims (never evicted by a
+/// foreign one). The same value as `n42_engine_types::frame_blocks`'s.
+pub const OWN_CLAIM_SOURCE: ClaimSource = [0; 8];
+
+/// The [`ClaimSource`] of a peer, from its id's bytes: never
+/// [`OWN_CLAIM_SOURCE`].
+pub fn claim_source_of(peer_id_bytes: &[u8]) -> ClaimSource {
+    let digest = alloy_primitives::keccak256(peer_id_bytes);
+    let mut source = [0u8; 8];
+    source.copy_from_slice(&digest[..8]);
+    if source == OWN_CLAIM_SOURCE {
+        source[7] = 1;
+    }
+    source
+}
+
+/// The tag of the optional [`ClaimSource`] tail of a foreign-body frame.
+const SOURCE_TAG: u8 = 1;
 
 /// The byte a caller sends for a held block ([`request::HOLD_EXECUTION`])
 /// once it has received the block's CHECKED frame.
@@ -216,7 +254,7 @@ pub fn unix_micros() -> u64 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactAnswer {
     /// The header as built (before the proposer stamps and seals it).
-    pub header: alloy_consensus::Header,
+    pub header: n42_h2_consensus::N42Header,
     /// How many transactions the block holds.
     pub tx_count: u32,
     /// The block's withdrawals (its rewards on a gov5 chain).
@@ -275,7 +313,7 @@ pub fn decode_compact_answer(buf: &[u8]) -> Result<CompactAnswer, String> {
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
     let rlp = r.bytes()?;
     let mut cursor = &rlp[..];
-    let header = alloy_consensus::Header::decode(&mut cursor).map_err(|e| format!("header: {e}"))?;
+    let header = n42_h2_consensus::N42Header::decode(&mut cursor).map_err(|e| format!("header: {e}"))?;
     if !cursor.is_empty() { return Err("header RLP has trailing bytes".into()); }
     let tx_count = r.u32()?;
     let n = r.count(44)?;
@@ -410,6 +448,9 @@ pub fn encode_execution_data(data: &ExecutionData) -> Vec<u8> {
         ExecutionPayload::V1(_) => 1,
         ExecutionPayload::V2(_) => 2,
         ExecutionPayload::V3(_) => 3,
+        // A V4 payload with gov5's registry root is kind 5: the root follows
+        // the slot number. Kind 4 stays the bytes it always was.
+        ExecutionPayload::V4(v4) if v4.mobile_registry_root.is_some() => 5,
         ExecutionPayload::V4(_) => 4,
     });
     w.fixed(v1.parent_hash.as_slice());
@@ -444,6 +485,9 @@ pub fn encode_execution_data(data: &ExecutionData) -> Vec<u8> {
     if let ExecutionPayload::V4(v4) = &data.payload {
         w.bytes(&v4.block_access_list);
         w.u64(v4.slot_number);
+        if let Some(root) = v4.mobile_registry_root {
+            w.fixed(root.as_slice());
+        }
     }
     match data.sidecar.cancun() {
         Some(cancun) => {
@@ -485,7 +529,7 @@ pub fn decode_execution_data_shared(buf: &Bytes) -> Result<ExecutionData, String
 fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
     let kind = r.u8()?;
-    if !(1..=4).contains(&kind) { return Err(format!("unknown payload kind {kind}")); }
+    if !(1..=5).contains(&kind) { return Err(format!("unknown payload kind {kind}")); }
     let parent_hash = r.b256()?;
     let fee_recipient = Address::from_slice(r.take(20)?);
     let state_root = r.b256()?;
@@ -527,9 +571,10 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
             let v3 = ExecutionPayloadV3 { payload_inner: v2, blob_gas_used, excess_blob_gas };
             if kind == 3 {
                 ExecutionPayload::V3(v3)
-            } else if kind == 4 {
+            } else if kind == 4 || kind == 5 {
                 let block_access_list = r.bytes()?; let slot_number = r.u64()?;
-                ExecutionPayload::V4(ExecutionPayloadV4 { payload_inner: v3, block_access_list, slot_number })
+                let mobile_registry_root = if kind == 5 { Some(r.b256()?) } else { None };
+                ExecutionPayload::V4(ExecutionPayloadV4 { payload_inner: v3, block_access_list, slot_number, mobile_registry_root })
             } else {
                 return Err(format!("unknown payload kind {kind}"));
             }
@@ -583,11 +628,28 @@ const fn profile_byte(profile: N42HeaderProfile) -> u8 {
 /// it is re-encoded: the whole point is that these bytes are parsed once, on
 /// the other side.
 pub fn encode_foreign_body(block_hash: B256, profile: N42HeaderProfile, body: &[u8]) -> Vec<u8> {
+    encode_foreign_body_from(block_hash, profile, body, None)
+}
+
+/// [`encode_foreign_body`], with who sent the body: a [`ClaimSource`] tail
+/// (a tag byte and eight bytes) after it when `source` is set, nothing more
+/// otherwise -- the frame without one is [`encode_foreign_body`]'s byte for
+/// byte.
+pub fn encode_foreign_body_from(
+    block_hash: B256,
+    profile: N42HeaderProfile,
+    body: &[u8],
+    source: Option<ClaimSource>,
+) -> Vec<u8> {
     let mut w = Writer(Vec::with_capacity(body.len() + 64));
     w.u8(VERSION);
     w.fixed(block_hash.as_slice());
     w.u8(profile_byte(profile));
     w.bytes(body);
+    if let Some(source) = source {
+        w.u8(SOURCE_TAG);
+        w.fixed(&source);
+    }
     w.0
 }
 
@@ -598,6 +660,13 @@ pub fn encode_foreign_body(block_hash: B256, profile: N42HeaderProfile, body: &[
 /// outlives nothing it hands on -- see `convert_body_to_block`, which copies
 /// what it keeps.
 pub fn decode_foreign_body(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8]), String> {
+    decode_foreign_body_from(buf).map(|(hash, profile, body, _)| (hash, profile, body))
+}
+
+/// [`decode_foreign_body`], with the sender's [`ClaimSource`] when the frame
+/// carries one ([`encode_foreign_body_from`]).
+#[allow(clippy::type_complexity)] // hot-path decoder; the return tuple is kept inline
+pub fn decode_foreign_body_from(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8], Option<ClaimSource>), String> {
     let mut r = Reader { rest: buf, shared: None };
     if r.u8()? != VERSION {
         return Err("unknown raw engine version".into());
@@ -610,10 +679,16 @@ pub fn decode_foreign_body(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8])
     };
     let len = r.u32()? as usize;
     let body = r.take(len)?;
-    if !r.rest.is_empty() {
-        return Err(format!("foreign body frame has {} trailing bytes", r.rest.len()));
-    }
-    Ok((block_hash, profile, body))
+    let source = match r.rest {
+        [] => None,
+        [SOURCE_TAG, source @ ..] if source.len() == 8 => {
+            let mut out = [0u8; 8];
+            out.copy_from_slice(source);
+            Some(out)
+        }
+        rest => return Err(format!("foreign body frame has {} trailing bytes", rest.len())),
+    };
+    Ok((block_hash, profile, body, source))
 }
 
 /// What a caller adds to a build-on-own request when the height after the
@@ -664,11 +739,16 @@ const TAIL_COMPACT_ANSWER: u8 = 3;
 /// to the block), so nothing else follows the request's mark.
 const TAIL_LAYOUT_ONLY: u8 = 4;
 
+/// Tail tag: the payload attributes' mobile-verification registry root
+/// (32 bytes follow). Written last, so an execution layer that predates it
+/// stops at the tag and keeps everything before it.
+const TAIL_MOBILE_REGISTRY_ROOT: u8 = 5;
+
 /// A decoded build-on-own request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuildOnOwn {
     /// The sealed header of the block just built.
-    pub header: alloy_consensus::Header,
+    pub header: n42_h2_consensus::N42Header,
     /// The attributes of the block to build on it.
     pub attrs: PayloadAttributes,
     /// The chain hint, when the request carried one.
@@ -685,7 +765,7 @@ pub struct BuildOnOwn {
 
 /// Encodes a build-on-own request: the sealed header of the block just built
 /// (RLP) and the attributes of the block to build on it.
-pub fn encode_build_on_own(header: &alloy_consensus::Header, attrs: &PayloadAttributes) -> Vec<u8> {
+pub fn encode_build_on_own(header: &n42_h2_consensus::N42Header, attrs: &PayloadAttributes) -> Vec<u8> {
     encode_build_on_own_chaining(header, attrs, None, false)
 }
 
@@ -698,7 +778,7 @@ pub fn encode_build_on_own(header: &alloy_consensus::Header, attrs: &PayloadAttr
 /// chaining), and one that knows the tail reads no hint out of a frame that
 /// has none (no chaining). Nothing chains unless both ends agree.
 pub fn encode_build_on_own_chaining(
-    header: &alloy_consensus::Header,
+    header: &n42_h2_consensus::N42Header,
     attrs: &PayloadAttributes,
     chain: Option<ChainHint>,
     want_hashes: bool,
@@ -711,7 +791,7 @@ pub fn encode_build_on_own_chaining(
 /// With it unset the frame is byte for byte the one
 /// [`encode_build_on_own_chaining`] has always written.
 pub fn encode_build_on_own_request(
-    header: &alloy_consensus::Header,
+    header: &n42_h2_consensus::N42Header,
     attrs: &PayloadAttributes,
     chain: Option<ChainHint>,
     want_hashes: bool,
@@ -726,7 +806,7 @@ pub fn encode_build_on_own_request(
 /// together with `compact_answer`). With it unset the frame is byte for byte
 /// the one [`encode_build_on_own_request`] writes.
 pub fn encode_build_on_own_request_layout(
-    header: &alloy_consensus::Header,
+    header: &n42_h2_consensus::N42Header,
     attrs: &PayloadAttributes,
     chain: Option<ChainHint>,
     want_hashes: bool,
@@ -776,6 +856,10 @@ pub fn encode_build_on_own_request_layout(
     if layout_only {
         w.u8(TAIL_LAYOUT_ONLY);
     }
+    if let Some(root) = attrs.mobile_registry_root {
+        w.u8(TAIL_MOBILE_REGISTRY_ROOT);
+        w.fixed(root.as_slice());
+    }
     w.0
 }
 
@@ -783,7 +867,7 @@ pub fn encode_build_on_own_request_layout(
 /// the frame carries one.
 pub fn decode_build_on_own(
     buf: &[u8],
-) -> Result<(alloy_consensus::Header, PayloadAttributes, Option<ChainHint>, bool), String> {
+) -> Result<(n42_h2_consensus::N42Header, PayloadAttributes, Option<ChainHint>, bool), String> {
     let request = decode_build_on_own_request(buf)?;
     Ok((request.header, request.attrs, request.chain, request.want_hashes))
 }
@@ -796,7 +880,7 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
     let rlp = r.bytes()?;
     let mut cursor = &rlp[..];
-    let header = alloy_consensus::Header::decode(&mut cursor).map_err(|e| format!("header: {e}"))?;
+    let header = n42_h2_consensus::N42Header::decode(&mut cursor).map_err(|e| format!("header: {e}"))?;
     if !cursor.is_empty() { return Err("header RLP has trailing bytes".into()); }
     let timestamp = r.u64()?;
     let prev_randao = r.b256()?;
@@ -820,12 +904,14 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
     let mut want_hashes = false;
     let mut compact_answer = false;
     let mut layout_only = false;
+    let mut mobile_registry_root = None;
     while !r.rest.is_empty() {
         match r.u8()? {
             TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.flag()? }),
             TAIL_WANT_HASHES => want_hashes = true,
             TAIL_COMPACT_ANSWER => compact_answer = true,
             TAIL_LAYOUT_ONLY => layout_only = true,
+            TAIL_MOBILE_REGISTRY_ROOT => mobile_registry_root = Some(r.b256()?),
             // A tag from a newer peer. Its length is not known here, so
             // there is nothing to skip to: stop reading and keep what was
             // understood. Fields are only ever appended, so everything
@@ -833,7 +919,16 @@ pub fn decode_build_on_own_request(buf: &[u8]) -> Result<BuildOnOwn, String> {
             _ => break,
         }
     }
-    let attrs = PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit };
+    let attrs = PayloadAttributes {
+        timestamp,
+        prev_randao,
+        suggested_fee_recipient,
+        withdrawals,
+        parent_beacon_block_root,
+        slot_number,
+        target_gas_limit,
+        mobile_registry_root,
+    };
     Ok(BuildOnOwn { header, attrs, chain, want_hashes, compact_answer, layout_only })
 }
 
@@ -947,25 +1042,37 @@ mod tests {
         let wd = Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(3), amount: 4 };
         let v2 = ExecutionPayloadV2 { payload_inner: v1(), withdrawals: vec![wd] };
         let v3 = ExecutionPayloadV3 { payload_inner: v2.clone(), blob_gas_used: 5, excess_blob_gas: 6 };
-        let v4 = ExecutionPayloadV4 { payload_inner: v3.clone(), block_access_list: Bytes::from_static(&[0xc0]), slot_number: 9 };
+        let v4 = ExecutionPayloadV4 { payload_inner: v3.clone(), block_access_list: Bytes::from_static(&[0xc0]), slot_number: 9, mobile_registry_root: None };
         let cancun = CancunPayloadFields { parent_beacon_block_root: B256::repeat_byte(7), versioned_hashes: vec![B256::repeat_byte(8)] };
         let prague = PraguePayloadFields { requests: RequestsOrHash::Requests(Requests::new(vec![Bytes::from_static(&[0x01, 0x02])])) };
         let cases = vec![
             ExecutionData::new(ExecutionPayload::V1(v1()), ExecutionPayloadSidecar::none()),
             ExecutionData::new(ExecutionPayload::V2(v2), ExecutionPayloadSidecar::none()),
             ExecutionData::new(ExecutionPayload::V3(v3), ExecutionPayloadSidecar::v3(cancun.clone())),
-            ExecutionData::new(ExecutionPayload::V4(v4), ExecutionPayloadSidecar::v4(cancun.clone(), prague)),
+            ExecutionData::new(ExecutionPayload::V4(v4.clone()), ExecutionPayloadSidecar::v4(cancun.clone(), prague.clone())),
+            // gov5's registry root (kind 5), and an access-list-less header (empty list).
+            ExecutionData::new(
+                ExecutionPayload::V4(ExecutionPayloadV4 {
+                    block_access_list: Bytes::new(),
+                    mobile_registry_root: Some(B256::repeat_byte(0x42)),
+                    ..v4.clone()
+                }),
+                ExecutionPayloadSidecar::v4(cancun.clone(), prague),
+            ),
             ExecutionData::new(ExecutionPayload::V1(v1()), ExecutionPayloadSidecar::v4(cancun, PraguePayloadFields { requests: RequestsOrHash::Hash(B256::repeat_byte(9)) })),
         ];
         for data in cases {
             let back = decode_execution_data(&encode_execution_data(&data)).expect("decodes");
             assert_eq!(format!("{back:?}"), format!("{data:?}"));
         }
+        // Without a root a V4 payload is the kind-4 frame it always was.
+        let plain = ExecutionData::new(ExecutionPayload::V4(v4), ExecutionPayloadSidecar::none());
+        assert_eq!(encode_execution_data(&plain)[1], 4);
     }
 
     #[test]
     fn build_on_own_round_trips_with_and_without_the_optional_fields() {
-        let header = alloy_consensus::Header { number: 41, gas_used: 3_423_000_000, extra_data: Bytes::from_static(&[9, 9]), ..Default::default() };
+        let header = n42_h2_consensus::N42Header::from(alloy_consensus::Header { number: 41, gas_used: 3_423_000_000, extra_data: Bytes::from_static(&[9, 9]), ..Default::default() });
         let full = PayloadAttributes {
             timestamp: 1_700_000_000,
             prev_randao: B256::repeat_byte(5),
@@ -974,8 +1081,16 @@ mod tests {
             parent_beacon_block_root: Some(B256::repeat_byte(7)),
             slot_number: Some(42),
             target_gas_limit: Some(3_600_000_000),
+            mobile_registry_root: Some(B256::repeat_byte(0x24)),
         };
-        let bare = PayloadAttributes { withdrawals: None, parent_beacon_block_root: None, slot_number: None, target_gas_limit: None, ..full.clone() };
+        let bare = PayloadAttributes {
+            withdrawals: None,
+            parent_beacon_block_root: None,
+            slot_number: None,
+            target_gas_limit: None,
+            mobile_registry_root: None,
+            ..full.clone()
+        };
         for attrs in [full, bare] {
             let (h, a, chain, hashes) = decode_build_on_own(&encode_build_on_own(&header, &attrs)).expect("decodes");
             assert_eq!(h, header);
@@ -991,7 +1106,12 @@ mod tests {
             // The hint is a tail: everything before it is the frame an
             // execution layer that predates it reads, byte for byte.
             let plain = encode_build_on_own(&header, &attrs);
-            assert_eq!(&hinted[..plain.len()], &plain[..], "the hint only appends");
+            // The registry root is the last tail of all, so it is left out
+            // of the prefix comparison.
+            let rootless = PayloadAttributes { mobile_registry_root: None, ..attrs.clone() };
+            let prefix = encode_build_on_own(&header, &rootless);
+            assert_eq!(&hinted[..prefix.len()], &prefix[..], "the hint only appends");
+            assert_eq!(&plain[..prefix.len()], &prefix[..], "so does the registry root");
             // And a tag this build does not know leaves the fields intact.
             let mut unknown = plain.clone();
             unknown.push(0xfe);
@@ -1015,6 +1135,22 @@ mod tests {
             let start = back_body.as_ptr() as usize - frame.as_ptr() as usize;
             assert!(start + back_body.len() <= frame.len());
         }
+    }
+
+    #[test]
+    fn a_foreign_body_carries_its_source_as_an_optional_tail() {
+        let body = vec![0xcd; 64];
+        let hash = B256::repeat_byte(0x5b);
+        let source = claim_source_of(b"peer");
+        let frame = encode_foreign_body_from(hash, N42HeaderProfile::Gov5H2, &body, Some(source));
+        let plain = encode_foreign_body(hash, N42HeaderProfile::Gov5H2, &body);
+        assert_eq!(&frame[..plain.len()], &plain[..], "the source only appends");
+        assert_eq!(decode_foreign_body_from(&frame).expect("decodes"), (hash, N42HeaderProfile::Gov5H2, &body[..], Some(source)));
+        assert_eq!(decode_foreign_body(&frame).expect("an old reader").2, &body[..]);
+        assert_eq!(decode_foreign_body_from(&plain).expect("no source").3, None);
+        assert!(decode_foreign_body_from(&frame[..frame.len() - 1]).is_err(), "a cut source");
+        assert_ne!(claim_source_of(b"peer"), OWN_CLAIM_SOURCE);
+        assert_ne!(claim_source_of(b"peer"), claim_source_of(b"other"));
     }
 
     #[test]
@@ -1051,7 +1187,8 @@ mod tests {
                 withdrawals_root: Some(B256::repeat_byte(4)),
                 extra_data: Bytes::from_static(&[9, 9]),
                 ..Default::default()
-            },
+            }
+            .into(),
             tx_count: 3,
             withdrawals: vec![Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(3), amount: 4 }],
             requests: Some(vec![Bytes::from_static(&[0x01, 0x02])]),
@@ -1119,7 +1256,7 @@ mod tests {
 
     #[test]
     fn the_layout_only_mark_is_a_last_tag_and_off_is_the_old_frame() {
-        let header = alloy_consensus::Header { number: 41, ..Default::default() };
+        let header = n42_h2_consensus::N42Header::from(alloy_consensus::Header { number: 41, ..Default::default() });
         let attrs = PayloadAttributes {
             timestamp: 1_700_000_000,
             prev_randao: B256::repeat_byte(5),
@@ -1128,6 +1265,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::repeat_byte(7)),
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let hint = Some(ChainHint { view: 7, chained: true });
         let old = encode_build_on_own_request(&header, &attrs, hint, true, true);
@@ -1144,7 +1282,7 @@ mod tests {
 
     #[test]
     fn the_compact_answer_tail_only_appends_and_off_is_the_old_frame() {
-        let header = alloy_consensus::Header { number: 41, ..Default::default() };
+        let header = n42_h2_consensus::N42Header::from(alloy_consensus::Header { number: 41, ..Default::default() });
         let attrs = PayloadAttributes {
             timestamp: 1_700_000_000,
             prev_randao: B256::repeat_byte(5),
@@ -1153,6 +1291,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::repeat_byte(7)),
             slot_number: None,
             target_gas_limit: None,
+            mobile_registry_root: None,
         };
         let hint = Some(ChainHint { view: 7, chained: false });
         for (chain, hashes) in [(None, false), (None, true), (hint, true)] {

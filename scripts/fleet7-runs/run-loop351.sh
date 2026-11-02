@@ -83,7 +83,10 @@ echo "replay set for every leg: $REPLAY (senders $F7_SENDERS_ARG)"
 echo $REPLAY > $S/replay-loop351.txt; echo $F7_SENDERS_ARG > $S/senders-loop351.txt
 export F7_LEADER_TENURE=16 F7_INGEST=1 F7_INGEST_ALL=1 F7_NO_TX_GOSSIP=1 N42_TX_INGEST_ASYNC=1
 export F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=250 F7_SKIP_STALE_CHECK=1 F7_METRICS_BASE=19300 N42_TX_QUEUE=1
-export N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=8 N42_TX_INGEST_DIRECT=1
+# The direct ingest and the bench gateway (N42_FRAME_GATEWAYS below) are
+# benchmark settings the node refuses without this acknowledgement (audit
+# 2026-10 C-2..C-4): every leg here gives it.
+export N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=8 N42_TX_INGEST_DIRECT=1 N42_BENCH_UNSAFE=1
 elpid() { ps -eo pid,args | grep -E '/n4[2] node' | grep -E 'rust-fleet7-bench/node2' | awk '{print $1}' | head -1; }
 sample() { local tag=$1
   for i in $(seq 1 44); do

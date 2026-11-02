@@ -6,6 +6,7 @@
 //! - Parallel execution support
 
 mod discovery;
+#[allow(clippy::module_inception)] // module name is part of the suite layout
 mod suite;
 
 pub use discovery::TestDiscovery;

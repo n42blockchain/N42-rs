@@ -5,6 +5,11 @@
 #   scripts/devnet-fleet.sh <tag> <seconds> [--gov5] [--keep]
 #   LATE_VALIDATOR=<i> LATE_DELAY=<s> [LATE_SNAPSHOT=<dir>] start one member late (from a snapshot)
 #   ABSENT_VALIDATOR=<i> ABSENT_AT=<s> ABSENT_FOR=<s> take one member (own EL) away and bring it back
+#   MOBILEVERIFY=1 serve gov5's /mobileverify on every member: Rust validator i on
+#     127.0.0.1:2101<i> (--mobileverify.http), the gov5 member on 127.0.0.1:21020
+#   PACKETD=<binary> with MOBILEVERIFY=1: gov5's cmd/mobileverify-packetd beside Rust validator 0
+#     (follows the EL on 18545 -- debug_getRawBlock, hence --http.api ...,debug -- and PUTs each
+#     block's StreamPacket to 127.0.0.1:21010, which publishes it to the fleet)
 #
 # Data lives under $N42_FLEET_DIR (default: /tmp/n42-fleet). Every process is
 # left running afterwards so it can be inspected; the next run kills them.
@@ -23,16 +28,20 @@ for arg in "$@"; do case $arg in --gov5) WITH_GOV5=1;; --keep) KEEP=1;; esac; do
 # a release build in a target directory of its own.
 GENESIS=${DEVNET_GENESIS:-$REPO/crates/chainspec/res/genesis/n42_devnet.json}
 BIN=${DEVNET_BIN:-$REPO/target/debug}
+# MOBILEVERIFY=1: the phone surface on every member (validator i: port 2101<i>).
+mv_flag() { [ "${MOBILEVERIFY:-}" = 1 ] && echo "--mobileverify.http 127.0.0.1:2101$1"; }
+GOV5_MV=; [ "${MOBILEVERIFY:-}" = 1 ] && GOV5_MV="--mobileverify --mobileverify.http 127.0.0.1:21020"
 mkdir -p $F
 [ -f $F/jwt.hex ] || openssl rand -hex 32 > $F/jwt.hex
 if [ ! -d $F/keys ]; then
   mkdir -p $F/keys
   $BIN/examples/h2_keygen --count 4 --seed n42-devnet-validator --out-dir $F/keys > /dev/null
 fi
+[ -n "${PACKETD:-}" ] && pkill -f "^$PACKETD " 2>/dev/null
 pkill -f "^$BIN/examples/h2_validator" 2>/dev/null; pkill -f "^$BIN/n42 node" 2>/dev/null; pkill -f "^$GOV5/build/bin/n42 " 2>/dev/null; sleep 1
 if [ -z "$KEEP" ]; then rm -rf $F/datadir $F/consensus-{0..3} $F/gov5; fi
 RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir \
-  --authrpc.port 18551 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18545 --port 30313 \
+  --authrpc.port 18551 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18545 --http.api eth,net,web3,debug --port 30313 \
   --disable-discovery --ipcdisable > $F/el-$TAG.log 2>&1 &
 for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-$TAG.log 2>/dev/null && break; sleep 1; done
 LAST=3; [ -n "$WITH_GOV5" ] && LAST=2
@@ -57,12 +66,12 @@ for i in $(seq 0 $LAST); do
   if [ "${ABSENT_VALIDATOR:-}" = "$i" ]; then
     rm -rf $F/consensus-$i $F/datadir-late
     own_el() { RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
-        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --port 30323 \
+        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --http.api eth,net,web3,debug --port 30323 \
         --disable-discovery --ipcdisable > $F/el-late-$TAG$1.log 2>&1 &
       for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG$1.log 2>/dev/null && break; sleep 1; done; }
     own_v() { RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
         --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18561 --el-rpc http://127.0.0.1:18555 --jwt $F/jwt.hex \
-        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
+        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} $(mv_flag $i) \
         > $F/v$i-$TAG$1.log 2>&1 & }
     own_el ""; own_v ""
     (sleep ${ABSENT_AT:-300}
@@ -91,18 +100,18 @@ for i in $(seq 0 $LAST); do
           --qmdb $LATE_SNAPSHOT/state.qmdb > $F/init-late-$TAG.log 2>&1
       fi
       RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
-        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --port 30323 \
+        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --http.api eth,net,web3,debug --port 30323 \
         --disable-discovery --ipcdisable > $F/el-late-$TAG.log 2>&1 &
       for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG.log 2>/dev/null && break; sleep 1; done
       RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
         --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18561 --el-rpc http://127.0.0.1:18555 --jwt $F/jwt.hex \
-        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
+        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} $(mv_flag $i) \
         > $F/v$i-$TAG.log 2>&1) > /dev/null 2>&1 &
     continue
   fi
   RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
     --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18551 --el-rpc http://127.0.0.1:18545 --jwt $F/jwt.hex \
-    --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
+    --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} $(mv_flag $i) \
     > $F/v$i-$TAG.log 2>&1 &
   if [ $i = 0 ]; then
     for _ in $(seq 1 30); do grep -aq "node peer id" $F/v0-$TAG.log 2>/dev/null && break; sleep 1; done
@@ -116,13 +125,19 @@ for i in $(seq 0 $LAST); do
       sleep ${GOV5_DELAY:-0}
       $GOV5/build/bin/n42 --chain private --profile n42 --data.dir $F/gov5 --mine --etherbase $ADDR3 \
         --http --http.port 28545 --port 30393 --p2p.no-discovery --p2p.min-sync-peers 0 \
-        --p2p.peer /ip4/127.0.0.1/tcp/19000/p2p/$ID --log.level ${GOV5_LOG:-info} --log.console \
+        --p2p.peer /ip4/127.0.0.1/tcp/19000/p2p/$ID --log.level ${GOV5_LOG:-info} --log.console $GOV5_MV \
         > $F/gov5-$TAG.log 2>&1 &
       sleep 6
       DIALGO="$GOPEER"
     fi
   fi
 done
+if [ "${MOBILEVERIFY:-}" = 1 ] && [ -n "${PACKETD:-}" ]; then
+  for _ in $(seq 1 30); do curl -sf http://127.0.0.1:21010/mobileverify/health >/dev/null && break; sleep 1; done
+  mkdir -p $F/packets
+  $PACKETD -rpc http://127.0.0.1:18545 -mv http://127.0.0.1:21010 -genesis $GENESIS -out $F/packets \
+    -verbosity ${PACKETD_VERBOSITY:-info} > $F/packetd-$TAG.log 2>&1 &
+fi
 sleep $SECS
 echo "=== summary after ${SECS}s ($TAG) ==="
 for i in $(seq 0 $LAST); do
@@ -148,4 +163,8 @@ if [ -n "$WITH_GOV5" ]; then
   echo "gov5: sealed=$(grep -ac 'sealed new block' $GL) committed=$(grep -ac 'block committed' $GL) errors=$(grep -ac '"level":"error"' $GL) height=$(height 28545)"
   H2=$(height 28545); M=$(( ${H2:-0} < ${H1:-0} ? ${H2:-0} : ${H1:-0} ))
   echo "block $M: reth=$(hash_at 18545 $M) gov5=$(hash_at 28545 $M)"
+fi
+if [ "${MOBILEVERIFY:-}" = 1 ]; then
+  for i in $(seq 0 $LAST); do echo "mobileverify v$i: $(curl -s http://127.0.0.1:2101$i/mobileverify/health) latest=$(curl -s http://127.0.0.1:2101$i/mobileverify/latest)"; done
+  [ -n "$WITH_GOV5" ] && echo "mobileverify gov5: $(curl -s http://127.0.0.1:21020/mobileverify/health)"
 fi

@@ -15,7 +15,12 @@ use thiserror::Error;
 pub enum BlsError {
     /// Invalid input length
     #[error("invalid input length: expected {expected}, got {actual}")]
-    InvalidInputLength { expected: usize, actual: usize },
+    InvalidInputLength {
+        /// Length the operation requires, in bytes.
+        expected: usize,
+        /// Length that was supplied, in bytes.
+        actual: usize,
+    },
 
     /// Invalid G1 point
     #[error("invalid G1 point")]
@@ -67,7 +72,7 @@ pub fn bls_precompile_name(address: &Address) -> Option<&'static str> {
 }
 
 /// Validate G1ADD input
-pub fn validate_g1add_input(input: &[u8]) -> BlsResult<()> {
+pub const fn validate_g1add_input(input: &[u8]) -> BlsResult<()> {
     let expected = G1_POINT_SIZE * 2;
     if input.len() != expected {
         return Err(BlsError::InvalidInputLength {
@@ -79,7 +84,7 @@ pub fn validate_g1add_input(input: &[u8]) -> BlsResult<()> {
 }
 
 /// Validate G1MUL input
-pub fn validate_g1mul_input(input: &[u8]) -> BlsResult<()> {
+pub const fn validate_g1mul_input(input: &[u8]) -> BlsResult<()> {
     let expected = G1_POINT_SIZE + SCALAR_SIZE;
     if input.len() != expected {
         return Err(BlsError::InvalidInputLength {
@@ -91,7 +96,7 @@ pub fn validate_g1mul_input(input: &[u8]) -> BlsResult<()> {
 }
 
 /// Validate G2ADD input
-pub fn validate_g2add_input(input: &[u8]) -> BlsResult<()> {
+pub const fn validate_g2add_input(input: &[u8]) -> BlsResult<()> {
     let expected = G2_POINT_SIZE * 2;
     if input.len() != expected {
         return Err(BlsError::InvalidInputLength {
@@ -103,7 +108,7 @@ pub fn validate_g2add_input(input: &[u8]) -> BlsResult<()> {
 }
 
 /// Validate G2MUL input
-pub fn validate_g2mul_input(input: &[u8]) -> BlsResult<()> {
+pub const fn validate_g2mul_input(input: &[u8]) -> BlsResult<()> {
     let expected = G2_POINT_SIZE + SCALAR_SIZE;
     if input.len() != expected {
         return Err(BlsError::InvalidInputLength {
@@ -115,9 +120,9 @@ pub fn validate_g2mul_input(input: &[u8]) -> BlsResult<()> {
 }
 
 /// Validate pairing input (must be multiple of pair size)
-pub fn validate_pairing_input(input: &[u8]) -> BlsResult<()> {
+pub const fn validate_pairing_input(input: &[u8]) -> BlsResult<()> {
     let pair_size = G1_POINT_SIZE + G2_POINT_SIZE;
-    if input.is_empty() || input.len() % pair_size != 0 {
+    if input.is_empty() || !input.len().is_multiple_of(pair_size) {
         return Err(BlsError::InvalidInputLength {
             expected: pair_size,
             actual: input.len(),
@@ -126,8 +131,8 @@ pub fn validate_pairing_input(input: &[u8]) -> BlsResult<()> {
     Ok(())
 }
 
-/// Validate MAP_FP_TO_G1 input
-pub fn validate_map_fp_to_g1_input(input: &[u8]) -> BlsResult<()> {
+/// Validate `MAP_FP_TO_G1` input
+pub const fn validate_map_fp_to_g1_input(input: &[u8]) -> BlsResult<()> {
     if input.len() != FP_SIZE {
         return Err(BlsError::InvalidInputLength {
             expected: FP_SIZE,
@@ -137,8 +142,8 @@ pub fn validate_map_fp_to_g1_input(input: &[u8]) -> BlsResult<()> {
     Ok(())
 }
 
-/// Validate MAP_FP2_TO_G2 input
-pub fn validate_map_fp2_to_g2_input(input: &[u8]) -> BlsResult<()> {
+/// Validate `MAP_FP2_TO_G2` input
+pub const fn validate_map_fp2_to_g2_input(input: &[u8]) -> BlsResult<()> {
     if input.len() != FP2_SIZE {
         return Err(BlsError::InvalidInputLength {
             expected: FP2_SIZE,
@@ -149,7 +154,7 @@ pub fn validate_map_fp2_to_g2_input(input: &[u8]) -> BlsResult<()> {
 }
 
 /// Calculate gas for G1 multiexp operation
-pub fn g1_multiexp_gas(num_pairs: usize) -> u64 {
+pub const fn g1_multiexp_gas(num_pairs: usize) -> u64 {
     if num_pairs == 0 {
         return 0;
     }
@@ -168,7 +173,7 @@ pub fn g1_multiexp_gas(num_pairs: usize) -> u64 {
 }
 
 /// Calculate gas for G2 multiexp operation
-pub fn g2_multiexp_gas(num_pairs: usize) -> u64 {
+pub const fn g2_multiexp_gas(num_pairs: usize) -> u64 {
     if num_pairs == 0 {
         return 0;
     }
@@ -187,7 +192,7 @@ pub fn g2_multiexp_gas(num_pairs: usize) -> u64 {
 }
 
 /// Calculate gas for pairing operation
-pub fn pairing_gas(num_pairs: usize) -> u64 {
+pub const fn pairing_gas(num_pairs: usize) -> u64 {
     BLS12_PAIRING_BASE_GAS + (num_pairs as u64 * BLS12_PAIRING_PAIR_GAS)
 }
 

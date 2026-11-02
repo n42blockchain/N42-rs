@@ -136,8 +136,8 @@ impl ReceiptAggregator {
         }
         // NOTE: N42-26 writes this as an edition-2024 let-chain; this crate is
         // edition 2021, so the binding is nested instead. Same semantics.
-        if self.blocks.len() >= self.max_tracked_blocks {
-            if let Some(oldest) = self
+        if self.blocks.len() >= self.max_tracked_blocks
+            && let Some(oldest) = self
                 .blocks
                 .iter()
                 .min_by_key(|(_, s)| s.block_number)
@@ -145,7 +145,6 @@ impl ReceiptAggregator {
             {
                 self.blocks.remove(&oldest);
             }
-        }
         self.blocks.insert(
             block_hash,
             BlockVerificationStatus::new(

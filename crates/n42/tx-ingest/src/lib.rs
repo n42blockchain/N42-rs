@@ -147,7 +147,7 @@ pub const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub fn is_loopback(addr: &SocketAddr) -> bool {
     match addr.ip() {
         std::net::IpAddr::V4(ip) => ip.is_loopback(),
-        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(ip.is_loopback(), |v4| v4.is_loopback()),
+        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(|| ip.is_loopback(), |v4| v4.is_loopback()),
     }
 }
 
@@ -269,6 +269,7 @@ const ASYNC_FRAMES_IN_FLIGHT: usize = 8;
 
 /// `N42_TX_INGEST_ASYNC_FRAMES`: frames a connection may have recovering
 /// or awaiting admission before its next answer waits; the default above.
+#[allow(dead_code)] // metric accessor kept for the async frame path; not used today
 fn async_frames_in_flight() -> usize {
     static FRAMES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *FRAMES.get_or_init(|| {
@@ -360,7 +361,7 @@ fn physical_cores() -> &'static [usize] {
         let all_logical = recovery_pin() == 2;
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         // SAFETY: sched_getaffinity fills a cpu_set_t of the given size.
-        let ok = unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } == 0;
+        let ok = unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut set) } == 0;
         let mut cpus: Vec<usize> = Vec::new();
         if ok {
             for cpu in 0..(8 * std::mem::size_of::<libc::cpu_set_t>()) {
@@ -409,7 +410,7 @@ fn apply_recovery_affinity_linux() {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(core, &mut set);
         let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
-        libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &raw const set);
     }
 }
 
@@ -429,12 +430,32 @@ fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     })
 }
 
-/// Largest single transaction, in bytes.
-const MAX_TX_BYTES: u32 = 1 << 20;
+/// Largest single transaction, in bytes: twice reth's pool limit (128 KiB of
+/// input), so nothing a pool could take is refused here, and nothing far
+/// larger is read into memory first.
+const MAX_TX_BYTES: u32 = 256 << 10;
+
+/// Largest blob transaction in its network form, sidecar included: six
+/// blobs of 128 KiB and their proofs, with room to spare (audit 2026-10
+/// round 3, R3-G6). Only type 3 may pass [`MAX_TX_BYTES`].
+const MAX_BLOB_TX_BYTES: usize = 1 << 20;
+
+/// Whether a transaction length announced in a frame may be read at all.
+const fn tx_len_readable(len: usize) -> bool {
+    len != 0 && len <= MAX_BLOB_TX_BYTES
+}
+
+/// Whether a transaction read in full is within its type's cap.
+fn tx_size_allowed(raw: &[u8]) -> bool {
+    raw.len() <= MAX_TX_BYTES as usize || raw.first() == Some(&0x03)
+}
 
 /// Bound the retained transaction bytes of one frame independently of its
 /// transaction count. The per-transaction cap alone allowed a 10 GiB frame.
-const MAX_FRAME_BYTES: usize = 64 << 20;
+/// A full frame of transfers is about 1.1 MB; across [`MAX_CONNECTIONS`]
+/// the frames being read hold at most 4 GiB (64 MiB a frame was 16 GiB:
+/// audit 2026-10 round 2, R2-X2).
+const MAX_FRAME_BYTES: usize = 16 << 20;
 
 /// How long to wait between checks when the pool is at its high water mark.
 const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
@@ -894,6 +915,7 @@ fn high_water() -> usize {
 /// gets its parallelism by opening several rather than by this doing anything
 /// clever with one.
 /// Prints the ingest's rate and time split every five seconds, once.
+#[allow(clippy::manual_checked_ops)] // stats line kept as written
 fn spawn_stats_reporter() {
     tokio::spawn(async move {
         let slots = recovery_slot_count();
@@ -1325,7 +1347,7 @@ where
 }
 
 async fn serve_connection<P>(
-    mut stream: TcpStream,
+    stream: TcpStream,
     pool: P,
     cache: Option<reth_evm::SenderRecoveryCache>,
     head: std::sync::Arc<AtomicU64>,
@@ -1333,8 +1355,7 @@ async fn serve_connection<P>(
 ) -> std::io::Result<()>
 where
     P: TransactionPool + Clone + 'static,
-    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
-    P::Transaction: 'static,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope> + 'static,
 {
     let gate = setup.gate;
     let allowance = setup.allowance;
@@ -1423,7 +1444,7 @@ where
             let mut frame_bytes = 0usize;
             for _ in 0..count {
                 let len = stream.read_u32_le().await? as usize;
-                if len == 0 || len > MAX_TX_BYTES as usize {
+                if !tx_len_readable(len) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("transaction of {len} bytes"),
@@ -1445,6 +1466,12 @@ where
                 }
                 frame_buf.resize(len, 0);
                 stream.read_exact(&mut frame_buf[..]).await?;
+                if !tx_size_allowed(&frame_buf) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("transaction of {len} bytes"),
+                    ));
+                }
                 raws.push(Bytes::from(frame_buf.split_to(len).freeze()));
             }
             // The attestation section, read either way and kept only where this
@@ -1857,8 +1884,8 @@ where
     // right for a generator that funds every sender, and the reason this is
     // opt-in.
     let installed = if setup.direct && setup.queue.is_none() { n42_tx_queue::global::<P::Transaction>() } else { None };
-    if setup.direct {
-        if let Some(queue) = setup.queue.as_ref().or(installed.as_ref()) {
+    if setup.direct
+        && let Some(queue) = setup.queue.as_ref().or(installed.as_ref()) {
             // The frame's transactions stay in its index entry, so the vote
             // road takes the frame by reference (`TxQueue::push_frame`).
             let noted = frame.is_some();
@@ -1872,12 +1899,18 @@ where
             STATS.pool_ns.fetch_add((started.elapsed() - recovered_at).as_nanos() as u64, Ordering::Relaxed);
             return u32::try_from(count).unwrap_or(u32::MAX);
         }
-    }
     // `External`, the same origin `eth_sendRawTransaction` uses for a
     // transaction that did not come from this node: it is validated, priced and
     // gossiped exactly as one that arrived over RPC.
     let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
-    if let Some(queue) = setup.queue.clone().or_else(n42_tx_queue::global::<P::Transaction>) {
+    // Whole only if the pool holds every transaction: a refused frame noted
+    // would take one of the index's bounded slots and evict an admitted one
+    // (audit 2026-10 round 2, R2-X3).
+    let whole = results.iter().all(|outcome| match outcome {
+        Ok(_) => true,
+        Err(err) => matches!(err.kind, reth_transaction_pool::error::PoolErrorKind::AlreadyImported),
+    });
+    if whole && let Some(queue) = setup.queue.clone().or_else(n42_tx_queue::global::<P::Transaction>) {
         note_frame(&queue, frame);
     }
     STATS.frames.fetch_add(1, Ordering::Relaxed);
@@ -2167,6 +2200,16 @@ where
                 STATS.dropped_altsig_disabled.fetch_add(1, Ordering::Relaxed);
                 if drop_warn_allowed() {
                     warn!(target: "n42.tx_ingest", dropped = 1, "a 0x50 transaction on a chain that does not enable them");
+                }
+                continue;
+            }
+            // The attestation vouches for the signature, not for the key:
+            // one the verified path would refuse (algorithm, length, a weak
+            // point) is dropped here too. A key-cache lookup, no signature.
+            if let Err(err) = alt_tx.tx().ed25519_key() {
+                STATS.dropped_altsig.fetch_add(1, Ordering::Relaxed);
+                if drop_warn_allowed() {
+                    warn!(target: "n42.tx_ingest", hash = %alt_tx.hash(), %err, "an attested 0x50 transaction with a key the type refuses");
                 }
                 continue;
             }
@@ -2671,6 +2714,24 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Audit 2026-10 round 3 (R3-G6): the 256 KiB cap refused a blob
+    /// transaction carrying its sidecar (six blobs are 768 KiB) and dropped
+    /// the connection. Type 3 has its own cap; every other type keeps 256 KiB.
+    #[test]
+    fn a_blob_transaction_with_its_sidecar_is_not_refused_for_size() {
+        let six_blobs = 6 * 131_072 + 40_000;
+        assert!(tx_len_readable(six_blobs));
+        let mut blob = vec![0u8; six_blobs];
+        blob[0] = 0x03;
+        assert!(tx_size_allowed(&blob), "a type-3 transaction with six blobs");
+        let mut other = vec![0u8; six_blobs];
+        other[0] = 0x02;
+        assert!(!tx_size_allowed(&other), "any other type past 256 KiB");
+        assert!(tx_size_allowed(&other[..MAX_TX_BYTES as usize]));
+        assert!(!tx_len_readable(0));
+        assert!(!tx_len_readable(MAX_BLOB_TX_BYTES + 1));
+    }
 
     /// Loopback binds silently; anything else needs the escape hatch, and
     /// a trusting mode refuses it even then.

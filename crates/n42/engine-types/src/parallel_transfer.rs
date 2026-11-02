@@ -24,11 +24,11 @@ use alloy_primitives::{Address, U256};
 use n42_tx_types::{Block, N42Primitives as EthPrimitives, Receipt};
 use alloy_consensus::TransactionEnvelope as _;
 use reth_evm::{
-    execute::{BlockExecutionError, BlockExecutor as _, BlockExecutorFactory},
+    execute::{BlockExecutionError, BlockExecutor as _},
     ConfigureEvm, Evm as _, EvmFactory as _,
 };
 use reth_execution_types::BlockExecutionOutput;
-use reth_primitives_traits::{RecoveredBlock, SignedTransaction};
+use reth_primitives_traits::{RecoveredBlock};
 use reth_revm::db::State;
 use revm::{
     context::TxEnv,
@@ -41,7 +41,7 @@ use crate::fast_transfer::N42EvmFactory;
 
 /// The block executor factory of a node with the transfer path: what
 /// [`execute_transfers`] requires of its EVM configuration.
-pub type FastExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<reth_chainspec::ChainSpec>;
+pub type FastExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<n42_header::N42ChainSpec>;
 
 /// The executor's phase timings, in milliseconds: partitioning, the groups'
 /// execution (wall), the merge into the block's state, the finish.
@@ -681,7 +681,7 @@ pub fn partition(txs: &[TxEnv], beneficiary: Address) -> Result<(Vec<Vec<usize>>
 /// back, which is exactly what a leg has to confirm.
 pub fn partition_hash() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARTITION_HASH").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARTITION_HASH", false))
 }
 
 /// A 64-bit hash of an address, for [`partition_shared`]'s duplicate search.
@@ -1899,7 +1899,7 @@ impl<T> BuildRun<T> {
 /// by default until a four-node leg measures it.
 pub fn build_collect_in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_COLLECT_IN_PLACE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_BUILD_COLLECT_IN_PLACE", false))
 }
 
 /// Folds bundles that were each computed against the parent's state into
@@ -3830,7 +3830,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set, Dispatch::from_env(), None, None, false)
 }
 
 /// [`execute_for_build_in_place`] with the dispatch chosen by the caller
@@ -3851,7 +3851,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), None, None, false)
 }
 
 fn execute_for_build_run<T, G>(
@@ -3868,7 +3868,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), None, None, false)
 }
 
 /// [`execute_for_build_in_place_after`] (with `before_batches` optional) with
@@ -3888,13 +3888,14 @@ pub fn execute_for_build_counted<T, G>(
     before_batches: Option<&mut dyn FnMut() -> bool>,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
     prepared: Option<PreparedExec<T>>,
+    includable: bool,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set(), Dispatch::from_env(), tip_of, prepared, includable)
 }
 
 /// [`execute_for_build_counted`] with the dispatch chosen by the caller: for
@@ -3916,7 +3917,7 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared)
+    execute_for_build_opts(evm_env, keys, convert, open, None, in_place, None, read_set(), Dispatch::from_one_wave(one_wave), tip_of, prepared, false)
 }
 
 /// [`execute_for_build_in_place`] with the [`Dispatch`] chosen by the caller:
@@ -3935,10 +3936,11 @@ where
     G: Database + std::fmt::Debug + Send + AccountHint,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None)
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, true, None, read_set(), dispatch, None, None, false)
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(deprecated)] // gas_used keeps the pre-EIP-8037 meaning the hot path was measured with
 fn execute_for_build_opts<T, G>(
     evm_env: &reth_evm::EvmEnv,
     keys: &[(Address, Address)],
@@ -3951,6 +3953,7 @@ fn execute_for_build_opts<T, G>(
     dispatch: Dispatch,
     tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
     prepared: Option<PreparedExec<T>>,
+    includable: bool,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -4033,6 +4036,9 @@ where
     // `N42_BUILD_MLP=<k>`: the lookahead distance, 0 when off.
     let mlp_k = build_mlp();
     phases.mlp_k = mlp_k;
+    // Audit R3-E3: the block's gas, against which each transfer's gas limit
+    // is checked by its index ([`crate::includability::fits_block_gas`]).
+    let block_gas_limit = evm_env.block_env.gas_limit;
     let run_batch = |members: &Vec<&Vec<usize>>| -> Result<BatchResult, NotParallel> {
         let start_us = batches_at.elapsed().as_micros() as u64;
         let cpu_start = ThreadMark::now();
@@ -4072,8 +4078,15 @@ where
             let mut ahead: std::collections::VecDeque<(usize, T, TxEnv)> =
                 std::collections::VecDeque::with_capacity(if mlp_k > 0 { mlp_k + 1 } else { 0 });
             let (mut pos, mut filled) = (0usize, 0usize);
+            // Audit R3-E1 (`includable`, deferred execution): each sender's
+            // summed worst-case cost against its balance before its first
+            // transfer, as the follower checks it. A group is one sender's
+            // transfers (`partition_by_sender`), so the run opens at each
+            // group's first transfer.
+            let mut ledger = crate::includability::RunLedger::new();
             for group in members {
                 let mut rest = group.iter();
+                let mut first = true;
                 for &i in rest.by_ref() {
                     // `N42_PHASE_TIMERS=1`: one transaction in
                     // `LOOP_SAMPLE_STRIDE` timed by section.
@@ -4124,8 +4137,24 @@ where
                         }
                     };
                     let t1 = mark();
+                    // Audit R3-E3: the gas limit within the block's gas left
+                    // (refused like a transfer the path does not take).
+                    if !crate::includability::fits_block_gas(i, env.gas_limit, crate::fast_transfer::TRANSFER_GAS, block_gas_limit) {
+                        skipped.push(i);
+                        break;
+                    }
                     match evm.transfer_plain(&env) {
                         Ok(Some((plain, result))) => {
+                            // Checked before the commit: a transfer refused
+                            // here leaves the batch's state as it was.
+                            if includable {
+                                let worst = revm::context_interface::Transaction::max_balance_spending(&env).unwrap_or(U256::MAX);
+                                if !ledger.admit(plain.caller, first, plain.sender.balance, worst) {
+                                    skipped.push(i);
+                                    break;
+                                }
+                            }
+                            first = false;
                             let t2 = mark();
                             let gas_used = result.gas_used();
                             let t3 = mark();
@@ -4339,7 +4368,7 @@ where
 /// check and the wait for the parent, instead of inside the execution gate.
 pub fn follower_partition_ahead() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARTITION_AHEAD").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARTITION_AHEAD", false))
 }
 
 /// Whether `N42_FOLLOWER_MERGE_BEHIND=1` is set: with the streamed graft, the
@@ -4418,7 +4447,7 @@ fn graft_base_swap() -> bool {
 /// Nothing reads any of it again, so the only cost is a job on the pool.
 pub fn free_async() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_FREE_ASYNC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_FREE_ASYNC", false))
 }
 
 /// Whether `N42_FOLLOWER_GRAFT=1` is set: the follower folds the groups'
@@ -4428,7 +4457,7 @@ pub fn free_async() -> bool {
 /// accounts).
 pub fn follower_graft() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_GRAFT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_GRAFT", false))
 }
 
 /// A block's transfers planned ahead of their execution: the transactions'
@@ -4560,12 +4589,20 @@ pub fn follower_batch_state() -> bool {
     *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_BATCH_STATE", true))
 }
 
+/// Whether block transaction `i` fits the block's gas left after `i`
+/// transfers on the path (audit R3-E3, [`crate::includability::fits_block_gas`]).
+#[inline(always)]
+fn fits_block_gas_at(i: usize, tx: &TxEnv, evm_env: &reth_evm::EvmEnv) -> bool {
+    crate::includability::fits_block_gas(i, tx.gas_limit, crate::fast_transfer::TRANSFER_GAS, evm_env.block_env.gas_limit)
+}
+
 /// One follower batch on the leader's cuts ([`follower_batch_state`]): the
 /// batch's groups in order, each transfer straight into a
 /// [`crate::batch_state::BatchState`] over `db`, and the batch's bundle with
 /// the gas each transaction used. A transaction the transfer path does not
 /// take, or a change the batch state does not model, sends the block to the
 /// serial executor as before.
+#[allow(deprecated)] // gas_used keeps the pre-EIP-8037 meaning the hot path was measured with
 fn follower_batch<G>(
     members: &[&Vec<usize>],
     txs: &[TxEnv],
@@ -4583,6 +4620,13 @@ where
     {
         let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
         for &i in members.iter().flat_map(|group| group.iter()) {
+            // Audit R3-E3: every transaction before this one in the block is
+            // a transfer on this path (or the block is not parallel), so
+            // `i * 21,000` gas is used before it, as the serial executor
+            // counts it; one that does not fit goes to that executor.
+            if !fits_block_gas_at(i, &txs[i], evm_env) {
+                return Err(NotParallel::Failed(i, "gas limit over the block's gas left".to_string()));
+            }
             match evm.transfer_plain(&txs[i]) {
                 Ok(Some((plain, result))) => {
                     gas.push((i, result.gas_used()));
@@ -4600,6 +4644,7 @@ where
 /// the grafted reverts' sort beside the rest of the merge
 /// ([`follower_merge_behind`]).
 #[allow(clippy::too_many_arguments)]
+#[allow(deprecated)] // gas_used keeps the pre-EIP-8037 meaning the hot path was measured with
 pub fn execute_transfers_with_plan<EvmConfig, DB, G>(
     evm_config: &EvmConfig,
     block: &RecoveredBlock<Block>,
@@ -4693,6 +4738,10 @@ where
                         let mut evm =
                             N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
                         for &i in members.iter().flat_map(|g| g.iter()) {
+                            // Audit R3-E3, as in `follower_batch`.
+                            if !fits_block_gas_at(i, &txs[i], &evm_env) {
+                                return Err(NotParallel::Failed(i, "gas limit over the block's gas left".to_string()));
+                            }
                             match evm.transfer(&txs[i]) {
                                 Ok(Some(out)) => {
                                     gas.push((i, out.result.gas_used()));
@@ -4898,7 +4947,7 @@ where
 /// default.
 pub fn follower_build_path() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_BUILD_PATH").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_BUILD_PATH", false))
 }
 
 /// A block executed on the build path ([`execute_transfers_build_path`]):
@@ -5057,11 +5106,12 @@ impl BuildPathTx for n42_tx_types::N42TxEnvelope {
 #[derive(Debug, Clone, Copy)]
 pub struct BuildPathBlock<'a, T> {
     /// The header.
-    pub header: &'a alloy_consensus::Header,
+    pub header: &'a n42_header::N42Header,
     /// The owned block, when there is one: its executor context is the
     /// configuration's own (`context_for_block`).
     pub sealed: Option<&'a reth_primitives_traits::SealedBlock<Block>>,
-    /// The ommers (a described block has none).
+    /// The ommers (a described block has none; no N42 chain has any, and
+    /// the executor's ommer rewards read Ethereum headers).
     pub ommers: &'a [alloy_consensus::Header],
     /// The withdrawals, as the block's body lists them.
     pub withdrawals: Option<&'a [alloy_eips::eip4895::Withdrawal]>,
@@ -5077,7 +5127,7 @@ impl<'a> BuildPathBlock<'a, n42_tx_types::N42TxEnvelope> {
         Self {
             header: block.header(),
             sealed: Some(block.sealed_block()),
-            ommers: &block.body().ommers,
+            ommers: &[],
             withdrawals: block.body().withdrawals.as_ref().map(|w| w.as_slice()),
             txs: &block.body().transactions,
             senders: block.senders(),
@@ -5313,7 +5363,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{Header, Signed, TxEip1559};
+    use alloy_consensus::{Signed, TxEip1559};
+    use n42_header::N42Header as Header;
     use alloy_primitives::{Bytes, Signature, TxKind, B256};
     use reth_chainspec::MAINNET;
     use reth_ethereum_primitives::TransactionSigned;
@@ -5366,9 +5417,20 @@ mod tests {
     /// A block of `n` transfers among `senders` accounts, every sender
     /// paying a few recipients in turn, some of them fresh, some shared.
     fn fixture(senders: u64, per: u64) -> (RecoveredBlock<Block>, CacheDB<EmptyDB>) {
+        fixture_with(senders, per, 1_000_000_000, None)
+    }
+
+    /// [`fixture`] with every transfer's priority fee `tip` (at 0 the block
+    /// pays its beneficiary nothing: the base fee is burned) and, with
+    /// `zero_value_to`, the fresh recipient shared by the senders replaced by
+    /// that funded account, sent nothing.
+    fn fixture_with(senders: u64, per: u64, tip: u128, zero_value_to: Option<Address>) -> (RecoveredBlock<Block>, CacheDB<EmptyDB>) {
         let mut db = CacheDB::new(EmptyDB::default());
         let beneficiary = addr(1);
         db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
+        if let Some(to) = zero_value_to {
+            db.insert_account_info(to, AccountInfo { balance: U256::from(9), nonce: 1, ..Default::default() });
+        }
         let mut txs = Vec::new();
         let mut recovered = Vec::new();
         for s in 0..senders {
@@ -5377,19 +5439,20 @@ mod tests {
             for k in 0..per {
                 // Recipients: another sender (shared), a fresh account, and
                 // the same fresh account again from a different sender.
-                let to = match k % 3 {
-                    0 => addr(100 + (s + 1) % senders),
-                    1 => addr(10_000 + s * per + k),
-                    _ => addr(20_000 + k),
+                let (to, value) = match (k % 3, zero_value_to) {
+                    (0, _) => (addr(100 + (s + 1) % senders), 1_000 + k),
+                    (1, _) => (addr(10_000 + s * per + k), 1_000 + k),
+                    (_, Some(to)) => (to, 0),
+                    _ => (addr(20_000 + k), 1_000 + k),
                 };
                 let inner = TxEip1559 {
                     chain_id: 1,
                     nonce: 3 + k,
                     gas_limit: 21_000,
                     max_fee_per_gas: 10_000_000_000,
-                    max_priority_fee_per_gas: 1_000_000_000,
+                    max_priority_fee_per_gas: tip,
                     to: TxKind::Call(to),
-                    value: U256::from(1_000 + k),
+                    value: U256::from(value),
                     input: Bytes::new(),
                     ..Default::default()
                 };
@@ -5401,7 +5464,7 @@ mod tests {
         }
         // Past the merge on mainnet, so the serial executor pays no
         // block reward: the builder path credits only the fees.
-        let header = Header {
+        let header = n42_header::N42Header::from(alloy_consensus::Header {
             number: 20_000_000,
             beneficiary,
             gas_limit: 1_000_000_000,
@@ -5413,7 +5476,7 @@ mod tests {
             excess_blob_gas: Some(0),
             requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
-        };
+        });
         let body = n42_tx_types::BlockBody {
             transactions: txs,
             ommers: Vec::new(),
@@ -5589,7 +5652,7 @@ mod tests {
     #[test]
     fn the_build_path_by_reference_matches_the_owned_block() {
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let (owned, _) = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone()))
             .expect("no execution error")
             .expect("the block qualifies on the build path");
@@ -5632,7 +5695,7 @@ mod tests {
     #[test]
     fn the_build_path_matches_the_follower_path_and_the_serial_executor() {
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
         let (follower, _) = execute_transfers_with(&evm_config, &block, db.clone(), &|| Some(db.clone()), true, false)
             .expect("no execution error")
@@ -5664,6 +5727,74 @@ mod tests {
         assert_eq!(hashed.accounts, theirs.accounts, "the hashed accounts");
     }
 
+    /// R3-E2, the rule every Rust path follows: an account a block touches
+    /// but leaves unchanged writes no QMDB leaf. A block whose tips are all
+    /// zero credits its beneficiary nothing, and revm's bundle keeps an
+    /// account only when its transition has a revert
+    /// (`BundleState::apply_transitions_and_create_reverts`), so the touched
+    /// but unchanged beneficiary is absent from the serial executor's bundle;
+    /// the parallel paths, which commit the beneficiary only for a non-zero
+    /// credit, agree. The same holds for the recipient of a zero-value
+    /// transfer that exists and stays as it was. gov5's serial path writes
+    /// both (an `AddBalance` of zero to an account not yet loaded dirties it),
+    /// its parallel path does not; the cross-client fix is a gated gov5 rule
+    /// (docs/audit/2026-10-5m/R3_E2.md), not a change here.
+    #[test]
+    fn an_unchanged_account_writes_no_leaf_on_any_path() {
+        let unchanged = addr(30_000);
+        let (block, db) = fixture_with(8, 6, 0, Some(unchanged));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
+        let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
+        let beneficiary = block.header().beneficiary;
+        let keys = [
+            n42_twig_core::qmdb_compat::gov5_account_key(&beneficiary.0 .0),
+            n42_twig_core::qmdb_compat::gov5_account_key(&unchanged.0 .0),
+        ];
+        let no_leaf = |ops: &n42_twig_core::qmdb_compat::QmdbOps, what: &str| {
+            let ops = ops.to_operations();
+            assert!(!ops.is_empty(), "{what}: the block writes leaves");
+            for key in &keys {
+                assert!(ops.iter().all(|op| op.key != *key), "{what}: a leaf for an unchanged account");
+            }
+        };
+        for address in [beneficiary, unchanged] {
+            assert!(!serial.state.state.contains_key(&address), "serial: {address} in the bundle");
+        }
+        let serial_ops = n42_qmdb_reth::sorted_operations_from_execution(&serial.state, true);
+        no_leaf(&serial_ops, "serial");
+        for (graft, sender_groups, ahead, merge_behind) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (false, true, false, false),
+            (true, false, true, true),
+            (true, true, true, false),
+            (false, false, false, true),
+        ] {
+            let what = format!("graft {graft}, sender groups {sender_groups}, ahead {ahead}, merge behind {merge_behind}");
+            let plan = ahead.then(|| plan_transfers(&evm_config, &block).expect("a plan"));
+            let (parallel, _) =
+                execute_transfers_with_plan(&evm_config, &block, db.clone(), &|| Some(db.clone()), graft, sender_groups, plan, merge_behind)
+                    .expect("no execution error")
+                    .expect("the block qualifies");
+            for address in [beneficiary, unchanged] {
+                assert!(!parallel.state.state.contains_key(&address), "{what}: {address} in the bundle");
+            }
+            assert_same_bundle(&parallel.state, &serial.state, &what);
+            let ops = n42_qmdb_reth::sorted_operations_from_execution(&parallel.state, true);
+            assert_eq!(ops, serial_ops, "{what}: the QMDB operations");
+        }
+        let (sharded, _) = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone()))
+            .expect("no execution error")
+            .expect("the block qualifies on the build path");
+        let overlaps = sharded.shards.overlaps(&sharded.residual);
+        let view = sharded.shards.view(&sharded.residual, &overlaps);
+        let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, true);
+        assert_eq!(ops, serial_ops, "the build path: the QMDB operations");
+        no_leaf(&ops, "the build path");
+        assert_same_bundle(&sharded.merged(), &serial.state, "the build path");
+    }
+
     /// A block the build path cannot reproduce exactly is refused, never
     /// executed short: a transfer its sender cannot pay is a skip on the
     /// leader's path and a `NotParallel` here.
@@ -5671,7 +5802,7 @@ mod tests {
     fn the_build_path_refuses_a_block_it_would_skip_a_transfer_of() {
         let (block, mut db) = fixture(4, 3);
         db.insert_account_info(addr(101), AccountInfo { balance: U256::from(1u64), nonce: 3, ..Default::default() });
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let refused = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone())).expect("no execution error");
         assert!(refused.is_err(), "an unfunded transfer sends the block elsewhere");
     }
@@ -5682,7 +5813,7 @@ mod tests {
 
     fn parallel_matches_serial_planned(graft: bool, sender_groups: bool, ahead: bool, merge_behind: bool) {
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
         // A plan made the way the follower makes it ahead; used only when its
         // grouping is the one asked for.
@@ -6298,7 +6429,7 @@ mod tests {
     fn build_run_matches_serial() {
         use alloy_consensus::Transaction as _;
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
@@ -6376,7 +6507,7 @@ mod tests {
     #[test]
     fn the_read_set_run_equals_the_plain_run() {
         let (block, db) = random_fixture(40, 12, 300, 3, 5);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6432,7 +6563,7 @@ mod tests {
                 db.insert_account_info(addr(100 + s), AccountInfo { balance: five, nonce: 0, ..Default::default() });
             }
             let evm_config =
-                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
             let evm_env = evm_config.evm_env(block.header()).expect("env");
             let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
             let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6497,7 +6628,7 @@ mod tests {
         for (senders, per, space, run) in [(400u64, 50u64, 0u64, 50usize), (300, 30, 0, 1), (200, 40, 2_000, 7)] {
             let (block, db) = random_fixture(senders, per, space, run, 5);
             let evm_config =
-                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
             let evm_env = evm_config.evm_env(block.header()).expect("env");
             let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
             let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6668,7 +6799,7 @@ mod tests {
                 }
             }
             let evm_config =
-                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
             let evm_env = evm_config.evm_env(block.header()).expect("env");
             let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
             let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6847,7 +6978,7 @@ mod tests {
     #[test]
     fn a_staged_graft_lands_where_the_graft_does() {
         let (block, db) = fixture(8, 6);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -6888,7 +7019,7 @@ mod tests {
     #[test]
     fn a_later_touch_of_a_grafted_account_keeps_the_grafts_revert() {
         let (block, db) = fixture(3, 2);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
@@ -7042,7 +7173,7 @@ mod tests {
             }
             k += run;
         }
-        let header = Header {
+        let header = n42_header::N42Header::from(alloy_consensus::Header {
             number: 20_000_000,
             beneficiary,
             gas_limit: 10_000_000_000,
@@ -7054,7 +7185,7 @@ mod tests {
             excess_blob_gas: Some(0),
             requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
-        };
+        });
         let body = n42_tx_types::BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(Vec::new().into()) };
         let block = SealedBlock::seal_slow(Block { header, body });
         (RecoveredBlock::new_sealed(block, recovered), db)
@@ -7099,7 +7230,7 @@ mod tests {
         let (senders, per, space, run) =
             (env("BENCH_SENDERS", 380), env("BENCH_PER", 429), env("BENCH_SPACE", 0), env("BENCH_RUN", 64));
         let (block, mut db) = random_fixture(senders, per, space, run as usize, env("BENCH_SPREAD", 8));
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let mut distinct: std::collections::HashSet<Address> = Default::default();
         for (sender, tx) in block.transactions_with_sender() {
             distinct.insert(*sender);
@@ -7358,8 +7489,8 @@ mod tests {
                 n42_tx_types::N42TxEnvelope::from(TransactionSigned::from(signed))
             })
             .collect();
-        let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() });
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
         let convert = |i: usize| (Recovered::new_unchecked(signed[i].clone(), envs[i].caller), envs[i].clone());
@@ -7727,7 +7858,7 @@ mod tests {
     #[test]
     fn the_hash_partition_is_the_serial_one_on_a_full_block() {
         let (block, _) = random_fixture(64, 200, 0, 64, 8);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("an environment");
         let txs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
         let beneficiary = evm_env.block_env.beneficiary;
@@ -7750,7 +7881,7 @@ mod tests {
         let senders = block.senders().to_vec();
         block = RecoveredBlock::new_unhashed(raw, senders);
         let _ = hash;
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let out = execute_transfers(&evm_config, &block, db.clone(), &|| Some(db.clone())).expect("no execution error");
         assert!(matches!(out, Err(NotParallel::TouchesBeneficiary(0))), "{out:?}");
     }
@@ -7785,7 +7916,7 @@ mod tests {
         for (senders, per, space, run) in [(400u64, 50u64, 0u64, 50usize), (300, 30, 0, 1), (200, 40, 2_000, 7)] {
             let (block, db) = random_fixture(senders, per, space, run, 5);
             let evm_config =
-                crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+                crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
             let evm_env = evm_config.evm_env(block.header()).expect("env");
             let beneficiary = evm_env.block_env.beneficiary;
             let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
@@ -7871,7 +8002,7 @@ mod tests {
         for r in (0..2_000u64).step_by(3) {
             db.insert_account_info(addr(1_000_000 + r), AccountInfo { balance: U256::from(5 + r), nonce: r % 4, ..Default::default() });
         }
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let beneficiary = evm_env.block_env.beneficiary;
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
@@ -8078,8 +8209,8 @@ mod tests {
                 envs.push(env);
             }
         }
-        let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() });
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
         let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
         let convert = |i: usize| ((), envs[i].clone());
@@ -8270,8 +8401,8 @@ mod tests {
                 }));
             }
         }
-        let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() });
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
         let keys: Vec<(Address, Address)> =
             cands.iter().map(|tx| (tx.sender(), alloy_consensus::Transaction::to(&tx.transaction).unwrap_or_default())).collect();
@@ -8463,5 +8594,97 @@ mod tests {
             drop(run);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plain transfers of 21,000 gas at a 10 gwei fee cap and a 1 gwei tip
+    /// (2 gwei effective at the 1 gwei base fee), value 1, `(sender, nonce)`
+    /// each, on a block of `gas_limit`; the senders hold `balances`.
+    fn includability_case(
+        gas_limit: u64,
+        balances: &[(u64, U256)],
+        txs: &[(u64, u64)],
+    ) -> (reth_evm::EvmEnv, Vec<TxEnv>, CacheDB<EmptyDB>) {
+        let mut db = CacheDB::new(EmptyDB::default());
+        let beneficiary = addr(1);
+        db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
+        for (s, balance) in balances {
+            db.insert_account_info(addr(*s), AccountInfo { balance: *balance, ..Default::default() });
+        }
+        let envs = txs
+            .iter()
+            .map(|(s, nonce)| TxEnv {
+                caller: addr(*s),
+                kind: TxKind::Call(addr(1_000_000 + s * 1_000 + nonce)),
+                value: U256::from(1),
+                gas_limit: 21_000,
+                gas_price: 10_000_000_000,
+                gas_priority_fee: Some(1_000_000_000),
+                nonce: *nonce,
+                tx_type: 2,
+                chain_id: Some(1),
+                ..Default::default()
+            })
+            .collect();
+        let header = n42_header::N42Header::from(alloy_consensus::Header {
+            number: 20_000_000,
+            beneficiary,
+            gas_limit,
+            base_fee_per_gas: Some(1_000_000_000),
+            timestamp: 1_800_000_000,
+            ..Default::default()
+        });
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(std::sync::Arc::new(n42_header::N42ChainSpec::from(MAINNET.clone())), N42EvmFactory::with_fast_transfers(true));
+        (evm_config.evm_env(&header).expect("env"), envs, db)
+    }
+
+    fn run_includable(
+        evm_env: &reth_evm::EvmEnv,
+        envs: &[TxEnv],
+        db: &CacheDB<EmptyDB>,
+        includable: bool,
+    ) -> BuildRun<()> {
+        let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
+        let shared = SharedDb(std::sync::Arc::new(db.clone()));
+        execute_for_build_counted(evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(shared.clone()), None, false, None, None, None, includable)
+            .expect("a block of transfers")
+    }
+
+    /// Audit R3-E1, the parallel step: a sender whose balance covers each of
+    /// its two transfers at the fee cap alone (and both at the effective
+    /// price) but not both at the fee cap gets one in; the follower's rule
+    /// sums the worst case against the parent's balance. Without the ledger
+    /// (reth's rule) both execute.
+    #[test]
+    fn the_build_run_keeps_a_senders_worst_case_within_its_balance() {
+        let worst = U256::from(21_000u64 * 10_000_000_000 + 1);
+        let (evm_env, envs, db) = includability_case(
+            1_000_000,
+            &[(100, worst * U256::from(2) - U256::from(1)), (101, U256::from(10u128.pow(21)))],
+            &[(100, 0), (100, 1), (101, 0), (101, 1)],
+        );
+        let run = run_includable(&evm_env, &envs, &db, true);
+        assert_eq!(run.skipped, vec![1], "sender 100's second transfer is skipped");
+        assert_eq!(run.executed.len(), 3);
+        let reth = run_includable(&evm_env, &envs, &db, false);
+        assert!(reth.skipped.is_empty(), "reth's rule takes both: {:?}", reth.skipped);
+    }
+
+    /// Audit R3-E3: a transfer whose gas limit no longer fits the block's
+    /// remaining gas (three 21,000 transfers already fill 63,000) is not
+    /// taken, ledger or not.
+    #[test]
+    fn the_build_run_keeps_the_block_gas() {
+        let rich = U256::from(10u128.pow(21));
+        let (evm_env, envs, db) = includability_case(
+            63_000,
+            &[(100, rich), (101, rich), (102, rich), (103, rich)],
+            &[(100, 0), (101, 0), (102, 0), (103, 0)],
+        );
+        for includable in [false, true] {
+            let run = run_includable(&evm_env, &envs, &db, includable);
+            assert_eq!(run.skipped, vec![3], "the fourth transfer does not fit");
+            let gas: u64 = run.executed.iter().map(|built| built.gas_used).sum();
+            assert!(gas <= 63_000);
+        }
     }
 }

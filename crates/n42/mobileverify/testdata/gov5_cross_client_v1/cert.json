@@ -1,0 +1,67 @@
+{
+  "_doc": "Certificate for header.json's full header: all four devices committed (registry.json order); devices 0,1,3 attest the header's ReceiptHash (majority), device 2 attests minority_root. Collector.Close aggregates each root bucket: indices sorted, signatures summed in G2 in index order (aggregate_signature, 96-byte compressed), mask per mask.json. Verification: decode the mask under the registry bound, sum the listed pubkeys in G1 (aggregate_pubkey), one Verify(aggregate_pubkey, message, dst BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_). cohort_coordinator_response = GET /mobileverify/cert/<hash> as production serves it (CohortCoordinator stores only the majority bucket; ties -> smaller root hex): a JSON array of one object, keys in struct order blockHash, blockNumber, receiptsRoot (0x), aggregateSig, signerMask (hex WITHOUT 0x), signers, windowClosedAt; body ends in \\n. windowClosedAt is the node's wall clock at close (1784372090000 here; the production coordinator's real run was checked to store the same aggregate and mask). window_manager_response = the test-only WindowManager variant, which stores every bucket, majority first. no_cert_response = the 404 before any window closed.",
+  "block_hash": "52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb",
+  "block_number": 4000123,
+  "majority_root": "0505050505050505050505050505050505050505050505050505050505050505",
+  "minority_root": "00000000000000000000000000000000000000000000000000000000000000bd",
+  "message": "52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb7b093d00000000000505050505050505050505050505050505050505050505050505050505050505",
+  "registry_index_bound": 4,
+  "signer_indices": [
+    0,
+    2,
+    3
+  ],
+  "signer_pubkeys": [
+    {
+      "index": 0,
+      "device": 0,
+      "pubkey": "a5e80bb7b744af578d5d12ae02ca2333fbe138b3c12c12ac4487638f896ed0601884e77b398f849ce279760e531f73e1"
+    },
+    {
+      "index": 2,
+      "device": 1,
+      "pubkey": "9199593a963d8bee9880178aee19c73192cf5dddefec2a423630a1faf85a63d991031f1b64f0e5176aa8086208eb0605"
+    },
+    {
+      "index": 3,
+      "device": 3,
+      "pubkey": "ad28c09d369a40c5d6317f8aeb5cfdc85c7a6321db19bd10512f0a0acac684c930f51b8a5b9960d9b001a62294b2df13"
+    }
+  ],
+  "signer_signatures": [
+    {
+      "index": 0,
+      "device": 0,
+      "signature": "a9ed9fec001386bd1fab6f4698ff9a9fdbe4570871c1dfa87adac4fe2976e5297d76c74131f4005f40c815ff3df11fbb08aae89119b02ee5f34bd864d59b53d814f7161f4433693466e873809a41798527db86e3827aec86513ceacea5c44b9a"
+    },
+    {
+      "index": 2,
+      "device": 1,
+      "signature": "8cb0ca2c0c87b1c767aa0f74122daedcdfa90ecf7947049556b5a247744f588d84772f451b18dcd8b4017690a1653e5702acb4e21d245be39c513c7cf63e8a6ea2305cc8c0bbf846d573fc6f065799d74f7e29453a419bc29c444ab6c063b838"
+    },
+    {
+      "index": 3,
+      "device": 3,
+      "signature": "83ad938ca244655cd72ec1c64c5ca4939ce134fdc076192b46d8c039a6b20eb8e0f5ed18e18cc5acd7d847248dce71900357c98396e92e523813e8dc752c30def465a9bb7f0552cff29606aae0a0417a2be271607f8d58707d03eadb4a7cbc73"
+    }
+  ],
+  "aggregate_pubkey": "b6605a45e302deb1858407bf1b3a5ffdc97a9e560a1850ecfda92b34fdb880ae0d6f38d0c964ccec3a848246bcdbf98e",
+  "aggregate_signature": "832039c77f3e2f79a866504945c4105d63710d1e374beb6466bb53fdd399b4e361425585e68dd0691c137d07af61ce1a1799ebb5b2871904623d7074be4a1bf28600a3729904ddac76e6b5d54bb1420716f4e17c31bc76a7e431c6e518cbb49c",
+  "signer_mask": "03000100",
+  "minority_bucket": {
+    "aggregate_signature": "834085d2d07fbfa0c7121a6b962cc80b38f1d0fc4345dd45f92642bdd5a9e02ac01985222df1ab16f5cb597ef123247b01d337bbff507c063f2537d5ec27ff610cfaab13a33acdc1bb0080fdf9946b56f63d252aa2af24cf23fbe8a39cab7e89",
+    "signer_mask": "0101"
+  },
+  "cohort_coordinator_response": {
+    "status": 200,
+    "body": "[{\"blockHash\":\"0x52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000123,\"receiptsRoot\":\"0x0505050505050505050505050505050505050505050505050505050505050505\",\"aggregateSig\":\"832039c77f3e2f79a866504945c4105d63710d1e374beb6466bb53fdd399b4e361425585e68dd0691c137d07af61ce1a1799ebb5b2871904623d7074be4a1bf28600a3729904ddac76e6b5d54bb1420716f4e17c31bc76a7e431c6e518cbb49c\",\"signerMask\":\"03000100\",\"signers\":3,\"windowClosedAt\":1784372090000}]\n"
+  },
+  "window_manager_response": {
+    "status": 200,
+    "body": "[{\"blockHash\":\"0x52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000123,\"receiptsRoot\":\"0x0505050505050505050505050505050505050505050505050505050505050505\",\"aggregateSig\":\"832039c77f3e2f79a866504945c4105d63710d1e374beb6466bb53fdd399b4e361425585e68dd0691c137d07af61ce1a1799ebb5b2871904623d7074be4a1bf28600a3729904ddac76e6b5d54bb1420716f4e17c31bc76a7e431c6e518cbb49c\",\"signerMask\":\"03000100\",\"signers\":3,\"windowClosedAt\":1784372090000},{\"blockHash\":\"0x52c027b145765dab51ecb3c463801eddcd8dc437956051ec109711957e8fcebb\",\"blockNumber\":4000123,\"receiptsRoot\":\"0x00000000000000000000000000000000000000000000000000000000000000bd\",\"aggregateSig\":\"834085d2d07fbfa0c7121a6b962cc80b38f1d0fc4345dd45f92642bdd5a9e02ac01985222df1ab16f5cb597ef123247b01d337bbff507c063f2537d5ec27ff610cfaab13a33acdc1bb0080fdf9946b56f63d252aa2af24cf23fbe8a39cab7e89\",\"signerMask\":\"0101\",\"signers\":1,\"windowClosedAt\":1784372090000}]\n"
+  },
+  "no_cert_response": {
+    "status": 404,
+    "body": "{\"error\":\"no certificates for block\"}\n"
+  }
+}

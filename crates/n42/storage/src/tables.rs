@@ -8,32 +8,32 @@
 //!
 //! # Table Schema
 //!
-//! ## BeaconStateRecord
+//! ## `BeaconStateRecord`
 //! | Key | Value |
 //! |-----|-------|
 //! | `BlockHash` | `BeaconState` |
 //!
-//! ## BeaconBlockRecord
+//! ## `BeaconBlockRecord`
 //! | Key | Value |
 //! |-----|-------|
 //! | `BlockHash` | `BeaconBlock` |
 //!
-//! ## BeaconNum2Hash
+//! ## `BeaconNum2Hash`
 //! | Key | Value |
 //! |-----|-------|
 //! | `BlockNumber` | `BlockHash` |
 //!
-//! ## PlainValidatorState
+//! ## `PlainValidatorState`
 //! | Key | Value |
 //! |-----|-------|
 //! | `Address` | `Validator` |
 //!
-//! ## ValidatorsHistory
+//! ## `ValidatorsHistory`
 //! | Key | Value |
 //! |-----|-------|
 //! | `ShardedKey<Address>` | `BlockNumberList` |
 //!
-//! ## ValidatorChangeSets (DUPSORT)
+//! ## `ValidatorChangeSets` (DUPSORT)
 //! | Key | SubKey | Value |
 //! |-----|--------|-------|
 //! | `BlockNumber` | `Address` | `ValidatorBeforeTx` |

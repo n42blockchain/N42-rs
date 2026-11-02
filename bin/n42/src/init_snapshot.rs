@@ -17,6 +17,9 @@
 //! and on a QMDB chain the header's root is the forest's, not the trie's. So
 //! the header check here is against the forest rebuilt from the portable
 //! snapshot, and the trie tables stay empty, as they are on any QMDB node.
+//! That forest also authenticates the dump: every account and slot written
+//! must be its leaf, and every live leaf must be written (gov5's exporter
+//! makes the same two checks, `verifyExportValue` / `verifyExportCoverage`).
 
 use alloy_consensus::Header;
 use alloy_genesis::GenesisAccount;
@@ -25,6 +28,9 @@ use clap::{Parser, Subcommand};
 use eyre::{bail, Context as _};
 use n42_engine_types::N42Node;
 use n42_qmdb_reth::{state_scheme, N42ChainSpecParser, QmdbNodeState, StateScheme};
+use n42_twig_core::qmdb_compat::{
+    encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbPortableSnapshot,
+};
 use reth_chainspec::EthChainSpec;
 use reth_cli_commands::{
     common::{AccessRights, Environment, EnvironmentArgs},
@@ -68,10 +74,27 @@ enum Command {
     Export(ExportArgs),
 }
 
+/// [`N42ChainSpecParser`] over the node's header: the node type opened here
+/// stores `N42Header`, so its chain spec is [`n42_header::N42ChainSpec`].
+#[derive(Debug, Clone, Copy, Default)]
+struct SnapshotChainSpecParser;
+
+impl reth_cli::chainspec::ChainSpecParser for SnapshotChainSpecParser {
+    type ChainSpec = n42_header::N42ChainSpec;
+
+    const SUPPORTED_CHAINS: &'static [&'static str] =
+        <N42ChainSpecParser as reth_cli::chainspec::ChainSpecParser>::SUPPORTED_CHAINS;
+
+    fn parse(s: &str) -> eyre::Result<std::sync::Arc<Self::ChainSpec>> {
+        let spec = <N42ChainSpecParser as reth_cli::chainspec::ChainSpecParser>::parse(s)?;
+        Ok(std::sync::Arc::new(n42_header::N42ChainSpec::from(spec)))
+    }
+}
+
 #[derive(Debug, Parser)]
 struct InitArgs {
     #[command(flatten)]
-    env: EnvironmentArgs<N42ChainSpecParser>,
+    env: EnvironmentArgs<SnapshotChainSpecParser>,
     /// reth `init-state` JSONL: `{"root": ...}` then one account per line.
     #[arg(long, value_name = "STATE_JSONL")]
     state: PathBuf,
@@ -86,7 +109,7 @@ struct InitArgs {
 #[derive(Debug, Parser)]
 struct ExportArgs {
     #[command(flatten)]
-    env: EnvironmentArgs<N42ChainSpecParser>,
+    env: EnvironmentArgs<SnapshotChainSpecParser>,
     /// The state JSONL's path, for naming: the header goes to
     /// `<out>.header.rlp`. The JSONL itself comes from gov5's
     /// `n42-reth-state-dump` at the same block.
@@ -165,9 +188,10 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
         let provider_rw = provider_factory.database_provider_rw()?;
         let last = provider_rw.last_block_number()?;
         if last == 0 && number > 0 {
-            setup_without_evm(&provider_rw, SealedHeader::new(header.clone(), hash), |n| Header {
-                number: n,
-                ..Default::default()
+            // A snapshot head carries no registry root: its header file is decoded as
+            // Ethereum's header (see the decode above).
+            setup_without_evm(&provider_rw, SealedHeader::new(n42_header::N42Header::from(header), hash), |n| {
+                n42_header::N42Header::from(Header { number: n, ..Default::default() })
             })?;
             provider_factory.static_file_provider().commit()?;
         } else if last != number {
@@ -193,25 +217,125 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     if dump_root.root != root {
         bail!("state dump root {} is not the header's state root {root}", dump_root.root);
     }
-    let (accounts, slots) = write_state_v2(&provider_factory, number, lines)?;
-    println!("state: {accounts} accounts, {slots} slots");
+    // The dump's first line is its own word; the portable snapshot, checked
+    // against the header, is what authenticates each row (audit 2026-10
+    // round 3, R3-P1).
+    let portable = fs::read(&args.qmdb).wrap_err("portable snapshot")?;
+    let tree = authenticated_tree(&portable, &chain, (number, hash), root)?;
+    let mut check = DumpCheck::new(&tree);
+    let (accounts, slots) = write_state_v2(&provider_factory, number, lines, |address, account| {
+        check.row(address, account)
+    })?;
+    check.finish()?;
+    drop(tree);
+    println!("state: {accounts} accounts, {slots} slots, every one a leaf of the snapshot");
 
     // The forest, from the portable snapshot, checked against the header.
-    let qmdb = QmdbNodeState::new(chain.clone(), data_dir.data_dir().join("qmdb"));
-    let portable = fs::read(&args.qmdb).wrap_err("portable snapshot")?;
+    let qmdb = QmdbNodeState::new(chain.inner().clone(), data_dir.data_dir().join("qmdb"));
     qmdb.initialize_from_portable(&portable, chain.chain().id(), chain.genesis_hash(), (number, hash), root)?;
     println!("QMDB forest restored at block {number}; the node can start");
     Ok(())
 }
 
+/// The portable snapshot's tree, once it is known to be at `head` on this
+/// chain with the header's `root`.
+fn authenticated_tree(
+    portable: &[u8],
+    chain: &reth_chainspec::ChainSpec,
+    head: (u64, B256),
+    root: B256,
+) -> eyre::Result<QmdbCompatTree> {
+    let snapshot = QmdbPortableSnapshot::decode(portable).map_err(|e| eyre::eyre!("portable snapshot: {e}"))?;
+    let at = (snapshot.block_number, B256::from(snapshot.block_hash));
+    if at != head {
+        bail!("the portable snapshot is at block {} {}, the header at {} {}", at.0, at.1, head.0, head.1);
+    }
+    let tree = snapshot
+        .verify_and_build(chain.chain().id(), &chain.genesis_hash().0)
+        .map_err(|e| eyre::eyre!("portable snapshot: {e}"))?;
+    if B256::from(tree.root()) != root {
+        bail!("the portable snapshot's root {} is not the header's state root {root}", B256::from(tree.root()));
+    }
+    Ok(tree)
+}
+
+/// Checks a state dump row by row against the snapshot's tree: each account
+/// and non-zero slot must be the tree's leaf, addresses strictly ascending
+/// (so no row is counted twice), and at the end every live leaf must have
+/// been a row but for the EIP-161 empty accounts QMDB keeps and the plain
+/// state, which the dump is read from, drops.
+struct DumpCheck<'a> {
+    tree: &'a QmdbCompatTree,
+    last: Option<Address>,
+    /// Leaves the rows matched.
+    matched: u64,
+    /// Rows that were empty accounts (leaf value `[0]`).
+    empty_rows: u64,
+}
+
+/// gov5's leaf for an account with no nonce, balance or code.
+const EMPTY_ACCOUNT_LEAF: [u8; 1] = [0];
+
+impl<'a> DumpCheck<'a> {
+    const fn new(tree: &'a QmdbCompatTree) -> Self {
+        Self { tree, last: None, matched: 0, empty_rows: 0 }
+    }
+
+    fn row(&mut self, address: &Address, account: &GenesisAccount) -> eyre::Result<()> {
+        if self.last.is_some_and(|last| last >= *address) {
+            bail!("state dump rows must be in strictly ascending address order: {address} after {:?}", self.last);
+        }
+        self.last = Some(*address);
+        let code_hash = account.code.as_ref().map_or(alloy_primitives::KECCAK256_EMPTY, keccak256);
+        let leaf = encode_gov5_account_value(
+            account.nonce.unwrap_or_default(),
+            &account.balance.to_be_bytes::<32>(),
+            &code_hash.0,
+        );
+        if self.tree.get(&gov5_account_key(&address.0 .0)) != Some(leaf.as_slice()) {
+            bail!("account {address} is not authenticated by the QMDB root");
+        }
+        self.matched += 1;
+        if leaf == EMPTY_ACCOUNT_LEAF {
+            self.empty_rows += 1;
+        }
+        for (slot, value) in account.storage.iter().flatten() {
+            let committed = self.tree.get(&gov5_storage_key(&address.0 .0, &slot.0));
+            let expected = (*value != B256::ZERO).then_some(value.as_slice());
+            if committed != expected {
+                bail!("storage {address} {slot} is not authenticated by the QMDB root");
+            }
+            self.matched += u64::from(expected.is_some());
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> eyre::Result<()> {
+        let retained_empty = (0..self.tree.next_slot())
+            .filter(|slot| self.tree.slot_active(*slot) == Some(true))
+            .filter(|slot| self.tree.entry_at(*slot).is_some_and(|entry| entry.value == EMPTY_ACCOUNT_LEAF))
+            .count() as u64;
+        let live = self.tree.len() as u64;
+        if self.empty_rows > retained_empty || self.matched != live - retained_empty + self.empty_rows {
+            bail!(
+                "the state dump is incomplete: {} rows for {live} live QMDB keys ({retained_empty} retained empty accounts)",
+                self.matched
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Writes the accounts of a state dump at `block`, as reth 2.5 stores them:
 /// hashed accounts and storage in MDBX, one changeset entry per account and
 /// slot ("created at `block`") in the static files, the history indices in
-/// RocksDB, bytecodes once. Chunked commits keep memory flat.
+/// `RocksDB`, bytecodes once. Chunked commits keep memory flat. `check` sees
+/// each account before it is written.
 fn write_state_v2<PF>(
     provider_factory: &PF,
     block: u64,
     lines: impl Iterator<Item = std::io::Result<String>>,
+    mut check: impl FnMut(&Address, &GenesisAccount) -> eyre::Result<()>,
 ) -> eyre::Result<(u64, u64)>
 where
     PF: DatabaseProviderFactory<
@@ -258,6 +382,7 @@ where
                 continue;
             }
             let parsed: DumpLine = serde_json::from_str(&line).wrap_err("account line")?;
+            check(&parsed.address, &parsed.account)?;
             let account_slots = parsed.account.storage.as_ref().map_or(0, |s| s.len());
             if units > 0 && units + 1 + account_slots > COMMIT_UNITS {
                 history_batch.commit()?;
@@ -343,7 +468,7 @@ fn export(args: ExportArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     // same block.
     println!("header -> {}", header_path.display());
 
-    let qmdb = QmdbNodeState::new(chain.clone(), data_dir.data_dir().join("qmdb"));
+    let qmdb = QmdbNodeState::new(chain.inner().clone(), data_dir.data_dir().join("qmdb"));
     let portable = qmdb.portable_export(chain.chain().id(), chain.genesis_hash())?;
     fs::write(&args.qmdb_out, &portable)?;
     println!("QMDB snapshot: {} bytes -> {}", portable.len(), args.qmdb_out.display());

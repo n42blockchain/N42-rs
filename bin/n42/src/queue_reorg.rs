@@ -71,7 +71,7 @@ pub(crate) mod tests {
 
     pub(crate) fn block(number: u64, txs: Vec<(Address, n42_tx_types::N42TxEnvelope)>) -> RecoveredBlock<n42_tx_types::Block> {
         let (senders, transactions): (Vec<_>, Vec<_>) = txs.into_iter().unzip();
-        let header = Header { number, ..Default::default() };
+        let header = n42_header::N42Header::from(Header { number, ..Default::default() });
         let body = n42_tx_types::BlockBody { transactions, ommers: Vec::new(), withdrawals: None };
         RecoveredBlock::new_sealed(SealedBlock::seal_slow(n42_tx_types::Block { header, body }), senders)
     }

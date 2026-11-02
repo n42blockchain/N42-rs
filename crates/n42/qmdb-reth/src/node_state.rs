@@ -37,7 +37,12 @@
 //! head (in either storage mode) is restored from the archived pair under
 //! `recovery-archive/fold-<number>-<hash>-*`: the checkpoint the fold replaced
 //! and the segment it folded. An archive retires at a later fold once the
-//! database's durable head has passed its fold head. The
+//! database's durable head has passed its fold head by
+//! [`ARCHIVE_RETIRE_MARGIN`] blocks: the durable head is read from MDBX's
+//! `Finish` checkpoint, which an unwind moves back and which, under
+//! `--db.sync-mode safe-no-sync`, a power cut can move back too (the default
+//! sync mode is durable); an unwind deeper than the margin past a retired
+//! archive's head leaves a restart that is refused. The
 //! `recovery-archive/rollback-<number>-<hash>-*` pair a restart below the
 //! checkpoint leaves (the future checkpoint and logs it set aside) retires by
 //! the same rule, against the database head it rolled back to.
@@ -113,6 +118,10 @@ const MIN_LOG_BEFORE_CHECKPOINT: u64 = 1 << 20;
 /// on the canonical follower, as before, instead of compacting the files on a
 /// background thread. The A/B's off arm; read once.
 fn checkpoint_sync() -> bool {
+    #[cfg(test)]
+    if FORCE_CHECKPOINT_SYNC.with(std::cell::Cell::get) {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_QMDB_CHECKPOINT_SYNC").is_ok_and(|v| v == "1"))
 }
@@ -206,7 +215,7 @@ fn trim_twigs() -> bool {
 /// the tree waits for it ([`TREE_FREE_LABELS`]).
 fn compute_offlock_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_COMPUTE_OFFLOCK").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_COMPUTE_OFFLOCK", false))
 }
 
 /// `N42_QMDB_CANONICAL_DEFER=1` (default off): a canonical head that
@@ -258,7 +267,7 @@ pub fn canonical_fatal() -> bool {
 /// view block by block outside it, instead of one hold per block.
 fn persist_batch_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_PERSIST_BATCH").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_PERSIST_BATCH", false))
 }
 
 /// The lock labels that never read the tree, so they do not wait for one
@@ -454,7 +463,7 @@ fn try_queue_release<T: Send>(sender: &std::sync::mpsc::SyncSender<T>, value: T)
 
 fn entry_file_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_QMDB_ENTRY_FILE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| n42_env::flag("N42_QMDB_ENTRY_FILE", false))
 }
 
 const ENTRY_FILE: &str = "entries.log";
@@ -467,6 +476,18 @@ pub enum NodeStateError {
     /// A portable snapshot could not be used.
     #[error("portable QMDB snapshot: {0}")]
     Portable(String),
+    /// The persisted tree has compacted twigs, whose dead slots keep only
+    /// their leaf hash, and a v1 portable snapshot is the complete slot log
+    /// that its verifier hashes slot by slot (`docs/QMDB_COMPACTION_DESIGN.md`
+    /// 3.2, the 2026-10-28 consequence): a compacting node is a pruned node.
+    #[error(
+        "QMDB slot {slot} keeps only its leaf hash (a compacted twig): a v1 portable snapshot needs every slot's key \
+         and value, so export from a node that runs with compaction off (an archive node)"
+    )]
+    PortableCompacted {
+        /// The first hash-only slot.
+        slot: u64,
+    },
     /// Nothing has restored the trees yet. See the module docs.
     #[error("QMDB state is not initialised; the node cannot compute state roots yet")]
     Uninitialised,
@@ -592,7 +613,10 @@ pub enum NodeStateError {
 /// The state roots of the last [`HeadRoots::SLOTS`] persisted heads, in a
 /// fixed ring of checksummed records (`[number][hash][root][digest]`, the
 /// record of block `n` at slot `n % SLOTS`), rewritten in place as heads are
-/// persisted and never fsynced: it is a check, not state. A restart compares
+/// persisted and fdatasynced once per persistence batch
+/// ([`QmdbNodeState::settle_through`]), off the block path: it is a check,
+/// not state, but one a power cut would otherwise take the last seconds of,
+/// which is exactly when a restart needs it. A restart compares
 /// the rebuilt tree's root with the record of its head, when there is a
 /// whole one for that very head (a crash can lose recent records, and an
 /// older datadir has none: the check is then skipped with a warning).
@@ -624,6 +648,15 @@ impl HeadRoots {
             file.write_all(&Self::encode(*number, *hash, *root))?;
         }
         Ok(())
+    }
+
+    /// Makes the records written so far durable; no file is nothing to sync.
+    fn sync(path: &Path) -> std::io::Result<()> {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(file) => file.sync_data(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// The root recorded for `(number, hash)`, if a whole record of that
@@ -683,6 +716,7 @@ struct Inner {
     forest: Mutex<Option<QmdbForest>>,
     /// Serialises the bounded checkpoint-parent sidecar's atomic replacements.
     frontier_write: Mutex<()>,
+    #[allow(clippy::type_complexity)] // hot-path callback field; its type is kept inline
     durable_head_reader: Mutex<Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>>,
     /// The label the forest's lock was last taken for ([`QmdbNodeState::lock_as`]),
     /// read by a caller that has to wait to say whom it waited for.
@@ -782,6 +816,10 @@ struct Inner {
     /// Why this run's restored tree was not checked against a recorded
     /// root, if it was not ([`QmdbNodeState::unchecked_restart`]).
     unchecked_restart: std::sync::OnceLock<String>,
+    /// The head header's own state root, when its chain's headers carry it
+    /// ([`QmdbNodeState::expect_head_root`]): the check a restart falls back
+    /// on when `forest.roots` has no record of that head.
+    head_header_root: std::sync::OnceLock<((u64, B256), B256)>,
 }
 
 /// A rename queued by [`QmdbNodeState::rename_or_defer`].
@@ -886,7 +924,7 @@ pub fn sort_and_hash_leaves(ops: &mut QmdbOps) -> Option<n42_twig_core::qmdb_com
 }
 
 /// Fills a computed root's split from the forest's last computation.
-fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
+const fn fill_split(forest: &QmdbForest, split: &mut RootSplit, publish_us: u64) {
     let (move_us, phases) = forest.last_compute();
     split.computed = true;
     split.move_ms = move_us / 1000;
@@ -1076,6 +1114,87 @@ struct PersistCursor {
     /// checkpoint; no second one starts, and the log is not rotated again,
     /// until it has finished.
     compacting: bool,
+    /// The segment the last compaction was started on, kept so a retry
+    /// after a failure folds it to its own head.
+    sealed: Option<SealedSegment>,
+}
+
+/// A sealed `forest.log.sealed` and when a fold of it was last started.
+#[derive(Debug, Clone, Copy)]
+struct SealedSegment {
+    /// The block the segment ends at: the head it was rotated at.
+    head: (u64, B256),
+    /// When a compaction of it was last started.
+    started_at: std::time::Instant,
+}
+
+/// How long a failed compaction waits before the next due block retries it:
+/// each retry reads the whole checkpoint and replays the segment.
+#[cfg(not(test))]
+const COMPACTION_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const COMPACTION_RETRY_PAUSE: std::time::Duration = std::time::Duration::ZERO;
+
+#[cfg(test)]
+thread_local! {
+    /// Run once between [`QmdbNodeState::persist_canonical`]'s two holds of
+    /// the forest, on the persisting thread: a test's way to move the tree
+    /// there.
+    static BETWEEN_PERSIST_HOLDS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next removal of the live log after a rewrite fail on this
+    /// thread, as an unlink refused by the file system would.
+    static FAIL_LOG_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`FAIL_LOG_REMOVAL`] for this thread.
+#[cfg(test)]
+fn fail_next_log_removal() {
+    FAIL_LOG_REMOVAL.with(|fail| fail.set(true));
+}
+
+/// Removes the live delta log a rewritten checkpoint supersedes
+/// ([`std::fs::remove_file`], or the failure a test asked for).
+fn remove_live_log(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_LOG_REMOVAL.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    std::fs::remove_file(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the `n`th delta append from now fail on this thread (0: none),
+    /// as a full disk would.
+    static FAIL_DELTA_APPEND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets [`FAIL_DELTA_APPEND`] for this thread.
+#[cfg(test)]
+fn fail_delta_append(nth: u32) {
+    FAIL_DELTA_APPEND.with(|fail| fail.set(nth));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`checkpoint_sync`] on for this thread.
+    static FORCE_CHECKPOINT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`FORCE_CHECKPOINT_SYNC`] for this thread.
+#[cfg(test)]
+fn force_checkpoint_sync() {
+    FORCE_CHECKPOINT_SYNC.with(|on| on.set(true));
+}
+
+/// Sets [`BETWEEN_PERSIST_HOLDS`] for this thread.
+#[cfg(test)]
+fn set_between_persist_holds(hook: Box<dyn FnOnce()>) {
+    BETWEEN_PERSIST_HOLDS.with(|slot| *slot.borrow_mut() = Some(hook));
 }
 
 /// A handle to the node's QMDB state. Cheap to clone; all clones share it.
@@ -1163,6 +1282,7 @@ impl QmdbNodeState {
                 persist_holds: Default::default(),
                 occupancy: Default::default(),
                 unchecked_restart: std::sync::OnceLock::new(),
+                head_header_root: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -1468,7 +1588,7 @@ impl QmdbNodeState {
         let hold = inner.persist_hold_us.fetch_add(split.lock_hold_us, Relaxed) + split.lock_hold_us;
         let advance = inner.persist_advance_us.fetch_add(split.advance_us, Relaxed) + split.advance_us;
         let holds = inner.persist_holds.fetch_add(split.holds, Relaxed) + split.holds;
-        if persists % PERSIST_SPLIT_LOG_EVERY == 0 {
+        if persists.is_multiple_of(PERSIST_SPLIT_LOG_EVERY) {
             info!(
                 target: "n42.qmdb",
                 persists,
@@ -1493,7 +1613,7 @@ impl QmdbNodeState {
     /// (`QmdbForest::check_build_parent`). Only for a chain with finality,
     /// where the canonical head follows the committed block and a parent
     /// below it is a stale request (the HotStuff-2 node sets it); on a chain
-    /// without finality (APoS, the deferred-execution fork tests) a build on
+    /// without finality (`APoS`, the deferred-execution fork tests) a build on
     /// an older block is a legitimate fork. Off by default.
     pub fn set_refuse_stale_builds(&self, on: bool) {
         self.inner.refuse_stale_builds.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -1701,6 +1821,17 @@ impl QmdbNodeState {
         self.inner.unchecked_restart.get().map(String::as_str)
     }
 
+    /// Gives the restart the state root `head`'s header carries, for a chain
+    /// whose headers carry their own root (not under deferred execution,
+    /// where a header carries its parent's). Called before
+    /// [`Self::initialize`]: a restart with no record of that very head in
+    /// `forest.roots` -- the file is not fsynced, so a power cut loses its
+    /// last records -- checks the rebuilt tree against this instead of
+    /// starting unchecked. The first call wins.
+    pub fn expect_head_root(&self, head: (u64, B256), state_root: B256) {
+        let _ = self.inner.head_header_root.set((head, state_root));
+    }
+
     /// Where the persisted heads' roots are recorded ([`HeadRoots`]).
     pub fn head_roots_path(&self) -> PathBuf {
         self.inner.dir.join(HEAD_ROOTS_FILE)
@@ -1727,8 +1858,12 @@ impl QmdbNodeState {
         let path = self.head_roots_path();
         // The record is a check, not state: a file that cannot be read skips
         // the comparison, as a missing record does.
+        let header_root =
+            self.inner.head_header_root.get().filter(|(at, _)| *at == head).map(|(_, root)| *root);
         let recorded = match HeadRoots::read(&path, head.0, head.1) {
             Ok(Some(recorded)) => Some(recorded),
+            // No record of this head, but its header carries its root.
+            Ok(None) | Err(_) if header_root.is_some() => header_root,
             Ok(None) if !path.exists() => {
                 self.note_unchecked_restart(head, "no forest.roots file (a datadir from before the root check)");
                 None
@@ -1987,6 +2122,7 @@ impl QmdbNodeState {
     /// the tree. A rename of the parent while it was out is followed (the
     /// block is filed on the new hash) and counted. A panic in the
     /// computation puts the tree back before it unwinds.
+    #[allow(clippy::too_many_arguments)] // hot-path helper; the argument list is kept
     fn with_leased_root<T>(
         &self,
         label: &'static str,
@@ -2099,14 +2235,45 @@ impl QmdbNodeState {
     /// Call at startup, before persistence and compaction tasks are running.
     /// Entry-file reconstruction must be read-only: opening an older prefix for
     /// normal recovery would truncate entries belonging to the database head.
+    ///
+    /// The rebuilt root is compared with the one recorded when the block was
+    /// persisted (`forest.roots`), as a restart's head root is: it goes into
+    /// the next header under deferred execution (audit 2026-10 round 2,
+    /// R2-Q5). No record, or an unreadable one, skips the comparison.
     pub fn persisted_state_root(&self, number: u64, hash: B256) -> Result<B256, NodeStateError> {
+        let restored = self.rebuild_persisted_state_root(number, hash)?;
+        match HeadRoots::read(&self.head_roots_path(), number, hash) {
+            Ok(Some(recorded)) if recorded != restored => {
+                tracing::error!(target: "n42.qmdb", block = number, %hash, %recorded, %restored, "the rebuilt historical QMDB root disagrees with its record");
+                Err(NodeStateError::RestoredRootMismatch { number, hash, recorded, restored })
+            }
+            Ok(_) => Ok(restored),
+            Err(error) => {
+                warn!(target: "n42.qmdb", %error, block = number, "forest.roots could not be read; the historical root goes unchecked");
+                Ok(restored)
+            }
+        }
+    }
+
+    /// [`Self::persisted_state_root`] without the record check.
+    fn rebuild_persisted_state_root(&self, number: u64, hash: B256) -> Result<B256, NodeStateError> {
         let unavailable = || NodeStateError::RecoveryFrontier(format!("no persisted root for block {number} ({hash})"));
         if let Some(mut checkpoint) = read_ckpt(&self.ckpt_path())? {
-            if checkpoint.version != ForestCheckpoint::VERSION {
+            if !ForestCheckpoint::reads(checkpoint.version) {
                 return Err(unavailable());
             }
             if checkpoint.head_number > number {
-                return self.parent_root_from_frontier((checkpoint.head_number, checkpoint.head_hash), (number, hash));
+                // A fold that ran ahead of the database archived the
+                // checkpoint it replaced with the segment it folded; the
+                // live entry file still holds that cursor's prefix, as the
+                // heap branch below reads its archived snapshot.
+                match self.archived_file_checkpoint((number, hash))? {
+                    Some(archived) => checkpoint = archived,
+                    None => {
+                        return self
+                            .parent_root_from_frontier((checkpoint.head_number, checkpoint.head_hash), (number, hash));
+                    }
+                }
             }
             if checkpoint.head_hash != hash {
                 checkpoint = replay_delta_log(&self.sealed_log_path(), checkpoint, Some(hash))?.0;
@@ -2172,8 +2339,9 @@ impl QmdbNodeState {
             let entry = entry.map_err(|source| NodeStateError::Io { path: root.clone(), source })?;
             let name = entry.file_name();
             let Some(number) = archive_label_number(&name.to_string_lossy()) else { continue };
-            // Retain the database head's parent frontier as well as its head.
-            if number.checked_add(1).is_none_or(|parent_boundary| parent_boundary >= durable) { continue; }
+            // Retain the database head's parent frontier as well as its head,
+            // and the margin an unwind could take it back by.
+            if number.checked_add(1 + ARCHIVE_RETIRE_MARGIN).is_none_or(|boundary| boundary >= durable) { continue; }
             retired.push((number, entry.path()));
         }
         // Oldest first, so an interrupted pass leaves the newest history.
@@ -2187,7 +2355,7 @@ impl QmdbNodeState {
     // Heap checkpoints may follow canonical execution ahead of the EL's
     // database transaction. Keep the overwritten base and folded log together.
     fn archive_heap_pair(&self, label: &str, log: &Path) -> Result<(), NodeStateError> {
-        self.archive_pair(label, &self.snapshot_path(), log)
+        self.archive_pair(label, &self.snapshot_path(), log).map(drop)
     }
 
     /// Hard-links `base` (the checkpoint about to be replaced: `forest.bin`
@@ -2195,7 +2363,7 @@ impl QmdbNodeState {
     /// `recovery-archive/<label>-<pid>-<sequence>`, made durable before it
     /// takes its name. Both storage modes archive through here, so a datadir
     /// has one archive scheme.
-    fn archive_pair(&self, label: &str, base: &Path, log: &Path) -> Result<(), NodeStateError> {
+    fn archive_pair(&self, label: &str, base: &Path, log: &Path) -> Result<PathBuf, NodeStateError> {
         let root = self.inner.dir.join("recovery-archive");
         let io = |path: &Path, source| NodeStateError::Io { path: path.to_path_buf(), source };
         std::fs::create_dir_all(&root).map_err(|e| io(&root, e))?;
@@ -2229,7 +2397,7 @@ impl QmdbNodeState {
         std::fs::File::open(&temporary).and_then(|f| f.sync_all()).map_err(|e| io(&temporary, e))?;
         std::fs::rename(&temporary, &target).map_err(|e| io(&target, e))?;
         std::fs::File::open(&root).and_then(|f| f.sync_all()).map_err(|e| io(&root, e))?;
-        Ok(())
+        Ok(target)
     }
 
     fn archived_heap_snapshot(&self, target: (u64, B256)) -> Result<Option<ForestSnapshot>, NodeStateError> {
@@ -2278,6 +2446,11 @@ impl QmdbNodeState {
         }
         paths.sort();
         for path in paths.into_iter().rev() {
+            // A rollback archive holds a checkpoint and logs set aside over
+            // entries since cut away: kept to inspect, never a way back.
+            if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("rollback-")) {
+                continue;
+            }
             let Some(ckpt) = read_ckpt(&path.join("forest.ckpt"))? else { continue };
             if ckpt.head_number > target.0 { continue; }
             let (ckpt, _) = replay_delta_log(&path.join("forest.log"), ckpt, Some(target.1))?;
@@ -2317,8 +2490,11 @@ impl QmdbNodeState {
         self.check_restored_root(head, forest.root())?;
         // The live log and any sealed segment continue from the fold head,
         // past the database's head; they stand on entries just cut away.
-        // They go before the checkpoint is replaced: a crash in between
+        // They are set aside with the future checkpoint as a `rollback-*`
+        // archive, as heap mode does, for inspection (audit 2026-10 D-9),
+        // then go before the checkpoint is replaced: a crash in between
         // finds the live checkpoint still past the head and comes back here.
+        self.archive_pair(&format!("rollback-{:020}-{:x}", head_number, head_hash), &self.ckpt_path(), &self.delta_log_path())?;
         for future in [self.delta_log_path(), self.sealed_log_path()] {
             match std::fs::remove_file(&future) {
                 Ok(()) => {}
@@ -2336,6 +2512,7 @@ impl QmdbNodeState {
             log_len: 0,
             checkpoint_len,
             compacting: false,
+            sealed: None,
         };
         info!(
             target: "n42.qmdb",
@@ -2508,6 +2685,7 @@ impl QmdbNodeState {
                     log_len,
                     checkpoint_len,
                     compacting: false,
+                    sealed: None,
                 };
                 info!(
                     target: "n42.qmdb",
@@ -2558,6 +2736,7 @@ impl QmdbNodeState {
                     log_len: 0,
                     checkpoint_len,
                     compacting: false,
+                    sealed: None,
                 };
                 forest
             }
@@ -2612,6 +2791,7 @@ impl QmdbNodeState {
                 log_len,
                 checkpoint_len,
                 compacting: false,
+                sealed: None,
             };
             info!(
                 target: "n42.qmdb",
@@ -2685,6 +2865,7 @@ impl QmdbNodeState {
             log_len: 0,
             checkpoint_len,
             compacting: false,
+            sealed: None,
         };
         info!(
             target: "n42.qmdb",
@@ -2756,6 +2937,7 @@ impl QmdbNodeState {
             log_len: 0,
             checkpoint_len,
             compacting: false,
+            sealed: None,
         };
         info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
         *self.lock_as("initialize_from_portable#2") = Some(self.configured(forest)?);
@@ -2785,6 +2967,9 @@ impl QmdbNodeState {
             let (snapshot, _) = replay_delta_log(&self.delta_log_path(), checkpoint, None)?;
             snapshot
         };
+        if let Some(slot) = snapshot.tree.first_hash_only_slot() {
+            return Err(NodeStateError::PortableCompacted { slot });
+        }
         let tree = QmdbForest::from_snapshot(&snapshot)?;
         let entries = snapshot
             .tree
@@ -3095,10 +3280,29 @@ impl QmdbNodeState {
             let reason = match head {
                 None => return Err(NodeStateError::Uninitialised),
                 Some((head_number, head_hash)) if head_number > number || (head_number == number && head_hash == hash) => {
-                    match self.settle_canonical() {
-                        Ok(()) => return Ok(()),
-                        Err(error @ (NodeStateError::Poisoned(_) | NodeStateError::Uninitialised)) => return Err(error),
-                        Err(error) => error.to_string(),
+                    // A head past the block settles it only if the block is
+                    // on its chain: a sibling is not in the log (audit
+                    // 2026-10 round 2, R2-Q2). Records that no longer reach
+                    // back that far cannot say; then the height decides, as
+                    // before.
+                    let off_chain = head_number > number
+                        && self.with_forest("settle_through", |forest| Ok(forest.canonical_at(number, hash)))? == Some(false);
+                    if off_chain {
+                        format!("block {number} ({hash}) is not on the forest's canonical chain, at block {head_number} ({head_hash})")
+                    } else {
+                        match self.settle_canonical() {
+                            Ok(()) => {
+                                // Once per persistence batch, off the block path:
+                                // the roots this batch recorded survive a power
+                                // cut, so the restart after one is checked.
+                                if let Err(error) = HeadRoots::sync(&self.head_roots_path()) {
+                                    warn!(target: "n42.qmdb", %error, "could not sync the persisted QMDB heads' roots; a restart after a power cut may go unchecked");
+                                }
+                                return Ok(());
+                            }
+                            Err(error @ (NodeStateError::Poisoned(_) | NodeStateError::Uninitialised)) => return Err(error),
+                            Err(error) => error.to_string(),
+                        }
                     }
                 }
                 Some((head_number, head_hash)) => format!(
@@ -3201,6 +3405,15 @@ impl QmdbNodeState {
         // off this thread (`release_off_lock`): after a persistence batch it
         // is the whole batch, and freed under the lock it held every build's
         // and import's QMDB root for up to a second (BREAKTHROUGH_DESIGN 10.38).
+        //
+        // The move bookkeeping describes changes since the last measured
+        // delta; what the taken deltas carry is forgotten in the same hold,
+        // so any move after it -- the next build, on any parent -- records
+        // itself afresh and is kept (audit 2026-10 D-5), and nothing that
+        // predates these deltas outlives them (round 2, R2-R4: counting
+        // moves between two holds kept the whole batch's bookkeeping whenever
+        // a build finished in between). If the append fails, `remeasure` puts
+        // the deltas back.
         let (block_hash, number, ready, released) = self.with_forest("on_canonical", |forest| {
             let block_hash = target.unwrap_or_else(|| forest.head().1);
             let released = forest.set_canonical_releasing(block_hash)?;
@@ -3209,9 +3422,16 @@ impl QmdbNodeState {
                     deltas.iter().map(|delta| (delta.head_number, delta.head_hash, forest.root_of(&delta.head_hash))).collect();
                 (deltas, roots)
             });
+            if ready.is_some() {
+                forest.forget_changes();
+            }
             Ok((block_hash, forest.head().0, ready, released))
         })?;
         release_off_lock(number, released);
+        #[cfg(test)]
+        if let Some(hook) = BETWEEN_PERSIST_HOLDS.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         // The catch-up's head may be behind one recorded since; that one
         // already set the number.
         if target.is_some() {
@@ -3219,27 +3439,37 @@ impl QmdbNodeState {
             self.note_reader_lag();
         }
         if let Some((deltas, roots)) = ready {
-            self.sync_entries_if_file()?;
-            for delta in &deltas {
-                let written = append_delta(&self.delta_log_path(), cursor.log_len, delta)?;
-                cursor.next_slot = delta.next_slot;
-                cursor.log_len = written;
-                debug!(
-                    target: "n42.qmdb",
-                    block = delta.head_number, block_hash = %delta.head_hash,
-                    appended = delta.appended.len(), changed = delta.changed.len(),
-                    "persisted a QMDB block from its own delta",
-                );
+            // What fails to reach the log goes back into the bookkeeping: the
+            // retry finds the deltas gone and measures from it instead.
+            let mut logged = 0;
+            let appended = self.sync_entries_if_file().and_then(|()| {
+                for delta in &deltas {
+                    cursor.log_len = append_delta(&self.delta_log_path(), cursor.log_len, delta)?;
+                    cursor.next_slot = delta.next_slot;
+                    cursor.head = delta.head_hash;
+                    logged += 1;
+                    debug!(
+                        target: "n42.qmdb",
+                        block = delta.head_number, block_hash = %delta.head_hash,
+                        appended = delta.appended.len(), changed = delta.changed.len(),
+                        "persisted a QMDB block from its own delta",
+                    );
+                }
+                Ok(())
+            });
+            if let Err(error) = appended {
+                // Back into the bookkeeping, for a retry on another branch,
+                // and back into their records, for one on this branch (R3-G1).
+                let unlogged: Vec<_> = deltas.into_iter().skip(logged).collect();
+                self.with_forest("on_canonical#remeasure", |forest| {
+                    forest.remeasure(&unlogged);
+                    forest.restore_deltas(unlogged);
+                    Ok(())
+                })?;
+                return Err(error);
             }
             cursor.head = block_hash;
             self.record_head_roots(&roots);
-            // The tree's move bookkeeping describes changes since the last
-            // measured delta; what these deltas carried is measured now, and
-            // any move that follows records itself afresh.
-            self.with_forest("on_canonical#2", |forest| {
-                forest.forget_changes();
-                Ok(())
-            })?;
             if checkpoint_due(cursor) {
                 return self.rewrite_checkpoint(target.map(|_| block_hash), cursor);
             }
@@ -3260,8 +3490,19 @@ impl QmdbNodeState {
         // The measured delta is appended first either way: the compaction
         // folds the log as it stands, and the synchronous checkpoint's
         // snapshot covers it too (the log is then emptied).
-        self.sync_entries_if_file()?;
-        let written = append_delta(&self.delta_log_path(), cursor.log_len, &delta)?;
+        let written = match self
+            .sync_entries_if_file()
+            .and_then(|()| append_delta(&self.delta_log_path(), cursor.log_len, &delta))
+        {
+            Ok(written) => written,
+            Err(error) => {
+                self.with_forest("on_canonical#remeasure", |forest| {
+                    forest.remeasure(core::slice::from_ref(&delta));
+                    Ok(())
+                })?;
+                return Err(error);
+            }
+        };
         let block_hash = delta.head_hash;
         cursor.head = block_hash;
         cursor.next_slot = delta.next_slot;
@@ -3331,25 +3572,49 @@ impl QmdbNodeState {
         block_hash: Option<B256>,
         cursor: &mut PersistCursor,
     ) -> Result<(), NodeStateError> {
+        if cursor.compacting {
+            // The previous compaction is still running; the log keeps growing
+            // and the next head asks again. Checked before the synchronous
+            // path too: a restart resumes a sealed segment's compaction in
+            // either mode, and two writers of one checkpoint race (audit
+            // 2026-10 round 2, R2-Q3).
+            return Ok(());
+        }
         if checkpoint_sync() {
             return self.checkpoint(block_hash, cursor);
         }
-        if cursor.compacting {
-            // The previous compaction is still running; the log keeps growing
-            // and the next head asks again.
-            return Ok(());
-        }
-        let head = self.with_forest("rewrite_checkpoint", |forest| Ok(forest.head()))?;
-        // Durable before rotating the log or replacing its checkpoint. Until
-        // replacement completes, the old checkpoint's frontier stays in the file.
-        self.save_checkpoint_frontier(head)?;
         let sealed_path = self.sealed_log_path();
         if sealed_path.exists() {
             // A compaction that failed left its segment behind (it is still
-            // needed: the checkpoint does not cover it). Fold that one first;
-            // the log is rotated once it is gone.
-            warn!(target: "n42.qmdb", path = %sealed_path.display(), "a sealed QMDB log segment is still waiting to be compacted; retrying it");
+            // needed: the checkpoint does not cover it). Fold that one first,
+            // to the block it ends at -- the forest's head has moved past it
+            // with the log since -- and the log is rotated once it is gone.
+            let head = match cursor.sealed {
+                Some(sealed) if sealed.started_at.elapsed() < COMPACTION_RETRY_PAUSE => return Ok(()),
+                Some(sealed) => sealed.head,
+                // No fold of it was started in this process: the forest's
+                // head, which is the segment's while the log is still empty
+                // (a wrong one is refused by the fold, not applied).
+                None => self.with_forest("rewrite_checkpoint", |forest| Ok(forest.head()))?,
+            };
+            warn!(target: "n42.qmdb", path = %sealed_path.display(), block = head.0, "a sealed QMDB log segment is still waiting to be compacted; retrying it");
             self.spawn_compaction(cursor, head);
+            return Ok(());
+        }
+        let head = self.with_forest("rewrite_checkpoint", |forest| Ok(forest.head()))?;
+        if head.1 != cursor.head {
+            // The forest's head is not the block the log ends at (a deferred
+            // canonical move); the segment would not end where its fold
+            // looks. The next due block rotates instead.
+            debug!(target: "n42.qmdb", forest = %head.1, log = %cursor.head, "QMDB log rotation waits for the forest's head to reach the log's");
+            return Ok(());
+        }
+        // Durable before rotating the log or replacing its checkpoint. Until
+        // replacement completes, the old checkpoint's frontier stays in the file.
+        // A rotation is never owed: the block that asked is already logged,
+        // so a frontier that cannot be written postpones it, not the block.
+        if let Err(err) = self.save_checkpoint_frontier(head) {
+            warn!(target: "n42.qmdb", %err, block = head.0, "could not write the QMDB checkpoint frontier; the log rotation waits");
             return Ok(());
         }
         let log_path = self.delta_log_path();
@@ -3386,6 +3651,7 @@ impl QmdbNodeState {
     /// and cleared by the thread.
     fn spawn_compaction(&self, cursor: &mut PersistCursor, sealed_head: (u64, B256)) {
         cursor.compacting = true;
+        cursor.sealed = Some(SealedSegment { head: sealed_head, started_at: std::time::Instant::now() });
         let state = self.clone();
         let spawned = std::thread::Builder::new()
             .name("qmdb-compact".into())
@@ -3559,16 +3825,17 @@ impl QmdbNodeState {
             let mut phases = CompactPhases::default();
             let block_hash = ckpt.head_hash;
             self.save_checkpoint_frontier((ckpt.head_number, block_hash))?;
-            self.archive_before_rewrite(&self.ckpt_path(), (ckpt.head_number, block_hash))?;
+            let archive = self.archive_before_rewrite(&self.ckpt_path(), (ckpt.head_number, block_hash))?;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
             self.record_head_roots(&[(ckpt.head_number, block_hash, root)]);
-            remove_file_logged(self.delta_log_path());
+            self.retire_superseded_log(archive.as_deref())?;
             *cursor = PersistCursor {
                 head: block_hash,
                 next_slot: ckpt.next_slot,
                 log_len: 0,
                 checkpoint_len: len,
                 compacting: cursor.compacting,
+                sealed: cursor.sealed,
             };
             let total_ms = started.elapsed().as_millis() as u64;
             self.note_compaction(len, total_ms, &phases, 0);
@@ -3596,19 +3863,20 @@ impl QmdbNodeState {
         let path = self.snapshot_path();
         let mut phases = CompactPhases::default();
         self.save_checkpoint_frontier((snapshot.head_number, block_hash))?;
-        self.archive_before_rewrite(&path, (snapshot.head_number, block_hash))?;
+        let archive = self.archive_before_rewrite(&path, (snapshot.head_number, block_hash))?;
         let len = write_snapshot(&path, &snapshot, &mut phases)?;
         self.record_head_roots(&[(snapshot.head_number, block_hash, root)]);
         // Order matters: the log is emptied only once the checkpoint that
         // supersedes it is on disk, so a crash between the two leaves a log
         // that is merely redundant rather than a state with neither.
-        remove_file_logged(self.delta_log_path());
+        self.retire_superseded_log(archive.as_deref())?;
         *cursor = PersistCursor {
             head: block_hash,
             next_slot: snapshot.tree.next_slot,
             log_len: 0,
             checkpoint_len: len,
             compacting: cursor.compacting,
+            sealed: cursor.sealed,
         };
         let total_ms = started.elapsed().as_millis() as u64;
         self.note_compaction(len, total_ms, &phases, 0);
@@ -3626,11 +3894,39 @@ impl QmdbNodeState {
     /// supersedes are kept as a `fold-<head>` pair, so a restart below
     /// `head` (the database behind the forest by the persistence lag) can
     /// replay from them. Nothing to keep when there is no checkpoint yet.
-    fn archive_before_rewrite(&self, base: &Path, head: (u64, B256)) -> Result<(), NodeStateError> {
+    /// Returns the archive's directory, if one was made.
+    fn archive_before_rewrite(&self, base: &Path, head: (u64, B256)) -> Result<Option<PathBuf>, NodeStateError> {
         if !base.exists() {
-            return Ok(());
+            return Ok(None);
         }
-        self.archive_pair(&format!("fold-{:020}-{:x}", head.0, head.1), base, &self.delta_log_path())
+        self.archive_pair(&format!("fold-{:020}-{:x}", head.0, head.1), base, &self.delta_log_path()).map(Some)
+    }
+
+    /// Removes the live log a rewritten checkpoint supersedes; `archive` is
+    /// the directory [`Self::archive_before_rewrite`] hard-linked it into.
+    ///
+    /// When the name cannot be removed, the archive and the live log still
+    /// share one inode, and the next head's append (from offset 0, the
+    /// cursor having moved to the new checkpoint) would empty the archive's
+    /// log through it. The archive gets its own copy then, as a rollback
+    /// archive always does; if even that fails the rewrite is refused before
+    /// the cursor moves (audit 2026-10 D-6).
+    fn retire_superseded_log(&self, archive: Option<&Path>) -> Result<(), NodeStateError> {
+        let path = self.delta_log_path();
+        let error = match remove_live_log(&path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => error,
+        };
+        warn!(target: "n42.qmdb", %error, path = %path.display(), "could not remove a superseded QMDB log; its archive gets a copy of its own");
+        let Some(archive) = archive else { return Ok(()) };
+        let archived = archive.join("forest.log");
+        let copy = archive.join(".forest.log.copy");
+        let io = |path: &Path, source| NodeStateError::Io { path: path.to_path_buf(), source };
+        std::fs::copy(&archived, &copy).map_err(|e| io(&copy, e))?;
+        std::fs::File::open(&copy).and_then(|f| f.sync_all()).map_err(|e| io(&copy, e))?;
+        std::fs::rename(&copy, &archived).map_err(|e| io(&archived, e))?;
+        std::fs::File::open(archive).and_then(|f| f.sync_all()).map_err(|e| io(archive, e))
     }
 
     /// Retires covered recovery archives after a live-forest rewrite, as a
@@ -3650,6 +3946,11 @@ fn archive_label_number(name: &str) -> Option<u64> {
     let suffix = name.strip_prefix("fold-").or_else(|| name.strip_prefix("rollback-"))?;
     suffix.split('-').next()?.parse().ok()
 }
+
+/// How many blocks past an archive's head the durable head must be before the
+/// archive retires: the depth an unwind (or a `safe-no-sync` power cut) can
+/// take the database back and still find the archive it restarts from.
+const ARCHIVE_RETIRE_MARGIN: u64 = 64;
 
 /// Whether the log has grown to the point where the checkpoint is rewritten.
 fn checkpoint_due(cursor: &PersistCursor) -> bool {
@@ -3870,6 +4171,16 @@ fn append_delta(path: &Path, from: u64, delta: &ForestDelta) -> Result<u64, Node
         std::fs::create_dir_all(dir).map_err(io)?;
     }
     let record = frame_delta(delta)?;
+    #[cfg(test)]
+    if FAIL_DELTA_APPEND.with(|fail| match fail.get() {
+        0 => false,
+        n => {
+            fail.set(n - 1);
+            n == 1
+        }
+    }) {
+        return Err(io(std::io::Error::from(std::io::ErrorKind::StorageFull)));
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         // Not truncated on open: the length this record belongs after is
@@ -4085,13 +4396,13 @@ mod tests {
             assert_eq!(restarted.persisted_state_root(2, hashes[1]).unwrap(), roots[1]);
             restarted.initialize((3, hashes[2])).unwrap();
             assert_eq!(restarted.state_root(), roots[2]);
-            // A heap node reads an older block from the pair the rewrite
-            // archived, exactly; without that archive, an arbitrary older
-            // block or corrupt frontier must not get the head root
-            // substituted for its missing historical root.
-            if !entry_file {
-                assert_eq!(restarted.persisted_state_root(1, hashes[0]).unwrap(), roots[0]);
-            }
+            // Either mode reads an older block from the pair the rewrite
+            // archived, exactly -- the launch asks for the deferred parent
+            // below a fold that ran ahead of the database (audit 2026-10
+            // D-1); without that archive, an arbitrary older block or
+            // corrupt frontier must not get the head root substituted for
+            // its missing historical root.
+            assert_eq!(restarted.persisted_state_root(1, hashes[0]).unwrap(), roots[0]);
             std::fs::remove_dir_all(dir.join("recovery-archive")).unwrap();
             assert!(restarted.persisted_state_root(1, hashes[0]).is_err());
             let mut corrupt = std::fs::read(restarted.frontier_path()).unwrap();
@@ -4179,6 +4490,9 @@ mod tests {
         assert!(reader.archived_heap_snapshot((1, hashes[0])).unwrap().is_some(), "database parent may still need the folded segment");
         durable.store(6, std::sync::atomic::Ordering::Relaxed);
         reader.prune_heap_archives().unwrap();
+        assert!(reader.archived_heap_snapshot((1, hashes[0])).unwrap().is_some(), "within the unwind margin");
+        durable.store(6 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
+        reader.prune_heap_archives().unwrap();
         assert!(reader.archived_heap_snapshot((1, hashes[0])).unwrap().is_none(), "covered compaction history can retire");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4234,15 +4548,42 @@ mod tests {
         // No durable boundary: nothing is guessed away.
         state.prune_heap_archives().unwrap();
         assert_eq!(archived().len(), 5);
-        let durable = Arc::new(std::sync::atomic::AtomicU64::new(4));
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(4 + ARCHIVE_RETIRE_MARGIN));
         let boundary = durable.clone();
         state.set_durable_head_reader(move || Some(boundary.load(std::sync::atomic::Ordering::Relaxed)));
         state.prune_heap_archives().unwrap();
-        // Block 3 is the durable head's parent and stays, as for a fold.
+        // Block 3 is the durable head's parent (less the margin) and stays, as for a fold.
         assert_eq!(archived(), vec![("rollback".to_owned(), 3), ("rollback".to_owned(), 5)]);
-        durable.store(7, std::sync::atomic::Ordering::Relaxed);
+        durable.store(7 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
         state.prune_heap_archives().unwrap();
         assert!(archived().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit 2026-10 D-7: the durable head can move back (an unwind, or
+    /// MDBX's `safe-no-sync` after a power cut), so an archive is retired
+    /// only once the durable head is a margin past it.
+    #[test]
+    fn an_archive_outlives_the_durable_head_by_a_margin() {
+        let chain = deferred_chain();
+        let dir = scratch("archive-margin");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, false);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let log = state.delta_log_path();
+        std::fs::write(&log, "a log").unwrap();
+        state.archive_heap_pair(&format!("fold-{:020}-{:x}", 10, B256::repeat_byte(0xa)), &log).unwrap();
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(12));
+        let boundary = durable.clone();
+        state.set_durable_head_reader(move || Some(boundary.load(std::sync::atomic::Ordering::Relaxed)));
+        let kept = || std::fs::read_dir(dir.join("recovery-archive")).unwrap().count();
+        state.prune_heap_archives().unwrap();
+        assert_eq!(kept(), 1, "two blocks past it is within the margin");
+        durable.store(11 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
+        state.prune_heap_archives().unwrap();
+        assert_eq!(kept(), 1, "the margin's last block");
+        durable.store(12 + ARCHIVE_RETIRE_MARGIN, std::sync::atomic::Ordering::Relaxed);
+        state.prune_heap_archives().unwrap();
+        assert_eq!(kept(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4509,6 +4850,70 @@ mod tests {
         assert_eq!(restarted.state_root(), root);
     }
 
+    /// Audit 2026-10 D-2: a compaction that fails once (here: the archive
+    /// directory cannot be made) leaves its sealed segment behind, and a
+    /// later checkpoint retries it. The retry must fold the segment up to
+    /// the block it ends at -- not the forest's head, which the regrown log
+    /// has carried past it -- so once the fault is gone the segment is
+    /// folded, the log rotates again and the head still restores.
+    #[test]
+    fn a_failed_compaction_is_retried_to_the_segments_own_head() {
+        use n42_qmdb_state::AccountState;
+        use alloy_primitives::{Address, U256};
+
+        for entry_file in [false, true] {
+            let chain = qmdb_chain();
+            let dir = scratch(if entry_file { "retry-file" } else { "retry-heap" });
+            let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+            state.initialize((0, chain.genesis_hash())).unwrap();
+            // A file where the archive directory goes: every fold fails.
+            let blocker = dir.join("recovery-archive");
+            std::fs::write(&blocker, b"not a directory").unwrap();
+
+            let mut parent = chain.genesis_hash();
+            let mut root = B256::ZERO;
+            let mut number = 0u64;
+            let block = |state: &QmdbNodeState, parent: &mut B256, root: &mut B256, number: &mut u64| {
+                *number += 1;
+                let mut changes = BlockChanges::new();
+                changes.set_account(
+                    Address::from_word(B256::from(U256::from(*number))),
+                    AccountState { nonce: *number, balance: U256::from(*number), code_hash: B256::ZERO },
+                );
+                let hash = B256::from(U256::from(*number) << 64);
+                let prepared = state.compute(*parent, &changes).unwrap();
+                *root = prepared.root;
+                state.insert(hash, *number, prepared).unwrap();
+                state.on_canonical(hash).unwrap();
+                *parent = hash;
+            };
+            while !state.sealed_log_path().exists() {
+                assert!(number < 20_000, "the log never rotated");
+                block(&state, &mut parent, &mut root, &mut number);
+            }
+            state.wait_for_compaction();
+            assert!(state.sealed_log_path().exists(), "the first fold failed and kept its segment");
+
+            // The fault clears; the chain goes on until the retry has had
+            // more than one chance.
+            std::fs::remove_file(&blocker).unwrap();
+            let failed_at = number;
+            while state.sealed_log_path().exists() && number < failed_at + 40_000 {
+                block(&state, &mut parent, &mut root, &mut number);
+                state.wait_for_compaction();
+            }
+            assert!(
+                !state.sealed_log_path().exists(),
+                "the segment sealed at block {failed_at} was never folded ({entry_file})"
+            );
+
+            let restarted = QmdbNodeState::new_with_entry_file(chain, &dir, entry_file);
+            restarted.initialize((number, parent)).unwrap();
+            assert_eq!(restarted.state_root(), root);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// A node can stop while a compaction is in flight: the checkpoint is
     /// then behind, the sealed segment carries the blocks up to the rotation
     /// and the log the ones after it. A restart replays all three in order,
@@ -4720,6 +5125,64 @@ mod tests {
         assert!(!portable.is_empty());
     }
 
+    /// A file-mode node whose tree was compacted restarts on the two entry
+    /// files at the same root, and refuses a v1 portable export, naming the
+    /// rule; the entry stats report the relocated bytes.
+    #[test]
+    fn a_compacted_node_restarts_and_refuses_a_portable_export() {
+        use alloy_primitives::{Address, U256};
+        use n42_qmdb_state::AccountState;
+        let chain = qmdb_chain();
+        let dir = scratch("compacted-export");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        // 2,100 accounts, then all of them rewritten: the first twig dies.
+        let mut parent = chain.genesis_hash();
+        for number in 1..=2u64 {
+            let mut changes = BlockChanges::new();
+            for i in 100..2200u64 {
+                changes.set_account(
+                    Address::from_word(B256::from(U256::from(i))),
+                    AccountState { nonce: number, balance: U256::from(i), code_hash: B256::ZERO },
+                );
+            }
+            let hash = B256::from(U256::from(number) << 64);
+            let prepared = state.compute(parent, &changes).unwrap();
+            state.insert(hash, number, prepared).unwrap();
+            state.on_canonical(hash).unwrap();
+            parent = hash;
+        }
+        // Enough small blocks that the forest lets the first two go.
+        let mut root = B256::ZERO;
+        for number in 3..=80 {
+            let (hash, r) = advance(&state, number, parent);
+            parent = hash;
+            root = r;
+        }
+        state.wait_for_compaction();
+        let report = state
+            .lock_as("a_compacted_node_restarts_and_refuses_a_portable_export")
+            .as_mut()
+            .unwrap()
+            .compact_twigs(u64::MAX, 0.5, 4)
+            .unwrap();
+        assert!(report.twigs >= 1, "{report:?}");
+        assert_eq!(state.state_root(), root);
+        assert_eq!(state.entry_stats().unwrap().relocated_bytes, report.bytes_written);
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        restarted.initialize((80, parent)).unwrap();
+        assert_eq!(restarted.state_root(), root);
+        assert_eq!(restarted.entry_stats().unwrap().relocated_bytes, report.bytes_written);
+        drop(restarted);
+        let refused = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true).portable_export(1143, chain.genesis_hash());
+        let error = refused.unwrap_err();
+        assert!(matches!(error, NodeStateError::PortableCompacted { .. }), "{error}");
+        assert!(error.to_string().contains("compaction off"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Both digests say the same thing about an intact record, and a torn
     /// one matches neither.
     #[test]
@@ -4737,7 +5200,7 @@ mod tests {
     #[test]
     fn replay_applies_branch_rewinds_instead_of_treating_them_as_checkpoint_coverage() {
         use n42_twig_core::qmdb_compat::{QmdbEntrySnapshot, QmdbSnapshot};
-        let entry = |key, value| QmdbEntrySnapshot { key: [key; 32], value: vec![value], active: true };
+        let entry = |key, value| QmdbEntrySnapshot::new([key; 32], vec![value], true);
         let checkpoint = ForestSnapshot {
             version: ForestSnapshot::VERSION, head_number: 1, head_hash: B256::repeat_byte(1),
             tree: QmdbSnapshot { next_slot: 2, entries: vec![entry(1, 1), entry(2, 1)] },
@@ -4785,6 +5248,7 @@ mod tests {
             head_hash: B256::repeat_byte(1),
             next_slot: 128,
             active: vec![u64::MAX, u64::MAX],
+            relocated_len: 0,
         };
         let delta = ForestDelta {
             version: ForestDelta::VERSION,

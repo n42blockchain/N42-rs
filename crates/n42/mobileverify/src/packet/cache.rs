@@ -171,9 +171,9 @@ impl PacketCache {
     /// Validates a gossiped packet and caches it if it fits the window and
     /// the per-height bound. Returns `(hash, number, newly_inserted)`.
     ///
-    /// Refused while `head` is `None` (a node before its first commit): gov5
-    /// has a head from its database by then, while here an unchecked number
-    /// near `u64::MAX` would pin `max_num` and end eviction for good.
+    /// Refused while `head` is `None` (a node before its first commit): an
+    /// unchecked number near `u64::MAX` would pin `max_num` and end eviction
+    /// for good.
     pub fn validate_incoming(
         &self,
         data: Bytes,

@@ -7,6 +7,9 @@
 #   ABSENT_VALIDATOR=<i> ABSENT_AT=<s> ABSENT_FOR=<s> take one member (own EL) away and bring it back
 #   MOBILEVERIFY=1 serve gov5's /mobileverify on every member: Rust validator i on
 #     127.0.0.1:2101<i> (--mobileverify.http), the gov5 member on 127.0.0.1:21020
+#   PACKETD=<binary> with MOBILEVERIFY=1: gov5's cmd/mobileverify-packetd beside Rust validator 0
+#     (follows the EL on 18545 -- debug_getRawBlock, hence --http.api ...,debug -- and PUTs each
+#     block's StreamPacket to 127.0.0.1:21010, which publishes it to the fleet)
 #
 # Data lives under $N42_FLEET_DIR (default: /tmp/n42-fleet). Every process is
 # left running afterwards so it can be inspected; the next run kills them.
@@ -34,10 +37,11 @@ if [ ! -d $F/keys ]; then
   mkdir -p $F/keys
   $BIN/examples/h2_keygen --count 4 --seed n42-devnet-validator --out-dir $F/keys > /dev/null
 fi
+[ -n "${PACKETD:-}" ] && pkill -f "^$PACKETD " 2>/dev/null
 pkill -f "^$BIN/examples/h2_validator" 2>/dev/null; pkill -f "^$BIN/n42 node" 2>/dev/null; pkill -f "^$GOV5/build/bin/n42 " 2>/dev/null; sleep 1
 if [ -z "$KEEP" ]; then rm -rf $F/datadir $F/consensus-{0..3} $F/gov5; fi
 RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir \
-  --authrpc.port 18551 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18545 --port 30313 \
+  --authrpc.port 18551 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18545 --http.api eth,net,web3,debug --port 30313 \
   --disable-discovery --ipcdisable > $F/el-$TAG.log 2>&1 &
 for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-$TAG.log 2>/dev/null && break; sleep 1; done
 LAST=3; [ -n "$WITH_GOV5" ] && LAST=2
@@ -62,7 +66,7 @@ for i in $(seq 0 $LAST); do
   if [ "${ABSENT_VALIDATOR:-}" = "$i" ]; then
     rm -rf $F/consensus-$i $F/datadir-late
     own_el() { RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
-        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --port 30323 \
+        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --http.api eth,net,web3,debug --port 30323 \
         --disable-discovery --ipcdisable > $F/el-late-$TAG$1.log 2>&1 &
       for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG$1.log 2>/dev/null && break; sleep 1; done; }
     own_v() { RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
@@ -96,7 +100,7 @@ for i in $(seq 0 $LAST); do
           --qmdb $LATE_SNAPSHOT/state.qmdb > $F/init-late-$TAG.log 2>&1
       fi
       RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
-        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --port 30323 \
+        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --http.api eth,net,web3,debug --port 30323 \
         --disable-discovery --ipcdisable > $F/el-late-$TAG.log 2>&1 &
       for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG.log 2>/dev/null && break; sleep 1; done
       RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
@@ -128,6 +132,12 @@ for i in $(seq 0 $LAST); do
     fi
   fi
 done
+if [ "${MOBILEVERIFY:-}" = 1 ] && [ -n "${PACKETD:-}" ]; then
+  for _ in $(seq 1 30); do curl -sf http://127.0.0.1:21010/mobileverify/health >/dev/null && break; sleep 1; done
+  mkdir -p $F/packets
+  $PACKETD -rpc http://127.0.0.1:18545 -mv http://127.0.0.1:21010 -genesis $GENESIS -out $F/packets \
+    -verbosity ${PACKETD_VERBOSITY:-info} > $F/packetd-$TAG.log 2>&1 &
+fi
 sleep $SECS
 echo "=== summary after ${SECS}s ($TAG) ==="
 for i in $(seq 0 $LAST); do

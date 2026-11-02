@@ -43,6 +43,12 @@ impl Collector {
 
     /// Validates and admits one receipt; returns the device's index.
     pub fn add(&self, r: &Receipt) -> Result<MobileIndex, MobileVerifyError> {
+        self.add_checked(r, false)
+    }
+
+    /// [`Self::add`], skipping the signature pairing when the caller has
+    /// already verified this receipt's signature.
+    pub(crate) fn add_checked(&self, r: &Receipt, signature_verified: bool) -> Result<MobileIndex, MobileVerifyError> {
         if r.block_hash != self.block_hash || r.block_number != self.block_number {
             return Err(MobileVerifyError::WrongBlock {
                 got_number: r.block_number,
@@ -52,7 +58,9 @@ impl Collector {
             });
         }
         let idx = self.reg.lookup(&r.verifier_pubkey).ok_or(MobileVerifyError::NotRegistered)?;
-        r.verify_signature()?;
+        if !signature_verified {
+            r.verify_signature()?;
+        }
         let mut st = self.state.lock();
         if st.closed || st.frozen {
             return Err(MobileVerifyError::WindowClosed);

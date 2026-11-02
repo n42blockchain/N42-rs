@@ -371,6 +371,12 @@ until a fleet runs the patched gov5 of `docs/patches/gov5-header-field-parity/`.
   It refuses to assemble a block whose timestamp falls under the root gate
   (`assemble_n42_block`), so it never builds a header that other members
   would refuse.
+  Update (2026-11-01, `feat/mobileverify-v3`, `docs/MOBILEVERIFY_V3_PARITY.md`
+  stage 2): the provider now exists. `h2_validator --mobileverify.http`
+  keeps gov5's registry and names `registry.root()` in the payload
+  attributes (`mobile_registry_root`, JSON `mobileRegistryRoot`); the builder
+  stamps it under the gate and still refuses a block there when the
+  attributes name none.
 - **Not covered yet.** `n42-init-snapshot` decodes the snapshot head as
   Ethereum's header, so it cannot start a node at a head that carries a
   root. The APoS miner and reth's own `init` / `db` commands stay on

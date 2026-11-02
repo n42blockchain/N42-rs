@@ -606,6 +606,10 @@ pub struct H2Service<E> {
     gossiped_transactions: std::collections::VecDeque<B256>,
     /// The headers of the same blocks.
     block_headers: std::collections::HashMap<B256, Header>,
+    /// gov5's mobile-verification topics: what arrives goes to the relay
+    /// task (never awaited on this loop), what it hands back is published.
+    mobile_inbound: Option<mpsc::Sender<(n42_h2_net::MobileTopic, Vec<u8>)>>,
+    mobile_outbound: Option<mpsc::Receiver<(n42_h2_net::MobileTopic, Vec<u8>)>>,
     /// Block numbers, same bookkeeping, for the height this node advertises
     /// in the status handshake once a block commits.
     block_numbers: std::collections::HashMap<B256, u64>,
@@ -1633,6 +1637,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             outbound_transactions: None,
             gossiped_transactions: std::collections::VecDeque::new(),
             block_headers: std::collections::HashMap::new(),
+            mobile_inbound: None,
+            mobile_outbound: None,
             block_numbers: std::collections::HashMap::new(),
             block_seen: std::collections::HashMap::new(),
             timestamp_order: Vec::new(),
@@ -1948,6 +1954,20 @@ impl<E: ExecutionLayer> H2Service<E> {
         self
     }
 
+    /// Relays gov5's mobile-verification topics: messages from them are
+    /// handed to `inbound` (dropped when it is full, never awaited), and what
+    /// arrives on `outbound` is published. The transport must have joined the
+    /// topics (`TransportConfig::mobileverify`).
+    pub fn with_mobile_gossip(
+        mut self,
+        inbound: mpsc::Sender<(n42_h2_net::MobileTopic, Vec<u8>)>,
+        outbound: mpsc::Receiver<(n42_h2_net::MobileTopic, Vec<u8>)>,
+    ) -> Self {
+        self.mobile_inbound = Some(inbound);
+        self.mobile_outbound = Some(outbound);
+        self
+    }
+
     /// Hands gossiped transactions to the execution layer's binary ingest
     /// instead of its JSON-RPC. The outbound direction is unchanged, so this
     /// goes after [`Self::with_transaction_source`] and replaces only the
@@ -2066,6 +2086,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let propose_at = tick.map_or(retry_at, |tick| retry_at.min(tick));
         let on_tick = tick.is_some_and(|tick| tick <= retry_at);
         let outbound = self.outbound_transactions.as_mut();
+        let mobile_outbound = self.mobile_outbound.as_mut();
         let body_rx = self.body_rx.as_mut();
         let own_imports = self.own_imports.as_mut();
         let foreign_imports = self.foreign_imports.as_mut();
@@ -2122,6 +2143,18 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return Err(ServiceError::TransportEnded);
                 };
                 self.handle_transport_event(event)?;
+            }
+            mobile = async {
+                match mobile_outbound {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some((topic, data)) = mobile
+                    && let Err(err) = self.transport.publish_mobile(topic, data)
+                {
+                    debug!(target: "n42.h2.node", %err, ?topic, "could not gossip a mobile-verification message");
+                }
             }
             batch = async {
                 match outbound {
@@ -2900,6 +2933,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.direct_votes.note_direct();
                 return self.handle_transport_event_inner(*inner);
             }
+            TransportEvent::MobilePacket { data, .. } => self.forward_mobile(n42_h2_net::MobileTopic::Packet, data),
+            TransportEvent::MobileRegistration { data, .. } => {
+                self.forward_mobile(n42_h2_net::MobileTopic::Registration, data);
+            }
             TransportEvent::Rejected { reason, .. } => {
                 debug!(target: "n42.h2.node", reason, "dropped a gossip payload");
             }
@@ -2909,6 +2946,15 @@ impl<E: ExecutionLayer> H2Service<E> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Hands a mobile-verification message to the relay task, if there is one.
+    fn forward_mobile(&self, topic: n42_h2_net::MobileTopic, data: Vec<u8>) {
+        if let Some(tx) = &self.mobile_inbound
+            && tx.try_send((topic, data)).is_err()
+        {
+            debug!(target: "n42.h2.node", ?topic, "mobile-verification relay queue full; message dropped");
+        }
     }
 
     /// Feeds a decoded consensus message to the engine.

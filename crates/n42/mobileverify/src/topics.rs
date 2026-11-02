@@ -9,7 +9,7 @@ use alloy_primitives::B256;
 
 use crate::bls::{PUBKEY_LEN, SIGNATURE_LEN};
 
-/// StreamPacket gossip.
+/// `StreamPacket` gossip.
 pub const PACKET: &str = "mobileverify_packet";
 /// Registration gossip (`pubkey48 ‖ pop96`).
 pub const REGISTRATION: &str = "mobileverify_registration";

@@ -134,7 +134,7 @@ impl Default for AlarmBuffer {
 
 impl AlarmBuffer {
     /// A buffer keeping the latest `max` alarms (0 means 256).
-    pub fn new(max: usize) -> Self {
+    pub const fn new(max: usize) -> Self {
         Self { max: if max == 0 { DEFAULT_ALARM_CAPACITY } else { max }, items: Mutex::new(Vec::new()) }
     }
 
@@ -513,7 +513,7 @@ mod tests {
         let (reg, chain, certs, keys) = setup();
         let h = B256::repeat_byte(0x10);
         chain.blocks.write().insert(h, 100);
-        let co = CohortCoordinator::new(reg.clone(), chain.clone(), certs.clone(), CohortConfig::default());
+        let co = CohortCoordinator::new(reg.clone(), chain, certs.clone(), CohortConfig::default());
         let alarms = Arc::new(AlarmBuffer::default());
         co.record_alarms_into(alarms.clone());
 

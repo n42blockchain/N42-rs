@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! gov5's protobuf transaction (`types_pb.Transaction`,
-//! `common/transaction/transaction.go:475-488`), the form a StreamPacket
+//! `common/transaction/transaction.go:475-488`), the form a `StreamPacket`
 //! carries. A packet's transactions have `from` (field 11) set: gov5's
 //! `AsMessage` trusts it and skips sender recovery. Bytes starting with
 //! `0xFF` are gov5's compact storage form, accepted inside a packet but not
@@ -96,7 +96,7 @@ impl PbTransaction {
     }
 
     /// Converts a uint256 to gov5's H256 (`convertUint256IntToH256IfSet`).
-    pub fn h256(v: &U256) -> super::proto::H256 {
+    pub const fn h256(v: &U256) -> super::proto::H256 {
         u256_to_h256(v)
     }
 

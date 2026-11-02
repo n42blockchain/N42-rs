@@ -35,7 +35,7 @@ pub fn verify_pop(pubkey: &[u8; PUBKEY_LEN], pop: &[u8; SIGNATURE_LEN]) -> Resul
 
 /// The registration body exactly as the SDK POSTs it
 /// (`cmd/evmsdk/mobileverify_client.go`: `json.Marshal` of a map, keys
-/// sorted, hex without `0x`; the PoW nonce, when solved, as a decimal string).
+/// sorted, hex without `0x`; the proof-of-work nonce, when solved, as a decimal string).
 pub fn register_request_json(pubkey: &[u8; PUBKEY_LEN], pop: &[u8; SIGNATURE_LEN], pow_nonce: Option<u64>) -> String {
     let mut obj = gojson::Obj::new().str("pop", &hex::encode(pop));
     if let Some(n) = pow_nonce {

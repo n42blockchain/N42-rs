@@ -144,7 +144,7 @@ mod tests {
         r.verify_signature().unwrap();
         let parsed = parse_receipt_request(r.to_request_json().as_bytes()).unwrap();
         assert_eq!(parsed, r);
-        let mut bad = r.clone();
+        let mut bad = r;
         bad.block_number = 43;
         assert_eq!(bad.verify_signature().unwrap_err().to_string(), "mobileverify: invalid receipt signature");
         assert_eq!(parse_receipt_request(b"{").unwrap_err(), ReceiptRequestError::BadJson);

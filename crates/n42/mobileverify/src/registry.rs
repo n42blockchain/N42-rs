@@ -94,7 +94,7 @@ impl Registry {
         *self.on_register.write() = Some(hook);
     }
 
-    /// Verifies the PoP and admits the key to the pending set. Idempotent:
+    /// Verifies the proof of possession and admits the key to the pending set. Idempotent:
     /// a committed key returns `(index, true)`, a pending one `(0, false)`;
     /// a revoked key is refused. The hook fires only for a new key.
     pub fn register(&self, pubkey: &Pubkey, pop: &Pop) -> Result<(MobileIndex, bool), MobileVerifyError> {
@@ -145,7 +145,7 @@ impl Registry {
         }
         let mut batch: Vec<(B256, Pubkey, Pop)> =
             inner.pending.drain().map(|(pk, pop)| (key_hash(&pk), pk, pop)).collect();
-        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        batch.sort_by_key(|a| a.0);
         let mut n = 0;
         for (kh, pubkey, pop) in batch {
             if inner.known.contains_key(&pubkey) {
@@ -199,7 +199,7 @@ impl Registry {
         (inner.tree.root(), true)
     }
 
-    /// Revokes `old` and admits `new` (with its PoP) to the pending set.
+    /// Revokes `old` and admits `new` (with its proof of possession) to the pending set.
     pub fn rotate(&self, old: &Pubkey, new: &Pubkey, new_pop: &Pop) -> Result<B256, MobileVerifyError> {
         verify_pop(new, new_pop)?;
         let mut inner = self.inner.write();
@@ -245,7 +245,7 @@ impl Registry {
         indices
             .iter()
             .map(|i| {
-                inner.committed.get(*i as usize).map(|e| e.pk).ok_or(MobileVerifyError::UnknownIndexAt(u64::from(*i)))
+                inner.committed.get(*i as usize).map(|e| e.pk).ok_or_else(|| MobileVerifyError::UnknownIndexAt(u64::from(*i)))
             })
             .collect()
     }
@@ -308,7 +308,7 @@ impl Registry {
         let mut by_key = HashMap::with_capacity(count);
         let mut known = HashMap::with_capacity(count);
         let mut tree = Accumulator::new();
-        for (i, entry) in body.chunks_exact(SNAPSHOT_ENTRY_LEN).enumerate() {
+        for (i, entry) in body.as_chunks::<SNAPSHOT_ENTRY_LEN>().0.iter().enumerate() {
             let mut pubkey = [0u8; 48];
             pubkey.copy_from_slice(&entry[..48]);
             let mut pop = [0u8; 96];

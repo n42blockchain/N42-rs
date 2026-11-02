@@ -226,7 +226,7 @@ pub fn h256_to_hash(h: Option<&H256>) -> B256 {
 }
 
 /// `ConvertUint256IntToH256`.
-pub fn u256_to_h256(v: &U256) -> H256 {
+pub const fn u256_to_h256(v: &U256) -> H256 {
     let w = v.as_limbs();
     H256 { hi: Some(H128 { hi: w[3], lo: w[2] }), lo: Some(H128 { hi: w[1], lo: w[0] }) }
 }

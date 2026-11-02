@@ -19,7 +19,7 @@
 //!   message and its JSON body, cohort certificates, merge and storage.
 //! - [`collector`], [`cohort`]: one block's intake and the height-driven
 //!   1/2/3/5-block schedule that turns receipts into stored certificates.
-//! - [`packet`]: StreamPacket V2, gov5's header `Marshal` and transaction
+//! - [`packet`]: `StreamPacket` V2, gov5's header `Marshal` and transaction
 //!   protobuf codecs, the read log, and the packet cache.
 //! - [`receipts_root`]: the native receipts root a phone recomputes.
 //! - [`topics`]: gossip topic names and the registration payload.

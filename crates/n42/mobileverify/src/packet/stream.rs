@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! StreamPacket V2 (`cmd/evmsdk/stream_packet.go:50-183`, header in
+//! `StreamPacket` V2 (`cmd/evmsdk/stream_packet.go:50-183`, header in
 //! `wire.go`). Every length and count is u32 little-endian:
 //!
 //! ```text
@@ -91,7 +91,7 @@ impl<'a> Reader<'a> {
 
 impl StreamPacket {
     /// The wire flags this packet encodes with.
-    pub fn flags(&self) -> u8 {
+    pub const fn flags(&self) -> u8 {
         if self.bytecodes.is_empty() { 0 } else { FLAG_HAS_BYTECODES }
     }
 

@@ -145,24 +145,24 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, ReadLogError> {
                     return Err(ReadLogError(format!("invalid account header 0x{h:02x} at offset {}", pos - 1)));
                 }
                 let nonce_len = if h & NONCE_8 != 0 { 8 } else { usize::from((h & NONCE_LEN_MASK) >> 1) };
-                let mut nonce = 0u64;
-                if nonce_len > 0 {
+                let nonce = if nonce_len > 0 {
                     let mut buf = [0u8; 8];
                     buf[8 - nonce_len..].copy_from_slice(take(&mut pos, nonce_len)?);
-                    nonce = u64::from_be_bytes(buf);
-                }
-                let mut balance = U256::ZERO;
-                if h & BALANCE != 0 {
+                    u64::from_be_bytes(buf)
+                } else {
+                    0
+                };
+                let balance = if h & BALANCE != 0 {
                     let len = usize::from(take(&mut pos, 1)?[0]);
                     if len > 32 {
                         return Err(ReadLogError(format!("balance length {len} > 32")));
                     }
-                    balance = U256::from_be_slice(take(&mut pos, len)?);
-                }
-                let mut code_hash = EMPTY_CODE_HASH;
-                if h & CODE_HASH != 0 {
-                    code_hash = B256::from_slice(take(&mut pos, 32)?);
-                }
+                    U256::from_be_slice(take(&mut pos, len)?)
+                } else {
+                    U256::ZERO
+                };
+                let code_hash =
+                    if h & CODE_HASH != 0 { B256::from_slice(take(&mut pos, 32)?) } else { EMPTY_CODE_HASH };
                 ReadLogEntry::Account { nonce, balance, code_hash }
             }
             h if h <= STORAGE_BASE + 32 => {

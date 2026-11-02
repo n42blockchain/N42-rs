@@ -580,7 +580,7 @@ fn transaction_protobuf() {
         let tx = decode_transaction(&bytes).expect("decode");
         assert_eq!(encode_transaction(&tx), bytes, "{name} re-encode");
         assert_eq!(tx.r#type, u(&t["type"]), "{name}");
-        assert_eq!(tx.sender().map(|a| hex::encode(a)), Some(s(&t["from"]).to_string()), "{name}");
+        assert_eq!(tx.sender().map(hex::encode), Some(s(&t["from"]).to_string()), "{name}");
         assert_eq!(h256_to_u256(tx.r.as_ref()), quantity(&t["r"]), "{name} r");
         assert_eq!(h256_to_u256(tx.s.as_ref()), quantity(&t["s"]), "{name} s");
         assert_eq!(h256_to_u256(tx.v.as_ref()), quantity(&t["v"]), "{name} v");

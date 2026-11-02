@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! gov5's header `Marshal`/`Unmarshal` (`common/block/header.go:294-388`),
-//! the encoding a StreamPacket carries (not RLP):
+//! the encoding a `StreamPacket` carries (not RLP):
 //!
 //! `proto(types_pb.Header) ‖ "N42H" ‖ flags ‖ UncleHash32 ‖ [WithdrawalsHash32
 //! 0x01] ‖ [ParentBeaconRoot32 0x02] ‖ [RequestsHash32 0x04] ‖ [BlobGasUsed LE8

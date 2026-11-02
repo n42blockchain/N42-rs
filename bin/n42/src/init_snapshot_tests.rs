@@ -105,7 +105,32 @@ fn a_header_file_may_hold_raw_rlp() {
     let header = sample_header();
     let path = scratch.path("raw.rlp");
     fs::write(&path, header_rlp(&header)).unwrap();
-    assert_eq!(read_header_from_file(&path).unwrap(), header);
+    assert_eq!(read_header_from_file(&path).unwrap().into_inner(), header);
+}
+
+/// What `export` writes for a head past MobileAnchor: the N42 header, with the
+/// registry root at element 24, whose hash covers the root.
+#[test]
+fn a_header_file_may_carry_the_registry_root() {
+    let scratch = Scratch::new();
+    let inner = Header {
+        base_fee_per_gas: Some(7),
+        withdrawals_root: Some(B256::repeat_byte(1)),
+        blob_gas_used: Some(0),
+        excess_blob_gas: Some(0),
+        parent_beacon_block_root: Some(B256::ZERO),
+        slot_number: Some(9),
+        number: 9,
+        ..Default::default()
+    };
+    let header = n42_header::N42Header::new(inner, Some(B256::repeat_byte(0x24)));
+    let mut rlp = Vec::new();
+    alloy_rlp::Encodable::encode(&header, &mut rlp);
+    let path = scratch.path("header.rlp");
+    fs::write(&path, rlp).unwrap();
+    let read = read_header_from_file(&path).unwrap();
+    assert_eq!(read, header);
+    assert_eq!(read.hash_slow(), header.hash_slow());
 }
 
 #[test]
@@ -120,7 +145,7 @@ fn a_header_file_may_hold_hex_with_or_without_the_prefix_and_a_newline() {
     ] {
         let path = scratch.path(name);
         fs::write(&path, text).unwrap();
-        assert_eq!(read_header_from_file(&path).unwrap(), header, "{name}");
+        assert_eq!(read_header_from_file(&path).unwrap().into_inner(), header, "{name}");
     }
 }
 

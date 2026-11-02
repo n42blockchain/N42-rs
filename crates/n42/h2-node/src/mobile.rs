@@ -92,6 +92,18 @@ impl CommittedHead {
         if inner.head.is_none_or(|(n, _)| number >= n) {
             inner.head = Some((number, hash));
         }
+        Self::remember_locked(&mut inner, number, hash);
+    }
+
+    /// Learns a block's number without moving the head: a header this node
+    /// holds before its commit (a relayed packet carries one, hash-checked).
+    /// gov5 pins receipts to any header it has (`ReadHeaderNumber`), so a
+    /// receipt that races the commit is not refused as unknown.
+    pub fn remember(&self, number: u64, hash: B256) {
+        Self::remember_locked(&mut self.inner.write(), number, hash);
+    }
+
+    fn remember_locked(inner: &mut HeadInner, number: u64, hash: B256) {
         if inner.numbers.insert(hash, number).is_none() {
             inner.order.push_back(hash);
         }
@@ -276,6 +288,7 @@ async fn relay(
                 let at = head.head().map(|(n, _)| n);
                 match packets.validate_incoming(Bytes::from(data), at) {
                     Ok((hash, number, new)) => {
+                        head.remember(number, hash);
                         debug!(target: "mobileverify", %hash, number, new, "relayed packet cached");
                     }
                     Err(err) => debug!(target: "mobileverify", %err, "dropped a gossiped packet"),
@@ -315,6 +328,9 @@ mod tests {
         assert_eq!(head.number_of(&B256::repeat_byte(4)), Some(4));
         assert_eq!(head.number_of(&B256::repeat_byte(6)), Some(6));
         assert_eq!(head.head(), Some((6, B256::repeat_byte(6))));
+        head.remember(9, B256::repeat_byte(9));
+        assert_eq!(head.number_of(&B256::repeat_byte(9)), Some(9), "a known header is looked up");
+        assert_eq!(head.head(), Some((6, B256::repeat_byte(6))), "but does not move the head");
     }
 
     #[test]

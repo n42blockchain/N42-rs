@@ -278,23 +278,41 @@ impl MobileVerify {
 async fn commit_epochs(registry: Arc<Registry>, every: Duration, snapshot: Option<PathBuf>) {
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every.max(Duration::from_secs(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut unsaved = false;
     loop {
         tick.tick().await;
-        let (root, added) = registry.commit_epoch();
-        if added == 0 {
-            continue;
-        }
+        commit_epoch_and_save(&registry, snapshot.as_deref(), &mut unsaved);
+    }
+}
+
+/// One epoch: folds the pending set and writes the snapshot if it changed.
+/// `unsaved` carries a failed write to the next epoch, which retries it even
+/// with nothing new to fold: otherwise a registry gone quiet after a failed
+/// write loses those devices' indices on the next restart.
+fn commit_epoch_and_save(registry: &Registry, snapshot: Option<&Path>, unsaved: &mut bool) {
+    let (root, added) = registry.commit_epoch();
+    if added > 0 {
+        *unsaved = true;
         info!(target: "n42::mobileverify", added, count = registry.index_bound(), %root, "registry epoch committed");
-        if let Some(path) = &snapshot
-            && let Err(err) = write_snapshot(path, &registry.export_committed())
-        {
-            warn!(target: "n42::mobileverify", path = %path.display(), %err, "could not persist the registry snapshot");
+    }
+    if !*unsaved {
+        return;
+    }
+    let Some(path) = snapshot else {
+        *unsaved = false;
+        return;
+    };
+    match write_snapshot(path, &registry.export_committed()) {
+        Ok(()) => *unsaved = false,
+        Err(err) => {
+            warn!(target: "n42::mobileverify", path = %path.display(), %err, "could not persist the registry snapshot; retrying next epoch");
         }
     }
 }
 
 /// Writes `data` to `path` through a temporary file and a rename, so a crash
-/// leaves the previous snapshot or the new one, never half of one.
+/// leaves the previous snapshot or the new one, never half of one. The
+/// directory is synced too: without it a power cut can undo the rename.
 pub fn write_snapshot(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     if let Some(dir) = path.parent() {
@@ -306,7 +324,11 @@ pub fn write_snapshot(path: &Path, data: &[u8]) -> std::io::Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::File::open(dir)?.sync_all(),
+        _ => Ok(()),
+    }
 }
 
 /// Validates what the two topics deliver: a packet against the window around
@@ -388,6 +410,35 @@ mod tests {
         assert_eq!(head.number_of(&B256::repeat_byte(6)), Some(6));
         assert_eq!(head.number_of(&B256::repeat_byte(0x80 + 63)), Some(7), "the newest are kept");
         assert_eq!(head.number_of(&B256::repeat_byte(0x80)), None, "bounded on their own");
+    }
+
+    /// An epoch whose write failed (a full disk, say) stays owed: the next
+    /// tick writes it even with nothing new to fold, or a quiet registry
+    /// loses every device index on the next restart.
+    #[test]
+    fn a_failed_snapshot_is_written_by_a_later_epoch() {
+        let dir = std::env::temp_dir().join(format!("n42-mv-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creates");
+        // A file where the snapshot's directory must go.
+        let blocker = dir.join("mobileverify");
+        std::fs::write(&blocker, b"x").expect("writes");
+        let path = dir.join(REGISTRY_FILE);
+
+        let reg = Registry::new();
+        let key = n42_mobileverify::DeviceKey::from_ikm(&[9u8; 32]).expect("key");
+        reg.register(&key.pubkey(), &key.proof_of_possession()).expect("registers");
+        let mut unsaved = false;
+        commit_epoch_and_save(&reg, Some(&path), &mut unsaved);
+        assert!(unsaved, "the write failed");
+
+        std::fs::remove_file(&blocker).expect("removes");
+        commit_epoch_and_save(&reg, Some(&path), &mut unsaved);
+        assert!(!unsaved);
+        let back = Registry::new();
+        back.import_committed(&std::fs::read(&path).expect("the retry wrote it")).expect("imports");
+        assert_eq!(back.lookup(&key.pubkey()), Some(0));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

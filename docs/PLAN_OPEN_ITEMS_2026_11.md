@@ -29,7 +29,8 @@ or `audit-notes/ci/`; research notes in English under `docs/`.
 | D4 | packetd polls every 250 ms | add an opt-in `newHeads` subscription over WebSocket, keep the poll as fallback | D | gov5 test; live run shows sub-50 ms packet latency | code + tests done (gov5 8fe815dc); live latency run pending |
 | D5 | Pure-Rust packet producer (gov5's read log is positional in Go `IntraBlockState` order) | feasibility spike only: can revm's access order be made identical for the devnet's transaction shapes? verdict in `MOBILEVERIFY_V3_PARITY.md`; no implementation unless the order is provably identical | D | the written verdict with a byte comparison against a sidecar packet | open |
 | D6 | Registry index may differ across nodes near epoch boundaries (gov5 has the same 45 s wall-clock timer) | design note: epoch commits keyed on block timestamp, proposed to gov5; no code until gov5 agrees | D | the note in `MOBILEVERIFY_V3_PARITY.md` | done 2026-11-02 (note written; gov5 agreement pending) |
-| A3 | Genesis parity on a chain with `glamsterdamTime` at genesis: gov5's genesis header carries `blockAccessListHash` = keccak(rlp([])) (element 22, no slot), reth's ends at `requestsHash`; gov5 puts no BAL hash in native blocks above genesis | decide which side changes (Rust genesis builder adds the empty BAL hash, or gov5 drops it on native chains), then implement | A/B | both clients init `n42_devnet_mobileanchor.json` to one hash; A1 rerun | open |
+| A3 | Genesis parity on a chain with `glamsterdamTime` at genesis: gov5's genesis header carries `blockAccessListHash` = keccak(rlp([])) (element 22, no slot), reth's ends at `requestsHash`; gov5 puts no BAL hash in native blocks above genesis | decide which side changes (Rust genesis builder adds the empty BAL hash, or gov5 drops it on native chains), then implement | A/B | both clients init `n42_devnet_mobileanchor.json` to one hash; A1 rerun | fixed in Rust (67ff48630, 2026-11-03): the genesis builder adds the empty BAL hash under gov5's `glamsterdamTime`; test pins `0x9e8628a6`; devnet and chain-94 hashes unchanged. Live check is the A1 rerun `mv4h3` |
+| G2 | Chain 94's Rust genesis still carried `glamsterdamTime` 1798761600 after gov5 7529e2e9 removed it | regenerate from gov5 main | A | hash unchanged; `cargo test -p reth-chainspec` | done (36111540d): both gov5 files regenerated from gov5 main 39cff9ce, chain 94 loses the key, chain 95 byte-identical, hashes unchanged; test run by the merge gate |
 | E1 | Commit b1a96f563's body names the `CLAUDE.md` file | not done: it is pushed `main` history and a rewrite was declined; the body contains no attribution | — | — | closed |
 | E2 | gov5 v2 tombstone portable snapshot (a compacting node is a pruned node to today's verifier) | gov5 cross-client item; C writes the format proposal into the compaction design doc | C | the proposal section | open |
 
@@ -52,6 +53,12 @@ builds.
   leader roots 111/111, packetd drops all 83 transaction blocks (Amsterdam execution, as mv4f),
   device 20/20 on empty blocks only (skipped 72). A2 `c94-a`: pass. Details and evidence paths:
   `docs/MOBILEVERIFY_V3_PARITY.md` "Gate verification"; evidence `audit-notes/devnet/{mv4h2,c94-a,c94-genesis}`.
+- 2026-11-03 (A): A3 fixed on the Rust side (67ff48630): gov5's genesis for a Glamsterdam-at-genesis
+  chain is reth's 21 elements plus the empty BAL hash, no slot (recomputed from gov5's hash; gov5's
+  `genesis_block.go` writes a slot too but its header carries none -- matched by observation). G2 done
+  (36111540d): chain 94's Rust genesis regenerated from gov5 main without `glamsterdamTime`, so neither
+  client puts the slot/root tail on chain 94 until a date is scheduled; chain 95 unchanged. A1 rerun
+  `mv4h3` waits for B's gov5 tree (EIP-8282 off on native chains) and B's binaries.
 - D1 (2026-11-02): `origin` in the shared checkout `/home/n42/src/n42/n42-rs` now points at
   `git@github.com:n42blockchain/N42-rs.git` (worktrees share that config; `git remote -v` and `git fetch origin`
   from `wt-small` succeed without the "repository moved" notice). `Cargo.toml` and `README.md` already named the

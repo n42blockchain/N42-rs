@@ -55,6 +55,14 @@ impl N42ChainSpec {
         reth_chainspec::qmdb::glamsterdam_active_at(self.inner.genesis(), timestamp)
     }
 
+    /// Whether a block at `timestamp` executes under gov5's Amsterdam rules
+    /// on this native chain
+    /// ([`reth_chainspec::qmdb::glamsterdam_execution_active_at`]); the
+    /// header and payload keep the native shape.
+    pub fn glamsterdam_execution_active_at(&self, timestamp: u64) -> bool {
+        reth_chainspec::qmdb::glamsterdam_execution_active_at(self.inner.genesis(), timestamp)
+    }
+
     /// Whether a header at `timestamp` carries `mobileRegistryRoot`
     /// ([`reth_chainspec::qmdb::mobile_registry_root_in_header_at`]).
     pub fn mobile_registry_root_in_header_at(&self, timestamp: u64) -> bool {

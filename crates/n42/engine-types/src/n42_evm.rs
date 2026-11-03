@@ -67,6 +67,10 @@ pub struct N42EvmConfig<C = ChainSpec, EvmF = crate::fast_transfer::N42EvmFactor
     pub sender_recovery_cache: Option<SenderRecoveryCache>,
     /// Whether the chain is a HotStuff chain, read from its genesis once.
     hotstuff: std::sync::OnceLock<bool>,
+    /// From when blocks execute under the Amsterdam rules on this native
+    /// chain (gov5's `glamsterdamTime`), read from its genesis once; `None`
+    /// on a chain that never does ([`glamsterdam_execution_time`]).
+    glamsterdam_execution: std::sync::OnceLock<Option<u64>>,
 }
 
 impl<C, EvmF> N42EvmConfig<C, EvmF> {
@@ -77,6 +81,7 @@ impl<C, EvmF> N42EvmConfig<C, EvmF> {
             sender_recovery_cache: None,
             executor_factory: EthBlockExecutorFactory::new(N42ReceiptBuilder, chain_spec, evm_factory),
             hotstuff: std::sync::OnceLock::new(),
+            glamsterdam_execution: std::sync::OnceLock::new(),
         }
     }
 
@@ -137,6 +142,31 @@ impl<C, EvmF> N42EvmConfig<C, EvmF> {
             .get_or_init(|| n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(self.chain_spec().genesis()).is_ok())
     }
 
+    /// Whether a block at `timestamp` executes under the Amsterdam rules
+    /// although the chain spec does not schedule reth's Amsterdam: an
+    /// N42-native chain past gov5's `glamsterdamTime`
+    /// ([`reth_chainspec::qmdb::glamsterdam_execution_active_at`]).
+    pub fn glamsterdam_execution_active_at(&self, timestamp: u64) -> bool
+    where
+        C: EthChainSpec,
+    {
+        self.glamsterdam_execution
+            .get_or_init(|| glamsterdam_execution_time(self.chain_spec().genesis()))
+            .is_some_and(|at| timestamp >= at)
+    }
+
+    /// Raises `cfg` to [`SpecId::AMSTERDAM`] (with its gas table, EIP-8037
+    /// and EIP-2780) for a block at `timestamp` that executes under gov5's
+    /// Amsterdam rules; leaves every other block's configuration as it is.
+    fn apply_glamsterdam_execution(&self, cfg: &mut CfgEnv<SpecId>, timestamp: u64)
+    where
+        C: EthChainSpec,
+    {
+        if self.glamsterdam_execution_active_at(timestamp) && !cfg.spec.is_enabled_in(SpecId::AMSTERDAM) {
+            glamsterdam_execution_cfg(cfg);
+        }
+    }
+
     /// Uses `cache` for sender recovery on import.
     pub fn with_sender_recovery_cache(mut self, cache: SenderRecoveryCache) -> Self {
         self.sender_recovery_cache = Some(cache);
@@ -181,11 +211,12 @@ where
             self.chain_spec().blob_params_at_timestamp(header.timestamp),
         );
         env.block_env.beneficiary = self.block_beneficiary(header);
+        self.apply_glamsterdam_execution(&mut env.cfg_env, header.timestamp);
         Ok(env)
     }
 
     fn next_evm_env(&self, parent: &Header, attributes: &NextBlockEnvAttributes) -> Result<EvmEnv, Self::Error> {
-        Ok(EvmEnv::for_eth_next_block(
+        let mut env = EvmEnv::for_eth_next_block(
             parent,
             NextEvmEnvAttributes {
                 timestamp: attributes.timestamp,
@@ -198,7 +229,16 @@ where
             self.chain_spec(),
             self.chain_spec().chain().id(),
             self.chain_spec().blob_params_at_timestamp(attributes.timestamp),
-        ))
+        );
+        self.apply_glamsterdam_execution(&mut env.cfg_env, attributes.timestamp);
+        // EIP-7843: on a native chain the header's slot number is its block
+        // number (`docs/HEADER_FIELD_PARITY.md` section 4), stamped after the
+        // build; SLOTNUM in the build reads the same value the header, and so
+        // every importer, will carry.
+        if attributes.slot_number.is_none() && self.glamsterdam_execution_active_at(attributes.timestamp) {
+            env.block_env.slot_num = parent.number.saturating_add(1);
+        }
+        Ok(env)
     }
 
     fn context_for_block<'a>(
@@ -268,6 +308,7 @@ where
         if self.chain_spec().is_osaka_active_at_timestamp(timestamp) {
             cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
         }
+        self.apply_glamsterdam_execution(&mut cfg_env, timestamp);
 
         let blob_excess_gas_and_price =
             payload.payload.excess_blob_gas().zip(blob_params).map(|(excess_blob_gas, params)| {
@@ -338,5 +379,270 @@ where
             Ok::<_, AnyError>(tx.with_signer(signer))
         };
         Ok((txs, convert))
+    }
+}
+
+/// From when a chain with `genesis` executes under gov5's Amsterdam rules:
+/// its `glamsterdamTime` on an N42-native chain, `None` otherwise (the time
+/// [`reth_chainspec::qmdb::glamsterdam_execution_active_at`] compares with).
+/// A chain spec that schedules reth's own Amsterdam already selects
+/// [`SpecId::AMSTERDAM`] and is left as it is.
+pub fn glamsterdam_execution_time(genesis: &alloy_genesis::Genesis) -> Option<u64> {
+    if !reth_chainspec::qmdb::is_n42_native(genesis) {
+        return None;
+    }
+    reth_chainspec::qmdb::glamsterdam_time(genesis)
+}
+
+/// Sets `cfg` to gov5's Amsterdam execution on a native chain: revm's
+/// [`SpecId::AMSTERDAM`] with its mainnet gas table, EIP-8037 and EIP-2780
+/// (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
+pub fn glamsterdam_execution_cfg(cfg: &mut CfgEnv<SpecId>) {
+    cfg.set_spec_and_mainnet_gas_params(SpecId::AMSTERDAM);
+}
+
+#[cfg(test)]
+mod glamsterdam_execution_tests {
+    //! gov5 runs its Amsterdam state transition on a native chain from
+    //! `glamsterdamTime` (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`); the EVM
+    //! configuration selects revm's Amsterdam there and nowhere else.
+    use super::*;
+    use crate::fast_transfer::N42EvmFactory;
+    use alloy_consensus::Transaction as _;
+    use alloy_primitives::{Address, B256};
+    use reth_evm::execute::Executor as _;
+    use reth_primitives_traits::{RecoveredBlock, SealedBlock};
+    use revm::{
+        database::{CacheDB, EmptyDB},
+        state::{AccountInfo, Bytecode},
+    };
+
+    type Config = N42EvmConfig<n42_header::N42ChainSpec, N42EvmFactory>;
+
+    fn config_for(json: &str) -> Config {
+        let genesis: alloy_genesis::Genesis = serde_json::from_str(json).expect("genesis");
+        let spec = n42_header::N42ChainSpec::from(reth_chainspec::ChainSpec::from_genesis(genesis));
+        N42EvmConfig::new_with_evm_factory(Arc::new(spec), N42EvmFactory::default())
+    }
+
+    /// A Prague/Osaka chain 1143 with `extra` in its config.
+    fn config_with(extra: &str) -> Config {
+        config_for(&format!(
+            r#"{{"config":{{"chainId":1143,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"terminalTotalDifficultyPassed":true,"shanghaiTime":0,"cancunTime":0,"pragueTime":0,"osakaTime":0{extra}}},"alloc":{{}}}}"#
+        ))
+    }
+
+    fn header_at(timestamp: u64) -> Header {
+        Header::from(alloy_consensus::Header { number: 5, timestamp, gas_limit: 30_000_000, base_fee_per_gas: Some(7), ..Default::default() })
+    }
+
+    fn next_at(timestamp: u64) -> NextBlockEnvAttributes {
+        NextBlockEnvAttributes {
+            timestamp,
+            suggested_fee_recipient: Address::repeat_byte(0xcb),
+            prev_randao: B256::ZERO,
+            gas_limit: 30_000_000,
+            parent_beacon_block_root: Some(B256::ZERO),
+            withdrawals: None,
+            extra_data: Default::default(),
+            slot_number: None,
+        }
+    }
+
+    #[test]
+    fn a_native_chain_executes_amsterdam_from_its_glamsterdam_time() {
+        let c = config_with(r#","consensus":"hotstuff","glamsterdamTime":100"#);
+        let before = c.evm_env(&header_at(99)).expect("env");
+        assert_eq!(before.cfg_env.spec, SpecId::OSAKA);
+        assert!(!before.cfg_env.enable_amsterdam_eip8037);
+        let after = c.evm_env(&header_at(100)).expect("env");
+        assert_eq!(after.cfg_env.spec, SpecId::AMSTERDAM);
+        assert!(after.cfg_env.enable_amsterdam_eip8037 && after.cfg_env.enable_amsterdam_eip2780);
+        assert_eq!(after.cfg_env.gas_params, revm::context_interface::cfg::GasParams::new_spec(SpecId::AMSTERDAM));
+        // The EIP-7825 cap stays: under EIP-8037 it bounds the regular gas only.
+        assert_eq!(after.cfg_env.tx_gas_limit_cap, Some(MAX_TX_GAS_LIMIT_OSAKA));
+        // The builder's environment follows, with SLOTNUM at the block number.
+        let parent = header_at(99);
+        let next = c.next_evm_env(&parent, &next_at(100)).expect("env");
+        assert_eq!(next.cfg_env.spec, SpecId::AMSTERDAM);
+        assert_eq!(next.block_env.slot_num, 6);
+        let next = c.next_evm_env(&parent, &next_at(99)).expect("env");
+        assert_eq!(next.cfg_env.spec, SpecId::OSAKA);
+        assert_eq!(next.block_env.slot_num, 0);
+        // reth's own Amsterdam is not scheduled: the header and payload rules
+        // that hang off it stay off.
+        assert!(!c.chain_spec().is_amsterdam_active_at_timestamp(u64::MAX));
+    }
+
+    #[test]
+    fn other_chains_keep_their_spec() {
+        // A native chain without the fork, and a non-native chain with it.
+        for extra in [r#","consensus":"hotstuff""#, r#","glamsterdamTime":0"#, ""] {
+            let c = config_with(extra);
+            for ts in [0, 100, u64::MAX / 2] {
+                assert_eq!(c.evm_env(&header_at(ts)).expect("env").cfg_env.spec, SpecId::OSAKA, "{extra} at {ts}");
+                let next = c.next_evm_env(&header_at(ts), &next_at(ts + 1)).expect("env");
+                assert_eq!(next.cfg_env.spec, SpecId::OSAKA);
+                assert_eq!(next.block_env.slot_num, 0);
+            }
+        }
+    }
+
+    /// The ungated devnet executes exactly as before: the environment is the
+    /// one `EvmEnv::for_eth_block` makes, field for field.
+    #[test]
+    fn the_ungated_devnet_environment_is_unchanged() {
+        let c = config_for(include_str!("../../../chainspec/res/genesis/n42_devnet.json"));
+        for ts in [0, 1_000, 1_798_761_600, u64::MAX / 2] {
+            let header = header_at(ts);
+            let got = c.evm_env(&header).expect("env");
+            let mut want = EvmEnv::for_eth_block(
+                &header,
+                c.chain_spec(),
+                c.chain_spec().chain().id(),
+                c.chain_spec().blob_params_at_timestamp(ts),
+            );
+            want.block_env.beneficiary = got.block_env.beneficiary;
+            assert_eq!(got.cfg_env.spec, want.cfg_env.spec);
+            assert_eq!(got.cfg_env.gas_params, want.cfg_env.gas_params);
+            assert_eq!(got.cfg_env.enable_amsterdam_eip8037, want.cfg_env.enable_amsterdam_eip8037);
+            assert_eq!(got.cfg_env.enable_amsterdam_eip2780, want.cfg_env.enable_amsterdam_eip2780);
+            assert_eq!(got.cfg_env.tx_gas_limit_cap, want.cfg_env.tx_gas_limit_cap);
+            assert_eq!(got.block_env, want.block_env);
+            assert_eq!(got.cfg_env.spec, SpecId::OSAKA);
+        }
+    }
+
+    /// gov5's fixture (`internal/glamsterdam_native_fixture_test.go` on gov5
+    /// branch `test/glamsterdam-native-fixtures`): one block of the native
+    /// chain's transaction shapes on the gated devnet genesis, executed by
+    /// gov5. Receipts, gas, logs, the receipts root and the touched accounts
+    /// must be the same here, by value.
+    #[test]
+    fn the_gated_devnet_block_matches_gov5() {
+        let fx: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/glamsterdam_native/block1.json")).expect("fixture");
+        let c = config_for(include_str!("../../../chainspec/res/genesis/n42_devnet_mobileanchor.json"));
+        let u = |v: &serde_json::Value| v.as_u64().expect("a number");
+        let s = |v: &serde_json::Value| v.as_str().expect("a string").to_string();
+        let addr = |v: &serde_json::Value| s(v).parse::<Address>().expect("an address");
+        let bytes = |v: &serde_json::Value| s(v).parse::<alloy_primitives::Bytes>().expect("hex bytes");
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        // The genesis system contracts, which the block's pre- and
+        // post-execution calls read (gov5's fixture skips them; they touch
+        // nothing the fixture compares).
+        for (address, account) in &c.chain_spec().genesis().alloc {
+            let code = account.code.clone().unwrap_or_default();
+            if code.is_empty() {
+                continue;
+            }
+            db.insert_account_info(
+                *address,
+                AccountInfo { balance: account.balance, nonce: account.nonce.unwrap_or(0), ..Default::default() }
+                    .with_code(Bytecode::new_raw(code)),
+            );
+        }
+        for account in fx["pre"].as_array().expect("pre") {
+            let code = bytes(&account["code"]);
+            let mut info = AccountInfo {
+                balance: s(&account["balance"]).parse().expect("balance"),
+                nonce: u(&account["nonce"]),
+                ..Default::default()
+            };
+            if !code.is_empty() {
+                info = info.with_code(Bytecode::new_raw(code));
+            }
+            db.insert_account_info(addr(&account["address"]), info);
+        }
+
+        let txs: Vec<N42TxEnvelope> = fx["transactions"]
+            .as_array()
+            .expect("txs")
+            .iter()
+            .map(|raw| N42TxEnvelope::decode_2718_exact(&bytes(raw)).expect("a transaction"))
+            .collect();
+        let senders: Vec<Address> = txs.iter().map(|tx| tx.try_recover().expect("signed")).collect();
+        let header = Header::from(alloy_consensus::Header {
+            number: u(&fx["number"]),
+            timestamp: u(&fx["timestamp"]),
+            gas_limit: u(&fx["gasLimit"]),
+            base_fee_per_gas: Some(u(&fx["baseFee"])),
+            beneficiary: addr(&fx["coinbase"]),
+            slot_number: Some(u(&fx["slotNumber"])),
+            parent_beacon_block_root: Some(B256::ZERO),
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+            ..Default::default()
+        });
+        assert!(c.glamsterdam_execution_active_at(header.timestamp));
+        let body = n42_tx_types::BlockBody { transactions: txs.clone(), ommers: Vec::new(), withdrawals: Some(Vec::new().into()) };
+        let block = SealedBlock::seal_slow(n42_tx_types::Block { header, body });
+        let block = RecoveredBlock::new_sealed(block, senders);
+        let out = c.executor(db).execute(&block).expect("the block executes");
+
+        let receipts = fx["receipts"].as_array().expect("receipts");
+        assert_eq!(out.result.receipts.len(), receipts.len());
+        let mut previous = 0;
+        for (i, (got, want)) in out.result.receipts.iter().zip(receipts).enumerate() {
+            assert_eq!(got.success, u(&want["status"]) == 1, "tx {i} status");
+            assert_eq!(got.cumulative_gas_used, u(&want["cumulativeGasUsed"]), "tx {i} cumulative gas");
+            assert_eq!(got.cumulative_gas_used - previous, u(&want["gasUsed"]), "tx {i} gas used");
+            previous = got.cumulative_gas_used;
+            let logs = want["logs"].as_array().expect("logs");
+            assert_eq!(got.logs.len(), logs.len(), "tx {i} log count");
+            for (j, (log, want)) in got.logs.iter().zip(logs).enumerate() {
+                assert_eq!(log.address, addr(&want["address"]), "tx {i} log {j} emitter");
+                let topics: Vec<B256> =
+                    want["topics"].as_array().expect("topics").iter().map(|t| s(t).parse().expect("topic")).collect();
+                assert_eq!(log.topics(), topics.as_slice(), "tx {i} log {j} topics");
+                assert_eq!(log.data.data, bytes(&want["data"]), "tx {i} log {j} data");
+            }
+        }
+        assert_eq!(previous, u(&fx["receiptsCumulativeGasUsed"]));
+        assert_eq!(out.result.gas_used, u(&fx["gasUsed"]), "the header's gas used (EIP-8037)");
+        let (root, _) = crate::hotstuff_consensus::gov5_receipt_root_bloom(&out.result.receipts);
+        assert_eq!(root, s(&fx["receiptsRoot"]).parse::<B256>().expect("root"), "the receipts root");
+
+        for account in fx["post"].as_array().expect("post") {
+            let address = addr(&account["address"]);
+            let got = out.state.account(&address).and_then(|a| a.info.clone());
+            if s(&account["balance"]) == "absent" {
+                assert!(got.as_ref().is_none_or(|info| info.is_empty()), "{address} must not exist: {got:?}");
+                continue;
+            }
+            // An account the block left as it was is not in the bundle: its
+            // post-state is its pre-state.
+            let info = got.unwrap_or_else(|| {
+                let pre = fx["pre"]
+                    .as_array()
+                    .expect("pre")
+                    .iter()
+                    .find(|pre| addr(&pre["address"]) == address)
+                    .unwrap_or_else(|| panic!("{address} is in the pre- or post-state"));
+                let code = bytes(&pre["code"]);
+                AccountInfo {
+                    balance: s(&pre["balance"]).parse().expect("balance"),
+                    nonce: u(&pre["nonce"]),
+                    ..Default::default()
+                }
+                .with_code(Bytecode::new_raw(code))
+            });
+            assert_eq!(info.balance, s(&account["balance"]).parse::<U256>().expect("balance"), "{address} balance");
+            assert_eq!(info.nonce, u(&account["nonce"]), "{address} nonce");
+            let code = bytes(&account["code"]);
+            assert_eq!(info.code.as_ref().map(|c| c.original_bytes()).unwrap_or_default(), code, "{address} code");
+            let slot0 = out.state.account(&address).and_then(|a| a.storage.get(&U256::ZERO)).map(|slot| slot.present_value);
+            let want = account
+                .get("storage")
+                .and_then(|storage| storage.as_object())
+                .and_then(|storage| storage.values().next())
+                .map(|v| s(v).parse::<U256>().expect("slot"));
+            assert_eq!(slot0.filter(|v| !v.is_zero()), want, "{address} slot 0");
+        }
+        // Every transaction's gas limit stayed inside the block's.
+        assert!(txs.iter().map(|tx| tx.gas_limit()).sum::<u64>() <= block.header().gas_limit);
     }
 }

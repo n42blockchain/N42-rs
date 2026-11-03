@@ -1572,7 +1572,15 @@ where
         }
     }
     let warm_parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
-    let defer_state = state_after_pull() && parallel_build() && builder_puller() != 0;
+    // The parallel transfer step models the Osaka gas rules (a transfer is
+    // its 21,000 and no log; the block's gas is the transactions' sum). A
+    // block under gov5's Amsterdam execution (EIP-8037's two gas dimensions,
+    // EIP-7708's transfer logs) is built serially, transaction by
+    // transaction, by the executor that applies them
+    // (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
+    let parallel_build = parallel_build()
+        && !reth_chainspec::qmdb::glamsterdam_execution_active_at(client.chain_spec().genesis(), attributes.timestamp);
+    let defer_state = state_after_pull() && parallel_build && builder_puller() != 0;
     let parent_state_slot: std::cell::OnceCell<reth_storage_api::StateProviderBox> = std::cell::OnceCell::new();
     if !defer_state {
         let _ = parent_state_slot.set(open_parent_state()?);
@@ -1768,7 +1776,7 @@ where
     // `N42_PULL_BY_FRAMES`: the selector may hand the block over as one
     // vector out of the plan's frames, which only the parallel step with the
     // puller consumes (`frame_blocks::take_bulk`).
-    crate::frame_blocks::want_bulk(parallel_build() && builder_puller() != 0);
+    crate::frame_blocks::want_bulk(parallel_build && builder_puller() != 0);
     // `N42_PLAN_AHEAD_BODY=1`: the queue makes the next block's body with its
     // plan; the partition is made at this build's beneficiary.
     if crate::frame_blocks::plan_ahead_body_wanted()
@@ -2389,7 +2397,7 @@ where
             (payload, recovered, block_hash, block_number, root_ms, fields_ms, sealed_ms, sealed_at_ms, parent_sealed)
         }};
     }
-    if parallel_build() && (pulled.is_some() || bulk.is_some()) {
+    if parallel_build && (pulled.is_some() || bulk.is_some()) {
         let par_at = std::time::Instant::now();
         par_start_ms = build_started.elapsed().as_millis() as u64;
         start_other_ms =

@@ -312,8 +312,11 @@ gov5: `verifyHeaderWithBatch` and `FinalizeAndAssemble` (`internal/consensus/hot
    `n42-gov5-genesis` (`bin/n42/src/gov5_genesis.rs:21`) carries
    `glamsterdamTime` through inert. The Rust copy of chain 94's genesis
    (`crates/chainspec/res/genesis/gov5/mainnet_qmdb_staggered.json:8316`)
-   says `glamsterdamTime` 1798761600 (2027-01-01). gov5's embedded chainspec
-   for the chain has none. One of the two is stale.
+   said `glamsterdamTime` 1798761600 (2027-01-01) while gov5's embedded
+   chainspec had none: gov5 7529e2e9 (2026-10-29) unscheduled Glamsterdam on
+   the staggered chains. The Rust copy was regenerated from gov5 main on
+   2026-11-03 (plan item G2) and carries none either; the genesis hash is
+   unchanged.
 5. **`mobileAnchorTime` has no Rust spelling.** Section 8 step 4 adds it.
 6. **Nothing in Rust consumes or produces the anchor.**
    `crates/n42/mobile-verify` and `crates/n42/mobile-service` never mention a
@@ -408,9 +411,9 @@ until a fleet runs the patched gov5 of `docs/patches/gov5-header-field-parity/`.
   it), so under it the two clients execute transfers differently: gas used,
   transfer logs, receipts root, then state root. Round `mv4f` (the same gated
   devnet with transfers) shows it: gov5's packetd refused every block with
-  transactions on the receipts root. On chain 94, `glamsterdamTime`
-  1798761600 (2027-01-01) switches gov5 to Amsterdam execution and the Rust
-  node does not follow yet. Fix: activate reth's Amsterdam from gov5's
+  transactions on the receipts root. Chain 94 schedules no Glamsterdam
+  (gov5 7529e2e9; the Rust copy follows since 2026-11-03), so this bites only
+  chains that set `glamsterdamTime`, the gated devnet among them. Fix: activate reth's Amsterdam from gov5's
   `glamsterdamTime` on native chains, after a rule-set audit (gov5
   `transitionAmsterdam` against reth 2.8.1's Amsterdam). Not done; the
   user's decision.
@@ -620,9 +623,10 @@ Tests (`cargo test -p n42-h2-consensus --test header_field_parity`):
 1. Gap 2: should the native chain stamp a real `BlockAccessListHash` from
    Glamsterdam (Ethereum RLP, no gaps), or keep `balTime` separate?
    `N42Header` handles both.
-2. Which chain-94 genesis is current for `glamsterdamTime`: gov5's embedded
-   chainspec (none) or the Rust copy (2027-01-01)? The answer decides when the
-   slot and root appear on chain 94.
+2. Which chain-94 genesis is current for `glamsterdamTime`? Answered: gov5's
+   (none, 7529e2e9); the Rust copy was regenerated to match on 2026-11-03.
+   Neither the slot nor the root appears on chain 94 until a Glamsterdam date
+   is scheduled.
 3. Is the block number the right slot in the long run? The view would expose
    HotStuff timing to `SLOTNUM`, but no Ethereum client could derive it.
 4. The re-genesis in section 5: same chain id or a new one? And who rebases

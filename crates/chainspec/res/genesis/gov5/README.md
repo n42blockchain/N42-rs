@@ -42,7 +42,12 @@ scripts/gov5-local-genesis.py --chain crates/chainspec/res/genesis/gov5/mainnet_
 ```
 
 (the devnet's four dev validators; Shanghai and Cancun from block 1 for both
-clients, gov5 reading `IsShanghaiAt(num, time)`; Pectra, mobileAnchor and
-Glamsterdam stay at the chain's timestamps, beyond the local clock, so headers
-carry neither slot nor registry root). Run it with
+clients, gov5 reading `IsShanghaiAt(num, time)`; Pectra and mobileAnchor stay
+at the chain's timestamps, beyond the local clock, and chain 94 schedules no
+Glamsterdam, so headers carry neither slot nor registry root).
+
+Both files were regenerated from gov5 main 39cff9ce on 2026-11-03: gov5
+7529e2e9 removed `glamsterdamTime` from chain 94's chainspec (chain 95 never had
+it). Chain 95 (`qs_epoch_test`) takes the alloc
+`internal/allocs/mainnet_qmdb_staggered.json`, timestamp 1678174161, difficulty 0. Run it with
 `DEVNET_GENESIS=<dir>/c94-local.json scripts/devnet-mobileanchor.sh <tag> --gov5`.

@@ -89,11 +89,16 @@ pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Hea
         .active_at_timestamp(genesis.timestamp)
         .then_some(EMPTY_REQUESTS_HASH);
 
-    // If Amsterdam is activated at genesis we set block access list hash to an empty bal hash
-    let block_access_list_hash = hardforks
+    // If Amsterdam is activated at genesis we set block access list hash to an empty bal hash.
+    // N42: so does gov5's Glamsterdam at genesis (`glamsterdamTime`), which reth's hardfork list
+    // never activates on a native chain. gov5's genesis header then carries the empty BAL hash
+    // and no slot number (22 elements), although its native blocks above genesis carry none;
+    // matched byte for byte by observation (`docs/MOBILEVERIFY_V3_PARITY.md`, mv4h2).
+    let block_access_list_hash = (hardforks
         .fork(EthereumHardfork::Amsterdam)
-        .active_at_timestamp(genesis.timestamp)
-        .then_some(EMPTY_BLOCK_ACCESS_LIST_HASH);
+        .active_at_timestamp(genesis.timestamp) ||
+        crate::qmdb::glamsterdam_active_at(genesis, genesis.timestamp))
+    .then_some(EMPTY_BLOCK_ACCESS_LIST_HASH);
 
     // If Amsterdam is activated at genesis we set slot number to the provided genesis or 0
     let slot_number = hardforks

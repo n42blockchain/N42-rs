@@ -105,7 +105,7 @@ fn a_header_file_may_hold_raw_rlp() {
     let header = sample_header();
     let path = scratch.path("raw.rlp");
     fs::write(&path, header_rlp(&header)).unwrap();
-    assert_eq!(read_header_from_file(&path).unwrap(), header);
+    assert_eq!(read_header_from_file(&path).unwrap(), header.into());
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn a_header_file_may_hold_hex_with_or_without_the_prefix_and_a_newline() {
     ] {
         let path = scratch.path(name);
         fs::write(&path, text).unwrap();
-        assert_eq!(read_header_from_file(&path).unwrap(), header, "{name}");
+        assert_eq!(read_header_from_file(&path).unwrap(), header.clone().into(), "{name}");
     }
 }
 
@@ -335,6 +335,18 @@ fn write_state_v2_commits_in_chunks_without_losing_accounts() {
 /// `bob` (nonce 1, 5 wei, `code`, slots 1 = 11 and 2 = 22) and an EIP-161
 /// empty account gov5's dump leaves out, at block 1 under `header`.
 fn write_snapshot_files(scratch: &Scratch, alice: Address, bob: Address, code: &[u8]) -> Header {
+    write_snapshot_files_at(scratch, alice, bob, code, None).inner
+}
+
+/// [`write_snapshot_files`] with the head optionally carrying gov5's slot
+/// number and `mobileRegistryRoot` (header elements 23 and 24).
+fn write_snapshot_files_at(
+    scratch: &Scratch,
+    alice: Address,
+    bob: Address,
+    code: &[u8],
+    registry_root: Option<B256>,
+) -> n42_header::N42Header {
     use n42_twig_core::qmdb_compat::{
         encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbPortableSnapshot,
         QmdbSlotEntry, QmdbSlotSnapshot,
@@ -350,8 +362,32 @@ fn write_snapshot_files(scratch: &Scratch, alice: Address, bob: Address, code: &
         tree.set(key, B256::with_last_byte(value).to_vec()).unwrap();
     }
     tree.set(gov5_account_key(&Address::repeat_byte(0xEE).0 .0), vec![0]).unwrap();
-    let header = Header { number: 1, state_root: B256::from(tree.root()), ..Default::default() };
-    fs::write(scratch.path("header.rlp"), header_rlp(&header)).unwrap();
+    let header = n42_header::N42Header {
+        inner: Header {
+            number: 1,
+            state_root: B256::from(tree.root()),
+            slot_number: registry_root.map(|_| 1),
+            // A root-carrying head is a post-Prague gov5 header: every
+            // Prague field is set; the BAL hash is gov5's gap (native chains).
+            ..if registry_root.is_some() {
+                Header {
+                    base_fee_per_gas: Some(7),
+                    withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+                    blob_gas_used: Some(0),
+                    excess_blob_gas: Some(0),
+                    parent_beacon_block_root: Some(B256::repeat_byte(0x42)),
+                    requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+                    ..Default::default()
+                }
+            } else {
+                Header::default()
+            }
+        },
+        mobile_registry_root: registry_root,
+    };
+    let mut rlp = Vec::new();
+    alloy_rlp::Encodable::encode(&header, &mut rlp);
+    fs::write(scratch.path("header.rlp"), rlp).unwrap();
     let snapshot = tree.snapshot();
     let chain = init_args(scratch, Some("qmdb")).env.chain;
     let portable = QmdbPortableSnapshot {
@@ -415,4 +451,47 @@ fn init_refuses_a_dump_the_snapshot_does_not_authenticate() {
     // A repeated row cannot stand in for a missing one.
     let err = run(&[honest_bob.clone(), honest_bob]).unwrap_err();
     assert!(format!("{err:#}").contains("ascending"), "repeated account: {err:#}");
+}
+
+/// HEADER_FIELD_PARITY.md 7.1: a head sealed under MobileAnchor and
+/// Glamsterdam carries `mobileRegistryRoot` at element 24. Decoded as
+/// Ethereum's header it was refused (alloy stops at `slot_number`); decoded as
+/// `N42Header` it keeps the root, so the head hashes to the chain's hash, the
+/// portable snapshot (keyed by that hash) authenticates, and the stored head
+/// is the one the chain sealed.
+#[test]
+fn init_starts_at_a_head_that_carries_a_registry_root() {
+    let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
+    let code = [0x60u8, 0x00, 0x60, 0x00];
+    let registry_root = B256::repeat_byte(0x24);
+    let scratch = Scratch::new();
+    let header = write_snapshot_files_at(&scratch, alice, bob, &code, Some(registry_root));
+
+    let read = read_header_from_file(&scratch.path("header.rlp")).unwrap();
+    assert_eq!(read.mobile_registry_root, Some(registry_root));
+    assert_eq!(read.slot_number, Some(1));
+    assert_eq!(read.hash_slow(), header.hash_slow());
+    assert_ne!(read.hash_slow(), header.inner.hash_slow(), "the root is part of the hash");
+    let rlp = fs::read(scratch.path("header.rlp")).unwrap();
+    assert!(
+        <Header as alloy_rlp::Decodable>::decode(&mut rlp.as_slice()).is_err(),
+        "Ethereum's header cannot hold element 24"
+    );
+
+    let dump = format!(
+        "{}{}\n{}\n",
+        root_line(header.state_root),
+        account_line(alice, 1_000, None, &[]),
+        account_line(bob, 5, Some(&code), &[(1, 11), (2, 22)])
+    );
+    fs::write(scratch.path("state.jsonl"), dump).unwrap();
+    run_init(&scratch).expect("init at a root-carrying head");
+
+    let args = init_args(&scratch, Some("qmdb"));
+    let Environment { provider_factory, .. } =
+        args.env.init::<N42Node>(AccessRights::RO, reth_tasks::Runtime::test()).unwrap();
+    let provider = provider_factory.provider().unwrap();
+    let stored = provider.header_by_number(1).unwrap().expect("the head is stored");
+    assert_eq!(stored, header);
+    assert_eq!(provider.block_hash(1).unwrap(), Some(header.hash_slow()));
 }

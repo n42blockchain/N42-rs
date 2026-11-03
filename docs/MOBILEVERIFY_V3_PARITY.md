@@ -598,3 +598,59 @@ write, `registry.bin` / gov5's snapshot), and devices re-register only if their 
 Chains without `mobileAnchorTime` need only step 1 (no header root); chain 94 needs both before its
 MobileAnchor + Glamsterdam gate opens (2027-01-01). Nothing is coded until gov5 agrees to the shape;
 this section is the proposal sent with the gov5 PRs.
+
+## Pure-Rust producer: feasibility (D5, 2026-11-03)
+
+**Question.** A StreamPacket's read log is positional: the phone replays it through Go's
+`IntraBlockState`, which asks its reader for each account and slot once per block in its own order. Can
+a Rust producer record that log from revm's `Database` calls instead of running gov5's execution in the
+sidecar?
+
+**Method (throwaway tools, kept in `/data/n42-build/audit-notes/d5-spike/`).**
+
+1. Go (`zz_spike_test.go`, run from gov5 `feat/mobileverify-packetd`): for every packet packetd built in
+   round `mv3b` (139 blocks of `n42_devnet.json`: 100 blocks with 8-14 transfers each, 39 empty), re-execute
+   the block with `packetd.BuildPacket` over the packet's own log (`StreamReplayStateReader`) wrapped in a
+   keyed reader. This names the account or slot behind every positional entry. The rebuilt log is
+   byte-identical to the packet's on all 139 blocks.
+2. Rust (`zz_d5_spike.rs`, an `n42-engine-types` integration test): rebuild the parent state from those
+   keyed values (plus the genesis bytecodes), execute the same block with reth 2.8.1's `EthEvmConfig`
+   (`apply_pre_execution_changes`, then each transaction; recording stops before the withdrawals, which
+   the phone does not execute), and record every `Database::basic` / `storage` call in order. Then encode
+   that order with gov5's read-log codec and compare it with the packet bytes.
+
+**Result** (`d5-spike/d5-rust.out`):
+
+- Gas used equals the header on all 139 blocks.
+- revm reads exactly the same set of accounts and slots as Go: no extra reads, no missing ones. The
+  coinbase is read where Go reads it, after the first transaction's sender and recipient.
+- The order differs in one place only: the block-start system calls. reth runs EIP-2935 (history storage)
+  before EIP-4788 (beacon roots); gov5 runs 4788 first (`ProcessExecutionBlockStart`). Raw revm order
+  equals Go's order on 0/139 blocks.
+- With that prelude swapped back (all 4788 entries, then the 2935 entries, then the transaction reads
+  as revm made them), the revm log is **byte-identical to the sidecar packet's read log on 139/139
+  blocks**.
+
+**Verdict.** For the shapes measured -- plain transfers between existing accounts, the coinbase credit
+and the Prague block-start system calls -- revm's access order can be made identical with one
+deterministic fix: record the two system calls in gov5's order. The withdrawal reward never enters the
+log, because neither the phone nor packetd executes it. This is **not yet a proof for the devnet's full
+shape set**, so nothing is implemented. Untested:
+
+- **Creating-recipient transfers.** `mv3b`'s recipients all exist. Go's `Exist(to)` and revm's
+  target load both read the account once, so they probably agree, but this has not been measured.
+- **Contract calls, reverts and failed transactions.** Go journals and reverts reads differently from
+  revm's checkpoints; the cross-client `stream_packet.json` fixture block is the next case to run.
+- **Amsterdam execution on gated chains.** Main now runs revm `SpecId::AMSTERDAM` there
+  (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`); the EIP-8037 and EIP-7708 paths were not covered.
+- **The 4788 write path.** On native chains gov5 writes the 4788 ring slots directly, even without
+  contract code (`UsesDirectBeaconRootWrites`), while revm executes the contract. On a chain whose
+  genesis lacks the 4788 code the read sets would differ (revm would read only the account). The bundled
+  genesis files all deploy it.
+
+**Next step if wanted.** Rerun the two tools on gov5's
+`test/glamsterdam-native-fixtures` block (11 shapes, creating transfers and contract calls included),
+and on a `mv4h`-style gated round with load. If every shape is byte-identical after the prelude swap, a
+Rust producer can wrap the node's `State` database in a recorder at the follower import, at the cost of
+one extra `Vec` push per cache miss. Until then the sidecar (§3.2 option 2) stays, because its log is
+right by construction.

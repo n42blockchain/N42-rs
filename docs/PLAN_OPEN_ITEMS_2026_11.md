@@ -24,10 +24,10 @@ or `audit-notes/ci/`; research notes in English under `docs/`.
 | C1 | QMDB compaction stage 1 read view: 2-4% read cost (+1 DRAM miss per read) | implement the fix named in the design review: the index keeps locations (512 GiB per file) | C | crate tests; X22 bench pair level with main (two pairs, same box state) | open |
 | C2 | QMDB compaction stages 3 and 4 (`docs/QMDB_COMPACTION_DESIGN.md`) | implement | C | crate tests; `fleet7.sh roll --kill` in file mode; X22 pair level; portable-snapshot export/import still verifies | open |
 | D1 | GitHub repository renamed to `n42blockchain/N42-rs` | set the remote URL in the shared checkout and the worktrees (config only) | D | `git remote -v`, a fetch | done 2026-11-02 |
-| D2 | Five gov5 pull requests (`design/header-field-parity`, `fix/unchanged-account-no-op`, `test/mobileverify-cross-client-fixtures`, `test/mobileverify-device-genesis`, `feat/mobileverify-packetd`); the drafted bodies were lost with the session scratchpad | re-draft the bodies into `/data/n42-build/audit-notes/pr/` (persistent); opening them needs `gh auth login`, which only the user can do | D | bodies reviewed; PRs opened once gh is logged in | open |
-| D3 | `n42-init-snapshot` cannot start at a root-carrying head; the SSZ payload form carries no root (`HEADER_FIELD_PARITY.md` 7.1) | implement both | D | unit tests; init at a gated devnet head and follow | open |
+| D2 | Five gov5 pull requests (`design/header-field-parity`, `fix/unchanged-account-no-op`, `test/mobileverify-cross-client-fixtures`, `test/mobileverify-device-genesis`, `feat/mobileverify-packetd`); the drafted bodies were lost with the session scratchpad | re-draft the bodies into `/data/n42-build/audit-notes/pr/` (persistent); opening them needs `gh auth login`, which only the user can do | D | bodies reviewed; PRs opened once gh is logged in | bodies drafted 2026-11-03 (seven, `audit-notes/pr/`, `OPEN.sh`); waiting for review and `gh auth login` |
+| D3 | `n42-init-snapshot` cannot start at a root-carrying head; the SSZ payload form carries no root (`HEADER_FIELD_PARITY.md` 7.1) | implement both | D | unit tests; init at a gated devnet head and follow | code + unit tests done (5370fc53a, 9b6b65d13); devnet init-and-follow pending |
 | D4 | packetd polls every 250 ms | add an opt-in `newHeads` subscription over WebSocket, keep the poll as fallback | D | gov5 test; live run shows sub-50 ms packet latency | code + tests done (gov5 8fe815dc); live latency run pending |
-| D5 | Pure-Rust packet producer (gov5's read log is positional in Go `IntraBlockState` order) | feasibility spike only: can revm's access order be made identical for the devnet's transaction shapes? verdict in `MOBILEVERIFY_V3_PARITY.md`; no implementation unless the order is provably identical | D | the written verdict with a byte comparison against a sidecar packet | open |
+| D5 | Pure-Rust packet producer (gov5's read log is positional in Go `IntraBlockState` order) | feasibility spike only: can revm's access order be made identical for the devnet's transaction shapes? verdict in `MOBILEVERIFY_V3_PARITY.md`; no implementation unless the order is provably identical | D | the written verdict with a byte comparison against a sidecar packet | done 2026-11-03: identical on 139/139 `mv3b` blocks after one prelude reorder; creating transfers, contracts and Amsterdam untested, so no implementation |
 | D6 | Registry index may differ across nodes near epoch boundaries (gov5 has the same 45 s wall-clock timer) | design note: epoch commits keyed on block timestamp, proposed to gov5; no code until gov5 agrees | D | the note in `MOBILEVERIFY_V3_PARITY.md` | done 2026-11-02 (note written; gov5 agreement pending) |
 | A3 | Genesis parity on a chain with `glamsterdamTime` at genesis: gov5's genesis header carries `blockAccessListHash` = keccak(rlp([])) (element 22, no slot), reth's ends at `requestsHash`; gov5 puts no BAL hash in native blocks above genesis | decide which side changes (Rust genesis builder adds the empty BAL hash, or gov5 drops it on native chains), then implement | A/B | both clients init `n42_devnet_mobileanchor.json` to one hash; A1 rerun | fixed in Rust (67ff48630, 2026-11-03): the genesis builder adds the empty BAL hash under gov5's `glamsterdamTime`; test pins `0x9e8628a6`; devnet and chain-94 hashes unchanged. Live check is the A1 rerun `mv4h3` |
 | G2 | Chain 94's Rust genesis still carried `glamsterdamTime` 1798761600 after gov5 7529e2e9 removed it | regenerate from gov5 main | A | hash unchanged; `cargo test -p reth-chainspec` | done (36111540d): both gov5 files regenerated from gov5 main 39cff9ce, chain 94 loses the key, chain 95 byte-identical, hashes unchanged; test run by the merge gate |
@@ -93,3 +93,23 @@ builds.
   `EvmEnv::for_eth_block` field for field.
 - **DEVNET_BIN for A:** `/data/n42-build/glam-target/debug/n42` and
   `/data/n42-build/glam-target/debug/examples/h2_validator` (debug), commit noted in the report line below.
+
+- D2 (2026-11-03): bodies in `/data/n42-build/audit-notes/pr/<branch with / as ->.md` (first line = title):
+  the five of the plan plus stream B's `test/glamsterdam-native-fixtures` and `fix/native-no-eip8282`
+  `OPEN.sh` opens them with `gh pr create --repo n42blockchain/N42-gov5 --base main`
+  in dependency order (both mobileverify test branches before `feat/mobileverify-packetd`, which contains their
+  commits; the fixtures before `fix/native-no-eip8282`). Every branch merges cleanly onto gov5 `main`
+  (`git merge-tree`). No PR opened (gh not logged in).
+- D3 (2026-11-03): `5370fc53a` the SSZ `ExecutionPayloadV4` carries `mobileRegistryRoot` as a trailing fixed
+  field present only when set (the first offset tells the forms apart; root-less encoding unchanged), test
+  `ssz_execution_payload_v4_carries_the_mobile_registry_root` plus the crate's 30 SSZ tests
+  (`audit-notes/ci/d3-ssz.out`); `9b6b65d13` `n42-init-snapshot` decodes the head as `N42Header`, test
+  `init_starts_at_a_head_that_carries_a_registry_root` runs init end to end over a root-carrying head
+  (14/14, `audit-notes/ci/d3-init.out`). The devnet init-and-follow (a `LATE_SNAPSHOT` run on
+  `n42_devnet_mobileanchor.json`) needs a box claim and is not run.
+- D5 (2026-11-03): verdict in `docs/MOBILEVERIFY_V3_PARITY.md` "Pure-Rust producer: feasibility". On 139 `mv3b`
+  sidecar packets (transfers, coinbase credit, Prague block-start calls), revm read exactly Go's set. The only
+  order difference is reth's 2935-before-4788 prelude; once that is swapped, the revm-recorded log is
+  byte-identical to the packet on 139/139 blocks. Creating-recipient transfers, contract calls, reverts and
+  gated Amsterdam execution are untested, so the sidecar stays. Tools and output are in
+  `/data/n42-build/audit-notes/d5-spike/`.

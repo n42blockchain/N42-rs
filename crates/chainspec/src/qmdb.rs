@@ -333,13 +333,16 @@ mod header_field_gate_tests {
     }
 
     #[test]
-    fn chain_94_carries_the_root_from_its_glamsterdam() {
+    fn chain_94_never_carries_the_root_while_glamsterdam_is_unscheduled() {
+        // gov5 7529e2e9 unscheduled Glamsterdam on chain 94; MobileAnchor alone
+        // does not put the root in the header.
         let g: Genesis = serde_json::from_str(include_str!("../res/genesis/gov5/mainnet_qmdb_staggered.json"))
             .expect("chain 94 parses");
-        let glamsterdam = glamsterdam_time(&g).expect("chain 94 schedules glamsterdamTime");
-        assert!(mobile_anchor_time(&g).is_some_and(|t| t < glamsterdam));
-        assert!(!mobile_registry_root_in_header_at(&g, glamsterdam - 1));
-        assert!(mobile_registry_root_in_header_at(&g, glamsterdam));
+        assert_eq!(glamsterdam_time(&g), None);
+        let anchor = mobile_anchor_time(&g).expect("chain 94 schedules mobileAnchorTime");
+        assert!(!glamsterdam_active_at(&g, u64::MAX));
+        assert!(!mobile_registry_root_in_header_at(&g, anchor));
+        assert!(!mobile_registry_root_in_header_at(&g, u64::MAX));
         // The native devnet schedules neither.
         let devnet: Genesis = serde_json::from_str(include_str!("../res/genesis/n42_devnet.json")).expect("parses");
         assert_eq!(glamsterdam_time(&devnet), None);

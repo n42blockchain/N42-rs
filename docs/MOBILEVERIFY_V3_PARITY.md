@@ -533,8 +533,9 @@ on a fresh fleet). Both clients built genesis `0xa2d2ff5d…`, chain 94's hash. 
 (validators 0 and 1, funded by the block reward) at 2 tx/s after 40 s, 1,162 sent, 0 rejected.
 Result: **pass.** Heights 159 on both, all 160 hashes equal; gov5 sealed 40 blocks, error-level
 lines 0; Rust validators 159 commits, 0-2 view timeouts, EL errors 0. Headers carry neither slot
-nor root (16-element genesis, 20-element blocks; the gates open in 2026-07/2027 by timestamp, the
-local chain lives in 2023). Device `devices=2 blocks=20 skipped=0 failures=0 certified(all
+nor root (16-element genesis, 20-element blocks; the local chain lives in 2023, before
+`mobileAnchorTime`, and the round's genesis still carried the since-removed `glamsterdamTime`
+2027-01-01, plan item G2 -- neither is reached locally). Device `devices=2 blocks=20 skipped=0 failures=0 certified(all
 devices)=20/20`, signers 2 each, on blocks with transactions. Packets: the sidecar built all 159
 (one error line, block 0), and every block's packet was in validator 1's and gov5's caches,
 including the 40 gov5-led blocks. The gov5-led blocks carried no transactions (the senders

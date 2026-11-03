@@ -836,6 +836,16 @@ pub fn state_after_pull() -> bool {
     *ON.get_or_init(|| n42_env::flag("N42_STATE_AFTER_PULL", false))
 }
 
+/// The transaction's and the account's nonce when evm2 refused `error` for a
+/// nonce mismatch (`HandlerError::InvalidNonce`, which reth's Ethereum
+/// executor exposes through `InvalidTxError::as_any`).
+fn invalid_nonce(error: &dyn reth_evm::execute::InvalidTxError) -> Option<(u64, u64)> {
+    match error.as_any().downcast_ref::<evm2::registry::HandlerError>()? {
+        evm2::registry::HandlerError::InvalidNonce { expected, got } => Some((*got, *expected)),
+        _ => None,
+    }
+}
+
 /// The builder's database over the parent's state: the provider in `slot`,
 /// opened through `open` on the first read if nothing opened it before
 /// (`N42_STATE_AFTER_PULL=1` opens it explicitly, timed, before the
@@ -1747,8 +1757,8 @@ where
     let mut tail_ticks: u64 = 0;
     let mut tail_at: u64 = 0;
     let mut cumulative_gas_used = 0;
-    let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
-    let base_fee = builder.evm_mut().block().basefee();
+    let block_gas_limit: u64 = reth_evm::EvmEnv::block_env(reth_evm::BlockBuilder::evm_env(&builder)).gas_limit.saturating_to();
+    let base_fee: u64 = reth_evm::EvmEnv::block_base_fee(reth_evm::BlockBuilder::evm_env(&builder));
 
     debug!(target: "payload_builder", ?block_gas_limit, ?base_fee, "payload builder block config");
 
@@ -1799,14 +1809,10 @@ where
         crate::frame_blocks::note_beneficiary(group_env.block.beneficiary);
         install_plan_ahead_body(&queue);
     }
-    let best_txs = best_txs(BestTransactionsAttributes::new(
-        base_fee,
-        builder
-            .evm_mut()
-            .block()
-            .blob_gasprice()
-            .map(|gasprice| gasprice as u64),
-    ));
+    let blob_fee = chain_spec
+        .blob_params_at_timestamp(attributes.timestamp)
+        .map(|_| reth_evm::EvmEnv::block_blob_base_fee(reth_evm::BlockBuilder::evm_env(&builder)));
+    let best_txs = best_txs(BestTransactionsAttributes::new(base_fee, blob_fee));
     let start_best_us = start_best_at.elapsed().as_micros() as u64;
     let start_best_ms = start_best_us / 1_000;
     let mut bulk = crate::frame_blocks::take_bulk::<Pool::Transaction>();
@@ -3803,10 +3809,10 @@ where
             // when consensus commits it, and the error is loud.
             let behind_the_seal = || -> Result<(), PayloadBuilderError> {
             let finish_at = std::time::Instant::now();
-            let (evm, mut execution_result) = builder
-                .executor
-                .finish()
-                .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+            // reth v2.9.0: the executor holds the block's state and hands
+            // back the bundle, its reverts merged, with the result.
+            let reth_execution_types::BlockExecutionOutput { result: mut execution_result, state: executed_state } =
+                builder.executor.finish().map_err(|err| PayloadBuilderError::Internal(err.into()))?;
             // Receipts built beside the parallel step: the executor committed
             // none, so its finish reports none and no gas.
             let receipts_late_used = receipts_pending.is_some();
@@ -3831,8 +3837,6 @@ where
                 execution_result.receipts = receipts;
                 execution_result.gas_used = gas_used;
             }
-            let (db, _evm_env) = reth_evm::Evm::finish(evm);
-            db.merge_transitions(reth_trie::bundle_state::BundleRetention::Reverts);
             let merge_ms = finish_at.elapsed().as_millis() as u64;
             // The post-state is final: the next block can be built on it.
             // The bundle is taken and its reverts appended once, here, and the
@@ -3841,7 +3845,7 @@ where
             // (~147,000 accounts) and every receipt only to drop the receipts,
             // inside the 26 ms before the next build could start (loop138).
             // The hashed state comes with `complete`.
-            let mut bundle = db.take_bundle();
+            let mut bundle = executed_state;
             let bundle_taken_at = std::time::Instant::now();
             // `N42_OUTPUT_INCREMENTAL=1`: the shards are filed on the early
             // output with this residual now -- the child's open proceeds --
@@ -5223,6 +5227,9 @@ where
                 // pool into the build's read cache: the serial execution then
                 // finds them there. At the bench tier almost every recipient is
                 // a cold miss, and those misses were most of the execution time.
+                // The cache sits inside the EVM's type-erased database on
+                // evm2; the prefetch into it waits for the port.
+                #[cfg(feature = "legacy-revm-paths")]
                 {
                     use rayon::prelude::*;
                     let cached: &mut reth_evm::cached::CachedReads = builder.evm_mut().db_mut().database.cached;
@@ -5302,7 +5309,7 @@ where
         // anyway, and the read cost ~1 us on every transaction (round 36).
         // Kept behind N42_BUILDER_STALE_CHECK=1 for the bookend.
         if stale_check()
-            && let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender())
+            && let Ok(Some(account)) = reth_evm::Evm::account_info(builder.evm_mut(), &pool_tx.sender())
                 && pool_tx.nonce() < account.nonce {
                     stale_txs += 1;
                     continue;
@@ -5346,15 +5353,22 @@ where
                 let sender = pool_tx.sender();
                 let nonce = pool_tx.nonce();
                 let verdict = ledger.admit(sender, crate::frame_scan::tx_cost(tx.inner()), || {
-                    let db = builder.evm_mut().db_mut();
                     let read = |err: &dyn std::fmt::Display| std::io::Error::other(format!("account {sender}: {err}"));
-                    let parent = db.database.basic(sender).map_err(|err| read(&err))?.unwrap_or_default();
+                    let parent = parent_state_ref()
+                        .map_err(|err| read(&err))
+                        .and_then(|provider| {
+                            reth_storage_api::AccountReader::basic_account(provider, &sender).map_err(|err| read(&err))
+                        })?
+                        .unwrap_or_default();
                     // A nonce past the parent's after the parallel step: the
                     // sender's transfers are in the block when its in-block
                     // nonce moved (a gap otherwise, which execution refuses).
                     let unseen_earlier = built_before_loop
                         && nonce > parent.nonce
-                        && db.basic(sender).map_err(|err| read(&err))?.map_or(0, |now| now.nonce) != parent.nonce;
+                        && reth_evm::Evm::account_info(builder.evm_mut(), &sender)
+                            .map_err(|err| read(&err))?
+                            .map_or(0, |now| now.nonce)
+                            != parent.nonce;
                     Ok::<_, std::io::Error>(Opening { balance: parent.balance, unseen_earlier })
                 });
                 match verdict {
@@ -5407,13 +5421,12 @@ where
                     // lower one for the sender for good; the sender's higher
                     // nonces are still offered.
                     if from_queue
-                        && let Some(revm::context_interface::result::InvalidTransaction::NonceTooLow { tx, state }) =
-                            reth_evm::InvalidTxError::as_invalid_tx_err(&*error)
+                        && let Some((tx, state)) = invalid_nonce(&*error).filter(|(tx, state)| tx < state)
                     {
                         refuse!(
                             &pool_tx,
                             InvalidPoolTransactionError::Consensus(
-                                InvalidTransactionError::NonceNotConsistent { tx: *tx, state: *state }
+                                InvalidTransactionError::NonceNotConsistent { tx, state }
                             )
                         );
                     }
@@ -5425,10 +5438,8 @@ where
                     // A nonce above the account's is reported as what it is,
                     // so a queue that orders by nonce can tell a hole from a
                     // bad transaction and fill it.
-                    let kind = match reth_evm::InvalidTxError::as_invalid_tx_err(&*error) {
-                        Some(revm::context_interface::result::InvalidTransaction::NonceTooHigh { tx, state }) => {
-                            InvalidTransactionError::NonceNotConsistent { tx: *tx, state: *state }
-                        }
+                    let kind = match invalid_nonce(&*error) {
+                        Some((tx, state)) if tx > state => InvalidTransactionError::NonceNotConsistent { tx, state },
                         _ => InvalidTransactionError::TxTypeNotSupported,
                     };
                     refuse!(&pool_tx, InvalidPoolTransactionError::Consensus(kind));
@@ -5512,6 +5523,7 @@ where
     let (
         BlockBuilderOutcome {
             execution_result,
+            execution_state,
             block,
             block_access_list,
             hashed_state,
@@ -5537,7 +5549,7 @@ where
                     .compute(
                         parent_header.hash(),
                         &changes_from_execution(
-                            &db.bundle_state,
+                            &outcome.execution_state,
                             chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
                         ),
                     )
@@ -5559,7 +5571,7 @@ where
     // The bundle and the receipts, kept for the sealed block's import. Taken
     // here, after the QMDB changes were read from it, and moved rather than
     // cloned: 163,000 receipts are not free to copy on the build's own path.
-    let mut bundle = db.take_bundle();
+    let mut bundle = execution_state;
     // The parallel step's accounts went into the bundle directly; their
     // reverts join the block's set here.
     crate::parallel_transfer::append_reverts(&mut bundle, std::mem::take(&mut par_reverts));
@@ -5901,7 +5913,7 @@ where
         let payload_builder = N42PayloadBuilder::new(
             ctx.provider().clone(),
             pool.clone(),
-            crate::n42_evm::N42EvmConfig::new_with_evm_factory(ctx.chain_spec(), crate::fast_transfer::N42EvmFactory::from_env()),
+            crate::n42_evm::N42EvmConfig::new(ctx.chain_spec()),
             EthereumBuilderConfig::new().with_gas_limit(gas_limit),
             consensus,
         )
@@ -6226,7 +6238,7 @@ mod seal_at_exec_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-revm-paths"))]
 mod plan_body_tests {
     //! `N42_PLAN_AHEAD_BODY=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 2):
     //! what the plan-ahead hook makes equals what the build's start, prep and
@@ -6702,10 +6714,7 @@ mod includability_tests {
             payload_id: Default::default(),
         };
         let args = BuildArguments::new(Default::default(), None, None, config, Default::default(), None);
-        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(
-            spec.clone(),
-            crate::fast_transfer::N42EvmFactory::with_fast_transfers(false),
-        );
+        let evm_config = crate::n42_evm::N42EvmConfig::new(spec.clone());
         let listed = Listed { txs: txs.into(), refused: Vec::new() };
         let outcome = default_n42_payload(
             evm_config,

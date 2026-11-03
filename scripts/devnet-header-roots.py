@@ -125,6 +125,9 @@ def main():
     g = json.load(open(a.genesis))
     vals = g["config"]["hotstuff"]["validators"]
     addr2idx = {v["address"].lower(): i for i, v in enumerate(vals)}
+    # The root is stamped only where both gates are open; elsewhere a header carries none.
+    cfg = g["config"]
+    gate = max(int(cfg.get("glamsterdamTime", 2**63)), int(cfg.get("mobileAnchorTime", 2**63)))
     logs = {}
     for i in range(len(vals)):
         p = os.path.join(a.logs, f"v{i}-{a.tag}.log")
@@ -175,7 +178,9 @@ def main():
         bhash = rpc(a.rpc, "eth_getBlockByNumber", [hex(n), False])["hash"].lower()
         commits, seen = logs[leader]
         built = seen.get(bhash)
-        if built is None:
+        if ts < gate:
+            expect = None
+        elif built is None:
             expect = "unknown"
         else:
             expect = ZERO

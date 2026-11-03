@@ -400,23 +400,20 @@ until a fleet runs the patched gov5 of `docs/patches/gov5-header-field-parity/`.
      list bytes, which the engine tree tried to RLP-decode (4d8b2cb32).
   `crates/n42/h2-node/tests/mobile_anchor_gate.rs` (ignored; real EL and four
   validators, about 40 s) now covers the path end to end.
-- **Glamsterdam execution (open, cross-client, found 2026-11-02).** gov5 runs
-  the Amsterdam state transition wherever `IsGlamsterdam` holds, N42-native
-  chains included: `internal/state_transition.go:447` (EIP-8037
-  two-dimensional gas pool), `:613` `transitionAmsterdam`, `IntrinsicGas` /
-  `FloorDataGas` with `rules.IsGlamsterdam`, `internal/vm/eips_amsterdam.go`.
-  Only EIP-7928 is excluded on native chains (`UsesEIP7928AccessList`,
-  `params/config.go:466`). The Rust node treats `glamsterdamTime` as
-  header-only (`reth_chainspec::qmdb` never activates reth's Amsterdam from
-  it), so under it the two clients execute transfers differently: gas used,
-  transfer logs, receipts root, then state root. Round `mv4f` (the same gated
-  devnet with transfers) shows it: gov5's packetd refused every block with
-  transactions on the receipts root. Chain 94 schedules no Glamsterdam
-  (gov5 7529e2e9; the Rust copy follows since 2026-11-03), so this bites only
-  chains that set `glamsterdamTime`, the gated devnet among them. Fix: activate reth's Amsterdam from gov5's
-  `glamsterdamTime` on native chains, after a rule-set audit (gov5
-  `transitionAmsterdam` against reth 2.8.1's Amsterdam). Not done; the
-  user's decision.
+- **Glamsterdam execution (found 2026-11-02, implemented 2026-11-03 on
+  `feat/glamsterdam-execution`).** gov5 runs the Amsterdam state transition
+  wherever `IsGlamsterdam` holds, N42-native chains included; only EIP-7928
+  is excluded there. Round `mv4f` showed the gap (packetd refused every block
+  with transactions on the receipts root: the EIP-7708 transfer logs). The
+  Rust node now executes a native block past `glamsterdamTime` under revm's
+  `SpecId::AMSTERDAM` (`N42EvmConfig`, gated by
+  `reth_chainspec::qmdb::glamsterdam_execution_active_at`) without
+  activating reth's Amsterdam, so the header and payload rules above are
+  unchanged. Rule-by-rule audit, remaining gaps (EIP-8282 calls gov5 required
+  on native chains, which gov5 now skips there, branch
+  `fix/native-no-eip8282`; chain 94's stale `glamsterdamTime` in the Rust copy, which
+  gov5 `7529e2e9` unscheduled and the Rust copy dropped on 2026-11-03) and test evidence:
+  `docs/GLAMSTERDAM_EXECUTION_PARITY.md`.
 - **Not covered yet.** `n42-init-snapshot` decodes the snapshot head as
   Ethereum's header, so it cannot start a node at a head that carries a
   root. The APoS miner and reth's own `init` / `db` commands stay on

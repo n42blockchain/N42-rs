@@ -19,8 +19,8 @@ or `audit-notes/ci/`; research notes in English under `docs/`.
 | --- | --- | --- | --- | --- | --- |
 | A1 | Mixed gated devnet round (3 Rust + gov5 member, `n42_devnet_mobileanchor.json`, transfer load) — the `mv4h` round the session loss killed | run it; before B lands it documents the divergence, after B lands it must reach the same hashes | A | 360 s round: Rust and gov5 heads equal, gov5 errors 0, device 20/20 | blocked: `mv4h2` (2026-11-03) fails at genesis, before execution: gov5 adds the BAL hash to a Glamsterdam-at-genesis header, reth does not (new item A3); rerun after A3 and B |
 | A2 | Chain-94 genesis run (`crates/chainspec/res/genesis/gov5/`, needs the `--fork-time` step; gate off until 2027-01-01) | run it | A | mixed fleet on chain 94 genesis: same hashes, `/mobileverify` device certifies through the sidecar | done: `c94-a` (2026-11-03) 160/160 hashes, gov5 errors 0, device 20/20 |
-| B1 | Glamsterdam execution parity: gov5 runs `transitionAmsterdam` on any `IsGlamsterdam` chain, N42-native included; the Rust node treats `glamsterdamTime` as header-only | implement: Amsterdam EVM rules from gov5's `glamsterdamTime` on native chains, header/payload rules unchanged (no EIP-7928 on native chains, as gov5) | B | rule-set audit doc; unit tests; gated devnet with transfers: packetd receipts root equals the header's (the mv4f oracle); mixed round A1 same hashes | open |
-| B2 | Rule-set audit: gov5 `transitionAmsterdam` / `IntrinsicGas` / `eips_amsterdam.go` against revm 43 `SpecId::AMSTERDAM` (both: 8037, 8038, 7708, 7843, 7981, 7954, 2780; revm also 7976, 8246, 7825, 7928, 7778, 7873, 7907; gov5 also 8024) | write `docs/GLAMSTERDAM_EXECUTION_PARITY.md`; parity with gov5 is the rule, every difference named with its effect on N42 transaction shapes | B | the doc, reviewed | open |
+| B1 | Glamsterdam execution parity: gov5 runs `transitionAmsterdam` on any `IsGlamsterdam` chain, N42-native included; the Rust node treats `glamsterdamTime` as header-only | implement: Amsterdam EVM rules from gov5's `glamsterdamTime` on native chains, header/payload rules unchanged (no EIP-7928 on native chains, as gov5) | B | rule-set audit doc; unit tests; gated devnet with transfers: packetd receipts root equals the header's (the mv4f oracle); mixed round A1 same hashes | implemented, unit + gov5-fixture tests pass; G1 (EIP-8282) decided 2026-11-03: gov5 skips 8282 on native chains (gov5 `fix/native-no-eip8282`); field oracle and A1 rerun pending |
+| B2 | Rule-set audit: gov5 `transitionAmsterdam` / `IntrinsicGas` / `eips_amsterdam.go` against revm 43 `SpecId::AMSTERDAM` (both: 8037, 8038, 7708, 7843, 7981, 7954, 2780; revm also 7976, 8246, 7825, 7928, 7778, 7873, 7907; gov5 also 8024) | write `docs/GLAMSTERDAM_EXECUTION_PARITY.md`; parity with gov5 is the rule, every difference named with its effect on N42 transaction shapes | B | the doc, reviewed | done: `docs/GLAMSTERDAM_EXECUTION_PARITY.md`, reviewed and accepted 2026-11-03 |
 | C1 | QMDB compaction stage 1 read view: 2-4% read cost (+1 DRAM miss per read) | implement the fix named in the design review: the index keeps locations (512 GiB per file) | C | crate tests; X22 bench pair level with main (two pairs, same box state) | open |
 | C2 | QMDB compaction stages 3 and 4 (`docs/QMDB_COMPACTION_DESIGN.md`) | implement | C | crate tests; `fleet7.sh roll --kill` in file mode; X22 pair level; portable-snapshot export/import still verifies | open |
 | D1 | GitHub repository renamed to `n42blockchain/N42-rs` | set the remote URL in the shared checkout and the worktrees (config only) | D | `git remote -v`, a fetch | done 2026-11-02 |
@@ -72,3 +72,24 @@ builds.
   ./internal/streamverify/packetd/ -run 'HeadSubscriber|Follower'` passes (`audit-notes/ci/d4-go.out`; block
   built 0.6 ms after its notification with a one-minute poll). The live devnet measurement needs a box claim
   and is left for stream A's next devnet round (add `-ws ws://127.0.0.1:18546` to packetd, EL `--ws`).
+### B1/B2 (2026-11-03, branch `feat/glamsterdam-execution`)
+
+- Audit: `docs/GLAMSTERDAM_EXECUTION_PARITY.md`. Every Amsterdam rule gov5 applies on a native chain
+  matches revm 43 for N42's shapes except: **G1** gov5 runs the EIP-8282 builder-request calls at every
+  Amsterdam block on native chains and refuses the block when the contracts have no code -- no bundled
+  native genesis (gated devnet, devnet, chain-94 copy) deploys them, so a gov5 member refuses every gated
+  devnet block (decided 2026-11-03: gov5 gates 8282 off on native chains, `UsesEIP8282BuilderRequests`, branch
+  `fix/native-no-eip8282`); **G2** gov5 `7529e2e9` removed `glamsterdamTime` from
+  chain 94, the Rust copy `crates/chainspec/res/genesis/gov5/mainnet_qmdb_staggered.json` still has
+  1798761600 (handed to stream A); G3 builder SLOTNUM (fixed); G4 total gas cap 2^32-1 (latent);
+  G5 parallel paths (fixed); G6/G7 pre-existing or admission-only.
+- Implementation: `reth_chainspec::qmdb::glamsterdam_execution_active_at` (native + glamsterdamTime);
+  `N42EvmConfig` selects `SpecId::AMSTERDAM` in `evm_env`/`next_evm_env`/`evm_env_for_payload`; reth's
+  `EthereumHardfork::Amsterdam` stays off (no BAL, header/payload unchanged); parallel build and follower
+  parallel paths fall back to serial; deferred includability prices Amsterdam intrinsic.
+- Tests: `cargo test -p n42-engine-types --lib glamsterdam_execution_tests` (4 pass) incl. gov5's fixture
+  block (gov5 branch `test/glamsterdam-native-fixtures` 9907ea97, 11 transaction shapes: receipts, logs,
+  gas 749,700 vs receipts 994,536, receipts root, post-state all equal); ungated devnet environment equal to
+  `EvmEnv::for_eth_block` field for field.
+- **DEVNET_BIN for A:** `/data/n42-build/glam-target/debug/n42` and
+  `/data/n42-build/glam-target/debug/examples/h2_validator` (debug), commit noted in the report line below.

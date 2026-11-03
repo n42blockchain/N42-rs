@@ -153,6 +153,7 @@ def main():
             ts = int.from_bytes(h[11], "big")
             slot = int.from_bytes(h[22], "big") if len(h) > 22 else None
             root = ("0x" + h[23].hex()) if len(h) > 23 else None
+            items = len(h)
         except RuntimeError:
             # gov5 serves no debug_getRawHeader: read its JSON header fields instead.
             b = rpc(a.rpc, "eth_getBlockByNumber", [hex(n), False])
@@ -162,10 +163,11 @@ def main():
             slot = int(b["slotNumber"], 16) if b.get("slotNumber") else None
             root = b.get("mobileRegistryRoot")
             root = root.lower() if root else None
+            items = "json"
         cls = "none" if root is None else "zero" if root == ZERO else "committed" if root in rust_roots else "other"
         stats[cls] += 1
         if root != prev:
-            print(f"root change at block {n} miner {coinbase} ts {ts} root {root} ({cls}) slot {slot} items {len(h)}")
+            print(f"root change at block {n} miner {coinbase} ts {ts} root {root} ({cls}) slot {slot} items {items}")
             prev = root
         if n == 0:
             continue

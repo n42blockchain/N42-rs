@@ -599,6 +599,17 @@ Chains without `mobileAnchorTime` need only step 1 (no header root); chain 94 ne
 MobileAnchor + Glamsterdam gate opens (2027-01-01). Nothing is coded until gov5 agrees to the shape;
 this section is the proposal sent with the gov5 PRs.
 
+**Mixed, gated, after A3 and B1** (`mv4h3`, 2026-11-03; Rust 6474989e0, gov5 member fcd7aa4b plus the
+native-chain EIP-8282 fix): the genesis now agrees (`0x9e8628a6…` on both, A3) and gov5 peers, but it
+refuses block 1, an empty block led by validator 1, with `state root mismatch at block 1: proposer
+fdde74e1…, locally computed 19dfd6ad…` and stays at height 0; the Rust validators commit alone (89
+commits). The question of a gov5 leader's registry root therefore stays open. Everything the sidecar
+checks passes: packetd built all 90 packets including the 68 with transactions (the receipts-root oracle
+of `mv4f` now agrees, B1), the device certified 20/20 with nothing skipped, and the leader-root check is
+89/89. Two short trace rounds (`mv4h3-trace`, `mv4h3-trace2`) show that block 1 writes the same four
+accounts and two slots with the same values on both clients, so the mismatch lies in the QMDB commitment
+of those leaves on an Amsterdam block, not in execution.
+
 ## Pure-Rust producer: feasibility (D5, 2026-11-03)
 
 **Question.** A StreamPacket's read log is positional: the phone replays it through Go's

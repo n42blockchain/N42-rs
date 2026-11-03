@@ -68,7 +68,7 @@ members = [
     "crates/ethereum/node/",
     #"crates/primitives/",
     #"crates/rpc/rpc-eth-api/",
-    "crates/rpc/rpc-types-compat/",
+    #"crates/rpc/rpc-types-compat/",
     "crates/storage/db/",
     "crates/storage/db-api/",
     "crates/storage/provider",
@@ -364,9 +364,9 @@ reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.9.0", default-features = false }
 reth-rpc-layer = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.9.0" }
 reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.9.0" }
-# Upstream renamed this crate reth-rpc-convert (reth #17013), so there is no
-# longer anything to [patch] — the vendored copy is now a plain path dependency.
-reth-rpc-types-compat = { path = "crates/rpc/rpc-types-compat" }
+# reth-rpc-types-compat (renamed reth-rpc-convert upstream, reth #17013) was
+# dropped in the v2.9.0 port: it carried no N42 delta and only re-exported
+# alloy-evm's revm-era RPC env types; consumers use reth-rpc-convert.
 reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.9.0" }
 reth-stages = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.9.0" }
 reth-stages-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.9.0" }

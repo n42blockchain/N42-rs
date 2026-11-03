@@ -1575,7 +1575,8 @@ pub struct ExecutionPayloadV4 {
     /// N42: gov5's `MobileRegistryRoot`, header element 24 (absent on every
     /// chain without gov5's MobileAnchor and Glamsterdam forks). It is part of
     /// the block hash, so a payload that dropped it could not reproduce the
-    /// block. Not in the SSZ form, which N42's engine path does not use.
+    /// block. In the SSZ form it is a trailing fixed field present only when
+    /// set (see the `ssz::Decode` impl), as the JSON form omits it when unset.
     #[cfg_attr(
         feature = "serde",
         serde(rename = "mobileRegistryRoot", default, skip_serializing_if = "Option::is_none")
@@ -1662,13 +1663,36 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadV4 {
     }
 }
 
+/// N42: the fixed section of the SSZ [`ExecutionPayloadV4`] without the
+/// `mobile_registry_root` trailer: five hashes, the fee recipient, the bloom,
+/// seven `u64`s (slot number included), the base fee and four offsets.
+#[cfg(feature = "ssz")]
+const EXECUTION_PAYLOAD_V4_SSZ_FIXED_LEN: usize = 32 * 5 + 20 + 256 + 8 * 7 + 32 + 4 * 4;
+
+/// N42: byte position of the first offset (`extra_data`) in the SSZ
+/// [`ExecutionPayloadV4`]: after five fixed hashes/addresses, the bloom,
+/// `prev_randao` and four `u64`s.
+#[cfg(feature = "ssz")]
+const EXECUTION_PAYLOAD_V4_SSZ_FIRST_OFFSET_AT: usize = 32 + 20 + 32 + 32 + 256 + 32 + 8 * 4;
+
 #[cfg(feature = "ssz")]
 impl ssz::Decode for ExecutionPayloadV4 {
     fn is_ssz_fixed_len() -> bool {
         false
     }
 
+    /// N42: a payload whose header carries gov5's `MobileRegistryRoot`
+    /// appends the root as a 32-byte fixed field after `slot_number`. SSZ
+    /// requires the first offset to point just past the fixed section, so the
+    /// first offset names the form: the standard length means no root (the
+    /// encoding is byte-identical to upstream's), 32 more means a root.
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+        let at = EXECUTION_PAYLOAD_V4_SSZ_FIRST_OFFSET_AT;
+        let first_offset = bytes
+            .get(at..at + ssz::BYTES_PER_LENGTH_OFFSET)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+        let with_root = first_offset == Some(EXECUTION_PAYLOAD_V4_SSZ_FIXED_LEN + 32);
+
         let mut builder = ssz::SszDecoderBuilder::new(bytes);
 
         builder.register_type::<B256>()?;
@@ -1690,6 +1714,9 @@ impl ssz::Decode for ExecutionPayloadV4 {
         builder.register_type::<u64>()?;
         builder.register_type::<Bytes>()?;
         builder.register_type::<u64>()?;
+        if with_root {
+            builder.register_type::<B256>()?;
+        }
 
         let mut decoder = builder.build()?;
 
@@ -1721,7 +1748,7 @@ impl ssz::Decode for ExecutionPayloadV4 {
             },
             block_access_list: decoder.decode_next()?,
             slot_number: decoder.decode_next()?,
-            mobile_registry_root: None,
+            mobile_registry_root: if with_root { Some(decoder.decode_next()?) } else { None },
         })
     }
 }
@@ -1738,7 +1765,8 @@ impl ssz::Encode for ExecutionPayloadV4 {
             + <Bloom as ssz::Encode>::ssz_fixed_len()
             + <u64 as ssz::Encode>::ssz_fixed_len() * 7 // includes slot_number
             + <U256 as ssz::Encode>::ssz_fixed_len()
-            + ssz::BYTES_PER_LENGTH_OFFSET * 4;
+            + ssz::BYTES_PER_LENGTH_OFFSET * 4
+            + self.mobile_registry_root.map_or(0, |_| <B256 as ssz::Encode>::ssz_fixed_len());
 
         let mut encoder = ssz::SszEncoder::container(buf, offset);
 
@@ -1761,6 +1789,9 @@ impl ssz::Encode for ExecutionPayloadV4 {
         encoder.append(&self.payload_inner.excess_blob_gas);
         encoder.append(&self.block_access_list);
         encoder.append(&self.slot_number);
+        if let Some(root) = &self.mobile_registry_root {
+            encoder.append(root);
+        }
 
         encoder.finalize();
     }
@@ -1770,6 +1801,7 @@ impl ssz::Encode for ExecutionPayloadV4 {
             + ssz::BYTES_PER_LENGTH_OFFSET
             + self.block_access_list.len()
             + <u64 as ssz::Encode>::ssz_fixed_len()
+            + self.mobile_registry_root.map_or(0, |_| <B256 as ssz::Encode>::ssz_fixed_len())
     }
 }
 
@@ -4660,6 +4692,53 @@ mod tests {
 
         let decoded = ExecutionPayloadEnvelopeV6::from_ssz_bytes(&envelope.as_ssz_bytes()).unwrap();
         assert_eq!(decoded, envelope);
+    }
+
+    /// N42: the SSZ payload carries `mobile_registry_root` the way the JSON
+    /// form does: absent when unset (the encoding is upstream's, byte for
+    /// byte), a trailing 32-byte fixed field when set, told apart by the first
+    /// offset.
+    #[test]
+    #[cfg(feature = "ssz")]
+    fn ssz_execution_payload_v4_carries_the_mobile_registry_root() {
+        use ssz::{Decode, Encode};
+
+        let plain = ssz_payload_v4();
+        let plain_bytes = plain.as_ssz_bytes();
+        assert_eq!(plain_bytes.len(), plain.ssz_bytes_len());
+        let at = EXECUTION_PAYLOAD_V4_SSZ_FIRST_OFFSET_AT;
+        assert_eq!(
+            u32::from_le_bytes(plain_bytes[at..at + 4].try_into().unwrap()) as usize,
+            EXECUTION_PAYLOAD_V4_SSZ_FIXED_LEN,
+            "the first offset sits where the decoder looks for it"
+        );
+        assert_eq!(ExecutionPayloadV4::from_ssz_bytes(&plain_bytes).unwrap(), plain);
+
+        let rooted = ExecutionPayloadV4 { mobile_registry_root: Some(B256::repeat_byte(0x24)), ..plain.clone() };
+        let rooted_bytes = rooted.as_ssz_bytes();
+        assert_eq!(rooted_bytes.len(), rooted.ssz_bytes_len());
+        assert_eq!(rooted_bytes.len(), plain_bytes.len() + 32);
+        // The root follows the slot number at the end of the fixed section.
+        let fixed = EXECUTION_PAYLOAD_V4_SSZ_FIXED_LEN;
+        assert_eq!(&rooted_bytes[fixed..fixed + 32], B256::repeat_byte(0x24).as_slice());
+        assert_eq!(&rooted_bytes[..at], &plain_bytes[..at]);
+        assert_eq!(ExecutionPayloadV4::from_ssz_bytes(&rooted_bytes).unwrap(), rooted);
+
+        // Inside a container (the Amsterdam getPayload envelope) too.
+        let envelope = ExecutionPayloadEnvelopeV6 {
+            execution_payload: rooted,
+            block_value: U256::from(26),
+            blobs_bundle: BlobsBundleV2::empty(),
+            should_override_builder: false,
+            execution_requests: Requests::from_requests([Bytes::from(vec![7, 8, 9])]),
+        };
+        let decoded = ExecutionPayloadEnvelopeV6::from_ssz_bytes(&envelope.as_ssz_bytes()).unwrap();
+        assert_eq!(decoded, envelope);
+
+        // A first offset that names neither form is refused.
+        let mut bad = plain_bytes;
+        bad[at..at + 4].copy_from_slice(&((fixed + 16) as u32).to_le_bytes());
+        assert!(ExecutionPayloadV4::from_ssz_bytes(&bad).is_err());
     }
 
     #[test]

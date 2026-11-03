@@ -24,11 +24,10 @@ use alloy_eips::Encodable2718;
 use alloy_primitives::B256;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_evm::{
-    block::BlockExecutorFactory,
-    eth::EthBlockExecutionCtx,
     execute::{BlockAssembler, BlockAssemblerInput, BlockExecutionError},
+    BlockExecutorFactory, EvmEnv as _,
 };
-use reth_evm_ethereum::EthBlockAssembler;
+use reth_evm_ethereum::{EthBlockAssembler, EthBlockExecutionCtx};
 use reth_primitives_traits::{logs_bloom, Receipt, SignedTransaction};
 use std::sync::{Arc, Mutex};
 
@@ -319,10 +318,10 @@ where
         ExecutionCtx<'a> = EthBlockExecutionCtx<'a>,
         Transaction: SignedTransaction,
         Receipt: Receipt,
-    >,
+    > + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
-    let timestamp: u64 = revm::context::Block::timestamp(&input.evm_env.block_env).saturating_to();
+    let timestamp: u64 = input.evm_env.block_env().timestamp.saturating_to();
     let stamp = registry_root_for_header(
         reth_chainspec::qmdb::mobile_registry_root_in_header_at(inner.chain_spec.genesis(), timestamp),
         mobile_registry_root,
@@ -338,7 +337,7 @@ where
         parent,
         transactions,
         output,
-        bundle_state,
+        execution_state,
         state_provider,
         state_root,
         block_access_list_hash,
@@ -351,7 +350,7 @@ where
         &parent,
         transactions,
         output,
-        bundle_state,
+        execution_state,
         state_provider,
         state_root,
         block_access_list_hash,
@@ -393,7 +392,7 @@ where
         ExecutionCtx<'a> = EthBlockExecutionCtx<'a>,
         Transaction: SignedTransaction,
         Receipt: Receipt,
-    >,
+    > + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
     type Block = Block<F::Transaction, N42Header>;
@@ -412,7 +411,7 @@ where
         ExecutionCtx<'a> = EthBlockExecutionCtx<'a>,
         Transaction: SignedTransaction,
         Receipt: Receipt,
-    >,
+    > + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
     type Block = Block<F::Transaction, N42Header>;
@@ -423,7 +422,7 @@ where
     ) -> Result<Self::Block, BlockExecutionError> {
         let receipts = &input.output.receipts;
         let hotstuff = self.hotstuff;
-        let bundle = input.bundle_state;
+        let bundle = input.execution_state;
         let assembling = std::time::Instant::now();
         let tx_root_ms = std::sync::atomic::AtomicU64::new(0);
         let qmdb_ms = std::sync::atomic::AtomicU64::new(0);
@@ -536,10 +535,10 @@ mod tests {
             serde_json::from_str(&format!(r#"{{"config":{{"chainId":1143{config}}},"alloc":{{}}}}"#)).expect("genesis");
         let spec = Arc::new(reth_chainspec::ChainSpec::from_genesis(genesis));
         let parent = reth_primitives_traits::SealedHeader::seal_slow(N42Header::from(alloy_consensus::Header::default()));
-        let mut evm_env: reth_evm::EvmEnv = Default::default();
-        evm_env.block_env.timestamp = U256::from(10);
-        evm_env.block_env.number = U256::from(1);
-        let ctx = alloy_evm::eth::EthBlockExecutionCtx {
+        let mut evm_env: reth_evm_ethereum::EthEvmEnv = Default::default();
+        evm_env.block.timestamp = U256::from(10);
+        evm_env.block.number = U256::from(1);
+        let ctx = reth_evm_ethereum::EthBlockExecutionCtx {
             parent_hash: parent.hash(),
             parent_beacon_block_root: None,
             ommers: &[],
@@ -549,7 +548,7 @@ mod tests {
             slot_number: None,
         };
         let output = reth_execution_types::BlockExecutionResult::<reth_ethereum_primitives::Receipt>::default();
-        let bundle = revm::database::BundleState::default();
+        let bundle = reth_evm::BundleState::default();
         let provider = reth_storage_api::noop::NoopProvider::default();
         let input = BlockAssemblerInput::<Factory, N42Header>::new(
             evm_env, ctx, &parent, Vec::new(), &output, &bundle, &provider, B256::ZERO, None,

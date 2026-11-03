@@ -13,8 +13,8 @@ use reth_evm::execute::Executor;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{AlloyBlockHeader, RecoveredBlock, SealedBlock};
 use reth_provider::test_utils::MockEthProvider;
-use reth_evm::{database::StateProviderDatabase, db::State};
-use revm_primitives::B256;
+use alloy_primitives::B256;
+use reth_evm::database::StateProviderDatabase;
 use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
 
@@ -137,9 +137,9 @@ fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
     let state = StateProviderDatabase::new(
         reth_provider::StateProvider::into_evm_state_provider(provider_1),
     );
-    let db = State::builder()
-        .with_database(unverifiedblock.db.as_db_mut(state))
-        .build();
+    // reth v2.9.0's executors take the database as it is: the block-level
+    // cache and bundle live inside the executor.
+    let db = unverifiedblock.db.as_db_mut(state);
     let chain_spec = Arc::new(
         ChainSpecBuilder::from(&*N42_DEVNET)
             .shanghai_activated()
@@ -182,7 +182,7 @@ fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
 }
 
 fn evm_config(chain_spec: Arc<ChainSpec>) -> n42_engine_types::N42EvmConfig {
-    n42_engine_types::N42EvmConfig::new_with_evm_factory(chain_spec, n42_engine_types::fast_transfer::N42EvmFactory::from_env())
+    n42_engine_types::N42EvmConfig::new(chain_spec)
 }
 
 #[cfg(test)]

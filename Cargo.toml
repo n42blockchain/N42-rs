@@ -719,6 +719,11 @@ reth-network-peers = { path = "crates/net/peers"}
 # switch that builds the canonical-state notification without cloning execution outcomes.
 reth-chain-state = { path = "crates/chain-state" }
 
+[patch."https://github.com/alloy-rs/evm2"]
+# Fee-disabled traceCall must retain the Geth beneficiary prestate
+# (vendor/dependency-repairs/evm2-inspectors-0.1.0/N42-PROVENANCE.md).
+evm2-inspectors = { path = "vendor/dependency-repairs/evm2-inspectors-0.1.0" }
+
 [patch.crates-io]
 # reth-core at the revision reth v2.9.0 patches in (its crates.io 0.8.2 predates evm2).
 reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
@@ -728,8 +733,6 @@ reth-rpc-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275
 reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
 # LLVM 23 support is not released yet (upstream's patch, for evm2-jit).
 inkwell = { git = "https://github.com/TheDan64/inkwell", rev = "c9d9734ae17dbaf1d9902dab3b8ee9d2041781ff" }
-# Fee-disabled traceCall must retain the Geth beneficiary prestate.
-revm-inspectors = { path = "vendor/dependency-repairs/revm-inspectors-0.44.3" }
 # TestRng trait compatibility with proptest 1.11 / rand 0.10.
 proptest-arbitrary-interop = { path = "vendor/dependency-repairs/proptest-arbitrary-interop-0.1.0" }
 pprof_util = { path = "vendor/dependency-repairs/pprof_util-0.8.2" }

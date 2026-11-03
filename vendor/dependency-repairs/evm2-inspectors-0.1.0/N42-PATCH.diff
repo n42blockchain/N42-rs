@@ -1,0 +1,55 @@
+--- upstream-f93318f/src/tracing/debug.rs
++++ n42/src/tracing/debug.rs
+@@ -7,9 +7,9 @@
+ use alloy_primitives::{Address, Log, U256};
+ use alloy_rpc_types_eth::TransactionInfo;
+ use alloy_rpc_types_trace::geth::{
+-    CallConfig, FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
++    AccountState, CallConfig, FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
+     GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, NoopFrame, PreStateConfig,
+-    StateGasTrace, erc7562::Erc7562Config, mux::MuxConfig,
++    PreStateFrame, StateGasTrace, erc7562::Erc7562Config, mux::MuxConfig,
+ };
+ use evm2::{
+     DatabaseError, EvmTypes, EvmTypesHost, Inspector, NoopInspector, TxResultWithState,
+@@ -260,11 +260,36 @@
+             }
+             Self::PreStateTracer(inspector, config) => {
+                 inspector.set_transaction_gas_limit(tx.gas_limit());
+-                inspector
++                let mut frame = inspector
+                     .geth_builder()
+-                    .geth_prestate_traces(res, config, db)
+-                    .map_err(DebugInspectorError::Database)?
+-                    .into()
++                    .geth_prestate_traces(res, config, &mut *db)
++                    .map_err(DebugInspectorError::Database)?;
++                // N42: Geth looks up the block beneficiary even when traceCall
++                // disables fee charging and the EVM never touches coinbase.
++                // Like every other account, it is omitted when it was empty
++                // before execution.
++                if let PreStateFrame::Default(prestate) = &mut frame {
++                    let beneficiary = block_env.beneficiary;
++                    if !prestate.0.contains_key(&beneficiary) {
++                        let account = db
++                            .get_account(&beneficiary)
++                            .map_err(DebugInspectorError::Database)?
++                            .unwrap_or_default();
++                        if !account.is_empty() {
++                            let code = if config.code_enabled() {
++                                crate::tracing::utils::load_account_code(db, &account)
++                                    .map_err(DebugInspectorError::Database)?
++                            } else {
++                                None
++                            };
++                            prestate.0.insert(
++                                beneficiary,
++                                AccountState::from_account_info(account.nonce, account.balance, code),
++                            );
++                        }
++                    }
++                }
++                frame.into()
+             }
+             Self::Noop(_) => NoopFrame::default().into(),
+             Self::StateGasTracer(_) => StateGasTrace {

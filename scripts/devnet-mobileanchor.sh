@@ -102,7 +102,7 @@ if [ -n "$WITH_GOV5" ]; then
   say "gov5 init: $(/usr/bin/grep -a 'genesis' "$F/gov5-init-$TAG.log" | tail -1 | cut -c1-200)"
   say "genesis: reth=$(j -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x0",false]}' http://127.0.0.1:18545 | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["hash"])' 2>/dev/null) gov5=$(j -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x0",false]}' http://127.0.0.1:28545 | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["hash"])' 2>/dev/null)"
   # A member on another genesis never peers ("wrong fork digest version"): say so loudly.
-  tail -1 "$LOG" | awk '{split($4,a,"=");split($5,b,"=");if(a[2]!=b[2])print "GENESIS MISMATCH: the gov5 member cannot join"}' | tee -a "$LOG"
+  tail -1 "$LOG" | awk '{split($3,a,"=");split($4,b,"=");if(a[2]!=b[2])print "GENESIS MISMATCH: the gov5 member cannot join"}' | tee -a "$LOG"
 fi
 
 if [ -n "$TXLOAD" ]; then

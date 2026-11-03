@@ -72,12 +72,16 @@ stop_round() {
 
 if [ "${NO_BOX_GATE:-}" != 1 ]; then
   export BOX_ME=rust BOX_LOG=$LOG
+  # box-gate.sh reads optional variables unset; it runs without -u.
+  set +u
   # shellcheck disable=SC1091
   . /data/blockchain/gov5-work/box-gate.sh
   say "box request filed"
   box_acquire
+  set -u
   say "box claimed"
   trap 'stop_round; box_drop_claim; box_drop_request; say "box released"' EXIT
+  trap 'exit 130' INT TERM
 else
   trap 'stop_round' EXIT
 fi

@@ -1128,7 +1128,8 @@ mod tests {
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_storage_api::{AccountReader, BlockHashReader, StateProvider as _};
     use reth_trie::{updates::TrieUpdates, HashedPostState};
-    use revm::{database::BundleState, state::AccountInfo};
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::BundleState;
 
     /// Serialises the tests that file builds in the process-wide stores.
     fn store_lock() -> std::sync::MutexGuard<'static, ()> {

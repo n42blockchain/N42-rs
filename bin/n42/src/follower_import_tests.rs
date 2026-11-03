@@ -14,7 +14,7 @@ use super::*;
 use alloy_primitives::U256;
 use reth_provider::test_utils::MockEthProvider;
 use reth_evm::db::BundleState;
-use reth_evm::primitives::hardfork::SpecId;
+use evm2::SpecId;
 use reth_evm::state::AccountInfo;
 
 fn info(nonce: u64, balance: u64) -> AccountInfo {

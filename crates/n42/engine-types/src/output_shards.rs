@@ -53,6 +53,7 @@ use alloy_primitives::{
 };
 use reth_primitives_traits::{Account, Bytecode};
 use evm2::bytecode::Bytecode as RevmBytecode;
+#[cfg(feature = "legacy-revm-paths")]
 use reth_evm::db::State;
 use reth_storage_api::{
     errors::ProviderResult, AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider,
@@ -62,8 +63,12 @@ use reth_trie::{
     updates::TrieUpdates, AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
+use reth_trie::bundle_state::{AccountRevert, BundleAccount, BundleState};
+// The cache commits (`take_cached`) and the staged fold write revm 43's
+// `State`: built only with `legacy-revm-paths` until the parallel step is
+// ported (docs/RETH_2_9_0_UPGRADE.md, port log).
+#[cfg(feature = "legacy-revm-paths")]
 use revm::{
-    database::{AccountRevert, BundleAccount, BundleState},
     state::{AccountStatus, EvmState},
     Database,
 };
@@ -1247,6 +1252,7 @@ impl EarlyOutput {
         self.parts.iter().map(|part| part.index.len()).sum()
     }
 
+    #[cfg(feature = "legacy-revm-paths")]
     /// [`FrozenShards::take_cached`] on the early output: the changes the
     /// batches made to accounts `state` holds in its cache, committed to it
     /// as deltas, read from the early output instead of taken out of the
@@ -1276,6 +1282,7 @@ fn early_parts(capacity: usize) -> Vec<Mutex<EarlyPart>> {
     (0..EARLY_PARTS).map(|_| Mutex::new(EarlyPart::with_capacity(each))).collect()
 }
 
+#[cfg(feature = "legacy-revm-paths")]
 /// `take_cached`'s commit: each account's change against its parent value
 /// laid over the value the block's state holds in its cache.
 fn commit_cached<DB: Database>(state: &mut State<DB>, taken: Vec<(Address, BundleAccount)>) -> usize {
@@ -2132,6 +2139,7 @@ impl FrozenShards {
         self.contracts.get(code_hash)
     }
 
+    #[cfg(feature = "legacy-revm-paths")]
     /// The accounts the block's own state already holds in its cache (a
     /// pre-execution system call's): their changes go on top of the block's
     /// values, not the parent's, so they leave the shards and are committed
@@ -2198,6 +2206,7 @@ impl FrozenShards {
         }
     }
 
+    #[cfg(feature = "legacy-revm-paths")]
     /// The shards folded into one map after all, for a build that needs the
     /// block's state in its executor (a serial loop, a cache-reading finish):
     /// installed by `install_staged` exactly as a streamed graft is.
@@ -2801,7 +2810,8 @@ reth_storage_api::macros::delegate_impls_to_as_ref!(
 #[cfg(test)]
 mod frozen_tests {
     use super::*;
-    use revm::{database::BundleState, state::AccountInfo};
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::BundleState;
 
     fn addr(i: u8) -> Address {
         Address::with_last_byte(i)
@@ -3246,7 +3256,8 @@ mod incremental_tests {
     //! reads the frozen set's values, and a freeze that ran beside an early
     //! reader leaves the same output as one that ran alone.
     use super::*;
-    use revm::{database::BundleState, state::AccountInfo};
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::BundleState;
 
     fn addr(i: u32) -> Address {
         Address::from_slice(&alloy_primitives::keccak256(i.to_be_bytes())[..20])
@@ -3357,6 +3368,7 @@ mod incremental_tests {
         (view, state, reverts, frozen.accounts())
     }
 
+    #[cfg(feature = "legacy-revm-paths")]
     #[test]
     fn a_freeze_beside_an_early_reader_equals_the_one_shot_freeze() {
         for defer in [false, true] {
@@ -3381,6 +3393,7 @@ mod incremental_tests {
         }
     }
 
+    #[cfg(feature = "legacy-revm-paths")]
     #[test]
     fn the_early_take_commits_what_the_frozen_take_commits() {
         use revm::Database as _;
@@ -3571,7 +3584,8 @@ mod shard_mix_tests {
     //! of this test binary ([`shard_mix_dump`]) and the parent compares the
     //! two dumps byte for byte ([`the_shard_mix_is_layout_only`]).
     use super::*;
-    use revm::{database::BundleState, state::AccountInfo};
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::BundleState;
     use std::fmt::Write as _;
 
     fn hashed(i: u32) -> Address {

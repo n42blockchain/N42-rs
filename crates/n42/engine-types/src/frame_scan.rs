@@ -23,7 +23,7 @@
 //! message never depend on whether a summary existed.
 
 use alloy_primitives::{map::B256HashMap, Address, B256, U256};
-use reth_evm::primitives::hardfork::SpecId;
+use evm2::SpecId;
 use std::sync::{Arc, Mutex};
 
 use crate::N42PooledTransaction;
@@ -95,19 +95,30 @@ pub fn intrinsic_gas_shortfall_from(tx: &TransactionSigned, sender: Option<Addre
         .access_list()
         .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
         .unwrap_or((0, 0));
-    let intrinsic = reth_evm::context_interface::cfg::gas::calculate_initial_tx_gas(
-        spec,
+    // evm2's own intrinsic rule (`intrinsic_and_floor_gas`, the one its
+    // handlers validate with), plus EIP-7702's per-authorization charge as
+    // reth's `EvmTransactionValidationGasRules` adds it. evm2 charges no state
+    // gas at the intrinsic phase (EIP-2780 moved it to the runtime phase).
+    let version = evm2::Version::new(spec);
+    // Without the sender a call is priced as one to another account.
+    let caller = sender.unwrap_or_else(|| match tx.kind().to() {
+        Some(to) if to.is_zero() => Address::with_last_byte(1),
+        _ => Address::ZERO,
+    });
+    let (mut intrinsic, floor) = evm2::ethereum::intrinsic_and_floor_gas(
+        &version,
+        caller,
+        tx.kind(),
         tx.input(),
-        tx.kind().is_create(),
         al_accounts,
         al_storages,
-        tx.authorization_list().map_or(0, |list| list.len() as u64),
-        spec.is_enabled_in(SpecId::AMSTERDAM).then(|| reth_evm::context_interface::cfg::gas_params::Eip2780TxInfo {
-            value: tx.value(),
-            is_self_transfer: sender.is_some() && tx.kind().to() == sender.as_ref(),
-        }),
+        tx.value(),
     );
-    let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
+    if version.feature(evm2::EvmFeatures::EIP7702) {
+        intrinsic += tx.authorization_list().map_or(0, |list| list.len() as u64)
+            * version.gas_params.get(evm2::version::GasId::TxEip7702PerEmptyAccountCost);
+    }
+    let needed = intrinsic.max(floor);
     (tx.gas_limit() < needed).then_some(needed)
 }
 

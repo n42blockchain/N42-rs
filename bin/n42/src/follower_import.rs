@@ -918,7 +918,7 @@ where
 /// cap, a gas limit at least a transfer's; for the block, the gas limits
 /// within the header's. Senders are read on the worker pool, each chunk on
 /// a state provider of its own.
-/// The revm spec the intrinsic gas of a block stamped `timestamp` is
+/// The evm2 spec the intrinsic gas of a block stamped `timestamp` is
 /// computed under (the forks that change it: Shanghai's init-code word
 /// cost, Prague's calldata floor).
 ///
@@ -929,8 +929,8 @@ where
 fn spec_for_intrinsic_gas<ChainSpec: reth_chainspec::EthereumHardforks + reth_chainspec::EthChainSpec>(
     chain_spec: &ChainSpec,
     timestamp: u64,
-) -> reth_evm::primitives::hardfork::SpecId {
-    use reth_evm::primitives::hardfork::SpecId;
+) -> evm2::SpecId {
+    use evm2::SpecId;
     if chain_spec.is_amsterdam_active_at_timestamp(timestamp)
         || reth_chainspec::qmdb::glamsterdam_execution_active_at(chain_spec.genesis(), timestamp)
     {
@@ -1006,7 +1006,7 @@ fn check_includable<Provider>(
     parent_output: Option<ParentBundles<'_>>,
     block: &RecoveredBlock<Block>,
     chain_id: u64,
-    spec: reth_evm::primitives::hardfork::SpecId,
+    spec: evm2::SpecId,
 ) -> Result<(), String>
 where
     Provider: StateProviderFactory + Sync,
@@ -1057,7 +1057,7 @@ fn check_includable_timed<Provider>(
     parent_output: Option<ParentBundles<'_>>,
     block: &RecoveredBlock<Block>,
     chain_id: u64,
-    spec: reth_evm::primitives::hardfork::SpecId,
+    spec: evm2::SpecId,
     times: &mut CheckTimes,
 ) -> Result<(), String>
 where
@@ -1076,7 +1076,7 @@ fn check_includable_laid_out<Provider>(
     parent_output: Option<ParentBundles<'_>>,
     block: &RecoveredBlock<Block>,
     chain_id: u64,
-    spec: reth_evm::primitives::hardfork::SpecId,
+    spec: evm2::SpecId,
     layout: Option<&[(B256, usize, bool)]>,
     times: &mut CheckTimes,
 ) -> Result<(), String>
@@ -1116,7 +1116,7 @@ fn scan_by_frames(
     block: &RecoveredBlock<Block>,
     layout: &[(B256, usize, bool)],
     chain_id: u64,
-    spec: reth_evm::primitives::hardfork::SpecId,
+    spec: evm2::SpecId,
     times: &mut CheckTimes,
 ) -> Vec<ChunkScan> {
     use rayon::prelude::*;
@@ -1183,7 +1183,7 @@ fn scan_by_frames(
 fn scan_transactions(
     block: &RecoveredBlock<Block>,
     chain_id: u64,
-    spec: reth_evm::primitives::hardfork::SpecId,
+    spec: evm2::SpecId,
 ) -> Vec<ChunkScan> {
     use rayon::prelude::*;
 
@@ -1208,7 +1208,7 @@ fn scan_range(
     base: usize,
     base_fee: u128,
     chain_id: u64,
-    spec: reth_evm::primitives::hardfork::SpecId,
+    spec: evm2::SpecId,
 ) -> ChunkScan {
     use alloy_consensus::Transaction as _;
     let mut scan = ChunkScan { runs: Vec::with_capacity(txs.len() / 8 + 1), ..Default::default() };
@@ -1992,7 +1992,7 @@ fn timed_check<Provider>(
     parent_output: Option<ParentBundles<'_>>,
     block: &RecoveredBlock<Block>,
     chain_id: u64,
-    spec: reth_evm::primitives::hardfork::SpecId,
+    spec: evm2::SpecId,
     times: &mut CheckTimes,
 ) -> Result<(u64, u64), String>
 where
@@ -4338,7 +4338,7 @@ mod tests {
     use reth_primitives_traits::{Account, SealedBlock};
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_evm::db::BundleState;
-    use reth_evm::primitives::hardfork::SpecId;
+    use evm2::SpecId;
     use reth_evm::state::AccountInfo;
 
     /// The implementation the fused scan replaced, kept as the oracle the
@@ -4351,7 +4351,7 @@ mod tests {
         parent_output: Option<ParentBundles<'_>>,
         block: &RecoveredBlock<Block>,
         chain_id: u64,
-        spec: reth_evm::primitives::hardfork::SpecId,
+        spec: evm2::SpecId,
     ) -> Result<(), String>
     where
         Provider: StateProviderFactory + Sync,
@@ -4409,7 +4409,7 @@ mod tests {
         parent_output: Option<ParentBundles<'_>>,
         block: &RecoveredBlock<Block>,
         groups: &[(Address, Vec<usize>)],
-        spec: reth_evm::primitives::hardfork::SpecId,
+        spec: evm2::SpecId,
     ) -> Result<(), String>
     where
         Provider: StateProviderFactory + Sync,
@@ -5587,7 +5587,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-revm-paths"))]
 mod by_description_bench;
 
 #[cfg(test)]

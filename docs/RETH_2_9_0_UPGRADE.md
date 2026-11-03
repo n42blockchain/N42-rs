@@ -168,3 +168,50 @@ real error count; (2) `N42EvmConfig` + 0x50 on the stock evm2 handler, fast/para
 to get a correct node on the devnet and the gov5 mixed devnet; (3) the fast transfer and parallel
 builder as evm2 handlers, each A/B-measured against v2.8.1 + X22 before it is switched on.
 Meanwhile v2.8.x patch releases (if upstream cuts any) can be taken on the current layer.
+
+## Port log
+
+The port runs as workstream F of `docs/PLAN_OPEN_ITEMS_2026_11.md` (user decision 2026-11-03:
+do it), in the spike's order: F3 shallow layer, F4 a correct node on the stock evm2 handler, F5
+the performance paths, F6 merge prep.
+
+### F3, shallow layer (2026-11-03)
+
+Decisions, as briefed:
+
+- **Bundle types.** `BundleState` / `BundleAccount` / `AccountRevert` / `Reverts` / ... come from
+  `reth_trie_common::bundle_state` (`reth_trie::bundle_state` in crates that have `reth-trie`),
+  `AccountInfo` from `evm2::evm`, `Bytecode` from `evm2::bytecode`. A rename everywhere: the copy
+  keeps revm's API. Done in the vendored provider and storage-overlay, `n42-sharded-output`,
+  `n42-deferred-reverts`, `n42-qmdb-reth` (c88338b04), and in `n42-engine-types` / `bin/n42`.
+- **`n42-header`.** `EthExecutorSpec` dropped (4f4317558); nothing else implemented or required it
+  but `n42_evm.rs` and three `payload.rs` bounds, which now ask for `EthChainSpec` only.
+- **`CachedReads` serde.** `n42-clique::cached_reads_serde` mirrors the old derived shape and is
+  used through `serde(with)`; the field keeps reth's type (07d41f51d).
+- **0x50 on evm2.** No tx-registry entry: reth converts a recovered transaction through
+  `FromRecoveredTx`, which has a blanket impl for every `T` with `evm2::ethereum::TxEnvelope:
+  From<T>`. `From<N42TxEnvelope>` / `From<AltSigTx>` make a 0x50 transaction
+  `TxEnvelope::Eip1559` with its fields, the type-byte-2 semantics it had on revm's `TxEnv`
+  (c01415cb8). The caller stays the recovered sender.
+- **`N42EvmConfig`** (639493f23). reth's `EthBlockExecutorFactory` bounds its chain spec by
+  `EthChainSpec<Header = alloy Header>`, which `N42ChainSpec` (header `N42Header`) cannot meet,
+  and its EVM constructor is crate-private; `N42BlockExecutorFactory` is the same ~60 lines
+  without that bound, creating reth's `EthBlockExecutor` over `N42ReceiptBuilder`. The EVM
+  factory is reth's `RethEvmFactory` (precompile cache policy `All`; JIT off in our build). The
+  environment is `EthEvmEnv` (spec, `evm2::Version`, block env) built the way `EthEvmConfig`
+  builds it, plus the N42 rules: the APoS signer as beneficiary, and on a native chain past
+  `glamsterdamTime` `SpecId::AMSTERDAM` without reth's Amsterdam hardfork. evm2's Amsterdam
+  version turns on EIP-8037, EIP-2780, EIP-7708 and EIP-8246 by default, which is the set gov5
+  runs (`docs/GLAMSTERDAM_EXECUTION_PARITY.md` rows 57-70); the gov5 fixture test
+  (`the_gated_devnet_block_matches_gov5`) is the arbiter in F4.
+- **`legacy-revm-paths`** (de21cda35). `fast_transfer`'s factory and transfer
+  (`fast_transfer_legacy.rs`, included under the feature), `parallel_transfer`, `batch_state` and
+  `warm_ahead` build only with the feature, off by default and forwarded by `bin/n42`. The parts
+  of `parallel_transfer` that never touch the EVM (knobs, worker pools, the sender partition,
+  phase timers, the revert helpers over reth's bundle state, the build-path keys) moved to
+  `parallel_common.rs`, which both builds see under the old `crate::parallel_transfer::` path.
+  `legacy_paths::KNOBS` lists every knob of the gated paths; `N42EvmConfig::new` logs once
+  "not available on evm2 yet" with the ones set. `follower_parallel()` and
+  `plan_ahead_body_wanted()` read false without the feature; the payload builder's parallel step,
+  the plan-ahead body and warm-ahead hooks and the follower's parallel / build-path execution are
+  gated at their call sites, so the stock evm2 executor runs everything.

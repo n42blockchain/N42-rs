@@ -29,7 +29,6 @@ n42-tx-queue.workspace = true
 n42-tx-types.workspace = true
 n42-header = { workspace = true, features = ["chainspec", "engine"] }
 n42-core-layout.workspace = true
-alloy-evm.workspace = true
 reth-rpc-convert.workspace = true
 reth-storage-errors.workspace = true
 rayon.workspace = true
@@ -90,13 +89,23 @@ alloy-rlp.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
-revm.workspace = true
+evm2 = { workspace = true, features = ["std"] }
+# The revm-era paths (`legacy-revm-paths`); see `src/legacy_paths.rs`.
+revm = { workspace = true, optional = true }
+alloy-evm = { workspace = true, optional = true }
 
 # metrics
 reth-metrics.workspace = true
 metrics.workspace = true
 
 
+
+[features]
+default = []
+# The fast transfer, parallel builder / graft, batch state and warm-ahead
+# paths written against revm 43. They do not build on reth v2.9.0 (evm2) yet
+# and are ported path by path (docs/RETH_2_9_0_UPGRADE.md, stage F5).
+legacy-revm-paths = ["dep:revm", "dep:alloy-evm"]
 
 [dev-dependencies]
 # `output_shards_bench` runs on the allocator the node runs on (`MALLOC_CONF` read).

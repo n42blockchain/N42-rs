@@ -43,12 +43,17 @@ pub mod memory_overlay;
 mod consensus;
 pub mod engine_validator;
 pub mod claimed_build;
+pub mod legacy_paths;
+#[cfg(feature = "legacy-revm-paths")]
 pub mod fast_transfer;
 pub mod frame_blocks;
 pub mod frame_scan;
 pub mod includability;
+#[cfg(feature = "legacy-revm-paths")]
 pub mod batch_state;
+#[cfg(feature = "legacy-revm-paths")]
 pub mod parallel_transfer;
+#[cfg(feature = "legacy-revm-paths")]
 pub mod warm_ahead;
 pub mod output_shards;
 pub mod hotstuff_consensus;

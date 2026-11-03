@@ -24,8 +24,8 @@ or `audit-notes/ci/`; research notes in English under `docs/`.
 | C1 | QMDB compaction stage 1 read view: 2-4% read cost (+1 DRAM miss per read) | implement the fix named in the design review: the index keeps locations (512 GiB per file) | C | crate tests; X22 bench pair level with main (two pairs, same box state) | open |
 | C2 | QMDB compaction stages 3 and 4 (`docs/QMDB_COMPACTION_DESIGN.md`) | implement | C | crate tests; `fleet7.sh roll --kill` in file mode; X22 pair level; portable-snapshot export/import still verifies | open |
 | D1 | GitHub repository renamed to `n42blockchain/N42-rs` | set the remote URL in the shared checkout and the worktrees (config only) | D | `git remote -v`, a fetch | done 2026-11-02 |
-| D2 | Five gov5 pull requests (`design/header-field-parity`, `fix/unchanged-account-no-op`, `test/mobileverify-cross-client-fixtures`, `test/mobileverify-device-genesis`, `feat/mobileverify-packetd`); the drafted bodies were lost with the session scratchpad | re-draft the bodies into `/data/n42-build/audit-notes/pr/` (persistent); opening them needs `gh auth login`, which only the user can do | D | bodies reviewed; PRs opened once gh is logged in | open |
-| D3 | `n42-init-snapshot` cannot start at a root-carrying head; the SSZ payload form carries no root (`HEADER_FIELD_PARITY.md` 7.1) | implement both | D | unit tests; init at a gated devnet head and follow | open |
+| D2 | Five gov5 pull requests (`design/header-field-parity`, `fix/unchanged-account-no-op`, `test/mobileverify-cross-client-fixtures`, `test/mobileverify-device-genesis`, `feat/mobileverify-packetd`); the drafted bodies were lost with the session scratchpad | re-draft the bodies into `/data/n42-build/audit-notes/pr/` (persistent); opening them needs `gh auth login`, which only the user can do | D | bodies reviewed; PRs opened once gh is logged in | bodies drafted 2026-11-03 (seven, `audit-notes/pr/`, `OPEN.sh`); waiting for review and `gh auth login` |
+| D3 | `n42-init-snapshot` cannot start at a root-carrying head; the SSZ payload form carries no root (`HEADER_FIELD_PARITY.md` 7.1) | implement both | D | unit tests; init at a gated devnet head and follow | code + unit tests done (5370fc53a, 9b6b65d13); devnet init-and-follow pending |
 | D4 | packetd polls every 250 ms | add an opt-in `newHeads` subscription over WebSocket, keep the poll as fallback | D | gov5 test; live run shows sub-50 ms packet latency | code + tests done (gov5 8fe815dc); live latency run pending |
 | D5 | Pure-Rust packet producer (gov5's read log is positional in Go `IntraBlockState` order) | feasibility spike only: can revm's access order be made identical for the devnet's transaction shapes? verdict in `MOBILEVERIFY_V3_PARITY.md`; no implementation unless the order is provably identical | D | the written verdict with a byte comparison against a sidecar packet | open |
 | D6 | Registry index may differ across nodes near epoch boundaries (gov5 has the same 45 s wall-clock timer) | design note: epoch commits keyed on block timestamp, proposed to gov5; no code until gov5 agrees | D | the note in `MOBILEVERIFY_V3_PARITY.md` | done 2026-11-02 (note written; gov5 agreement pending) |
@@ -65,3 +65,16 @@ builds.
   ./internal/streamverify/packetd/ -run 'HeadSubscriber|Follower'` passes (`audit-notes/ci/d4-go.out`; block
   built 0.6 ms after its notification with a one-minute poll). The live devnet measurement needs a box claim
   and is left for stream A's next devnet round (add `-ws ws://127.0.0.1:18546` to packetd, EL `--ws`).
+- D2 (2026-11-03): bodies in `/data/n42-build/audit-notes/pr/<branch with / as ->.md` (first line = title):
+  the five of the plan plus stream B's `test/glamsterdam-native-fixtures` and `fix/native-no-eip8282`
+  (body pending B's notes). `OPEN.sh` opens them with `gh pr create --repo n42blockchain/N42-gov5 --base main`
+  in dependency order (both mobileverify test branches before `feat/mobileverify-packetd`, which contains their
+  commits; the fixtures before `fix/native-no-eip8282`). Every branch merges cleanly onto gov5 `main`
+  (`git merge-tree`). No PR opened (gh not logged in).
+- D3 (2026-11-03): `5370fc53a` the SSZ `ExecutionPayloadV4` carries `mobileRegistryRoot` as a trailing fixed
+  field present only when set (the first offset tells the forms apart; root-less encoding unchanged), test
+  `ssz_execution_payload_v4_carries_the_mobile_registry_root` plus the crate's 30 SSZ tests
+  (`audit-notes/ci/d3-ssz.out`); `9b6b65d13` `n42-init-snapshot` decodes the head as `N42Header`, test
+  `init_starts_at_a_head_that_carries_a_registry_root` runs init end to end over a root-carrying head
+  (14/14, `audit-notes/ci/d3-init.out`). The devnet init-and-follow (a `LATE_SNAPSHOT` run on
+  `n42_devnet_mobileanchor.json`) needs a box claim and is not run.

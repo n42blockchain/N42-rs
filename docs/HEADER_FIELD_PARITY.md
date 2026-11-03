@@ -363,8 +363,10 @@ until a fleet runs the patched gov5 of `docs/patches/gov5-header-field-parity/`.
   `mobileRegistryRoot`. An empty `blockAccessList` means a header without a
   BAL hash (gov5's gap). `n42_header::engine` carries the root and the slot
   number in both directions. The raw channel encodes a root-carrying V4 as
-  kind 5, and headers on it travel as RLP. The SSZ payload form does not carry
-  the root, because the N42 engine path does not use it.
+  kind 5, and headers on it travel as RLP. The SSZ payload form carries the
+  root too since 2026-11-03 (5370fc53a): a trailing 32-byte fixed field after
+  `slot_number`, present only when set, told apart by the first offset, so a
+  root-less SSZ payload stays byte-identical to upstream's.
 - **Gossip.** `block_body.rs` and `compact_body.rs` decode and re-encode
   24-element headers.
 - **Leader (gap 6, open).** The Rust builder has no registry root provider.
@@ -414,9 +416,9 @@ until a fleet runs the patched gov5 of `docs/patches/gov5-header-field-parity/`.
   `glamsterdamTime` on native chains, after a rule-set audit (gov5
   `transitionAmsterdam` against reth 2.8.1's Amsterdam). Not done; the
   user's decision.
-- **Not covered yet.** `n42-init-snapshot` decodes the snapshot head as
-  Ethereum's header, so it cannot start a node at a head that carries a
-  root. The APoS miner and reth's own `init` / `db` commands stay on
+- **`n42-init-snapshot`** decodes the snapshot head as `N42Header` since
+  2026-11-03 (9b6b65d13; test `init_starts_at_a_head_that_carries_a_registry_root`),
+  so it can start a node at a head that carries a root. Not covered yet: the APoS miner and reth's own `init` / `db` commands stay on
   Ethereum's header (an APoS header never carries a root).
 - **Verified (2026-10-30).** The check
   `cargo check -p n42 -p n42-h2-node -p n42-testing --tests --examples` passes.

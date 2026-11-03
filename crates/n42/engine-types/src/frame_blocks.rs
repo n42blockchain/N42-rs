@@ -126,6 +126,7 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             // `N42_PLAN_AHEAD_WARM`: the identity of the take (its frames,
             // each from its start), which names the plan's warm read whether
             // or not the plan's body was ready.
+            #[cfg(feature = "legacy-revm-paths")]
             if crate::warm_ahead::threads() > 0 {
                 let ident = crate::warm_ahead::segments_ident(segments.iter().map(|(txs, from, to)| (txs, *from, *to)));
                 WARM_IDENT.with(|slot| slot.set(ident));
@@ -270,7 +271,9 @@ pub fn plan_ahead_body() -> bool {
 /// Whether the build asks for the plan's prepared body: the switch and every
 /// switch it stands on.
 pub fn plan_ahead_body_wanted() -> bool {
-    plan_ahead_body() && n42_tx_queue::plan_ahead() && pull_by_frames() && crate::payload::seal_on_counters()
+    // The prepared body is the parallel step's (`legacy-revm-paths`).
+    crate::legacy_paths::LEGACY_REVM_PATHS
+        && plan_ahead_body() && n42_tx_queue::plan_ahead() && pull_by_frames() && crate::payload::seal_on_counters()
 }
 
 /// What the plan-ahead hook makes of a prepared plan (`N42_PLAN_AHEAD_BODY=1`):
@@ -295,6 +298,7 @@ pub struct PreparedBuild<T: reth_transaction_pool::PoolTransaction> {
     /// The partition of `keys` at this beneficiary, when one was known.
     pub groups: Option<(alloy_primitives::Address, Vec<Vec<usize>>)>,
     /// One empty slot a candidate.
+    #[cfg(feature = "legacy-revm-paths")]
     pub slots: Vec<std::sync::OnceLock<crate::parallel_transfer::BuiltTransfer<()>>>,
     /// The hook's time.
     pub made_us: u64,

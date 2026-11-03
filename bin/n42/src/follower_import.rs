@@ -2460,6 +2460,7 @@ where
     // Not on the build path (`N42_FOLLOWER_BUILD_PATH=1`), which partitions by
     // sender inside its call and converts each transaction on its batch's
     // thread, as the leader does.
+    #[cfg(feature = "legacy-revm-paths")]
     let plan_ahead = (follower_parallel()
         && n42_engine_types::parallel_transfer::follower_partition_ahead()
         && !(deferred && n42_engine_types::parallel_transfer::follower_build_path()))
@@ -2737,6 +2738,7 @@ where
         // The plan made ahead, collected before the gate so that a plan
         // still running never holds another block's execution.
         let ahead_at = std::time::Instant::now();
+        #[cfg(feature = "legacy-revm-paths")]
         let plan = plan_ahead.as_ref().and_then(|plan| match plan.recv() {
             Ok(Ok(plan)) => Some(plan),
             Ok(Err(err)) => {
@@ -2793,6 +2795,7 @@ where
         let mut output = None;
         let mut sharded = None;
         let mut split = ExecSplit::default();
+        #[cfg(feature = "legacy-revm-paths")]
         if build_path {
             // The root's thread, up before the execution: its spawn and its
             // wait for the parent's fields happen beside the batches, and
@@ -3840,6 +3843,10 @@ fn ms_between(from: std::time::Instant, to: std::time::Instant) -> u64 {
 
 /// `N42_FOLLOWER_PARALLEL`, read once.
 fn follower_parallel() -> bool {
+    // The parallel follower is the revm-era path (`legacy-revm-paths`).
+    if !n42_engine_types::legacy_paths::LEGACY_REVM_PATHS {
+        return false;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARALLEL", false))
 }

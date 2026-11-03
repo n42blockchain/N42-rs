@@ -934,6 +934,7 @@ fn transfer_key<P: PoolTransaction<Consensus = TransactionSigned>>(
 /// hashes, the partition at the beneficiary this node builds for, and the
 /// empty slots -- what the next build's start, prep and gap made. `None`
 /// when not every candidate is a plain transfer (the build preps as before).
+#[cfg(feature = "legacy-revm-paths")]
 fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     segments: &[(n42_tx_queue::FrameTxs<P>, usize)],
     plan: &n42_tx_queue::FramePlan,
@@ -1002,6 +1003,7 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
 }
 
 /// Installs the plan-ahead hook on the queue once (`N42_PLAN_AHEAD_BODY=1`).
+#[cfg(feature = "legacy-revm-paths")]
 fn install_plan_ahead_body<P: PoolTransaction<Consensus = TransactionSigned>>(queue: &n42_tx_queue::TxQueue<P>) {
     if queue.has_plan_ahead_hook() {
         return;
@@ -1013,6 +1015,7 @@ fn install_plan_ahead_body<P: PoolTransaction<Consensus = TransactionSigned>>(qu
 
 /// The cumulative gas through each transaction of a block the parallel step
 /// left in its slots, in block order, and the block's gas.
+#[cfg(feature = "legacy-revm-paths")]
 fn cumulative_gas(
     refs: &[&crate::parallel_transfer::BuiltTransfer<()>],
 ) -> (Vec<u64>, u64) {
@@ -1031,6 +1034,7 @@ fn cumulative_gas(
 /// them beside the freeze on the background cores, and they were the whole
 /// of `par_fold_ms` (8.5 ms a 200,000-transaction block, 10.199), on the
 /// leader's serial seal chain.
+#[cfg(feature = "legacy-revm-paths")]
 fn receipts_on_build_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_RECEIPTS_ON_BUILD_POOL", false))
@@ -1039,6 +1043,7 @@ fn receipts_on_build_pool() -> bool {
 /// The pool a block's receipts are built on: the build pool
 /// ([`receipts_on_build_pool`]), the pool behind the seal
 /// (`N42_FREEZE_POOL=own`), or `None` for the global pool.
+#[cfg(feature = "legacy-revm-paths")]
 fn receipts_pool() -> Option<&'static rayon::ThreadPool> {
     if receipts_on_build_pool() {
         Some(crate::parallel_transfer::build_pool())
@@ -1051,6 +1056,7 @@ fn receipts_pool() -> Option<&'static rayon::ThreadPool> {
 
 /// The receipts of a block the parallel step left in its slots, in block
 /// order, with `cumulative[i]` the block's gas through transaction `i`.
+#[cfg(feature = "legacy-revm-paths")]
 fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
     refs: &[&crate::parallel_transfer::BuiltTransfer<()>],
     cumulative: &[u64],
@@ -1096,6 +1102,7 @@ const RECEIPTS_CHUNK: usize = 2048;
 /// ([`receipts_fused`]): each chunk's filled count and gas, a prefix over
 /// the ~100 chunks, then each chunk writes its receipts, cumulative gas
 /// included, into its own range of the output. Returns the block's gas too.
+#[cfg(feature = "legacy-revm-paths")]
 fn receipts_fused_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
     slots: &[std::sync::OnceLock<crate::parallel_transfer::BuiltTransfer<()>>],
     pulled: &Pulled<P>,
@@ -1785,10 +1792,11 @@ where
     crate::frame_blocks::want_bulk(parallel_build && builder_puller() != 0);
     // `N42_PLAN_AHEAD_BODY=1`: the queue makes the next block's body with its
     // plan; the partition is made at this build's beneficiary.
+    #[cfg(feature = "legacy-revm-paths")]
     if crate::frame_blocks::plan_ahead_body_wanted()
         && let Some(queue) = n42_tx_queue::global::<Pool::Transaction>()
     {
-        crate::frame_blocks::note_beneficiary(group_env.block_env.beneficiary);
+        crate::frame_blocks::note_beneficiary(group_env.block.beneficiary);
         install_plan_ahead_body(&queue);
     }
     let best_txs = best_txs(BestTransactionsAttributes::new(
@@ -1807,6 +1815,7 @@ where
     let mut prepared_build = crate::frame_blocks::take_prepared::<Pool::Transaction>();
     // `N42_PLAN_AHEAD_WARM`: the take's identity (its plan's warm read).
     let warm_plan_id = crate::frame_blocks::take_warm_ident();
+    #[cfg(feature = "legacy-revm-paths")]
     if warm_ahead_on {
         crate::warm_ahead::note_selected(warm_plan_id, parent_hash_for_state);
     }
@@ -2363,7 +2372,7 @@ where
             if chain_spec.is_cancun_active_at_timestamp(attributes.timestamp) {
                 // A block of transfers carries no blobs.
                 header.blob_gas_used = Some(0);
-                header.excess_blob_gas = group_env.block_env.blob_excess_gas_and_price.as_ref().map(|b| b.excess_blob_gas);
+                header.excess_blob_gas = group_env.block.blob_excess_gas_and_price.as_ref().map(|b| b.excess_blob_gas);
             }
             // A block of transfers produces no EIP-7685 requests; the finish
             // behind the seal says so loudly if that ever stops being true.
@@ -2591,10 +2600,10 @@ where
             // not used beside it).
             let shard_count = crate::output_shards::output_shards();
             let sharded_out = (shard_count > 0).then(|| {
-                crate::output_shards::OutputShards::new(group_env.block_env.beneficiary, keys.len(), shard_count)
+                crate::output_shards::OutputShards::new(group_env.block.beneficiary, keys.len(), shard_count)
             });
             let staged = (sharded_out.is_none() && crate::parallel_transfer::graft_stream()).then(|| {
-                std::sync::Mutex::new(crate::parallel_transfer::StagedGraft::new(group_env.block_env.beneficiary, keys.len()))
+                std::sync::Mutex::new(crate::parallel_transfer::StagedGraft::new(group_env.block.beneficiary, keys.len()))
             });
             let sink = staged.as_ref().map(|staged| {
                 move |bundle: reth_trie::bundle_state::BundleState| staged.lock().expect("the staged graft's lock").add(bundle)
@@ -2663,7 +2672,7 @@ where
                         groups: made
                             .groups
                             .take()
-                            .filter(|(beneficiary, _)| *beneficiary == group_env.block_env.beneficiary)
+                            .filter(|(beneficiary, _)| *beneficiary == group_env.block.beneficiary)
                             .map(|(_, groups)| groups),
                         slots: Some(std::mem::take(&mut made.slots)),
                     }
@@ -2727,7 +2736,7 @@ where
             match executed {
                 Ok(mut run) => {
                     use reth_evm::execute::BlockExecutor as _;
-                    let beneficiary = group_env.block_env.beneficiary;
+                    let beneficiary = group_env.block.beneficiary;
                     // The batches are done: the fold, a task a shard on the
                     // build pool.
                     let freeze_at = std::time::Instant::now();
@@ -3107,7 +3116,7 @@ where
                         // recipients: the next build may use the read made
                         // at this build's parent leaving those out.
                         if warm_ahead_on && from_bulk && cands.len() <= bulk_len && nothing_before_par && warm_plan_id != 0 {
-                            let mut extra = vec![group_env.block_env.beneficiary];
+                            let mut extra = vec![group_env.block.beneficiary];
                             if let Some(withdrawals) = attributes.withdrawals.as_ref() {
                                 extra.extend(withdrawals.iter().map(|w| w.address));
                             }

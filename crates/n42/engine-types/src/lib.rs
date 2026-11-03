@@ -44,15 +44,21 @@ mod consensus;
 pub mod engine_validator;
 pub mod claimed_build;
 pub mod legacy_paths;
-#[cfg(feature = "legacy-revm-paths")]
 pub mod fast_transfer;
 pub mod frame_blocks;
 pub mod frame_scan;
 pub mod includability;
 #[cfg(feature = "legacy-revm-paths")]
 pub mod batch_state;
+pub mod parallel_common;
 #[cfg(feature = "legacy-revm-paths")]
 pub mod parallel_transfer;
+/// Without `legacy-revm-paths`: the EVM-free parts ([`parallel_common`]) under
+/// the module's usual path.
+#[cfg(not(feature = "legacy-revm-paths"))]
+pub mod parallel_transfer {
+    pub use crate::parallel_common::*;
+}
 #[cfg(feature = "legacy-revm-paths")]
 pub mod warm_ahead;
 pub mod output_shards;

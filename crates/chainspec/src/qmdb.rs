@@ -131,6 +131,32 @@ pub fn glamsterdam_active_at(genesis: &Genesis, timestamp: u64) -> bool {
     glamsterdam_time(genesis).is_some_and(|at| timestamp >= at)
 }
 
+/// Genesis `config` key gov5 reads the consensus engine from
+/// (`params.ChainConfig.Consensus`).
+pub const CONSENSUS_KEY: &str = "consensus";
+
+/// Whether the genesis describes an N42-native chain: gov5's `IsN42Native`
+/// (`params/config.go:473`), consensus `hotstuff` or `apos`, or a `hotstuff`
+/// / `apos` section in the config.
+pub fn is_n42_native(genesis: &Genesis) -> bool {
+    let fields = &genesis.config.extra_fields;
+    let consensus: Option<String> = fields.get_deserialized(CONSENSUS_KEY).and_then(Result::ok);
+    matches!(consensus.as_deref(), Some("hotstuff" | "apos")) || fields.contains_key("hotstuff") || fields.contains_key("apos")
+}
+
+/// Whether a block with `timestamp` executes under the Amsterdam rules
+/// (revm's `SpecId::AMSTERDAM`) although reth's own Amsterdam hardfork is not
+/// scheduled: an N42-native chain past gov5's `glamsterdamTime`. gov5 runs
+/// its Amsterdam state transition on any chain where `IsGlamsterdam` holds,
+/// native ones included (`internal/state_transition.go`), while the header
+/// and payload keep the native shape (no EIP-7928 block access list, gov5's
+/// `UsesEIP7928AccessList`), so reth's `EthereumHardfork::Amsterdam`, which
+/// the header and payload validation hang off, stays off
+/// (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
+pub fn glamsterdam_execution_active_at(genesis: &Genesis, timestamp: u64) -> bool {
+    is_n42_native(genesis) && glamsterdam_active_at(genesis, timestamp)
+}
+
 /// gov5's `mobileAnchorTime`, if the genesis declares one.
 pub fn mobile_anchor_time(genesis: &Genesis) -> Option<u64> {
     genesis.config.extra_fields.get_deserialized::<u64>(MOBILE_ANCHOR_TIME_KEY).and_then(Result::ok)
@@ -330,6 +356,37 @@ mod header_field_gate_tests {
         assert_eq!(glamsterdam_time(&genesis(r#","amsterdamTime":7"#)), Some(7));
         assert_eq!(glamsterdam_time(&genesis(r#","amsterdamTime":7,"glamsterdamTime":5"#)), Some(5));
         assert_eq!(glamsterdam_time(&genesis(r#","amsterdamTime":3,"glamsterdamTime":5"#)), Some(3));
+    }
+
+    #[test]
+    fn amsterdam_execution_needs_a_native_chain() {
+        // A native chain: from its glamsterdamTime on.
+        let g = genesis(r#","consensus":"hotstuff","glamsterdamTime":100"#);
+        assert!(is_n42_native(&g));
+        assert!(!glamsterdam_execution_active_at(&g, 99));
+        assert!(glamsterdam_execution_active_at(&g, 100));
+        let g = genesis(r#","consensus":"apos","glamsterdamTime":0"#);
+        assert!(glamsterdam_execution_active_at(&g, 0));
+        let g = genesis(r#","hotstuff":{},"glamsterdamTime":0"#);
+        assert!(glamsterdam_execution_active_at(&g, 0));
+        // A native chain without the fork: never.
+        let g = genesis(r#","consensus":"hotstuff""#);
+        assert!(!glamsterdam_execution_active_at(&g, u64::MAX));
+        // Not native: the slot rule may hold, the execution rule does not.
+        let g = genesis(r#","consensus":"clique","glamsterdamTime":0"#);
+        assert!(!is_n42_native(&g));
+        assert!(glamsterdam_active_at(&g, 0));
+        assert!(!glamsterdam_execution_active_at(&g, 0));
+    }
+
+    #[test]
+    fn bundled_native_genesis_files() {
+        let gated: Genesis =
+            serde_json::from_str(include_str!("../res/genesis/n42_devnet_mobileanchor.json")).expect("parses");
+        assert!(glamsterdam_execution_active_at(&gated, 0));
+        let devnet: Genesis = serde_json::from_str(include_str!("../res/genesis/n42_devnet.json")).expect("parses");
+        assert!(is_n42_native(&devnet));
+        assert!(!glamsterdam_execution_active_at(&devnet, u64::MAX));
     }
 
     #[test]

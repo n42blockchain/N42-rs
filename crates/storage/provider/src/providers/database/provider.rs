@@ -623,7 +623,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         // (~147,000 accounts each at the fleet's tier).
         let n42_timers = crate::providers::n42_persist::metrics();
         let reverts_start = Instant::now();
-        let plain_reverts: Vec<revm::database::states::PlainStateReverts> = if first_number.is_some() {
+        let plain_reverts: Vec<reth_trie::bundle_state::PlainStateReverts> = if first_number.is_some() {
             use rayon::prelude::*;
             use crate::providers::n42_persist::N42PlainReverts as _;
             // An own block handed out before its revert set was merged

@@ -1182,7 +1182,7 @@ mod tests {
         per_block: u64,
         overlap: u64,
     ) -> eyre::Result<(BlockchainProvider<MockNodeTypesWithDB>, Vec<B256>)> {
-        use revm::state::AccountInfo;
+        use evm2::evm::AccountInfo;
         let factory = create_test_provider_factory();
         let genesis = SealedBlock::seal_slow(Block::default());
         let provider_rw = factory.provider_rw()?;
@@ -1204,11 +1204,11 @@ mod tests {
                 };
                 // Every 16th account also writes one slot (its own index), so storage reads
                 // walk the overlay too.
-                let mut storage = revm::database::states::StorageWithOriginalValues::default();
+                let mut storage = reth_trie::bundle_state::StorageWithOriginalValues::default();
                 if n % 16 == 0 {
                     storage.insert(
                         U256::from(n),
-                        revm::database::states::StorageSlot::new_changed(
+                        reth_trie::bundle_state::StorageSlot::new_changed(
                             U256::ZERO,
                             U256::from(n * 10 + number),
                         ),
@@ -1216,11 +1216,11 @@ mod tests {
                 }
                 state.state.insert(
                     n42_address(n),
-                    revm::database::BundleAccount::new(
+                    reth_trie::bundle_state::BundleAccount::new(
                         None,
                         Some(info),
                         storage,
-                        revm::database::AccountStatus::Changed,
+                        reth_trie::bundle_state::AccountStatus::Changed,
                     ),
                 );
             }

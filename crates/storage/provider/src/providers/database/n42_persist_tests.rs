@@ -16,7 +16,8 @@ use reth_db_api::models::StorageSettings;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_primitives_traits::SealedBlock;
 use reth_trie::{HashedPostState, KeccakKeyHasher, SortedTrieData};
-use revm::{database::BundleState, state::AccountInfo};
+use evm2::evm::AccountInfo;
+use reth_trie::bundle_state::BundleState;
 
 type TestFactory = ProviderFactory<crate::test_utils::MockNodeTypesWithDB>;
 

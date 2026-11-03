@@ -1547,7 +1547,7 @@ impl RocksDBProvider {
         &self,
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
-        plain_reverts: &[revm::database::states::PlainStateReverts],
+        plain_reverts: &[reth_trie::bundle_state::PlainStateReverts],
         ctx: RocksDBWriteCtx,
         runtime: &reth_tasks::Runtime,
     ) -> ProviderResult<()> {
@@ -1642,7 +1642,7 @@ impl RocksDBProvider {
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all)]
     fn write_account_history(
         &self,
-        plain_reverts: &[revm::database::states::PlainStateReverts],
+        plain_reverts: &[reth_trie::bundle_state::PlainStateReverts],
         ctx: &RocksDBWriteCtx,
     ) -> ProviderResult<()> {
         // N42: the three phases timed (map build, shard reads, batch build).
@@ -1737,7 +1737,7 @@ impl RocksDBProvider {
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all)]
     fn write_storage_history(
         &self,
-        plain_reverts: &[revm::database::states::PlainStateReverts],
+        plain_reverts: &[reth_trie::bundle_state::PlainStateReverts],
         ctx: &RocksDBWriteCtx,
     ) -> ProviderResult<()> {
         let mut storage_history: BTreeMap<(Address, B256), Vec<u64>> = BTreeMap::new();

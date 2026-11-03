@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use alloy_primitives::{B256, U256};
-use revm_database::states::RevertToSlot;
+use reth_trie::bundle_state::RevertToSlot;
 use std::iter::Peekable;
 
 /// Iterator over storage reverts.

@@ -1244,14 +1244,14 @@ fn n42_hashed_state_version<TX: DbTx>(tx: &TX) -> Option<u64> {
 
 /// N42: hashes a bundle's accounts in parallel chunks once it is large enough to pay for it
 /// (the same as `reth_provider::providers::state::latest::hashed_post_state_from_bundle`).
-fn n42_hashed_post_state_from_bundle(bundle_state: &revm::database::BundleState) -> HashedPostState {
+fn n42_hashed_post_state_from_bundle(bundle_state: &reth_trie_common::bundle_state::BundleState) -> HashedPostState {
     #[cfg(feature = "rayon")]
     {
         const PARALLEL_FROM: usize = 8192;
         let state = bundle_state.state();
         if state.len() >= PARALLEL_FROM {
             use rayon::prelude::*;
-            let entries: Vec<(&Address, &revm::database::BundleAccount)> = state.iter().collect();
+            let entries: Vec<(&Address, &reth_trie_common::bundle_state::BundleAccount)> = state.iter().collect();
             let chunks: Vec<HashedPostState> = entries
                 .par_chunks(4096)
                 .map(|chunk| {

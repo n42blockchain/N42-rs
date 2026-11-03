@@ -27,7 +27,7 @@
 
 use alloy_primitives::{address, Address, B256, U256};
 use n42_qmdb_state::{AccountState, BlockChanges};
-use revm_database::BundleState;
+use reth_trie::bundle_state::BundleState;
 use n42_twig_core::qmdb_compat::QmdbOps;
 
 /// The leaves a block writes, from the bundle its execution left behind.
@@ -97,7 +97,7 @@ pub fn changes_from_execution(bundle: &BundleState, prague_active: bool) -> Bloc
 /// 190 ms root phase; here the leaves are keyed and encoded on the worker
 /// pool and sorted there too.
 pub fn sorted_operations_from_execution(bundle: &BundleState, prague_active: bool) -> QmdbOps {
-    let accounts: Vec<(&Address, &revm_database::BundleAccount)> = bundle.state.iter().collect();
+    let accounts: Vec<(&Address, &reth_trie::bundle_state::BundleAccount)> = bundle.state.iter().collect();
     sorted_operations_from_accounts(&accounts, prague_active)
 }
 
@@ -107,7 +107,7 @@ pub fn sorted_operations_from_execution(bundle: &BundleState, prague_active: boo
 /// accounts here directly, so the root does not wait for them to be merged
 /// into one `BundleState`.
 pub fn sorted_operations_from_accounts(
-    accounts: &[(&Address, &revm_database::BundleAccount)],
+    accounts: &[(&Address, &reth_trie::bundle_state::BundleAccount)],
     prague_active: bool,
 ) -> QmdbOps {
     sorted_operations_from_accounts_timed(accounts, prague_active).0
@@ -128,7 +128,7 @@ pub struct OpsSplit {
 
 /// [`sorted_operations_from_accounts`], timed in its three pieces.
 pub fn sorted_operations_from_accounts_timed(
-    accounts: &[(&Address, &revm_database::BundleAccount)],
+    accounts: &[(&Address, &reth_trie::bundle_state::BundleAccount)],
     prague_active: bool,
 ) -> (QmdbOps, OpsSplit) {
     let at = std::time::Instant::now();
@@ -163,7 +163,7 @@ pub struct OpsAhead {
 }
 
 /// [`OpsAhead`] over `accounts` (each address once, as in a bundle's map).
-pub fn operations_ahead(accounts: &[(&Address, &revm_database::BundleAccount)], prague_active: bool) -> OpsAhead {
+pub fn operations_ahead(accounts: &[(&Address, &reth_trie::bundle_state::BundleAccount)], prague_active: bool) -> OpsAhead {
     let at = std::time::Instant::now();
     let mut ops = QmdbOps::concat(encode_account_pieces(accounts, prague_active));
     let encoded = std::time::Instant::now();
@@ -186,8 +186,8 @@ impl OpsAhead {
     /// encoded ahead are the rest of the view.
     pub fn finish(
         self,
-        replaced: &[(&Address, &revm_database::BundleAccount)],
-        newer: &[(&Address, &revm_database::BundleAccount)],
+        replaced: &[(&Address, &reth_trie::bundle_state::BundleAccount)],
+        newer: &[(&Address, &reth_trie::bundle_state::BundleAccount)],
         prague_active: bool,
     ) -> QmdbOps {
         use n42_twig_core::qmdb_compat::{gov5_account_key, gov5_storage_key};
@@ -222,7 +222,7 @@ fn push_prague_system_caller(ops: &mut QmdbOps) {
 /// Every account's leaves keyed and encoded, a chunk of accounts an arena on
 /// the worker pool, unsorted; on a Prague block the system caller's account
 /// leaf is left out (its storage is not), for the caller to write once.
-fn encode_account_pieces(accounts: &[(&Address, &revm_database::BundleAccount)], prague_active: bool) -> Vec<QmdbOps> {
+fn encode_account_pieces(accounts: &[(&Address, &reth_trie::bundle_state::BundleAccount)], prague_active: bool) -> Vec<QmdbOps> {
     use n42_twig_core::qmdb_compat::{encode_gov5_account_value_into, gov5_account_key, gov5_storage_key};
     use rayon::prelude::*;
     // Each chunk of accounts writes its leaves into an arena of its own on
@@ -308,8 +308,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     const KECCAK_EMPTY: B256 = alloy_primitives::KECCAK256_EMPTY;
-    use revm_database::states::bundle_state::BundleBuilder;
-    use revm_state::AccountInfo;
+    use reth_trie::bundle_state::BundleBuilder;
+    use evm2::evm::AccountInfo;
 
     const ALICE: Address = Address::with_last_byte(1);
     const BOB: Address = Address::with_last_byte(2);
@@ -448,8 +448,8 @@ mod state_commit_bench {
     use super::*;
     use alloy_primitives::{Address, B256, U256};
     use n42_qmdb_state::QmdbForest;
-    use revm_state::AccountInfo;
-    use revm_database::{BundleAccount, BundleState};
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::{BundleAccount, BundleState};
 
     fn addr(i: u64) -> Address {
         let mut a = [0u8; 20];
@@ -463,7 +463,7 @@ mod state_commit_bench {
         for i in ids {
             let info = AccountInfo { balance: U256::from(1_000_000u64 + i), nonce: i % 7, ..Default::default() };
             let original = existed.then(|| AccountInfo { balance: U256::from(i), nonce: i % 7, ..Default::default() });
-            b.state.insert(addr(i), BundleAccount::new(original, Some(info), Default::default(), revm_database::AccountStatus::Changed));
+            b.state.insert(addr(i), BundleAccount::new(original, Some(info), Default::default(), reth_trie::bundle_state::AccountStatus::Changed));
         }
         b
     }
@@ -477,15 +477,15 @@ mod state_commit_bench {
         for (a, acc) in bundle(10_000..10_200, false).state {
             b.state.insert(a, acc);
         }
-        b.state.insert(addr(77), BundleAccount::new(Some(AccountInfo::default()), None, Default::default(), revm_database::AccountStatus::Destroyed));
-        b.state.insert(addr(78), BundleAccount::new(None, Some(AccountInfo::default()), Default::default(), revm_database::AccountStatus::InMemoryChange));
+        b.state.insert(addr(77), BundleAccount::new(Some(AccountInfo::default()), None, Default::default(), reth_trie::bundle_state::AccountStatus::Destroyed));
+        b.state.insert(addr(78), BundleAccount::new(None, Some(AccountInfo::default()), Default::default(), reth_trie::bundle_state::AccountStatus::InMemoryChange));
         let mut storage = std::collections::HashMap::default();
-        storage.insert(U256::from(1), revm_database::states::StorageSlot::new_changed(U256::ZERO, U256::from(9)));
-        storage.insert(U256::from(2), revm_database::states::StorageSlot::new_changed(U256::from(5), U256::ZERO));
-        b.state.insert(addr(79), BundleAccount::new(Some(AccountInfo::default()), Some(AccountInfo::default()), storage, revm_database::AccountStatus::Changed));
+        storage.insert(U256::from(1), reth_trie::bundle_state::StorageSlot::new_changed(U256::ZERO, U256::from(9)));
+        storage.insert(U256::from(2), reth_trie::bundle_state::StorageSlot::new_changed(U256::from(5), U256::ZERO));
+        b.state.insert(addr(79), BundleAccount::new(Some(AccountInfo::default()), Some(AccountInfo::default()), storage, reth_trie::bundle_state::AccountStatus::Changed));
         for prague in [false, true] {
             let mut with_caller = b.clone();
-            with_caller.state.insert(PRAGUE_SYSTEM_CALLER, BundleAccount::new(None, Some(AccountInfo { nonce: 3, ..Default::default() }), Default::default(), revm_database::AccountStatus::Changed));
+            with_caller.state.insert(PRAGUE_SYSTEM_CALLER, BundleAccount::new(None, Some(AccountInfo { nonce: 3, ..Default::default() }), Default::default(), reth_trie::bundle_state::AccountStatus::Changed));
             for bundle in [&b, &with_caller] {
                 let mut expected = changes_from_execution(bundle, prague).operations();
                 expected.sort_unstable_by_key(|op| op.key);
@@ -506,11 +506,11 @@ mod state_commit_bench {
     #[test]
     fn operations_ahead_finished_equal_the_whole_views() {
         let slot = |n: u64, from: u64, to: u64| {
-            (U256::from(n), revm_database::states::StorageSlot::new_changed(U256::from(from), U256::from(to)))
+            (U256::from(n), reth_trie::bundle_state::StorageSlot::new_changed(U256::from(from), U256::from(to)))
         };
         let mut shards = bundle(0..3000, true);
-        let with_storage = |slots: Vec<(U256, revm_database::states::StorageSlot)>| {
-            BundleAccount::new(Some(AccountInfo::default()), Some(AccountInfo { nonce: 1, ..Default::default() }), slots.into_iter().collect(), revm_database::AccountStatus::Changed)
+        let with_storage = |slots: Vec<(U256, reth_trie::bundle_state::StorageSlot)>| {
+            BundleAccount::new(Some(AccountInfo::default()), Some(AccountInfo { nonce: 1, ..Default::default() }), slots.into_iter().collect(), reth_trie::bundle_state::AccountStatus::Changed)
         };
         shards.state.insert(addr(5), with_storage(vec![slot(1, 0, 9), slot(2, 5, 0)]));
         shards.state.insert(addr(6), with_storage(vec![slot(3, 1, 2)]));
@@ -520,13 +520,13 @@ mod state_commit_bench {
         let mut residual = bundle(20_000..20_010, false);
         for i in [7u64, 900, 2999] {
             let over = AccountInfo { balance: U256::from(7_000_000 + i), nonce: 99, ..Default::default() };
-            residual.state.insert(addr(i), BundleAccount::new(None, Some(over), Default::default(), revm_database::AccountStatus::Changed));
+            residual.state.insert(addr(i), BundleAccount::new(None, Some(over), Default::default(), reth_trie::bundle_state::AccountStatus::Changed));
         }
         residual.state.insert(addr(5), with_storage(vec![slot(2, 5, 4), slot(8, 0, 1)]));
-        residual.state.insert(addr(20_011), BundleAccount::new(Some(AccountInfo::default()), None, Default::default(), revm_database::AccountStatus::Destroyed));
+        residual.state.insert(addr(20_011), BundleAccount::new(Some(AccountInfo::default()), None, Default::default(), reth_trie::bundle_state::AccountStatus::Destroyed));
         for caller_in in [None, Some(true), Some(false)] {
             let (mut shards, mut residual) = (shards.clone(), residual.clone());
-            let caller = BundleAccount::new(None, Some(AccountInfo { nonce: 3, ..Default::default() }), Default::default(), revm_database::AccountStatus::Changed);
+            let caller = BundleAccount::new(None, Some(AccountInfo { nonce: 3, ..Default::default() }), Default::default(), reth_trie::bundle_state::AccountStatus::Changed);
             match caller_in {
                 Some(true) => drop(shards.state.insert(PRAGUE_SYSTEM_CALLER, caller)),
                 Some(false) => drop(residual.state.insert(PRAGUE_SYSTEM_CALLER, caller)),

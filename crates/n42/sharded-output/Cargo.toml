@@ -10,7 +10,8 @@ description = "An own block's post-state handed out as its frozen output shards 
 
 [dependencies]
 alloy-primitives.workspace = true
-revm-database = { workspace = true, features = ["std"] }
+reth-trie-common = { workspace = true, features = ["std"] }
+evm2 = { workspace = true, features = ["std"] }
 tracing.workspace = true
 
 [lints]

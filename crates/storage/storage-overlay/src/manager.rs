@@ -1214,11 +1214,11 @@ mod tests {
             .build();
         extra.state.get_mut(&one).unwrap().info.as_mut().unwrap().account_id =
             AccountId::new(9);
-        let mut destroyed = revm::database::BundleAccount::new(
+        let mut destroyed = reth_trie_common::bundle_state::BundleAccount::new(
             None,
             None,
             Default::default(),
-            revm::database::AccountStatus::Destroyed,
+            reth_trie_common::bundle_state::AccountStatus::Destroyed,
         );
         destroyed.storage.clear();
         extra.state.insert(two, destroyed);

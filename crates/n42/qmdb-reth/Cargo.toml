@@ -41,7 +41,6 @@ reth-storage-overlay.workspace = true
 reth-storage-api.workspace = true
 alloy-eips.workspace = true
 reth-trie.workspace = true
-revm-database.workspace = true
 bincode.workspace = true
 # The delta log's per-record tear digest; see `frame_delta`.
 crc32fast = "1.5"
@@ -57,7 +56,7 @@ reth-ethereum-engine-primitives.workspace = true
 # The read_bench example: point reads of the same accounts from MDBX and from QMDB.
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api.workspace = true
-revm-state.workspace = true
+evm2 = { workspace = true, features = ["std"] }
 # `records_cost` runs on the allocator the node runs on (`MALLOC_CONF` read).
 tikv-jemallocator = { workspace = true, features = ["unprefixed_malloc_on_supported_platforms"] }
 

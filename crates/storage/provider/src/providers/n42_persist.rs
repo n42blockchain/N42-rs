@@ -353,11 +353,11 @@ mod tests {
 /// (`N42_ANSWER_BEFORE_REVERTS`, `n42_deferred_reverts`) waits for it here.
 pub(crate) trait N42PlainReverts {
     /// The plain reverts of the complete revert set.
-    fn n42_plain_reverts(&self) -> ProviderResult<revm::database::states::PlainStateReverts>;
+    fn n42_plain_reverts(&self) -> ProviderResult<reth_trie::bundle_state::PlainStateReverts>;
 }
 
 impl<R> N42PlainReverts for reth_execution_types::BlockExecutionOutput<R> {
-    fn n42_plain_reverts(&self) -> ProviderResult<revm::database::states::PlainStateReverts> {
+    fn n42_plain_reverts(&self) -> ProviderResult<reth_trie::bundle_state::PlainStateReverts> {
         match n42_deferred_reverts::resolve(self).map_err(ProviderError::other)? {
             Some((reverts, _)) => Ok(reverts.to_plain_state_reverts()),
             None => Ok(self.state.reverts.to_plain_state_reverts()),
@@ -399,7 +399,7 @@ mod late_reverts_tests {
     use super::{n42_completed_output, N42PlainReverts};
     use alloy_primitives::Address;
     use reth_execution_types::BlockExecutionOutput;
-    use revm::database::{states::reverts::Reverts, AccountRevert, BundleState};
+    use reth_trie::bundle_state::{states::reverts::Reverts, AccountRevert, BundleState};
     use std::sync::Arc;
 
     fn reverts(addresses: &[u8]) -> Reverts {
@@ -421,7 +421,7 @@ mod late_reverts_tests {
             result: Default::default(),
         });
         let plain = BlockExecutionOutput::<u8> { state: complete.clone(), result: Default::default() };
-        let debug = |reverts: revm::database::states::PlainStateReverts| format!("{reverts:?}");
+        let debug = |reverts: reth_trie::bundle_state::PlainStateReverts| format!("{reverts:?}");
         assert_eq!(debug(plain.n42_plain_reverts().expect("plain")), debug(complete.reverts.to_plain_state_reverts()));
         assert!(n42_completed_output(&plain).expect("plain").is_none());
 

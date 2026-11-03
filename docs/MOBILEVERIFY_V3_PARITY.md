@@ -489,3 +489,52 @@ Left for stage 3:
 - Sidecar latency is set by its 1 s head poll. A phone that reads `/latest` before the packet has
   landed sees `packet: false` for up to a second.
 
+
+## Proposal: registry epochs keyed on block timestamps (D6, 2026-11-02; no code)
+
+**Today.** Each node folds its pending registrations into the committed registry on its own
+wall-clock timer: gov5's `EpochCommitter` ticks every `collect_window_sec` (45 s,
+`internal/mobileverify/replication.go` `Start`/`commitOnce`), and the Rust `commit_epochs`
+(`crates/n42/h2-node/src/mobile.rs`) copies it. `CommitEpoch` sorts a batch by BMT key hash, so two
+nodes that commit the *same pending set* assign the same indices and reach the same accumulator root.
+Nothing makes them commit the same set at the same point: a registration gossiped a second before one
+node's tick and a second after another's lands in different epochs, and from then on the two
+registries assign different indices to every later key. The leader stamps *its* `registry.root()` into
+`MobileRegistryRoot` (gov5 `worker.go` `mobileAnchorRoot`, Rust payload attributes); followers on both
+clients check only that the field is present (`HEADER_FIELD_PARITY.md` 7.1), because their own root may
+legitimately differ. Indices matter beyond the root: certificates name signers by index (signer masks),
+so a certificate built on one node can name different devices on another.
+
+**Proposal.** Make the commit a function of the chain, in two steps that can ship separately.
+
+1. *Deterministic commit point.* A chain-config parameter `mobileRegistryEpochSeconds` (E, 45 on
+   today's chains) defines epoch boundaries on the block timestamp: block B closes an epoch when
+   `floor(B.time / E) > floor(parent.time / E)`. Every node commits its pending set when it **commits**
+   (finalises) such a block, never on a timer, and the leader stamps the root committed at the last
+   epoch-closing ancestor. All nodes then commit at the same height; the root in a header is the root
+   at a known chain point. On its own this removes the timer skew (tens of seconds) but not the gossip
+   race (a registration that reached the leader before the boundary block and a follower after it).
+2. *Deterministic content.* The epoch-closing block carries its batch: the leader puts the pubkeys
+   (and PoPs) it commits into the block's body side-channel that both clients already gossip with the
+   block (gov5's `block_gossip` RLP `[header, txs, verifiers, rewards]` gains an optional fifth
+   element, or a zero-value system transaction to a registry address, whichever gov5 prefers). A
+   follower applies exactly that batch at that block (verifying each PoP, ignoring keys already
+   committed, keeping its own unlisted pending keys pending), recomputes the root and **checks the
+   header's value**, not just its presence. Index assignment is then a pure function of the chain.
+
+**What changes.**
+
+| Side | Step 1 | Step 2 |
+| --- | --- | --- |
+| gov5 | `EpochCommitter` driven from the chain-commit hook instead of `time.Ticker`; `mobileAnchorRoot` returns the root at the last epoch-closing ancestor; new `params` field | leader attaches the batch; `verifyHeaderWithBatch` (or import) applies it and compares the root; registry snapshot carries the commit height |
+| n42-rs | `commit_epochs` driven from the validator's commit stream (`h2-node` already sees commits for `/latest`); `header::qmdb` reads the new field; payload attributes name the root at the last boundary | `block_body.rs`/`compact_body.rs` carry the batch; `HotStuffConsensus` gains the value check under the gate (the root stops being presence-only) |
+| Phone / SDK | none (indices and masks keep their format) | none |
+
+**Migration.** Gate both steps on a chain-config time (`mobileRegistryChainEpochTime`, nil = the
+timer, as `unchangedAccountNoOpTime` is gated). At the switch, nodes may already hold divergent
+registries; the first epoch-closing block at or after the time is a *re-base*: every node imports the
+leader's committed registry from the registry snapshot export (the format both clients already
+write, `registry.bin` / gov5's snapshot), and devices re-register only if their key is missing from it.
+Chains without `mobileAnchorTime` need only step 1 (no header root); chain 94 needs both before its
+MobileAnchor + Glamsterdam gate opens (2027-01-01). Nothing is coded until gov5 agrees to the shape;
+this section is the proposal sent with the gov5 PRs.

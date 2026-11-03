@@ -87,6 +87,9 @@ arbitrary = ["dep:arbitrary", "std", "alloy-primitives/arbitrary", "alloy-serde/
 
 [dev-dependencies]
 base64 = "0.22"
+# The jwt tests sign tokens, which needs a jsonwebtoken crypto provider; the
+# `jwt` feature selects none (see above), so the tests select aws-lc-rs here.
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 # the `any(test, feature = "arbitrary")` derives need the Arbitrary impls from
 # these crates, which are behind their own arbitrary features
 alloy-eips = { workspace = true, features = ["arbitrary"] }

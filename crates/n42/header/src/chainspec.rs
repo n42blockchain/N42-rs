@@ -16,7 +16,7 @@ use crate::N42Header;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams};
 use alloy_genesis::Genesis;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{B256, U256};
 use core::fmt::Display;
 use reth_chainspec::{
     Chain, ChainSpec, DepositContract, EthChainSpec, EthereumHardfork, EthereumHardforks, ForkCondition, ForkFilter,
@@ -175,12 +175,6 @@ impl Hardforks for N42ChainSpec {
 impl EthereumHardforks for N42ChainSpec {
     fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
         EthereumHardforks::ethereum_fork_activation(&*self.inner, fork)
-    }
-}
-
-impl alloy_evm::eth::spec::EthExecutorSpec for N42ChainSpec {
-    fn deposit_contract_address(&self) -> Option<Address> {
-        alloy_evm::eth::spec::EthExecutorSpec::deposit_contract_address(&*self.inner)
     }
 }
 

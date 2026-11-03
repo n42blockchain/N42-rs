@@ -11,7 +11,7 @@ use n42_header::N42Header as Header;
 use alloy_primitives::{Bytes, U256};
 use n42_engine_types::N42PooledTransaction;
 use reth_evm::revm::database::{CacheDB, EmptyDB};
-use reth_evm::revm::state::AccountInfo;
+use reth_evm::evm2::evm::AccountInfo;
 
 type Held = Arc<reth_transaction_pool::ValidPoolTransaction<N42PooledTransaction>>;
 
@@ -86,7 +86,7 @@ impl reth_evm::revm::Database for SharedDb {
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         reth_evm::revm::DatabaseRef::basic_ref(&*self.0, address)
     }
-    fn code_by_hash(&mut self, code_hash: B256) -> Result<reth_evm::revm::state::Bytecode, Self::Error> {
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<reth_evm::evm2::bytecode::Bytecode, Self::Error> {
         reth_evm::revm::DatabaseRef::code_by_hash_ref(&*self.0, code_hash)
     }
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {

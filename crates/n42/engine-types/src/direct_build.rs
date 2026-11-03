@@ -37,7 +37,7 @@ use reth_trie::{
     updates::TrieUpdates, AccountProof, SortedTrieData, ExecutionWitnessMode, HashedPostState, HashedStorage,
     LazyTrieData, MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
-use revm::database::BundleState;
+use reth_trie::bundle_state::BundleState;
 
 use crate::{built_executions::BuiltExecution, engine_types::N42BuiltPayload};
 

@@ -52,7 +52,7 @@ use alloy_primitives::{
     Address, BlockNumber, Bytes, StorageKey, StorageValue, B256, U256,
 };
 use reth_primitives_traits::{Account, Bytecode};
-use revm::bytecode::Bytecode as RevmBytecode;
+use evm2::bytecode::Bytecode as RevmBytecode;
 use reth_evm::db::State;
 use reth_storage_api::{
     errors::ProviderResult, AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider,
@@ -223,7 +223,7 @@ pub fn merge_elide_refusal() -> Option<&'static str> {
 
 /// Puts a block's complete revert set ([`FrozenShards::late_reverts`]) into
 /// the bundle [`FrozenShards::merged_state_first`] gave.
-pub fn complete_reverts(bundle: &mut BundleState, reverts: revm::database::states::reverts::Reverts, size: usize) {
+pub fn complete_reverts(bundle: &mut BundleState, reverts: reth_trie::bundle_state::Reverts, size: usize) {
     bundle.reverts = reverts;
     bundle.reverts_size = size;
 }
@@ -415,7 +415,7 @@ impl EarlyPart {
 
 /// `staged` with the change `account` made to the parent's value added:
 /// `StagedGraft::add`'s rule for an account an earlier batch wrote.
-fn add_delta(staged: &mut revm::state::AccountInfo, account: &BundleAccount) {
+fn add_delta(staged: &mut evm2::evm::AccountInfo, account: &BundleAccount) {
     let Some(info) = account.info.as_ref() else { return };
     let (new_balance, new_nonce) = (info.balance, info.nonce);
     let (old_balance, old_nonce) = match &account.original_info {
@@ -2429,10 +2429,10 @@ impl FrozenShards {
     /// copies it.
     pub fn late_reverts(
         &self,
-        block_reverts: revm::database::states::reverts::Reverts,
+        block_reverts: reth_trie::bundle_state::Reverts,
         graft: Vec<(Address, AccountRevert)>,
         pool: Option<&rayon::ThreadPool>,
-    ) -> (revm::database::states::reverts::Reverts, usize) {
+    ) -> (reth_trie::bundle_state::Reverts, usize) {
         let shards = match pool {
             Some(pool) => pool.install(|| self.merged_reverts_parallel()),
             None => self.merged_reverts(),
@@ -2981,7 +2981,7 @@ mod frozen_tests {
                 .build();
             let graft = || -> Vec<(Address, AccountRevert)> {
                 let revert = |balance| AccountRevert {
-                    account: revm::database::states::reverts::AccountInfoRevert::RevertTo(info(0, balance)),
+                    account: reth_trie::bundle_state::AccountInfoRevert::RevertTo(info(0, balance)),
                     ..Default::default()
                 };
                 vec![(addr(9), revert(7)), (wide(4), revert(11))]
@@ -3078,14 +3078,14 @@ mod frozen_tests {
                 let account = wide(next(space * 2));
                 let storage = if k % 2 == 0 { slots(&[(next(4), 3, 4)]) } else { Default::default() };
                 let status = if k % 2 == 0 {
-                    revm::database::AccountStatus::DestroyedChanged
+                    reth_trie::bundle_state::AccountStatus::DestroyedChanged
                 } else {
-                    revm::database::AccountStatus::Destroyed
+                    reth_trie::bundle_state::AccountStatus::Destroyed
                 };
                 let present = (k % 2 == 0).then(|| info(0, 5 + k));
                 let storage = storage
                     .into_iter()
-                    .map(|(slot, (before, after))| (slot, revm::database::states::StorageSlot::new_changed(before, after)))
+                    .map(|(slot, (before, after))| (slot, reth_trie::bundle_state::StorageSlot::new_changed(before, after)))
                     .collect();
                 residual.state.insert(
                     account,
@@ -3179,7 +3179,7 @@ mod frozen_tests {
             // Graft reverts: one the shards also hold, two of their own.
             let graft = |_: ()| -> Vec<(Address, AccountRevert)> {
                 let revert = |balance| AccountRevert {
-                    account: revm::database::states::reverts::AccountInfoRevert::RevertTo(info(0, balance)),
+                    account: reth_trie::bundle_state::AccountInfoRevert::RevertTo(info(0, balance)),
                     ..Default::default()
                 };
                 vec![(addr(9), revert(7)), (wide(10), revert(11)), (addr(2), revert(13))]

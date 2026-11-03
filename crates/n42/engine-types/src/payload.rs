@@ -28,15 +28,14 @@ use reth_evm_ethereum::EthBlockAssembler;
 use crate::engine_types::N42BuiltPayload as EthBuiltPayload;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_evm::{database::StateProviderDatabase, db::State};
+use reth_evm::database::StateProviderDatabase;
 use reth_storage_api::StateProviderFactory;
 use reth_transaction_pool::{
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
     ValidPoolTransaction,
 };
-use revm::context_interface::Block as _;
-use revm::Database as _;
+use evm2::evm::Database as _;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -295,7 +294,7 @@ where
         BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
     >,
     Client: StateProviderFactory
-        + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec + reth_evm::eth::spec::EthExecutorSpec>
+        + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec>
         + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + 'static,
@@ -443,7 +442,7 @@ where
         + Sync
         + 'static,
     Client: StateProviderFactory
-        + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec + reth_evm::eth::spec::EthExecutorSpec>
+        + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec>
         + Clone
         + Send
         + Sync
@@ -864,23 +863,23 @@ impl LazyParentDb<'_> {
     }
 }
 
-impl revm::DatabaseRef for LazyParentDb<'_> {
+impl evm2::evm::Database for LazyParentDb<'_> {
     type Error = reth_storage_api::errors::ProviderError;
 
-    fn basic_ref(&self, address: alloy_primitives::Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
-        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).basic_ref(address)
+    fn get_account(&mut self, address: &alloy_primitives::Address) -> Result<Option<evm2::evm::AccountInfo>, Self::Error> {
+        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).get_account(address)
     }
 
-    fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
-        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).code_by_hash_ref(code_hash)
+    fn get_code_by_hash(&mut self, code_hash: &B256) -> Result<evm2::bytecode::Bytecode, Self::Error> {
+        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).get_code_by_hash(code_hash)
     }
 
-    fn storage_ref(&self, address: alloy_primitives::Address, index: U256) -> Result<U256, Self::Error> {
-        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).storage_ref(address, index)
+    fn get_storage(&mut self, address: &alloy_primitives::Address, index: &U256) -> Result<U256, Self::Error> {
+        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).get_storage(address, index)
     }
 
-    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).block_hash_ref(number)
+    fn get_block_hash(&mut self, number: &U256) -> Result<B256, Self::Error> {
+        StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(self.provider()?)).get_block_hash(number)
     }
 }
 
@@ -1166,10 +1165,10 @@ type LateRevertsTx = std::sync::mpsc::SyncSender<n42_deferred_reverts::LateRever
 /// back with `None` when no thread could be had: the caller merges whole.
 fn spawn_late_reverts(
     shards: &Arc<crate::output_shards::FrozenShards>,
-    residual: &revm::database::BundleState,
-    graft: Vec<(alloy_primitives::Address, revm::database::AccountRevert)>,
+    residual: &reth_trie::bundle_state::BundleState,
+    graft: Vec<(alloy_primitives::Address, reth_trie::bundle_state::AccountRevert)>,
     pool: Option<&'static rayon::ThreadPool>,
-) -> (Vec<(alloy_primitives::Address, revm::database::AccountRevert)>, Option<LateRevertsTx>) {
+) -> (Vec<(alloy_primitives::Address, reth_trie::bundle_state::AccountRevert)>, Option<LateRevertsTx>) {
     spawn_late_reverts_with(shards, residual, graft, pool, OsThread)
 }
 
@@ -1193,11 +1192,11 @@ impl SpawnThread for OsThread {
 /// [`spawn_late_reverts`] with the thread started by `spawner`.
 fn spawn_late_reverts_with(
     shards: &Arc<crate::output_shards::FrozenShards>,
-    residual: &revm::database::BundleState,
-    graft: Vec<(alloy_primitives::Address, revm::database::AccountRevert)>,
+    residual: &reth_trie::bundle_state::BundleState,
+    graft: Vec<(alloy_primitives::Address, reth_trie::bundle_state::AccountRevert)>,
     pool: Option<&'static rayon::ThreadPool>,
     spawner: impl SpawnThread,
-) -> (Vec<(alloy_primitives::Address, revm::database::AccountRevert)>, Option<LateRevertsTx>) {
+) -> (Vec<(alloy_primitives::Address, reth_trie::bundle_state::AccountRevert)>, Option<LateRevertsTx>) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<n42_deferred_reverts::LateReverts>(1);
     let shards = Arc::clone(shards);
     let block_reverts = residual.reverts.clone();
@@ -1516,7 +1515,7 @@ where
         BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
     >,
     Client: StateProviderFactory
-        + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec + reth_evm::eth::spec::EthExecutorSpec>,
+        + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
     Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + 'static,
@@ -1564,7 +1563,11 @@ where
     // `N42_PLAN_AHEAD_WARM`: the next plan's warm read is made at the state
     // this build reads; the builder's hash of this build's parent and its
     // grandparent decide whether the read made for this build fits.
+    #[cfg(feature = "legacy-revm-paths")]
     let warm_ahead_on = crate::warm_ahead::threads() > 0;
+    #[cfg(not(feature = "legacy-revm-paths"))]
+    let warm_ahead_on = false;
+    #[cfg(feature = "legacy-revm-paths")]
     if warm_ahead_on {
         match parent_state.as_ref() {
             Some(open) => crate::warm_ahead::note_base(parent_hash_for_state, Arc::clone(open)),
@@ -1607,11 +1610,9 @@ where
     // active -- the forkchoice had already refused attributes without EIP-7843's
     // slot number.
     let is_amsterdam = client.chain_spec().is_amsterdam_active_at_timestamp(attributes.timestamp);
-    let mut db = State::builder()
-        .with_database(cached_reads.as_db_mut(state))
-        .with_bundle_update()
-        .with_bal_builder_if(is_amsterdam)
-        .build();
+    // reth v2.9.0 (evm2): the executor keeps the block's state and bundle
+    // itself; the database is the cached reads over the parent's state.
+    let db = cached_reads.as_db_mut(state);
 
     // Get signer address from consensus to use as coinbase (beneficiary)
     // This ensures consistency between payload builder and engine tree execution
@@ -1671,7 +1672,7 @@ where
         .next_evm_env(&parent_header, &next_attributes)
         .map_err(PayloadBuilderError::other)?;
     let group_env = evm_env.clone();
-    let evm = evm_config.evm_with_env(&mut db, evm_env);
+    let evm = evm_config.evm_with_env(db, evm_env.clone());
     let block_ctx = evm_config
         .context_for_next_block(&parent_header, next_attributes)
         .map_err(PayloadBuilderError::other)?;
@@ -1691,13 +1692,18 @@ where
     }
     let build_stage = BuildStage(parent_header.number);
     build_stage.at(1);
-    let mut builder: reth_evm::execute::BasicBlockBuilder<'_, EvmConfig::BlockExecutorFactory, _, _, EthPrimitives> = reth_evm::execute::BasicBlockBuilder {
-        executor: evm_config.create_executor(evm, block_ctx.clone()),
-        ctx: block_ctx,
-        assembler,
-        parent: &parent_header,
-        transactions: Vec::new(),
-    };
+    let mut builder: reth_evm::execute::BasicBlockBuilder<'_, EvmConfig::BlockExecutorFactory, _, _, EthPrimitives> =
+        reth_evm::execute::BasicBlockBuilder::new(
+            evm_config.block_executor_factory(),
+            &assembler,
+            evm,
+            evm_env,
+            &parent_header,
+            block_ctx,
+        );
+    if is_amsterdam {
+        reth_evm::execute::BlockExecutor::enable_block_access_list_builder(builder.executor_mut());
+    }
 
     debug!(target: "payload_builder", id=%payload_id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
     // Timed in phases, because at the 163,000-transaction tier this function
@@ -2029,7 +2035,7 @@ where
     // queue instead of a refusal that says nothing. See the diagnosis after
     // the parallel step.
     let mut skipped_heads: alloy_primitives::map::AddressHashMap<(u64, u64)> = Default::default();
-    let mut par_reverts: Vec<(alloy_primitives::Address, revm::database::AccountRevert)> = Vec::new();
+    let mut par_reverts: Vec<(alloy_primitives::Address, reth_trie::bundle_state::AccountRevert)> = Vec::new();
     let mut par_drained = false;
     let mut par_prep_ms = 0u64;
     let mut par_collect_ms = 0u64;
@@ -2397,6 +2403,9 @@ where
             (payload, recovered, block_hash, block_number, root_ms, fields_ms, sealed_ms, sealed_at_ms, parent_sealed)
         }};
     }
+    // The parallel step is written against revm 43: built only with
+    // `legacy-revm-paths` until it is ported (docs/RETH_2_9_0_UPGRADE.md).
+    #[cfg(feature = "legacy-revm-paths")]
     if parallel_build && (pulled.is_some() || bulk.is_some()) {
         let par_at = std::time::Instant::now();
         par_start_ms = build_started.elapsed().as_millis() as u64;
@@ -2588,12 +2597,12 @@ where
                 std::sync::Mutex::new(crate::parallel_transfer::StagedGraft::new(group_env.block_env.beneficiary, keys.len()))
             });
             let sink = staged.as_ref().map(|staged| {
-                move |bundle: revm::database::BundleState| staged.lock().expect("the staged graft's lock").add(bundle)
+                move |bundle: reth_trie::bundle_state::BundleState| staged.lock().expect("the staged graft's lock").add(bundle)
             });
-            let shard_sink = sharded_out.as_ref().map(|shards| move |bundle: revm::database::BundleState| shards.add(bundle));
-            let sink: Option<&(dyn Fn(revm::database::BundleState) + Sync)> = match shard_sink.as_ref() {
-                Some(sink) => Some(sink as &(dyn Fn(revm::database::BundleState) + Sync)),
-                None => sink.as_ref().map(|sink| sink as &(dyn Fn(revm::database::BundleState) + Sync)),
+            let shard_sink = sharded_out.as_ref().map(|shards| move |bundle: reth_trie::bundle_state::BundleState| shards.add(bundle));
+            let sink: Option<&(dyn Fn(reth_trie::bundle_state::BundleState) + Sync)> = match shard_sink.as_ref() {
+                Some(sink) => Some(sink as &(dyn Fn(reth_trie::bundle_state::BundleState) + Sync)),
+                None => sink.as_ref().map(|sink| sink as &(dyn Fn(reth_trie::bundle_state::BundleState) + Sync)),
             };
             // `N42_BUILD_COLLECT_IN_PLACE=1`: the transfers stay in the slots the
             // batches wrote them to; the body and the receipts below are made from
@@ -3430,7 +3439,7 @@ where
                         let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
                         let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
                             n42_core_layout::enter(n42_core_layout::Set::Critical);
-                            let empty = revm::database::BundleState::default();
+                            let empty = reth_trie::bundle_state::BundleState::default();
                             let accounts = shards.view(&empty, &[]);
                             (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
                         });
@@ -3814,7 +3823,7 @@ where
                 execution_result.gas_used = gas_used;
             }
             let (db, _evm_env) = reth_evm::Evm::finish(evm);
-            db.merge_transitions(revm::database::states::bundle_state::BundleRetention::Reverts);
+            db.merge_transitions(reth_trie::bundle_state::BundleRetention::Reverts);
             let merge_ms = finish_at.elapsed().as_millis() as u64;
             // The post-state is final: the next block can be built on it.
             // The bundle is taken and its reverts appended once, here, and the
@@ -3870,7 +3879,7 @@ where
                     let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
                     let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
                         n42_core_layout::enter(n42_core_layout::Set::Critical);
-                        let empty = revm::database::BundleState::default();
+                        let empty = reth_trie::bundle_state::BundleState::default();
                         let accounts = shards.view(&empty, &[]);
                         (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
                     });
@@ -4104,7 +4113,7 @@ where
             // input (they join the merged bundle in the output below), and
             // `StateReady` and `Complete` stay where they are: after the
             // publication, which files this block's QMDB tree.
-            type EarlyMerge = (revm::database::BundleState, crate::output_shards::MergeSplit, u64, u32, std::time::Instant, std::time::Instant, Option<LateRevertsTx>);
+            type EarlyMerge = (reth_trie::bundle_state::BundleState, crate::output_shards::MergeSplit, u64, u32, std::time::Instant, std::time::Instant, Option<LateRevertsTx>);
             let (early_merge, shard_reverts): (Option<std::thread::JoinHandle<EarlyMerge>>, _) =
                 match crate::output_shards::merge_at_shards_ready().then(crate::output_shards::merge_pool).flatten() {
                     Some(pool) => {
@@ -4207,12 +4216,12 @@ where
                         let (ahead, done_at) = job.join().ok().filter(|_| ahead_prague == prague)?;
                         let waited = joined_at.elapsed();
                         let finish_at = std::time::Instant::now();
-                        let replaced: Vec<(&alloy_primitives::Address, &revm::database::BundleAccount)> = residual_state
+                        let replaced: Vec<(&alloy_primitives::Address, &reth_trie::bundle_state::BundleAccount)> = residual_state
                             .state
                             .keys()
                             .filter_map(|address| shards_ref.get(address).map(|account| (address, account)))
                             .collect();
-                        let newer: Vec<(&alloy_primitives::Address, &revm::database::BundleAccount)> = residual_state
+                        let newer: Vec<(&alloy_primitives::Address, &reth_trie::bundle_state::BundleAccount)> = residual_state
                             .state
                             .iter()
                             .filter(|(address, _)| !shards_ref.holds(address))
@@ -5223,7 +5232,7 @@ where
                     wanted.dedup();
                     // The build's state provider is not shared across threads;
                     // each chunk opens its own on the same parent.
-                    let fetched: Vec<(alloy_primitives::Address, Option<Option<revm::state::AccountInfo>>)> = wanted
+                    let fetched: Vec<(alloy_primitives::Address, Option<Option<evm2::evm::AccountInfo>>)> = wanted
                         .par_chunks(256)
                         .flat_map_iter(|chunk| {
                             let provider = open_parent_state().ok();
@@ -6115,9 +6124,9 @@ mod late_reverts_tests {
     #[test]
     fn a_late_revert_set_without_a_thread_hands_the_graft_back() {
         let shards = Arc::new(crate::output_shards::OutputShards::with_index_live(Address::ZERO, 8, 1, false, false).freeze());
-        let residual = revm::database::BundleState::default();
+        let residual = reth_trie::bundle_state::BundleState::default();
         let graft: Vec<_> = (1u8..=3)
-            .map(|i| (Address::repeat_byte(i), revm::database::AccountRevert::default()))
+            .map(|i| (Address::repeat_byte(i), reth_trie::bundle_state::AccountRevert::default()))
             .collect();
         let (back, late) = spawn_late_reverts_with(&shards, &residual, graft, None, NoThread);
         assert!(late.is_none(), "no thread, no promise");
@@ -6223,7 +6232,7 @@ mod plan_body_tests {
         TransactionOrigin, ValidPoolTransaction,
     };
     use revm::database::{CacheDB, EmptyDB};
-    use revm::state::AccountInfo;
+    use evm2::evm::AccountInfo;
 
     type Cand = Arc<ValidPoolTransaction<crate::N42PooledTransaction>>;
 

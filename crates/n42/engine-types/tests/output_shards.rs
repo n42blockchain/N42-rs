@@ -12,11 +12,11 @@ use n42_engine_types::output_shards::{
 };
 use n42_engine_types::parallel_transfer::{append_reverts, graft_bundles_folded, install_staged, GraftFold, StagedGraft};
 use reth_evm::db::State;
-use revm::database::BundleState;
+use reth_trie::bundle_state::BundleState;
 use revm::state::{AccountStatus, EvmState};
 use revm::Database as _;
 use revm::database::{states::bundle_state::BundleRetention, CacheDB, EmptyDB};
-use revm::state::AccountInfo;
+use evm2::evm::AccountInfo;
 
 const BATCHES: u64 = 16;
 const PER_BATCH: u64 = 500;

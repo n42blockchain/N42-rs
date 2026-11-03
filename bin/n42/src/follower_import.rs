@@ -4039,7 +4039,7 @@ mod parent_output_tests {
     use super::*;
     use alloy_primitives::U256;
     use reth_evm::db::BundleState;
-    use reth_evm::revm::state::AccountInfo;
+    use reth_evm::evm2::evm::AccountInfo;
 
     /// [`PARENT_OUTPUTS`] is one process-wide queue of [`PARENT_OUTPUTS_KEPT`]
     /// entries, and `cargo test` runs these in threads of one process: two

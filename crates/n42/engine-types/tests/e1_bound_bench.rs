@@ -47,8 +47,8 @@ use reth_transaction_pool::{
     identifier::{SenderId, TransactionId},
     PoolTransaction as _, TransactionOrigin, ValidPoolTransaction,
 };
-use revm::database::BundleState;
-use revm::state::AccountInfo;
+use reth_trie::bundle_state::BundleState;
+use evm2::evm::AccountInfo;
 use revm::Database;
 
 /// The node's allocator: run with the fleet's `MALLOC_CONF` to see its pages.
@@ -148,8 +148,8 @@ impl Database for StackDb {
         Ok(self.0.view.account(&address, self.0.head).flatten().map(AccountInfo::from))
     }
 
-    fn code_by_hash(&mut self, _code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
-        Ok(revm::state::Bytecode::default())
+    fn code_by_hash(&mut self, _code_hash: B256) -> Result<evm2::bytecode::Bytecode, Self::Error> {
+        Ok(evm2::bytecode::Bytecode::default())
     }
 
     fn storage(&mut self, _address: Address, _index: revm::primitives::StorageKey) -> Result<revm::primitives::StorageValue, Self::Error> {
@@ -430,9 +430,9 @@ fn e1_exec_bound() {
     // theirs.
     println!(
         "sizes: BundleAccount {} B, AccountInfo {} B, map slot {} B",
-        std::mem::size_of::<revm::database::BundleAccount>(),
+        std::mem::size_of::<reth_trie::bundle_state::BundleAccount>(),
         std::mem::size_of::<AccountInfo>(),
-        std::mem::size_of::<(Address, revm::database::BundleAccount)>()
+        std::mem::size_of::<(Address, reth_trie::bundle_state::BundleAccount)>()
     );
     for pass in 0..4 {
         // Passes 2 and 3 with `AccountInfo::default()`'s code: the shared
@@ -443,7 +443,7 @@ fn e1_exec_bound() {
             .map(|tx| alloy_consensus::Transaction::to(&tx.transaction).unwrap_or_default())
             .collect();
         let busy = std::sync::atomic::AtomicU64::new(0);
-        let (sender, receiver) = std::sync::mpsc::channel::<alloy_primitives::map::AddressMap<revm::database::BundleAccount>>();
+        let (sender, receiver) = std::sync::mpsc::channel::<alloy_primitives::map::AddressMap<reth_trie::bundle_state::BundleAccount>>();
         let dropper = std::thread::spawn(move || receiver.into_iter().count());
         let at = Instant::now();
         build_pool().scope(|scope| {
@@ -451,7 +451,7 @@ fn e1_exec_bound() {
                 let (busy, sender) = (&busy, sender.clone());
                 scope.spawn(move |_| {
                     let at = Instant::now();
-                    let mut map: alloy_primitives::map::AddressMap<revm::database::BundleAccount> =
+                    let mut map: alloy_primitives::map::AddressMap<reth_trie::bundle_state::BundleAccount> =
                         alloy_primitives::map::AddressMap::with_capacity_and_hasher(chunk.len() + chunk.len() / 4 + 1, Default::default());
                     for (i, address) in chunk.iter().enumerate() {
                         let info = AccountInfo {
@@ -459,13 +459,13 @@ fn e1_exec_bound() {
                             balance: U256::from(i),
                             code_hash: alloy_primitives::KECCAK256_EMPTY,
                             account_id: None,
-                            code: if shared_code { Some(revm::state::Bytecode::default()) } else { None },
+                            code: if shared_code { Some(evm2::bytecode::Bytecode::default()) } else { None },
                         };
-                        map.entry(*address).or_insert_with(|| revm::database::BundleAccount {
+                        map.entry(*address).or_insert_with(|| reth_trie::bundle_state::BundleAccount {
                             original_info: Some(info.clone()),
                             info: Some(info),
                             storage: Default::default(),
-                            status: revm::database::AccountStatus::Loaded,
+                            status: reth_trie::bundle_state::AccountStatus::Loaded,
                         });
                     }
                     busy.fetch_add(at.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -581,7 +581,7 @@ fn qmdb_chain() -> Arc<reth_chainspec::ChainSpec> {
     Arc::new(n42_qmdb_reth::chainspec::with_declared_state_scheme(genesis.into()).expect("a qmdb chain"))
 }
 
-fn changed(nonce: u64, balance: u64) -> revm::database::BundleAccount {
+fn changed(nonce: u64, balance: u64) -> reth_trie::bundle_state::BundleAccount {
     // No code: `AccountInfo::default()`'s `Some(Bytecode::default())` is one
     // process-wide `Arc`, and cloning it from many threads is a contended
     // atomic (the provider's accounts carry none either).
@@ -592,18 +592,18 @@ fn changed(nonce: u64, balance: u64) -> revm::database::BundleAccount {
         account_id: None,
         code: None,
     };
-    revm::database::BundleAccount {
+    reth_trie::bundle_state::BundleAccount {
         original_info: Some(info.clone()),
         info: Some(info),
         storage: Default::default(),
-        status: revm::database::AccountStatus::Changed,
+        status: reth_trie::bundle_state::AccountStatus::Changed,
     }
 }
 
 /// Block `n`'s accounts as the leader's output shards hand them to the root:
 /// its 400 senders, the beneficiary, and ~190,000 distinct recipients of
 /// 200,000 transfers drawn from 2,000,000.
-fn block_accounts(n: u64) -> Vec<(Address, revm::database::BundleAccount)> {
+fn block_accounts(n: u64) -> Vec<(Address, reth_trie::bundle_state::BundleAccount)> {
     let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ n.wrapping_mul(0x2545_f491_4f6c_dd1d);
     let mut touched = std::collections::HashMap::with_capacity(200_000);
     for s in (n * BLOCK_SENDERS..(n + 1) * BLOCK_SENDERS).map(|s| s % TOTAL_SENDERS) {
@@ -639,11 +639,11 @@ fn e1_root_bound() {
 
     // Block 1: every account of the set.
     let at = Instant::now();
-    let mut all: Vec<(Address, revm::database::BundleAccount)> = Vec::with_capacity((TOTAL_SENDERS + RECIPIENTS + 1) as usize);
+    let mut all: Vec<(Address, reth_trie::bundle_state::BundleAccount)> = Vec::with_capacity((TOTAL_SENDERS + RECIPIENTS + 1) as usize);
     all.push((beneficiary(), changed(0, 7)));
     all.extend((0..TOTAL_SENDERS).map(|s| (sender_of(s), changed(0, 10u64.pow(18)))));
     all.extend((0..RECIPIENTS).map(|r| (recipient_of(r), changed(r % 3, 1 + r))));
-    let refs: Vec<(&Address, &revm::database::BundleAccount)> = all.iter().map(|(a, b)| (a, b)).collect();
+    let refs: Vec<(&Address, &reth_trie::bundle_state::BundleAccount)> = all.iter().map(|(a, b)| (a, b)).collect();
     let ops = n42_qmdb_reth::changes::sorted_operations_from_accounts(&refs, true);
     let prepared = state.compute_operations(chain.genesis_hash(), ops).expect("block 1");
     state.insert(hash_of(1), 1, prepared).expect("insert 1");
@@ -657,7 +657,7 @@ fn e1_root_bound() {
     let mut rows = Vec::new();
     for n in 2..2 + warm + rounds {
         let accounts = block_accounts(n);
-        let refs: Vec<(&Address, &revm::database::BundleAccount)> = accounts.iter().map(|(a, b)| (a, b)).collect();
+        let refs: Vec<(&Address, &reth_trie::bundle_state::BundleAccount)> = accounts.iter().map(|(a, b)| (a, b)).collect();
         let measured = n >= 2 + warm;
         if measured && n == 2 + warm {
             perf.send("enable");
@@ -784,11 +784,11 @@ fn e1_overlap() {
     state.initialize((0, chain.genesis_hash())).expect("initialize");
     let hash_of = |n: u64| B256::from(U256::from(n + 1) << 64);
     {
-        let mut all: Vec<(Address, revm::database::BundleAccount)> = Vec::with_capacity((TOTAL_SENDERS + RECIPIENTS + 1) as usize);
+        let mut all: Vec<(Address, reth_trie::bundle_state::BundleAccount)> = Vec::with_capacity((TOTAL_SENDERS + RECIPIENTS + 1) as usize);
         all.push((beneficiary(), changed(0, 7)));
         all.extend((0..TOTAL_SENDERS).map(|s| (sender_of(s), changed(0, 10u64.pow(18)))));
         all.extend((0..RECIPIENTS).map(|r| (recipient_of(r), changed(r % 3, 1 + r))));
-        let refs: Vec<(&Address, &revm::database::BundleAccount)> = all.iter().map(|(a, b)| (a, b)).collect();
+        let refs: Vec<(&Address, &reth_trie::bundle_state::BundleAccount)> = all.iter().map(|(a, b)| (a, b)).collect();
         let ops = n42_qmdb_reth::changes::sorted_operations_from_accounts(&refs, true);
         let prepared = state.compute_operations(chain.genesis_hash(), ops).expect("block 1");
         state.insert(hash_of(1), 1, prepared).expect("insert 1");
@@ -796,9 +796,9 @@ fn e1_overlap() {
     }
     let mut parent = hash_of(1);
     let mut next = 2u64;
-    let mut root_once = |state: &n42_qmdb_reth::QmdbNodeState, accounts: &[(Address, revm::database::BundleAccount)]| {
+    let mut root_once = |state: &n42_qmdb_reth::QmdbNodeState, accounts: &[(Address, reth_trie::bundle_state::BundleAccount)]| {
         let at = Instant::now();
-        let refs: Vec<(&Address, &revm::database::BundleAccount)> = accounts.iter().map(|(a, b)| (a, b)).collect();
+        let refs: Vec<(&Address, &reth_trie::bundle_state::BundleAccount)> = accounts.iter().map(|(a, b)| (a, b)).collect();
         let ops = n42_qmdb_reth::changes::sorted_operations_from_accounts(&refs, true);
         let prepared = state.compute_operations(parent, ops).expect("a block's root");
         let took = at.elapsed().as_micros() as u64;

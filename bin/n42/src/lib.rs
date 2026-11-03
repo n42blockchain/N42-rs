@@ -145,9 +145,9 @@ pub mod consensus_common {
     pub use reth_consensus_common::*;
 }
 
-/// Re-exported from `reth_revm`.
+/// Re-exported from `reth_evm`.
 pub mod revm {
-    pub use reth_revm::*;
+    pub use reth_evm::*;
 }
 
 /// Re-exported from `reth_tasks`.

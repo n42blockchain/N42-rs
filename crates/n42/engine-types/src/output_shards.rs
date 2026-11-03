@@ -53,7 +53,7 @@ use alloy_primitives::{
 };
 use reth_primitives_traits::{Account, Bytecode};
 use revm::bytecode::Bytecode as RevmBytecode;
-use reth_revm::db::State;
+use reth_evm::db::State;
 use reth_storage_api::{
     errors::ProviderResult, AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider,
     StateProofProvider, StateProvider, StateProviderBox, StateRootProvider, StorageRootProvider,

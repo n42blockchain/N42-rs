@@ -373,7 +373,7 @@ pub fn hashed_post_state_from_bundle(bundle_state: &revm::database::BundleState)
 impl<Provider: DBProvider> HashedPostStateProvider for LatestStateProviderRef<'_, Provider> {
     fn hashed_post_state(
         &self,
-        bundle_state: &revm::database::BundleState,
+        bundle_state: &reth_trie::bundle_state::BundleState,
     ) -> ProviderResult<HashedPostState> {
         let mut hashed_state = hashed_post_state_from_bundle(bundle_state);
         zero_destroyed_account_storage(

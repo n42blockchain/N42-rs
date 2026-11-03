@@ -32,6 +32,9 @@ reth-trie-db.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 
+# evm
+evm2.workspace = true
+
 # metrics
 metrics.workspace = true
 

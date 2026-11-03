@@ -31,7 +31,7 @@ use reth_node_builder::components::ConsensusBuilder;
 use reth_node_builder::{BuilderContext, NodeTypes};
 use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
 use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider};
-use reth_revm::cached::CachedReads;
+use reth_evm::cached::CachedReads;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

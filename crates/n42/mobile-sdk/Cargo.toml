@@ -25,7 +25,6 @@ n42-clique.workspace = true
 n42-primitives.workspace = true
 revm-primitives.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
-reth-revm.workspace = true
 reth-chainspec.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-evm-ethereum.workspace = true

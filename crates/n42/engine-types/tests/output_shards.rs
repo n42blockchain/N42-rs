@@ -11,7 +11,7 @@ use n42_engine_types::output_shards::{
     any_destroyed, hashed_post_state_of, live_index_defer, output_shards, FrozenShards, LiveLockCounts, OutputShards,
 };
 use n42_engine_types::parallel_transfer::{append_reverts, graft_bundles_folded, install_staged, GraftFold, StagedGraft};
-use reth_revm::db::State;
+use reth_evm::db::State;
 use revm::database::BundleState;
 use revm::state::{AccountStatus, EvmState};
 use revm::Database as _;

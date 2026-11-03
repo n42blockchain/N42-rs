@@ -23,7 +23,7 @@
 //! message never depend on whether a summary existed.
 
 use alloy_primitives::{map::B256HashMap, Address, B256, U256};
-use reth_revm::primitives::hardfork::SpecId;
+use reth_evm::primitives::hardfork::SpecId;
 use std::sync::{Arc, Mutex};
 
 use crate::N42PooledTransaction;
@@ -95,14 +95,14 @@ pub fn intrinsic_gas_shortfall_from(tx: &TransactionSigned, sender: Option<Addre
         .access_list()
         .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
         .unwrap_or((0, 0));
-    let intrinsic = reth_revm::context_interface::cfg::gas::calculate_initial_tx_gas(
+    let intrinsic = reth_evm::context_interface::cfg::gas::calculate_initial_tx_gas(
         spec,
         tx.input(),
         tx.kind().is_create(),
         al_accounts,
         al_storages,
         tx.authorization_list().map_or(0, |list| list.len() as u64),
-        spec.is_enabled_in(SpecId::AMSTERDAM).then(|| reth_revm::context_interface::cfg::gas_params::Eip2780TxInfo {
+        spec.is_enabled_in(SpecId::AMSTERDAM).then(|| reth_evm::context_interface::cfg::gas_params::Eip2780TxInfo {
             value: tx.value(),
             is_self_transfer: sender.is_some() && tx.kind().to() == sender.as_ref(),
         }),

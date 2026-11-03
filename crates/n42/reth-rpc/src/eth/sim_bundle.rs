@@ -12,7 +12,7 @@ use alloy_rpc_types_mev::{
 use jsonrpsee::core::RpcResult;
 use reth_evm::{ConfigureEvm, Evm};
 use reth_primitives_traits::Recovered;
-use reth_revm::{database::StateProviderDatabase, db::CacheDB};
+use reth_evm::{database::StateProviderDatabase, db::CacheDB};
 use reth_rpc_api::MevSimApiServer;
 use reth_rpc_eth_api::{
     helpers::{block::LoadBlock, Call, EthTransactions},

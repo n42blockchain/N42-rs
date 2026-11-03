@@ -10,8 +10,8 @@ use super::*;
 use n42_header::N42Header as Header;
 use alloy_primitives::{Bytes, U256};
 use n42_engine_types::N42PooledTransaction;
-use reth_revm::revm::database::{CacheDB, EmptyDB};
-use reth_revm::revm::state::AccountInfo;
+use reth_evm::revm::database::{CacheDB, EmptyDB};
+use reth_evm::revm::state::AccountInfo;
 
 type Held = Arc<reth_transaction_pool::ValidPoolTransaction<N42PooledTransaction>>;
 
@@ -81,19 +81,19 @@ fn fixture(key_base: u64, senders: u64, per: u64, space: u64, run: usize) -> (Ve
 #[derive(Debug, Clone)]
 struct SharedDb(Arc<CacheDB<EmptyDB>>);
 
-impl reth_revm::revm::Database for SharedDb {
-    type Error = <CacheDB<EmptyDB> as reth_revm::revm::DatabaseRef>::Error;
+impl reth_evm::revm::Database for SharedDb {
+    type Error = <CacheDB<EmptyDB> as reth_evm::revm::DatabaseRef>::Error;
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        reth_revm::revm::DatabaseRef::basic_ref(&*self.0, address)
+        reth_evm::revm::DatabaseRef::basic_ref(&*self.0, address)
     }
-    fn code_by_hash(&mut self, code_hash: B256) -> Result<reth_revm::revm::state::Bytecode, Self::Error> {
-        reth_revm::revm::DatabaseRef::code_by_hash_ref(&*self.0, code_hash)
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<reth_evm::revm::state::Bytecode, Self::Error> {
+        reth_evm::revm::DatabaseRef::code_by_hash_ref(&*self.0, code_hash)
     }
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        reth_revm::revm::DatabaseRef::storage_ref(&*self.0, address, index)
+        reth_evm::revm::DatabaseRef::storage_ref(&*self.0, address, index)
     }
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        reth_revm::revm::DatabaseRef::block_hash_ref(&*self.0, number)
+        reth_evm::revm::DatabaseRef::block_hash_ref(&*self.0, number)
     }
 }
 

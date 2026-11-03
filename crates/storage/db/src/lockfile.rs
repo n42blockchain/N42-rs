@@ -44,17 +44,18 @@ impl StorageLock {
     #[cfg(any(test, not(feature = "disable-lock")))]
     fn try_acquire_file_lock(path: &Path) -> Result<Self, StorageLockError> {
         let file_path = path.join(LOCKFILE_NAME);
-        if let Some(process_lock) = ProcessUID::parse(&file_path)? {
-            if process_lock.pid != (process::id() as usize) && process_lock.is_active() {
-                reth_tracing::tracing::error!(
-                    target: "reth::db::lockfile",
-                    path = ?file_path,
-                    pid = process_lock.pid,
-                    start_time = process_lock.start_time,
-                    "Storage lock already taken."
-                );
-                return Err(StorageLockError::Taken(process_lock.pid))
-            }
+        if let Some(process_lock) = ProcessUID::parse(&file_path)? &&
+            process_lock.pid != (process::id() as usize) &&
+            process_lock.is_active()
+        {
+            tracing::error!(
+                target: "reth::db::lockfile",
+                path = ?file_path,
+                pid = process_lock.pid,
+                start_time = process_lock.start_time,
+                "Storage lock already taken."
+            );
+            return Err(StorageLockError::Taken(process_lock.pid))
         }
 
         Ok(Self(Arc::new(StorageLockInner::new(file_path)?)))
@@ -72,10 +73,10 @@ impl Drop for StorageLockInner {
                     // Only remove if the lock file belongs to our process
                     if process_uid.pid == process::id() as usize {
                         if let Err(err) = reth_fs_util::remove_file(file_path) {
-                            reth_tracing::tracing::error!(%err, "Failed to delete lock file");
+                            tracing::error!(%err, "Failed to delete lock file");
                         }
                     } else {
-                        reth_tracing::tracing::warn!(
+                        tracing::warn!(
                             "Lock file belongs to different process (PID: {}), not removing",
                             process_uid.pid
                         );
@@ -84,7 +85,7 @@ impl Drop for StorageLockInner {
                     // If we can't parse the lock file, still try to remove it
                     // as it might be corrupted or from a previous run
                     if let Err(err) = reth_fs_util::remove_file(file_path) {
-                        reth_tracing::tracing::error!(%err, "Failed to delete lock file");
+                        tracing::error!(%err, "Failed to delete lock file");
                     }
                 }
             }

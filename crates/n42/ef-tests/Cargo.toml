@@ -20,8 +20,7 @@ reth-chainspec.workspace = true
 reth-primitives-traits.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-ethereum-forks.workspace = true
-reth-revm = { workspace = true, features = ["std"] }
-reth-evm.workspace = true
+reth-evm = { workspace = true, features = ["std"] }
 reth-evm-ethereum.workspace = true
 reth-provider.workspace = true
 reth-db.workspace = true

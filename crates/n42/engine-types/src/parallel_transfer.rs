@@ -29,7 +29,7 @@ use reth_evm::{
 };
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::{RecoveredBlock};
-use reth_revm::db::State;
+use reth_evm::db::State;
 use revm::{
     context::TxEnv,
     database::{states::bundle_state::BundleRetention, states::CacheAccount, AccountRevert, BundleAccount, BundleState, PlainAccount},
@@ -1425,7 +1425,7 @@ impl<ExtDB> AccountHint for revm::database::CacheDB<ExtDB> {
     }
 }
 
-impl<DB: reth_storage_api::EvmStateProvider> AccountHint for reth_revm::database::StateProviderDatabase<DB> {
+impl<DB: reth_storage_api::EvmStateProvider> AccountHint for reth_evm::database::StateProviderDatabase<DB> {
     #[inline]
     fn hint_account(&self, address: &Address) -> bool {
         self.0.n42_prefetch_account(address)

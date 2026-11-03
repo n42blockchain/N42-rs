@@ -67,7 +67,7 @@ use reth_primitives_traits::{
 
 // N42 imports
 use n42_primitives::Snapshot;
-use reth_revm::cached::CachedReads;
+use reth_evm::cached::CachedReads;
 use std::collections::HashMap;
 use std::time::Duration;
 

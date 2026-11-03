@@ -43,6 +43,7 @@ alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-consensus.workspace = true
+# N42: revm 43 types in the QMDB hooks and persistence timers; to be ported to evm2.
 revm.workspace = true
 revm-database.workspace = true
 
@@ -69,6 +70,7 @@ tokio = { workspace = true, features = ["sync"], optional = true }
 
 # test-utils
 reth-ethereum-engine-primitives = { workspace = true, optional = true }
+evm2 = { workspace = true, optional = true }
 
 # parallel utils
 rayon.workspace = true
@@ -89,6 +91,7 @@ reth-ethereum-primitives.workspace = true
 reth-tracing.workspace = true
 # N42: 0x50 transfers for the transactions segment's tests and bench (`n42_sf_tests.rs`).
 n42-tx-types.workspace = true
+evm2.workspace = true
 
 tempfile.workspace = true
 assert_matches.workspace = true
@@ -97,8 +100,8 @@ rand.workspace = true
 tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
 
 [features]
-jemalloc = ["rocksdb/jemalloc"]
 test-utils = [
+    "dep:evm2",
     "reth-db/test-utils",
     "reth-nippy-jar/test-utils",
     "reth-trie/test-utils",
@@ -121,7 +124,8 @@ account-ext = [
     "alloy-genesis/account-ext",
     "reth-codecs/account-ext",
     "reth-primitives-traits/account-ext",
-    "revm/account-ext",
     "reth-trie/account-ext",
     "reth-trie-db/account-ext",
+    "reth-execution-types/account-ext",
+    "evm2?/account-ext",
 ]

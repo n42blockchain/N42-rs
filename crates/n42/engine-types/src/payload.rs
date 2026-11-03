@@ -28,7 +28,7 @@ use reth_evm_ethereum::EthBlockAssembler;
 use crate::engine_types::N42BuiltPayload as EthBuiltPayload;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_revm::{database::StateProviderDatabase, db::State};
+use reth_evm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::StateProviderFactory;
 use reth_transaction_pool::{
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
@@ -5207,7 +5207,7 @@ where
                 // a cold miss, and those misses were most of the execution time.
                 {
                     use rayon::prelude::*;
-                    let cached: &mut reth_revm::cached::CachedReads = builder.evm_mut().db_mut().database.cached;
+                    let cached: &mut reth_evm::cached::CachedReads = builder.evm_mut().db_mut().database.cached;
                     let mut wanted: Vec<alloy_primitives::Address> = Vec::with_capacity(lookahead.len() * 2);
                     for pool_tx in &lookahead {
                         let sender = pool_tx.sender();
@@ -5239,7 +5239,7 @@ where
                         // A read that failed is left for the execution to
                         // repeat, and report.
                         if let Some(info) = info {
-                            cached.accounts.entry(address).or_insert(reth_revm::cached::CachedAccount { info, storage: Default::default() });
+                            cached.accounts.entry(address).or_insert(reth_evm::cached::CachedAccount { info, storage: Default::default() });
                         }
                     }
                 }

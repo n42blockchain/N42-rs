@@ -13,7 +13,7 @@ use reth_evm::execute::Executor;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{AlloyBlockHeader, RecoveredBlock, SealedBlock};
 use reth_provider::test_utils::MockEthProvider;
-use reth_revm::{database::StateProviderDatabase, db::State};
+use reth_evm::{database::StateProviderDatabase, db::State};
 use revm_primitives::B256;
 use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;

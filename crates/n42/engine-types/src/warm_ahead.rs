@@ -378,7 +378,7 @@ pub fn start(id: u64, keys: impl FnOnce() -> Option<Vec<(Address, Address)>> + S
         };
         let open_db = || {
             open().ok().map(|state| {
-                reth_revm::database::StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(
+                reth_evm::database::StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(
                     state,
                 ))
             })

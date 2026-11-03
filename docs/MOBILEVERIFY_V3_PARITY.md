@@ -489,3 +489,54 @@ Left for stage 3:
 - Sidecar latency is set by its 1 s head poll. A phone that reads `/latest` before the packet has
   landed sees `packet: false` for up to a second.
 
+
+## Gate verification
+
+Rounds are driven by `scripts/devnet-mobileanchor.sh <tag> [--gov5] [--txload]` (box claim,
+fleet with `MOBILEVERIFY=1` and the packetd sidecar beside validator 0, optional `send_tx` load,
+gov5's `cmd/mobileverify-device` against validator 1, then `scripts/devnet-header-roots.py`,
+per-block hashes on both chains, gov5's errors and per-block packet sources). Evidence under
+`/data/n42-build/audit-notes/devnet/<tag>/` (`run.log`, `fleet.out`, `device.out`, `send_tx.out`,
+`hdrroots*.out`, `hashes.out`, `packets.out`, `NOTES.md`).
+
+**All-Rust, gated** (`n42_devnet_mobileanchor.json`, `glamsterdamTime` = `mobileAnchorTime` = 0):
+`mv4g`, recorded in `HEADER_FIELD_PARITY.md` section 7.1 -- 24-element headers, leader-root check
+120/120, device 20/20 on empty blocks. With transfers (`mv4f`) the sidecar drops every block with
+transactions (receipts root mismatch: gov5's re-execution runs Amsterdam rules, the Rust node does
+not), so the device certifies nothing but empty blocks.
+
+**Mixed, gated** (`mv4h2`, 2026-11-03, three Rust validators + the gov5 member from
+`test/mobileverify-device-genesis` fcd7aa4b, two senders at 2 tx/s): **the gov5 member never
+joins -- the two clients build different genesis blocks.** reth's genesis header has 21 elements
+(through `requestsHash`, hash `0x112489f0…`); gov5's has the same 21 plus `blockAccessListHash` =
+keccak(rlp([])) (`0x1dcc4de8…`) as element 22 and no slot (`0x9e8628a6…`, recomputed from reth's raw
+header). gov5 `internal/genesis_block.go` sets the BAL hash and a slot under `IsGlamsterdam` at
+genesis, although on native chains it never puts the BAL hash in a block above genesis (the Rust
+node's blocks carry an empty element 21, slot 22, root 23). gov5 logs `Peer status mismatch ...
+wrong fork digest version` every 10 s and sits at height 0 in view 1 (no error-level lines); the
+earlier `mv4h` had the same genesis hash. The predicted Amsterdam-execution divergence is
+therefore not reached by the gov5 node, only by its sidecar (packetd dropped all 83 blocks with
+transactions, as in `mv4f`). Consensus carried on with three Rust votes: 89 commits per validator
+over 118 views, 58 view timeouts (the gov5 member's views), EL errors 0; leader-root check 111/111
+(zero root on blocks 1-11, `0xcbc6f248…` from block 12). Device `certified 20/20` with
+`skipped=72`: every certified block is empty. Packet relay: all 28 empty-block packets came from
+the sidecar and reached validator 1; no transaction block had a packet anywhere; gov5 cached none.
+Whether a gov5 leader stamps a registry root is not observable until the genesis agrees.
+Two fixes are needed before a mixed gated round can pass: genesis parity for a chain whose
+`glamsterdamTime` is at genesis (one side must change; the Rust genesis builder adding the empty
+BAL hash, or gov5 dropping it on native chains) and the Amsterdam execution parity of workstream B.
+
+**Chain 94, mixed** (`c94-a`, 2026-11-03): genesis from `scripts/gov5-local-genesis.py`
+(chain 94's file with the devnet's four validators and Shanghai/Cancun at block 1, config only;
+see `crates/chainspec/res/genesis/gov5/README.md` for why the production fork schedule cannot run
+on a fresh fleet). Both clients built genesis `0xa2d2ff5d…`, chain 94's hash. 360 s, two senders
+(validators 0 and 1, funded by the block reward) at 2 tx/s after 40 s, 1,162 sent, 0 rejected.
+Result: **pass.** Heights 159 on both, all 160 hashes equal; gov5 sealed 40 blocks, error-level
+lines 0; Rust validators 159 commits, 0-2 view timeouts, EL errors 0. Headers carry neither slot
+nor root (16-element genesis, 20-element blocks; the gates open in 2026-07/2027 by timestamp, the
+local chain lives in 2023). Device `devices=2 blocks=20 skipped=0 failures=0 certified(all
+devices)=20/20`, signers 2 each, on blocks with transactions. Packets: the sidecar built all 159
+(one error line, block 0), and every block's packet was in validator 1's and gov5's caches,
+including the 40 gov5-led blocks. The gov5-led blocks carried no transactions (the senders
+submitted to reth's RPC; the Rust leaders sealed them first), so a gov5-built transaction block
+was not exercised.

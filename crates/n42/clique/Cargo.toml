@@ -14,15 +14,11 @@ n42-header.workspace = true
 reth-ethereum-primitives.workspace = true
 n42-clique-utils.workspace = true
 once_cell.workspace = true
-unexpected = "0.1"
 
-hash-db = "0.16.0"
 itertools.workspace = true
 derive_more.workspace = true
-lazy_static = "1.4"
 
 parking_lot.workspace = true
-tiny-keccak = "2.0"
 sled = "0.34.7"
 
 

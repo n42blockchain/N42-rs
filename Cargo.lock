@@ -4619,12 +4619,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d23bd4e7b5eda0d0f3a307e8b381fdc8ba9000f26fbe912250c0a4cc3956364a"
 
 [[package]]
-name = "hash-db"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e7d7786361d7425ae2fe4f9e407eb0efaa0840f5212d109cc018c40c35c6ab4"
-
-[[package]]
 name = "hashbag"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7131,11 +7125,9 @@ dependencies = [
  "criterion",
  "derive_more 2.1.1",
  "eyre",
- "hash-db 0.16.0",
  "hex",
  "itertools 0.14.0",
  "k256 0.13.4",
- "lazy_static",
  "n42-clique-utils",
  "n42-consensus-traits",
  "n42-header",
@@ -7159,10 +7151,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sled",
- "tiny-keccak",
  "tokio",
  "tracing",
- "unexpected",
 ]
 
 [[package]]
@@ -12723,7 +12713,7 @@ dependencies = [
  "arrayvec",
  "bytes",
  "derive_more 2.1.1",
- "hash-db 0.15.2",
+ "hash-db",
  "itertools 0.14.0",
  "nybbles",
  "plain_hasher",
@@ -15337,7 +15327,7 @@ version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1631b201eb031b563d2e85ca18ec8092508e262a3196ce9bd10a67ec87b9f5c"
 dependencies = [
- "hash-db 0.15.2",
+ "hash-db",
  "rlp",
 ]
 
@@ -15421,12 +15411,6 @@ name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
-
-[[package]]
-name = "unexpected"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9df4ce6bc62b0a38d1f2a7fb3888e4140a95a6db32809dbbeb376dbe2f9c7994"
 
 [[package]]
 name = "unicase"

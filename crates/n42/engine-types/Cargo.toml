@@ -81,6 +81,7 @@ eyre.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 tracing = "0.1.41"
@@ -104,7 +105,6 @@ tikv-jemallocator = { workspace = true, features = ["unprefixed_malloc_on_suppor
 libc.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 alloy-eip7928.workspace = true
-serde_json.workspace = true
 # `claimed_build`'s tests sign the transactions they check the claim of.
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
 secp256k1.workspace = true

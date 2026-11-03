@@ -1461,6 +1461,30 @@ fn say_once_a_second(last: &std::sync::atomic::AtomicU64) -> bool {
         && last.compare_exchange(seen, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_ok()
 }
 
+/// The trailing fields gov5's schedule puts on a header at its time
+/// (`docs/HEADER_FIELD_PARITY.md`): from Glamsterdam the slot number, equal to
+/// the block number; from MobileAnchor and Glamsterdam the registry root the
+/// leader named in its attributes, which is returned for the sealed
+/// [`n42_header::N42Header`]. The header is rebuilt here from the assembled
+/// block's fields one by one, so whatever the assembler stamped beyond them is
+/// set again rather than lost. A gated header without a named root is refused.
+fn stamp_gov5_tail(
+    genesis: &alloy_genesis::Genesis,
+    header: &mut alloy_consensus::Header,
+    named_root: Option<B256>,
+) -> Result<Option<B256>, PayloadBuilderError> {
+    let rules = crate::hotstuff_consensus::header_tail_rules(genesis, header.timestamp);
+    if rules.slot_number {
+        header.slot_number = Some(header.number);
+    }
+    crate::assembler::registry_root_for_header(rules.mobile_registry_root, named_root).ok_or_else(|| {
+        PayloadBuilderError::other(std::io::Error::other(format!(
+            "a header at {} carries mobileRegistryRoot, and the payload attributes named none",
+            header.timestamp
+        )))
+    })
+}
+
 /// Constructs an Ethereum transaction payload using the best transactions from the pool.
 ///
 /// Given build arguments including an Ethereum client, transaction pool,
@@ -2336,11 +2360,12 @@ where
             header.mix_hash = attributes.prev_randao;
             header.parent_beacon_block_root = attributes.parent_beacon_block_root;
             let block_number = header.number;
+            let registry_root = stamp_gov5_tail(chain_spec.genesis(), &mut header, attributes.mobile_registry_root)?;
             cons.seal(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
             seal_header_ms = (seal_at.elapsed().as_millis() as u64).saturating_sub(root_ms + fields_ms);
             let step_at = std::time::Instant::now();
             let body = alloy_consensus::BlockBody { transactions, ommers: Vec::new(), withdrawals };
-            let sealed_block = SealedBlock::seal_parts(n42_header::N42Header::from(header.clone()), body);
+            let sealed_block = SealedBlock::seal_parts(n42_header::N42Header::new(header.clone(), registry_root), body);
             let block_hash = SealedBlock::hash(&sealed_block);
             let recovered: Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>> =
                 Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(sealed_block, senders));
@@ -5614,6 +5639,7 @@ where
     header.parent_beacon_block_root = attributes.parent_beacon_block_root;
 
     let block_number = header.number;
+    let registry_root = stamp_gov5_tail(chain_spec.genesis(), &mut header, attributes.mobile_registry_root)?;
 
     // seal
     build_stage.at(5);
@@ -5623,7 +5649,7 @@ where
     // Keep the recovered senders: EthBuiltPayload now takes a RecoveredBlock, and
     // re-recovering them from signatures here would be pure waste.
     let senders = block.senders().to_vec();
-    let sealed_block = SealedBlock::seal_parts(n42_header::N42Header::from(header), block.into_block().body);
+    let sealed_block = SealedBlock::seal_parts(n42_header::N42Header::new(header, registry_root), block.into_block().body);
     let block_hash = SealedBlock::hash(&sealed_block);
     // Under the sealed hash, for the next header: the child's header is
     // assembled from and checked against exactly this.
@@ -6601,7 +6627,18 @@ mod includability_tests {
     /// The block built over `accounts` from `txs`, the first past the fork
     /// (deferred execution from `TIMESTAMP`) when `deferred`.
     fn build(deferred: bool, accounts: &[(Address, u64, U256)], txs: Vec<Candidate>) -> RecoveredBlock<n42_tx_types::Block> {
-        let spec = chain(deferred);
+        build_on(chain(deferred), None, None, accounts, txs)
+    }
+
+    /// [`build`] on `spec`, with the attributes naming `slot_number` and
+    /// `mobile_registry_root`.
+    fn build_on(
+        spec: Arc<ChainSpec>,
+        slot_number: Option<u64>,
+        mobile_registry_root: Option<B256>,
+        accounts: &[(Address, u64, U256)],
+        txs: Vec<Candidate>,
+    ) -> RecoveredBlock<n42_tx_types::Block> {
         let client = MockEthProvider::default().with_chain_spec((*spec).clone());
         for (address, nonce, balance) in accounts {
             client.add_account(*address, ExtendedAccount::new(*nonce, *balance));
@@ -6628,9 +6665,9 @@ mod includability_tests {
             suggested_fee_recipient: address(7),
             withdrawals: Some(Vec::new()),
             parent_beacon_block_root: Some(B256::ZERO),
-            slot_number: None,
+            slot_number,
             target_gas_limit: None,
-            mobile_registry_root: None,
+            mobile_registry_root,
         };
         let config = PayloadConfig {
             parent_header: Arc::new(SealedHeader::seal_slow(parent)),
@@ -6693,6 +6730,23 @@ mod includability_tests {
     }
 
     const RICH: U256 = U256::from_limbs([0, 1, 0, 0]);
+
+    /// gov5's MobileAnchor gate on a HotStuff chain (`glamsterdamTime` and
+    /// `mobileAnchorTime`, no reth Amsterdam): the leader's build carries the
+    /// slot number and the registry root its attributes named, so the header
+    /// it seals is the one the chain's members expect.
+    #[test]
+    fn a_gated_build_carries_the_slot_and_the_registry_root() {
+        let mut genesis = alloy_genesis::Genesis::default();
+        for key in [reth_chainspec::qmdb::GLAMSTERDAM_TIME_KEY, reth_chainspec::qmdb::MOBILE_ANCHOR_TIME_KEY] {
+            genesis.config.extra_fields.insert(key.to_owned(), serde_json::json!(0));
+        }
+        let spec = Arc::new(ChainSpecBuilder::mainnet().genesis(genesis).prague_activated().build());
+        let root = B256::repeat_byte(0x24);
+        let block = build_on(spec, Some(1_000_000_001), Some(root), &[], Vec::new());
+        assert_eq!(block.header().mobile_registry_root, Some(root), "the registry root");
+        assert_eq!(block.header().slot_number, Some(1_000_000_001), "the slot number");
+    }
 
     /// Thirty transfers of 60,000 gas limit that use 21,000 each: the gas
     /// used fits a 1,000,000 block, the gas limits do not.

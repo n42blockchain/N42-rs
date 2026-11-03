@@ -20,8 +20,8 @@ block timestamps are genesis + slot x period, so a local fleet from chain 94 run
 pre-Shanghai for its whole life, and gov5 pays the block reward that the Rust side
 can only express as withdrawals. `+1` puts Shanghai and Cancun on block 1 for both
 clients (gov5 reads `IsShanghaiAt(num, time)`, so the time alone is enough). Every
-timestamp fork (Pectra 2025, mobileAnchor 2026-07, Glamsterdam 2027) stays where the
-chain has it, i.e. beyond the local fleet's clock.
+timestamp fork (Pectra 2025, mobileAnchor 2026-07; chain 94 schedules no Glamsterdam)
+stays where the chain has it, i.e. beyond the local fleet's clock.
 """
 import argparse
 import json

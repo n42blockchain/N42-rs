@@ -390,17 +390,72 @@ mod header_field_gate_tests {
     }
 
     #[test]
-    fn chain_94_carries_the_root_from_its_glamsterdam() {
+    fn chain_94_never_carries_the_root_while_glamsterdam_is_unscheduled() {
+        // gov5 7529e2e9 unscheduled Glamsterdam on chain 94; MobileAnchor alone
+        // does not put the root in the header.
         let g: Genesis = serde_json::from_str(include_str!("../res/genesis/gov5/mainnet_qmdb_staggered.json"))
             .expect("chain 94 parses");
-        let glamsterdam = glamsterdam_time(&g).expect("chain 94 schedules glamsterdamTime");
-        assert!(mobile_anchor_time(&g).is_some_and(|t| t < glamsterdam));
-        assert!(!mobile_registry_root_in_header_at(&g, glamsterdam - 1));
-        assert!(mobile_registry_root_in_header_at(&g, glamsterdam));
+        assert_eq!(glamsterdam_time(&g), None);
+        let anchor = mobile_anchor_time(&g).expect("chain 94 schedules mobileAnchorTime");
+        assert!(!glamsterdam_active_at(&g, u64::MAX));
+        assert!(!mobile_registry_root_in_header_at(&g, anchor));
+        assert!(!mobile_registry_root_in_header_at(&g, u64::MAX));
         // The native devnet schedules neither.
         let devnet: Genesis = serde_json::from_str(include_str!("../res/genesis/n42_devnet.json")).expect("parses");
         assert_eq!(glamsterdam_time(&devnet), None);
         assert_eq!(mobile_anchor_time(&devnet), None);
+    }
+}
+
+#[cfg(test)]
+mod glamsterdam_genesis_tests {
+    use alloy_genesis::Genesis;
+    use alloy_primitives::b256;
+    use alloy_rlp::Encodable;
+
+    fn spec(json: &str) -> crate::ChainSpec {
+        crate::ChainSpec::from_genesis(serde_json::from_str::<Genesis>(json).expect("a bundled genesis parses"))
+    }
+
+    /// gov5's genesis for a chain whose `glamsterdamTime` is at genesis carries
+    /// the empty block-access-list hash and no slot number: 22 elements, hash
+    /// measured from gov5's `n42 init` (audit-notes/devnet/mv4h2).
+    #[test]
+    fn a_glamsterdam_genesis_matches_gov5() {
+        let spec = spec(include_str!("../res/genesis/n42_devnet_mobileanchor.json"));
+        let header = spec.genesis_header();
+        assert_eq!(header.block_access_list_hash, Some(alloy_eips::eip7928::EMPTY_BLOCK_ACCESS_LIST_HASH));
+        assert_eq!(header.slot_number, None);
+        let mut rlp = Vec::new();
+        header.encode(&mut rlp);
+        let mut buf = rlp.as_slice();
+        let list = alloy_rlp::Header::decode(&mut buf).expect("a list");
+        assert!(list.list);
+        let mut elements = 0;
+        while !buf.is_empty() {
+            let item = alloy_rlp::Header::decode(&mut buf).expect("an element");
+            buf = &buf[item.payload_length..];
+            elements += 1;
+        }
+        assert_eq!(elements, 22, "gov5's 21 elements plus the empty BAL hash, no slot");
+        assert_eq!(
+            spec.genesis_hash(),
+            b256!("0x9e8628a6dae0ce078dbd21b2e0d91c3f4389272aa597efae3a499b5ac62ffc95")
+        );
+    }
+
+    #[test]
+    fn chains_without_glamsterdam_at_genesis_keep_their_hashes() {
+        assert_eq!(
+            spec(include_str!("../res/genesis/n42_devnet.json")).genesis_hash(),
+            b256!("0x112489f0dd526cd9dcf3bd9352f723a66182b41cc93f33615175828e5e16ae60")
+        );
+        let chain94 = spec(include_str!("../res/genesis/gov5/mainnet_qmdb_staggered.json"));
+        assert_eq!(chain94.genesis_header().block_access_list_hash, None);
+        assert_eq!(
+            chain94.genesis_hash(),
+            b256!("0xa2d2ff5d814552bb9a113b68ad7ed2b824fbb52caed42dbe573068845b57be99")
+        );
     }
 }
 

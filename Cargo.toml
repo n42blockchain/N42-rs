@@ -793,6 +793,3 @@ alloy-rpc-types-beacon = { path = "./crates/n42/alloy-rpc-types-beacon" }
 # jsonrpsee-http-client = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 # jsonrpsee-types = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 
-
-[patch."https://github.com/paradigmxyz/revmc"]
-revmc-builtins = { path = "vendor/dependency-repairs/revmc-builtins-0.1.0" }

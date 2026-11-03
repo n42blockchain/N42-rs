@@ -168,15 +168,5 @@
     "modified_files": [
       "Cargo.toml"
     ]
-  },
-  {
-    "package": "revmc-builtins",
-    "version": "0.1.0",
-    "source": "git+https://github.com/paradigmxyz/revmc?branch=main#5fba0216ed6bb3c73c4ce214b58c8e434a948e98",
-    "path": "vendor/dependency-repairs/revmc-builtins-0.1.0",
-    "upstream_manifest_sha256": "6ea1c9ce68766e24dfffbbc33d29ae6cbf5d7f166b551258232fa80471d67239",
-    "modified_files": [
-      "Cargo.toml"
-    ]
   }
 ]

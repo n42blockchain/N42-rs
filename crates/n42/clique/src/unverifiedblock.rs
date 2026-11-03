@@ -27,6 +27,7 @@ pub struct UnverifiedBlock {
     /// The sealed block to verify.
     pub blockbody: SealedBlock,
     /// Cached reads of the block's execution, so a verifier can re-execute it cheaply.
+    #[serde(with = "crate::cached_reads_serde")]
     pub db: CachedReads,
     /// Total difficulty of the chain at this block.
     pub td: U256,

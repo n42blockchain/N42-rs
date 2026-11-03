@@ -50,6 +50,8 @@ tracing.workspace = true
 
 #reth
 reth-evm.workspace = true
+# evm2 types inside `CachedReads`, serialised by `cached_reads_serde`.
+evm2 = { workspace = true, features = ["std", "serde"] }
 reth-execution-types.workspace = true
 reth-node-api.workspace = true
 #reth-rpc.workspace = true

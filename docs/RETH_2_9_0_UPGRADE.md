@@ -215,3 +215,31 @@ Decisions, as briefed:
   `plan_ahead_body_wanted()` read false without the feature; the payload builder's parallel step,
   the plan-ahead body and warm-ahead hooks and the follower's parallel / build-path execution are
   gated at their call sites, so the stock evm2 executor runs everything.
+- **Payload builder on evm2** (9f77dd0cb). The block executor's `finish` returns
+  `BlockExecutionOutput { result, state }` with the bundle already merged, so the early-seal path
+  drops its own `merge_transitions`. Refused nonces are classified by downcasting
+  `InvalidTxError::as_any()` to evm2's `HandlerError::InvalidNonce { expected, got }`
+  (reth's `EthInvalidTxError` exposes it that way): `got < expected` is "too low" (skipped, the
+  queue told), `got > expected` "too high". `execute_transaction` returns a `GasOutput`; the
+  builder counts `tx_gas_used()`. Account reads in the stale check and the includability check go
+  through `Evm::account_info` and the parent's `AccountReader`. The builder's `CachedReads`
+  prefetch (`N42_BUILDER_PREFETCH`) wrote revm's cache directly and is legacy-only for now.
+- **Output shards** (3cfd00ae7). The frozen output, its merges and its view are bundle-state code
+  and build everywhere; the two `take_cached` commits and `into_staged` write revm's `State`
+  cache and build only with `legacy-revm-paths`.
+- **Intrinsic gas** (3cfd00ae7). `frame_scan` prices a transaction with evm2's
+  `intrinsic_and_floor_gas` plus EIP-7702's per-authorization charge, the rule reth's
+  `EvmTransactionValidationGasRules` and evm2's handlers apply. evm2 charges no state gas at the
+  intrinsic phase (EIP-2780 moved it to runtime), so the shortfall is
+  `max(intrinsic, floor) - gas_limit`. Without a known sender a call is priced as one to another
+  account, as before.
+- **Dependency repairs** (d12c2e574, 076c682e9). revmc-builtins (evm2-jit replaced revmc) and the
+  stale revm-inspectors 0.44.1 lockfile are gone. The traceCall beneficiary-prestate repair moved
+  to a vendored `evm2-inspectors` at the pinned evm2 revision (patched in through
+  `[patch."https://github.com/alloy-rs/evm2"]`): evm2's default prestate lists only the accounts
+  in the pending state, the same omission. Unlike the revm-era repair, an empty beneficiary is
+  left out, the rule evm2 (and current Geth) applies to every account.
+- **`reth-rpc-types-compat` dropped** (b5f643721). It carried no N42 delta and re-exported
+  alloy-evm's revm-era RPC env types; node-core, `bin/n42` and `bin/reth` re-export
+  `reth-rpc-convert` as upstream does. `crates/n42/reth-rpc` (not a member, disabled since
+  v1.9.3) is left as it is.

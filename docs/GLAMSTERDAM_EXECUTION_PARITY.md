@@ -106,6 +106,14 @@ Fix side, a decision:
 
 The A1 mixed round on `n42_devnet_mobileanchor.json` cannot pass before this is decided.
 
+**Decided 2026-11-03: (a).** gov5 branch `fix/native-no-eip8282` (3d25f36d) adds
+`ChainConfig.UsesEIP8282BuilderRequests(time)` (Glamsterdam and not N42 native, the
+twin of `UsesEIP7928AccessList`), consulted by the system-contract registry that the
+block start and end hooks resolve, so the miner and every import path skip the calls on
+native chains. `TestProcessPragueSystemCallsAmsterdamBuilderContractsOnlyOffNative`: a
+native Amsterdam block without the contracts is valid, a non-native one is still
+refused. No Rust change: the Rust node never ran them on a native chain.
+
 **G2 — chain-94 schedule (finding).** gov5 `7529e2e9` (2026-10-29, "unschedule
 Glamsterdam on the staggered chains") removed `glamsterdamTime` from
 `mainnet_qmdb_staggered.json`; it is on gov5 main. The Rust copy
@@ -182,7 +190,25 @@ not an N42 feature crate. It is left as a known difference: the pool is stricter
     and compares by value every receipt's status, gas, cumulative gas and logs, the
     header gas used, the gov5 receipts root, and the touched accounts' balance, nonce,
     code and slot 0.
-- **Field oracle (workstream A):**
-  - the gated devnet with transfers: packetd's re-execution receipts root must equal the
-    header's (mv4f);
-  - the mixed round A1, which first needs G1 decided.
+- **Import gas check** (`hotstuff_consensus.rs`,
+  `post_execution_takes_the_header_gas_from_the_result_not_the_receipts`): the header's
+  gas used is compared with the execution result (the executor's max(regular, state) under
+  revm's Amsterdam), never with the last receipt's cumulative gas, so a block whose header
+  gas is below its receipts' (749,700 against 994,536 in the fixture) is accepted with
+  reth's Amsterdam off; under deferred execution the remembered value is the same result
+  field.
+- **Field oracle, all-Rust gated round with transfers (`mv4b2`, 2026-11-03,**
+  **`audit-notes/devnet/mv4b2/`)**: `n42_devnet_mobileanchor.json`, four Rust validators
+  from `feat/glamsterdam-execution` 773c11e60 (debug), two `send_tx` senders at 2 tx/s
+  (1,322 sent, 0 rejected), 360 s. 120 commits on every validator, 0 view timeouts, EL
+  errors 0; leader-root check 120/120. **packetd built a packet for all 120 blocks, 110 of
+  them with transactions** (the mv4f round, before B1, dropped every transaction
+  block on the receipts root); device `certified 20/20`, `skipped=0`, on blocks 17-36 of
+  12 transactions each. The transfers went to existing accounts (21,000 gas each, no state
+  gas), so this round does not show a header gas below the receipts' -- the fixture and
+  the unit test above cover that.
+  The first attempt `mv4b1` ran without `examples/h2_keygen` in the debug directory and
+  never started the fleet.
+- **Mixed round A1:** rerun by workstream A with gov5 `test/mobileverify-device-genesis`
+  plus `fix/native-no-eip8282` (local `integ/mvdev-native-no-eip8282`,
+  `/data/n42-build/gov5-wt-mvdev8282`) and A's binaries carrying A3.

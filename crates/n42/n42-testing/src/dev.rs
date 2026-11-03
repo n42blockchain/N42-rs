@@ -12,7 +12,7 @@ use reth_node_builder::node::NodeTypes;
 use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_primitives_traits::{NodePrimitives, SealedHeader};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt};
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 #[cfg(test)]
 use crate::{snapshot_test_utils::TesterAccountPool, utils::n42_payload_attributes};

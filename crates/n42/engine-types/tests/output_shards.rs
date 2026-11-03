@@ -6,6 +6,9 @@
 //! the crate's public surface only, as the builder uses it.
 #![allow(missing_docs, unreachable_pub, unused_crate_dependencies)]
 
+#![cfg(feature = "legacy-revm-paths")]
+// The parallel step and the fast transfer these exercise are revm-era
+// (`legacy-revm-paths`, docs/RETH_2_9_0_UPGRADE.md port log).
 use alloy_primitives::{Address, U256};
 use n42_engine_types::output_shards::{
     any_destroyed, hashed_post_state_of, live_index_defer, output_shards, FrozenShards, LiveLockCounts, OutputShards,

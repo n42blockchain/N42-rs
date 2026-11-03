@@ -8,6 +8,9 @@
 //! `taskset -c 0-15 cargo test --release -p n42-engine-types --test output_shards_bench -- --ignored --nocapture`
 #![allow(missing_docs, unreachable_pub, unused_crate_dependencies)]
 
+#![cfg(feature = "legacy-revm-paths")]
+// The parallel step and the fast transfer these exercise are revm-era
+// (`legacy-revm-paths`, docs/RETH_2_9_0_UPGRADE.md port log).
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, U256};

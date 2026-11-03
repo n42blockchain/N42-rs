@@ -1,0 +1,303 @@
+{
+  "comment": "gov5 serial execution of one block on the n42-rs gated devnet genesis (chain 1143, glamsterdamTime 0); written by TestGlamsterdamNativeExecutionFixture",
+  "genesis": "n42_devnet_mobileanchor.json",
+  "number": 1,
+  "timestamp": 1000,
+  "gasLimit": 30000000,
+  "baseFee": 7,
+  "coinbase": "0xCB00000000000000000000000000000000000001",
+  "slotNumber": 1,
+  "pre": [
+    {
+      "address": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+      "balance": "0x3635c9adc5dea00000",
+      "nonce": 0,
+      "code": "0x"
+    },
+    {
+      "address": "0x1563915e194D8CfBA1943570603F7606A3115508",
+      "balance": "0x3635c9adc5dea00000",
+      "nonce": 0,
+      "code": "0x"
+    },
+    {
+      "address": "0xeE00000000000000000000000000000000000001",
+      "balance": "0x1",
+      "nonce": 0,
+      "code": "0x"
+    },
+    {
+      "address": "0xCB00000000000000000000000000000000000001",
+      "balance": "0x1",
+      "nonce": 0,
+      "code": "0x"
+    },
+    {
+      "address": "0xC000000000000000000000000000000000000001",
+      "balance": "0x0",
+      "nonce": 1,
+      "code": "0x3460005500"
+    },
+    {
+      "address": "0xc000000000000000000000000000000000000002",
+      "balance": "0x0",
+      "nonce": 1,
+      "code": "0x60006000600060003473f2000000000000000000000000000000000000015af15000"
+    },
+    {
+      "address": "0xC000000000000000000000000000000000000003",
+      "balance": "0x0",
+      "nonce": 1,
+      "code": "0x602a600052600160206000a100"
+    },
+    {
+      "address": "0xC000000000000000000000000000000000000004",
+      "balance": "0x0",
+      "nonce": 1,
+      "code": "0x4b60005500"
+    }
+  ],
+  "transactions": [
+    "0x02f86c82047780026482520894ee00000000000000000000000000000000000001880de0b6b3a764000080c080a0e1d4f1bfb4e82f5d1dca3eff7d566ab5885d8f8ad8a9ff834328e0cf95d2d6bda06137445649b2c2caec04f2a96b74550ee71ebaca4dfe3241d83af51a84fe1a81",
+    "0x02f8658204770102648303345094f1000000000000000000000000000000000000010180c001a013fd8079d02204342961104dda6c9bc41f11fc1dcbfba4cbee6d880cd5cde505a04c08af2c453f1fa44e236d0eff450072c45ac8917d1f8501e5bd14d820c0d750",
+    "0x02f864820477020264823a9894ee000000000000000000000000000000000000018080c001a077a5587389948238cd8a1dbf47924193e5a519e39d36d8b85c364596ad043f8ea00df2b4c1247107257ac909b37de01668dc9e8d7b18c727cbf65f1c241b8271cd",
+    "0x02f864820477030264822ee09419e7e376e7c213b7e7e7e46cc70a5dd086daff2a0580c001a0e8d62d4ab120041b64304e1c35e876b08edf54b4ffc2953fef7c12171d76ac54a0592fa9203ee431547583ae809f1e17d73a9efdf4dc459c0c937904d04ff5f819",
+    "0x02f86582047704026483030d4094c0000000000000000000000000000000000000010580c080a0bd4af4e32b1e5e004b119fe2845cabe22aeacdb399904ad33ad5f86e9e31e12fa00f15e7f336dc176531ebc297a1f2719bb2b90971b62705bd220c0ae1c29ff8a2",
+    "0x02f865820477050264830493e094c0000000000000000000000000000000000000020980c001a05fabcf867c8e2c6ce54ecd98fb851fa20d2fce22e84a7f614148778f5049c0f3a0317edd90f45c4a01b58409b6625ec1108d31ce81f956fc5b87714c874854ab03",
+    "0x02f865820477060264830186a094c0000000000000000000000000000000000000038080c001a0087e9e999bf2ad18ed4bfa15b3d5679a080ae8ec43149526e89ed4ced97c8381a07ca9bbbc7e5c5a3494b50e75d930ecbcd306d6c310c95521b2d8ea339808e364",
+    "0x02f85c820477070264830493e080078b6160006000526002601ef3c080a0134a3ad3d6098564a324077c1c49511191c2b3fc1f79786f58dc373293d59c4aa0181e229e82a64473a3319bbaeb4cc7d268e1a507389b3ff5823ca885827ae565",
+    "0x02f86582047780026483030d4094c0000000000000000000000000000000000000048080c001a0863a39a48e9bd153a2722cd968643738f1c4268a4e5bc7c36969816427520664a03909a304f46ede0dda15563512ffe84bb2ac25d1f61448d8c451b2819582134c",
+    "0x02f86482047701026482520894f3000000000000000000000000000000000000010380c001a046e4521dd87d71c951d1795ba35f4b89650bd5181264ba4a8bc486d37ac6bef3a0747d0c01cb0316551c1e28b2fdd21a144fe271bbdae9866018f30d921c5b86d1",
+    "0x02f8c982047702026482753094ee0000000000000000000000000000000000000180b864ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababc001a0a4093363585b8e18d73de3b57503b030a9a219472be2fd0d1a8bbc09d781d44ea022643637c3d36db2dc463878841cd6fd44914918f89f2fddf77fa5014f832a29"
+  ],
+  "receipts": [
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 21000,
+      "cumulativeGasUsed": 21000,
+      "logs": [
+        {
+          "address": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+          "topics": [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x00000000000000000000000019e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+            "0x000000000000000000000000ee00000000000000000000000000000000000001"
+          ],
+          "data": "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000"
+        }
+      ]
+    },
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 204600,
+      "cumulativeGasUsed": 225600,
+      "logs": [
+        {
+          "address": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+          "topics": [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x00000000000000000000000019e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+            "0x000000000000000000000000f100000000000000000000000000000000000001"
+          ],
+          "data": "0x0000000000000000000000000000000000000000000000000000000000000001"
+        }
+      ]
+    },
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 15000,
+      "cumulativeGasUsed": 240600,
+      "logs": []
+    },
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 12000,
+      "cumulativeGasUsed": 252600,
+      "logs": []
+    },
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 131025,
+      "cumulativeGasUsed": 383625,
+      "logs": [
+        {
+          "address": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+          "topics": [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x00000000000000000000000019e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+            "0x000000000000000000000000c000000000000000000000000000000000000001"
+          ],
+          "data": "0x0000000000000000000000000000000000000000000000000000000000000005"
+        }
+      ]
+    },
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 216621,
+      "cumulativeGasUsed": 600246,
+      "logs": [
+        {
+          "address": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+          "topics": [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x00000000000000000000000019e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+            "0x000000000000000000000000c000000000000000000000000000000000000002"
+          ],
+          "data": "0x0000000000000000000000000000000000000000000000000000000000000009"
+        },
+        {
+          "address": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+          "topics": [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x000000000000000000000000c000000000000000000000000000000000000002",
+            "0x000000000000000000000000f200000000000000000000000000000000000001"
+          ],
+          "data": "0x0000000000000000000000000000000000000000000000000000000000000009"
+        }
+      ]
+    },
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 16027,
+      "cumulativeGasUsed": 616273,
+      "logs": [
+        {
+          "address": "0xC000000000000000000000000000000000000003",
+          "topics": [
+            "0x0000000000000000000000000000000000000000000000000000000000000001"
+          ],
+          "data": "0x000000000000000000000000000000000000000000000000000000000000002a"
+        }
+      ]
+    },
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 210838,
+      "cumulativeGasUsed": 827111,
+      "logs": [
+        {
+          "address": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+          "topics": [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x00000000000000000000000019e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+            "0x0000000000000000000000002ce636d6240f8955d085a896e12429f8b3c7db26"
+          ],
+          "data": "0x0000000000000000000000000000000000000000000000000000000000000007"
+        }
+      ]
+    },
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 125025,
+      "cumulativeGasUsed": 952136,
+      "logs": []
+    },
+    {
+      "type": 2,
+      "status": 0,
+      "gasUsed": 21000,
+      "cumulativeGasUsed": 973136,
+      "logs": []
+    },
+    {
+      "type": 2,
+      "status": 1,
+      "gasUsed": 21400,
+      "cumulativeGasUsed": 994536,
+      "logs": []
+    }
+  ],
+  "gasUsed": 749700,
+  "receiptsCumulativeGasUsed": 994536,
+  "receiptsRoot": "0xb18a8dbc2ba0d2c64bc917a8491184b3ff3e8331835f723b2f10a90262a99ce8",
+  "post": [
+    {
+      "address": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+      "balance": "0x3627e8f71236ca69cb",
+      "nonce": 8,
+      "code": "0x"
+    },
+    {
+      "address": "0x1563915e194D8CfBA1943570603F7606A3115508",
+      "balance": "0x3635c9adc5de8901f7",
+      "nonce": 3,
+      "code": "0x"
+    },
+    {
+      "address": "0xeE00000000000000000000000000000000000001",
+      "balance": "0xde0b6b3a7640001",
+      "nonce": 0,
+      "code": "0x"
+    },
+    {
+      "address": "0xCB00000000000000000000000000000000000001",
+      "balance": "0x1e59d1",
+      "nonce": 0,
+      "code": "0x"
+    },
+    {
+      "address": "0xF100000000000000000000000000000000000001",
+      "balance": "0x1",
+      "nonce": 0,
+      "code": "0x"
+    },
+    {
+      "address": "0xF200000000000000000000000000000000000001",
+      "balance": "0x9",
+      "nonce": 0,
+      "code": "0x"
+    },
+    {
+      "address": "0xf300000000000000000000000000000000000001",
+      "balance": "absent",
+      "nonce": 0,
+      "code": ""
+    },
+    {
+      "address": "0xC000000000000000000000000000000000000001",
+      "balance": "0x5",
+      "nonce": 1,
+      "code": "0x3460005500",
+      "storage": {
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x5"
+      }
+    },
+    {
+      "address": "0xc000000000000000000000000000000000000002",
+      "balance": "0x0",
+      "nonce": 1,
+      "code": "0x60006000600060003473f2000000000000000000000000000000000000015af15000"
+    },
+    {
+      "address": "0xC000000000000000000000000000000000000003",
+      "balance": "0x0",
+      "nonce": 1,
+      "code": "0x602a600052600160206000a100"
+    },
+    {
+      "address": "0xC000000000000000000000000000000000000004",
+      "balance": "0x0",
+      "nonce": 1,
+      "code": "0x4b60005500",
+      "storage": {
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x1"
+      }
+    },
+    {
+      "address": "0x2Ce636d6240f8955d085a896e12429f8B3c7db26",
+      "balance": "0x7",
+      "nonce": 1,
+      "code": "0x6000"
+    }
+  ],
+  "postWatchSlot": "0x0000000000000000000000000000000000000000000000000000000000000000"
+}

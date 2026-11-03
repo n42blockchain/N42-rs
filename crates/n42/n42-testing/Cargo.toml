@@ -53,7 +53,7 @@ reth-node-ethereum.workspace = true
 eyre.workspace = true
 
 secp256k1  = { workspace = true, features = ["recovery"] }
-zerocopy = "0.7.35"
+zerocopy = "0.8"
 hex = "0.4"
 tiny-keccak = "2.0"
 

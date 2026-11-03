@@ -17,21 +17,15 @@ once_cell.workspace = true
 unexpected = "0.1"
 
 hash-db = "0.16.0"
-keccak-hash = "0.10.0"
 itertools.workspace = true
 derive_more.workspace = true
 lazy_static = "1.4"
 
 parking_lot.workspace = true
-primitive-types = "0.3.0"
-hex-literal = "0.3"
-num-bigint = "0.4"
 tiny-keccak = "2.0"
-uint = "0.9"
 sled = "0.34.7"
 
 
-rlp = "0.4"
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
 alloy-genesis.workspace = true
@@ -43,7 +37,6 @@ rand.workspace = true
 blst.workspace = true
 secp256k1  = { workspace = true, features = ["recovery"] }
 sha2.workspace = true
-sha3 = "0.10.5"
 # n42
 n42-primitives.workspace = true
 n42-consensus-traits.workspace = true

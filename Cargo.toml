@@ -458,7 +458,7 @@ op-alloy-flz = { version = "0.13.1", default-features = false }
 hex = "0.4"
 sled = "0.34"
 educe = "0.8.1"
-ethereum_hashing = "0.7.0"
+ethereum_hashing = "0.8.0"
 integer-sqrt = "0.1.5"
 aquamarine = "0.6"
 arrayvec = { version = "0.7.6", default-features = false }
@@ -722,7 +722,6 @@ proptest-arbitrary-interop = { path = "vendor/dependency-repairs/proptest-arbitr
 pprof_util = { path = "vendor/dependency-repairs/pprof_util-0.8.2" }
 
 # Narrow upstream dependency repairs; provenance is recorded in vendor/dependency-repairs.
-alloy-primitives_0_8_26 = { package = "alloy-primitives", path = "vendor/dependency-repairs/alloy-primitives-0.8.26" }
 alloy-primitives_1_7_3 = { package = "alloy-primitives", path = "vendor/dependency-repairs/alloy-primitives-1.7.3" }
 aquamarine_0_6_0 = { package = "aquamarine", path = "vendor/dependency-repairs/aquamarine-0.6.0" }
 ark-ff_0_3_0 = { package = "ark-ff", path = "vendor/dependency-repairs/ark-ff-0.3.0" }

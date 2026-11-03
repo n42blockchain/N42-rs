@@ -21,7 +21,7 @@ use reth_storage_api::{
     StorageChangeSetReader, StorageSettingsCache,
 };
 use reth_trie::{updates::TrieUpdatesSorted, HashedPostStateSorted, TrieInputSorted};
-use reth_trie_common::bundle_state::BundleState;
+use reth_trie_common::bundle_state::{BundleAccount, BundleState};
 use reth_trie_db::DatabaseHashedPostState;
 use std::{
     ops::RangeInclusive,
@@ -151,7 +151,7 @@ impl ExecutionOverlay {
             return Some(account.clone())
         }
         self.layers.0.iter().find_map(|layer| {
-            layer.account(address).map(|account| Self::normalized_account_info(account.info.clone()))
+            layer.account(address).map(|account| account.info.clone())
         })
     }
 

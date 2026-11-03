@@ -142,13 +142,23 @@ def main():
     items_seen = set()
     prev = object()
     for n in range(a.start, to + 1):
-        raw = bytes.fromhex(rpc(a.rpc, "debug_getRawHeader", [hex(n)])[2:])
-        h = rlp_list(raw)
-        items_seen.add(len(h))
-        coinbase = "0x" + h[2].hex()
-        ts = int.from_bytes(h[11], "big")
-        slot = int.from_bytes(h[22], "big") if len(h) > 22 else None
-        root = ("0x" + h[23].hex()) if len(h) > 23 else None
+        try:
+            raw = bytes.fromhex(rpc(a.rpc, "debug_getRawHeader", [hex(n)])[2:])
+            h = rlp_list(raw)
+            items_seen.add(len(h))
+            coinbase = "0x" + h[2].hex()
+            ts = int.from_bytes(h[11], "big")
+            slot = int.from_bytes(h[22], "big") if len(h) > 22 else None
+            root = ("0x" + h[23].hex()) if len(h) > 23 else None
+        except RuntimeError:
+            # gov5 serves no debug_getRawHeader: read its JSON header fields instead.
+            b = rpc(a.rpc, "eth_getBlockByNumber", [hex(n), False])
+            items_seen.add("json")
+            coinbase = b["miner"].lower()
+            ts = int(b["timestamp"], 16)
+            slot = int(b["slotNumber"], 16) if b.get("slotNumber") else None
+            root = b.get("mobileRegistryRoot")
+            root = root.lower() if root else None
         cls = "none" if root is None else "zero" if root == ZERO else "committed" if root in rust_roots else "other"
         stats[cls] += 1
         if root != prev:
@@ -177,7 +187,7 @@ def main():
         else:
             mismatch += 1
             print(f"MISMATCH block {n} leader v{leader} root {root} expected {expect}")
-    print(f"blocks {a.start}..{to}: items={sorted(items_seen)} stats={stats}")
+    print(f"blocks {a.start}..{to}: items={sorted(items_seen, key=str)} stats={stats}")
     print(f"leader-root check: ok={ok} mismatch={mismatch} not-a-rust-leader={foreign} {foreign_classes}")
     return 1 if mismatch else 0
 

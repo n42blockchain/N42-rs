@@ -31,6 +31,8 @@
 #   DEVICE [$N42_GOV5/build/mobileverify-device]  DEVICE_ARGS [-genesis $DEVNET_GENESIS]
 #   EVIDENCE_ROOT [/data/n42-build/audit-notes/devnet]
 #   TX_KEYS / TX_TO: senders' keys and recipients [anvil accounts 4,5 -> 6,7]
+#   TX_DELAY [0]: seconds before the senders start (a chain whose senders are funded
+#     only by the block reward)
 #   NO_BOX_GATE=1 skips the claim (only when the caller already holds the box)
 set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -99,13 +101,16 @@ done
 if [ -n "$WITH_GOV5" ]; then
   say "gov5 init: $(/usr/bin/grep -a 'genesis' "$F/gov5-init-$TAG.log" | tail -1 | cut -c1-200)"
   say "genesis: reth=$(j -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x0",false]}' http://127.0.0.1:18545 | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["hash"])' 2>/dev/null) gov5=$(j -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x0",false]}' http://127.0.0.1:28545 | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["hash"])' 2>/dev/null)"
+  # A member on another genesis never peers ("wrong fork digest version"): say so loudly.
+  tail -1 "$LOG" | awk '{split($4,a,"=");split($5,b,"=");if(a[2]!=b[2])print "GENESIS MISMATCH: the gov5 member cannot join"}' | tee -a "$LOG"
 fi
 
 if [ -n "$TXLOAD" ]; then
-  say "tx load: two senders at 2 tx/s"
+  say "tx load: two senders at 2 tx/s after ${TX_DELAY:-0} s"
+  sleep "${TX_DELAY:-0}"
   for k in 0 1; do
     "$BIN/examples/send_tx" --rpc http://127.0.0.1:18545 --key "${KEYS[$k]}" --to "${TOS[$k]}" \
-      --chain-id "$CHAIN_ID" --rate 2 --seconds $((SECS - 30)) >> "$EV/send_tx.out" 2>&1 &
+      --chain-id "$CHAIN_ID" --rate 2 --seconds $((SECS - 30 - ${TX_DELAY:-0})) >> "$EV/send_tx.out" 2>&1 &
   done
 fi
 

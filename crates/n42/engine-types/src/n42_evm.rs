@@ -67,6 +67,10 @@ pub struct N42EvmConfig<C = ChainSpec, EvmF = crate::fast_transfer::N42EvmFactor
     pub sender_recovery_cache: Option<SenderRecoveryCache>,
     /// Whether the chain is a HotStuff chain, read from its genesis once.
     hotstuff: std::sync::OnceLock<bool>,
+    /// From when blocks execute under the Amsterdam rules on this native
+    /// chain (gov5's `glamsterdamTime`), read from its genesis once; `None`
+    /// on a chain that never does ([`glamsterdam_execution_time`]).
+    glamsterdam_execution: std::sync::OnceLock<Option<u64>>,
 }
 
 impl<C, EvmF> N42EvmConfig<C, EvmF> {
@@ -77,6 +81,7 @@ impl<C, EvmF> N42EvmConfig<C, EvmF> {
             sender_recovery_cache: None,
             executor_factory: EthBlockExecutorFactory::new(N42ReceiptBuilder, chain_spec, evm_factory),
             hotstuff: std::sync::OnceLock::new(),
+            glamsterdam_execution: std::sync::OnceLock::new(),
         }
     }
 
@@ -137,6 +142,31 @@ impl<C, EvmF> N42EvmConfig<C, EvmF> {
             .get_or_init(|| n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(self.chain_spec().genesis()).is_ok())
     }
 
+    /// Whether a block at `timestamp` executes under the Amsterdam rules
+    /// although the chain spec does not schedule reth's Amsterdam: an
+    /// N42-native chain past gov5's `glamsterdamTime`
+    /// ([`reth_chainspec::qmdb::glamsterdam_execution_active_at`]).
+    pub fn glamsterdam_execution_active_at(&self, timestamp: u64) -> bool
+    where
+        C: EthChainSpec,
+    {
+        self.glamsterdam_execution
+            .get_or_init(|| glamsterdam_execution_time(self.chain_spec().genesis()))
+            .is_some_and(|at| timestamp >= at)
+    }
+
+    /// Raises `cfg` to [`SpecId::AMSTERDAM`] (with its gas table, EIP-8037
+    /// and EIP-2780) for a block at `timestamp` that executes under gov5's
+    /// Amsterdam rules; leaves every other block's configuration as it is.
+    fn apply_glamsterdam_execution(&self, cfg: &mut CfgEnv<SpecId>, timestamp: u64)
+    where
+        C: EthChainSpec,
+    {
+        if self.glamsterdam_execution_active_at(timestamp) && !cfg.spec.is_enabled_in(SpecId::AMSTERDAM) {
+            glamsterdam_execution_cfg(cfg);
+        }
+    }
+
     /// Uses `cache` for sender recovery on import.
     pub fn with_sender_recovery_cache(mut self, cache: SenderRecoveryCache) -> Self {
         self.sender_recovery_cache = Some(cache);
@@ -181,11 +211,12 @@ where
             self.chain_spec().blob_params_at_timestamp(header.timestamp),
         );
         env.block_env.beneficiary = self.block_beneficiary(header);
+        self.apply_glamsterdam_execution(&mut env.cfg_env, header.timestamp);
         Ok(env)
     }
 
     fn next_evm_env(&self, parent: &Header, attributes: &NextBlockEnvAttributes) -> Result<EvmEnv, Self::Error> {
-        Ok(EvmEnv::for_eth_next_block(
+        let mut env = EvmEnv::for_eth_next_block(
             parent,
             NextEvmEnvAttributes {
                 timestamp: attributes.timestamp,
@@ -198,7 +229,16 @@ where
             self.chain_spec(),
             self.chain_spec().chain().id(),
             self.chain_spec().blob_params_at_timestamp(attributes.timestamp),
-        ))
+        );
+        self.apply_glamsterdam_execution(&mut env.cfg_env, attributes.timestamp);
+        // EIP-7843: on a native chain the header's slot number is its block
+        // number (`docs/HEADER_FIELD_PARITY.md` section 4), stamped after the
+        // build; SLOTNUM in the build reads the same value the header, and so
+        // every importer, will carry.
+        if attributes.slot_number.is_none() && self.glamsterdam_execution_active_at(attributes.timestamp) {
+            env.block_env.slot_num = parent.number.saturating_add(1);
+        }
+        Ok(env)
     }
 
     fn context_for_block<'a>(
@@ -268,6 +308,7 @@ where
         if self.chain_spec().is_osaka_active_at_timestamp(timestamp) {
             cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
         }
+        self.apply_glamsterdam_execution(&mut cfg_env, timestamp);
 
         let blob_excess_gas_and_price =
             payload.payload.excess_blob_gas().zip(blob_params).map(|(excess_blob_gas, params)| {
@@ -339,4 +380,23 @@ where
         };
         Ok((txs, convert))
     }
+}
+
+/// From when a chain with `genesis` executes under gov5's Amsterdam rules:
+/// its `glamsterdamTime` on an N42-native chain, `None` otherwise (the time
+/// [`reth_chainspec::qmdb::glamsterdam_execution_active_at`] compares with).
+/// A chain spec that schedules reth's own Amsterdam already selects
+/// [`SpecId::AMSTERDAM`] and is left as it is.
+pub fn glamsterdam_execution_time(genesis: &alloy_genesis::Genesis) -> Option<u64> {
+    if !reth_chainspec::qmdb::is_n42_native(genesis) {
+        return None;
+    }
+    reth_chainspec::qmdb::glamsterdam_time(genesis)
+}
+
+/// Sets `cfg` to gov5's Amsterdam execution on a native chain: revm's
+/// [`SpecId::AMSTERDAM`] with its mainnet gas table, EIP-8037 and EIP-2780
+/// (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
+pub fn glamsterdam_execution_cfg(cfg: &mut CfgEnv<SpecId>) {
+    cfg.set_spec_and_mainnet_gas_params(SpecId::AMSTERDAM);
 }

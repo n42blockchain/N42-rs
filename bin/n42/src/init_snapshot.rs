@@ -138,7 +138,7 @@ const COMMIT_UNITS: usize = 100_000;
 
 /// A header from a file holding its RLP, raw or as hex. It is decoded as
 /// [`n42_header::N42Header`], so a head that carries gov5's
-/// `mobileRegistryRoot` (element 24, MobileAnchor + Glamsterdam) keeps it and
+/// `mobileRegistryRoot` (element 24, `MobileAnchor` + Glamsterdam) keeps it and
 /// hashes to the chain's block hash; a header without one decodes as before.
 fn read_header_from_file(path: &std::path::Path) -> eyre::Result<n42_header::N42Header> {
     let bytes = fs::read(path).wrap_err("header file")?;

@@ -1,0 +1,17 @@
+{
+  "blockNumber": 137,
+  "blockHash": "0x2f325e0e79daa6a1bd4270959f33d6b80383503c97d3de6e81bd7305ccafda1d",
+  "headerReceiptsRoot": "0xe8c427cdf8308a6d37d006bc2b5d9df8618f052b19d2b10d813d4c5ecc277dac",
+  "transactions": 5,
+  "certificates": [
+    {
+      "blockHash": "0x2f325e0e79daa6a1bd4270959f33d6b80383503c97d3de6e81bd7305ccafda1d",
+      "blockNumber": 137,
+      "receiptsRoot": "0xe8c427cdf8308a6d37d006bc2b5d9df8618f052b19d2b10d813d4c5ecc277dac",
+      "aggregateSig": "b0c89a22e5f70538cf3626a4eb6386862a54a4f0b1932d869c257df7d4d901671a069fb38f904fd21bfcc1ebf682283f07bcc7e444e67d600d51fcfa9c28142a621e3b579f37aa244024fe24f1a44d26c2e369e09f09e16d3977398af9bb80c3",
+      "signerMask": "0101",
+      "signers": 1,
+      "windowClosedAt": 1793687923005
+    }
+  ]
+}

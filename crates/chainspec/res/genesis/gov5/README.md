@@ -46,3 +46,10 @@ clients, gov5 reading `IsShanghaiAt(num, time)`; Pectra, mobileAnchor and
 Glamsterdam stay at the chain's timestamps, beyond the local clock, so headers
 carry neither slot nor registry root). Run it with
 `DEVNET_GENESIS=<dir>/c94-local.json scripts/devnet-mobileanchor.sh <tag> --gov5`.
+
+The genesis-aware device harness can load those changed fork times. A phone
+SDK selecting the built-in `mainnet_qmdb_staggered` preset cannot: that preset
+still activates Shanghai/Cancun at the production block heights. Empty blocks
+can pass while transaction blocks fail because the replay's block-start reads
+differ. For phone tests, use a local genesis with the selected SDK preset's
+execution rules. See the [iPhone test record](../../../../../docs/device-test-reports/2026-11-03-mobileverify-v3-ios.md).

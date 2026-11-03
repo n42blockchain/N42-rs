@@ -1,0 +1,22 @@
+{
+  "rustCommit": "2b75d4062aa2e3612653a310e453a7a488c0543a",
+  "sdkCommit": "537fed759c4d504ace2323119ed59190359f5d34",
+  "packetdCommit": "8fe815dc2",
+  "bundleId": "mining.ai.n42.www.flutterMiningExample",
+  "version": "1.0.0",
+  "build": "8",
+  "appFrameworkSha256": "291da87ce4bef2a55bc5d4f3db174c4259d6d7574824355893627f6679513060",
+  "node": "http://192.168.0.56:21103",
+  "chain": "mainnet_qmdb",
+  "genesisSha256": "323d5606084329fcca7cc120eafa0cda4c0c4b7d9e7dd97f92dc0e47eb4d14e4",
+  "device": "iPhone 13 Pro Max",
+  "os": "27.0.1",
+  "mode": "release",
+  "soakSeconds": 300,
+  "smokeSourceSha256": "05b506667b708c28b7f76b9f13e4d80ea8492e57877f8198f000d349a2a86b33",
+  "appBaseCommit": "e3865373734bdf4b17cf2e447461bb9e33ce3dd1",
+  "sdkProvenanceVerified": true,
+  "nodeSha256": "25eb276d02e577043a368b30e381534fc0ef0c22483e7e55b68cccf4be3fe723",
+  "validatorSha256": "b7098e4b1041d3e53ce851019735b53e36004c01120e316806fa1826d0f327fa",
+  "appSourceCommit": "156fabf3d"
+}

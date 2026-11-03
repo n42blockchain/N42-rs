@@ -1,0 +1,173 @@
+    Blocking waiting for file lock on build directory
+   Compiling serde v1.0.229
+   Compiling ff v0.13.1
+   Compiling indexmap v2.14.2
+   Compiling sha3 v0.11.0
+   Compiling portable-atomic v1.15.0
+   Compiling crypto-bigint v0.5.5
+   Compiling digest v0.10.7
+   Compiling thiserror v2.0.21
+   Compiling serde_json v1.0.154
+   Compiling blst v0.3.17
+   Compiling group v0.13.0
+   Compiling tokio-macros v2.7.2
+   Compiling mio v1.2.4
+   Compiling socket2 v0.6.5
+   Compiling num_cpus v1.17.0
+   Compiling once_cell v1.21.4
+   Compiling hmac v0.12.1
+   Compiling signature v2.2.0
+   Compiling sha2 v0.10.9
+   Compiling blake3 v1.8.7
+   Compiling bytes v1.12.1
+   Compiling serdect v0.2.0
+   Compiling smallvec v1.16.4
+   Compiling either v1.19.0
+   Compiling bitvec v1.1.1
+   Compiling tracing-core v0.1.36
+   Compiling rfc6979 v0.4.0
+   Compiling nonmax v0.5.5
+   Compiling threadpool v1.8.1
+   Compiling bincode_reloaded v3.1.26
+   Compiling sec1 v0.7.3
+   Compiling alloy-rlp v0.3.16
+   Compiling http v1.5.0
+   Compiling parity-scale-codec v3.7.5
+   Compiling tokio v1.54.1
+   Compiling tracing v0.1.44
+   Compiling parking_lot_core v0.9.12
+   Compiling elliptic-curve v0.13.8
+   Compiling n42-legacy-codec v0.1.0 (/Users/jieliu/Documents/n42/N42-rs/crates/n42/legacy-codec)
+   Compiling http-body v1.1.0
+   Compiling prost-derive v0.14.4
+   Compiling getrandom v0.4.3
+   Compiling parking_lot v0.12.5
+   Compiling ecdsa v0.16.9
+   Compiling ruint v1.21.1
+   Compiling http-body-util v0.1.5
+   Compiling prost v0.14.4
+   Compiling k256 v0.13.4
+   Compiling nybbles v0.4.8
+   Compiling alloy-primitives v1.7.3 (/Users/jieliu/Documents/n42/N42-rs/vendor/dependency-repairs/alloy-primitives-1.7.3)
+   Compiling hyper v1.12.0
+   Compiling hyper-util v0.1.21
+   Compiling alloy-eip7928 v0.4.11
+   Compiling alloy-eip2930 v0.2.4
+   Compiling alloy-eip2124 v0.2.0
+   Compiling alloy-eip7702 v0.6.3
+   Compiling alloy-serde v2.5.0
+   Compiling alloy-eip8141 v0.1.1
+   Compiling alloy-trie v0.9.8
+   Compiling revm-primitives v43.0.0
+   Compiling n42-h2-primitives v2.1.5 (/Users/jieliu/Documents/n42/N42-rs/crates/n42/h2-primitives)
+   Compiling revm-bytecode v43.0.0 (/Users/jieliu/Documents/n42/N42-rs/vendor/dependency-repairs/revm-bytecode-43.0.0)
+   Compiling alloy-eips v2.5.0
+   Compiling revm-state v43.0.1
+   Compiling alloy-consensus v2.5.0
+   Compiling alloy-genesis v2.5.0
+   Compiling reth-codecs v0.8.2
+   Compiling reth-primitives-traits v0.8.2
+   Compiling n42-header v2.1.5 (/Users/jieliu/Documents/n42/N42-rs/crates/n42/header)
+   Compiling n42-mobileverify v2.1.5 (/Users/jieliu/Documents/n42/N42-rs/crates/n42/mobileverify)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 24s
+     Running unittests src/lib.rs (target/debug/deps/n42_mobileverify-42d15b1f50b61228)
+
+running 55 tests
+test accumulator::tests::replace_changes_root ... ok
+test accumulator::tests::empty_and_single ... ok
+test accumulator::tests::split_chain_has_empty_siblings ... ok
+test cert::tests::json_shape ... ok
+test cert::tests::store_evicts_oldest ... ok
+test bls::tests::rejects_garbage_and_identity ... ok
+test cohort::tests::alarm_buffer_and_json ... ok
+test cohort::tests::config_sane ... ok
+test accumulator::tests::order_independent_and_delete_inverse ... ok
+test cert::tests::majority_and_tie_break ... ok
+test deadline_io::tests::header_scan_across_reads ... ok
+test gojson::tests::decodes_like_go ... ok
+test gojson::tests::escapes_like_go ... ok
+test http::tests::accept_backoff_doubles_to_one_second ... ok
+test collector::tests::close_order_ties_by_smaller_root ... ok
+test http::tests::go_uint_and_hash_path ... ok
+test http::tests::rate_limiter_fixed_window ... ok
+test cohort::tests::chain_lookup_runs_outside_the_lock ... ok
+test mask::tests::go_uvarint_edges ... ok
+test mask::tests::rejections ... ok
+test keys::tests::signs_under_the_pop_dst ... ok
+test mask::tests::round_trip ... ok
+test packet::cache::tests::per_height_bound_for_peers ... ok
+test packet::cache::tests::validation ... ok
+test packet::cache::tests::window_eviction ... ok
+test cohort::tests::unauthenticated_receipts_open_no_window ... ok
+test packet::header::tests::proto_overrides_trailer_uncle ... ok
+test packet::header::tests::round_trip_every_flag ... ok
+test packet::proto::tests::word_mapping ... ok
+test packet::header::tests::round_trip_legacy ... ok
+test packet::proto::tests::zero_hash_is_two_empty_submessages ... ok
+test packet::read_log::tests::account_header_bits ... ok
+test packet::read_log::tests::rejections ... ok
+test packet::read_log::tests::round_trip_all_kinds ... ok
+test packet::stream::tests::rejections ... ok
+test packet::stream::tests::round_trip_and_layout ... ok
+test packet::tx::tests::dynamic_fee_round_trip ... ok
+test pop::tests::pop_message_layout ... ok
+test pow::tests::leading_zeros ... ok
+test pow::tests::message_layout ... ok
+test cohort::tests::async_variants_run_the_cascade ... ok
+test receipt::tests::message_layout_matches_gov5_pin ... ok
+test cohort::tests::jump_cascades_and_stop_flushes ... ok
+test cohort::tests::divergence_sink_may_call_back ... ok
+test receipt::tests::json_round_trip_and_verify ... ok
+test pop::tests::verify_pop_accepts_and_rejects ... ok
+test collector::tests::intake_rules_and_close ... ok
+test cert::tests::verify_and_merge ... ok
+test cohort::tests::schedule_majority_and_alarm ... ok
+test registry::tests::revoked_key_must_rotate ... ok
+test registry::tests::pending_then_committed ... ok
+test registry::tests::indices_follow_key_hash_order ... ok
+test registry::tests::snapshot_round_trip ... ok
+test pow::tests::solve_then_verify ... ok
+test http::tests::pairings_overflow_to_busy ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/gov5_fixtures.rs (target/debug/deps/gov5_fixtures-4f5276b8bd690cbf)
+
+running 14 tests
+test mask_vectors ... ok
+test read_log_codec ... ok
+test keys_from_ikm ... ok
+test receipts_root_vectors ... ok
+test header_codec ... ok
+test gossip_topics ... ok
+test transaction_protobuf ... ok
+test stream_packets ... ok
+test sha256sums_match ... ok
+test pop_messages_and_rejections ... ok
+test pow_vectors_and_server ... ok
+test receipt_vectors_and_server ... ok
+test cert_aggregate_and_routes ... ok
+test registry_epochs ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/http.rs (target/debug/deps/http-aa7126326a3cc701)
+
+running 9 tests
+test ingest_hook_fires_once_per_new_packet ... ok
+test register_pow ... ok
+test snapshot_magnet_and_unknown ... ok
+test packet_latest_and_ingest ... ok
+test register_flow ... ok
+test receipt_cert_health_alarms ... ok
+test connections_beyond_the_cap_wait ... ok
+test a_client_that_never_reads_is_cut_at_the_write_deadline ... ok
+test idle_and_header_deadlines_are_separate ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.91s
+
+   Doc-tests n42_mobileverify
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1,0 +1,95 @@
+{
+  "capturedAtUtc": "2026-11-03T06:40:52.627113+00:00",
+  "validators": [
+    {
+      "index": 0,
+      "commits": 182,
+      "timeoutWarnings": 0,
+      "errorLines": 0,
+      "health": {
+        "accumulator": "0x9f4b7e2c468640b56e4c050166927670ca8cbc2be4befb420227f21d1c10a8cd",
+        "alarms": 0,
+        "certBlocks": 0,
+        "openWindows": 0,
+        "pending": 0,
+        "registry": 2
+      },
+      "latest": {
+        "hash": "0x506aa88d04cb61a08c27048d566ac268bccfe126eef742f4450baed51e9f63c4",
+        "number": 182,
+        "packet": true
+      }
+    },
+    {
+      "index": 1,
+      "commits": 182,
+      "timeoutWarnings": 0,
+      "errorLines": 0,
+      "health": {
+        "accumulator": "0x9f4b7e2c468640b56e4c050166927670ca8cbc2be4befb420227f21d1c10a8cd",
+        "alarms": 0,
+        "certBlocks": 137,
+        "openWindows": 0,
+        "pending": 0,
+        "registry": 2
+      },
+      "latest": {
+        "hash": "0x506aa88d04cb61a08c27048d566ac268bccfe126eef742f4450baed51e9f63c4",
+        "number": 182,
+        "packet": true
+      }
+    },
+    {
+      "index": 2,
+      "commits": 182,
+      "timeoutWarnings": 0,
+      "errorLines": 0,
+      "health": {
+        "accumulator": "0x9f4b7e2c468640b56e4c050166927670ca8cbc2be4befb420227f21d1c10a8cd",
+        "alarms": 0,
+        "certBlocks": 0,
+        "openWindows": 0,
+        "pending": 0,
+        "registry": 2
+      },
+      "latest": {
+        "hash": "0x506aa88d04cb61a08c27048d566ac268bccfe126eef742f4450baed51e9f63c4",
+        "number": 182,
+        "packet": true
+      }
+    },
+    {
+      "index": 3,
+      "commits": 182,
+      "timeoutWarnings": 0,
+      "errorLines": 0,
+      "health": {
+        "accumulator": "0x9f4b7e2c468640b56e4c050166927670ca8cbc2be4befb420227f21d1c10a8cd",
+        "alarms": 0,
+        "certBlocks": 0,
+        "openWindows": 0,
+        "pending": 0,
+        "registry": 2
+      },
+      "latest": {
+        "hash": "0x506aa88d04cb61a08c27048d566ac268bccfe126eef742f4450baed51e9f63c4",
+        "number": 182,
+        "packet": true
+      }
+    }
+  ],
+  "executionErrorLines": 0,
+  "packetd": {
+    "packets": 182,
+    "transactionPackets": 176,
+    "transactions": 1027,
+    "errors": [
+      "[EROR] [11-03|01:31:36.915] packetd: block dropped, no packet        number=0 err=\"block 0 has no parent state\""
+    ]
+  },
+  "load": {
+    "sent": 1032,
+    "rejected": 0,
+    "seconds": 537.2369775419938
+  }
+}

@@ -4,7 +4,8 @@ Status: stages 0-4 done (2026-11-02; the table in section 4, "Stage 2 verificati
 verification" at the end). Open:
 
 - a run on chain 94's genesis (all runs so far are on `n42_devnet.json`);
-- packet latency of up to about 1 s for Rust-built blocks, set by the sidecar's head poll;
+- packet latency for Rust-built blocks: up to one 250 ms head poll, or one `newHeads` notification
+  with packetd `-ws` (gov5 8fe815dc; live measurement pending);
 - registry index divergence between nodes when a registration straddles an epoch boundary (each
   node commits on its own timer, as in gov5);
 - the reward model (gov5 item 8);
@@ -486,8 +487,15 @@ Left for stage 3:
 - A run on chain 94's genesis (`crates/chainspec/res/genesis/gov5/`, with its README's
   `--fork-time` step). The device took its ChainConfig from `n42_devnet.json` here, so the
   devnet sufficed for the device and the sidecar.
-- Sidecar latency is set by its 1 s head poll. A phone that reads `/latest` before the packet has
-  landed sees `packet: false` for up to a second.
+- Sidecar latency is set by its head poll. A phone that reads `/latest` before the packet has
+  landed sees `packet: false` for up to one poll. gov5 3d77dec1 cut the poll to 250 ms and stopped
+  sleeping behind a backlog; gov5 8fe815dc (2026-11-02) adds an opt-in `-ws <url>`: packetd subscribes
+  to the node's `newHeads` (`eth_subscribe` over WebSocket, redialled after 1 s on loss) and wakes on
+  every head, with the poll kept as fallback and catch-up, so a missed notification costs at most one
+  poll. Run it as `mobileverify-packetd -rpc http://127.0.0.1:18545 -ws ws://127.0.0.1:18546 -mv …`
+  (the execution layer needs `--ws`). Unit tests: `TestHeadSubscriberWakesOnEveryHeadAndReconnects`,
+  `TestFollowerBuildsOnNewHeadWithoutWaitingForThePoll` (block built 0.6 ms after its notification
+  with a one-minute poll). A live devnet latency measurement with `-ws` is still to run.
 
 
 ## Proposal: registry epochs keyed on block timestamps (D6, 2026-11-02; no code)

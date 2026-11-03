@@ -26,7 +26,7 @@ or `audit-notes/ci/`; research notes in English under `docs/`.
 | D1 | GitHub repository renamed to `n42blockchain/N42-rs` | set the remote URL in the shared checkout and the worktrees (config only) | D | `git remote -v`, a fetch | done 2026-11-02 |
 | D2 | Five gov5 pull requests (`design/header-field-parity`, `fix/unchanged-account-no-op`, `test/mobileverify-cross-client-fixtures`, `test/mobileverify-device-genesis`, `feat/mobileverify-packetd`); the drafted bodies were lost with the session scratchpad | re-draft the bodies into `/data/n42-build/audit-notes/pr/` (persistent); opening them needs `gh auth login`, which only the user can do | D | bodies reviewed; PRs opened once gh is logged in | open |
 | D3 | `n42-init-snapshot` cannot start at a root-carrying head; the SSZ payload form carries no root (`HEADER_FIELD_PARITY.md` 7.1) | implement both | D | unit tests; init at a gated devnet head and follow | open |
-| D4 | packetd polls every 250 ms | add an opt-in `newHeads` subscription over WebSocket, keep the poll as fallback | D | gov5 test; live run shows sub-50 ms packet latency | open |
+| D4 | packetd polls every 250 ms | add an opt-in `newHeads` subscription over WebSocket, keep the poll as fallback | D | gov5 test; live run shows sub-50 ms packet latency | code + tests done (gov5 8fe815dc); live latency run pending |
 | D5 | Pure-Rust packet producer (gov5's read log is positional in Go `IntraBlockState` order) | feasibility spike only: can revm's access order be made identical for the devnet's transaction shapes? verdict in `MOBILEVERIFY_V3_PARITY.md`; no implementation unless the order is provably identical | D | the written verdict with a byte comparison against a sidecar packet | open |
 | D6 | Registry index may differ across nodes near epoch boundaries (gov5 has the same 45 s wall-clock timer) | design note: epoch commits keyed on block timestamp, proposed to gov5; no code until gov5 agrees | D | the note in `MOBILEVERIFY_V3_PARITY.md` | done 2026-11-02 (note written; gov5 agreement pending) |
 | E1 | Commit b1a96f563's body names the `CLAUDE.md` file | not done: it is pushed `main` history and a rewrite was declined; the body contains no attribution | — | — | closed |
@@ -52,3 +52,8 @@ builds.
   `docs/MOBILEVERIFY_V3_PARITY.md`: step 1 commits on the first committed block of each timestamp epoch
   (`mobileRegistryEpochSeconds`), step 2 carries the batch with that block so followers can check the root's
   value; gated by a chain-config time with a one-time re-base from the leader's registry snapshot. No code.
+- D4 (2026-11-02): gov5 `feat/mobileverify-packetd` 8fe815dc (pushed): `-ws <url>` and
+  `packetd.HeadSubscriber`; `Follower.Wake` ends an idle or back-off wait. `go test
+  ./internal/streamverify/packetd/ -run 'HeadSubscriber|Follower'` passes (`audit-notes/ci/d4-go.out`; block
+  built 0.6 ms after its notification with a one-minute poll). The live devnet measurement needs a box claim
+  and is left for stream A's next devnet round (add `-ws ws://127.0.0.1:18546` to packetd, EL `--ws`).

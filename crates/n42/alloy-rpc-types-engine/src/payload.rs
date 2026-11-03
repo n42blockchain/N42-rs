@@ -2844,8 +2844,18 @@ impl ExecutionPayload {
     /// Returns the block access list for the payload (EIP-7928).
     ///
     /// Returns `None` for pre-Amsterdam payloads (V1, V2, V3).
+    ///
+    /// N42: also `None` for a V4 payload whose list is zero-length bytes.
+    /// Those are never a valid EIP-7928 encoding (an empty access list is
+    /// `0xc0`), so this removes no legitimate case; they are how a gov5
+    /// header tail (slot number, registry root) travels in a V4 payload
+    /// before the access-list fork, the same convention as
+    /// [`ExecutionPayloadV4::block_access_list_hash`]. Handed on, the engine
+    /// tree tried to decode them and refused the block. Under Amsterdam such
+    /// a payload is still refused, by N42's engine validator
+    /// (`NoBlockAccessListPostAmsterdam`).
     pub fn block_access_list(&self) -> Option<&Bytes> {
-        self.as_v4().map(|payload| &payload.block_access_list)
+        self.as_v4().map(|payload| &payload.block_access_list).filter(|bal| !bal.is_empty())
     }
 
     /// Returns the block access list hash for the payload (EIP-7928).
@@ -6074,6 +6084,30 @@ mod tests {
         assert_eq!(execution_data.block_hash(), block_hash);
         assert_eq!(execution_data.payload.block_access_list(), Some(&block_access_list));
         assert_eq!(execution_data.payload.slot_number(), Some(7));
+    }
+
+    #[test]
+    fn an_empty_v4_access_list_reads_as_absent() {
+        // A gov5 header tail before the access-list fork: slot and registry
+        // root in a V4 payload whose list is empty.
+        let header = Header {
+            withdrawals_root: Some(B256::ZERO),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::ZERO),
+            ..Default::default()
+        };
+        let block: Block<TxEnvelope> = Block::new(header, BlockBody::default());
+        let v3 = ExecutionPayloadV3::from_block_unchecked(B256::with_last_byte(9), &block);
+        let payload = ExecutionPayload::V4(ExecutionPayloadV4 {
+            payload_inner: v3,
+            block_access_list: Bytes::new(),
+            slot_number: 3,
+            mobile_registry_root: Some(B256::repeat_byte(0x24)),
+        });
+        assert_eq!(payload.block_access_list(), None);
+        assert_eq!(payload.bal_hash(), None);
+        assert_eq!(payload.slot_number(), Some(3));
     }
 
     #[test]

@@ -1524,16 +1524,23 @@ pub enum QmdbUndoError {
 
 
 /// What [`QmdbCompatTree::compact_twigs`] did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompactReport {
     /// Twigs rewritten into `entries.relocated`.
     pub twigs: usize,
     /// Bytes appended to `entries.relocated`.
     pub bytes_written: u64,
     /// Bytes the compacted twigs held where they were before (their records
-    /// in `entries.log`, or their previous group): what punching will free
-    /// (stage 3). Nothing is freed yet.
+    /// in `entries.log`, or their previous group): what punching frees.
     pub bytes_reclaimable: u64,
+    /// Each compacted twig's live key with its read-view location before
+    /// and after (`crate::entry_view`), for a read view to retarget the
+    /// keys it holds before the old bytes are punched.
+    pub moves: Vec<(Hash, u64, u64)>,
+    /// The ranges the compacted twigs' records left, one a twig: free to
+    /// punch once no reader can still name them
+    /// (`docs/QMDB_COMPACTION_DESIGN.md` 3.5).
+    pub freed: Vec<(usize, crate::entry_store::FileRange)>,
 }
 
 /// Why [`QmdbCompatTree::compact_twigs`] stopped. Twigs compacted before the
@@ -1832,10 +1839,13 @@ impl QmdbCompatTree {
         Ok(())
     }
 
-    /// Byte offset of `slot`'s record in the entry file (`[key 32][len u32 LE]
-    /// [value]`); `None` in the heap or past the last slot. A record's bytes
-    /// never change once appended; only a truncation (`apply_undo`) removes
-    /// them, after telling the [`TruncationGuard`].
+    /// `slot`'s read-view location (`crate::entry_view`): the byte offset of
+    /// its record (`[key 32][len u32 LE][value]`) in `entries.log`, or, bit 39
+    /// set, of its key in `entries.relocated`; `None` in the heap, past the
+    /// last slot, or for a hash-only slot. A record's bytes never change once
+    /// appended; a truncation (`apply_undo`) removes them after telling the
+    /// [`TruncationGuard`], and a compaction moves them (`compact_twigs`'s
+    /// moves) before its old range is punched.
     pub fn entry_offset(&self, slot: u64) -> Option<u64> {
         self.entries.file_offset(usize::try_from(slot).ok()?)
     }
@@ -1847,8 +1857,8 @@ impl QmdbCompatTree {
         self.entries.offsets_reader()
     }
 
-    /// Every live entry's key and record offset, in slot order; `None` in the
-    /// heap. What a read view over the entry file is built from.
+    /// Every live entry's key and read-view location, in slot order; `None` in
+    /// the heap. What a read view over the entry files is built from.
     pub fn live_entry_offsets(&self) -> Option<Vec<(Hash, u64)>> {
         self.entries.file_path()?;
         let mut out = Vec::with_capacity(self.index.len());
@@ -3213,13 +3223,13 @@ impl QmdbCompatTree {
     }
 
     /// Rewrites up to `max_twigs` mostly dead twigs into `entries.relocated`
-    /// (`docs/QMDB_COMPACTION_DESIGN.md` 3.4, stage 2): each as one group in
-    /// slot order -- a live slot's payload, a dead slot's leaf hash -- made
+    /// (`docs/QMDB_COMPACTION_DESIGN.md` 3.4): each as one group in slot
+    /// order -- a live slot's payload, a dead slot's leaf hash -- made
     /// durable before its 2048 offsets are pointed at it. Slots, leaves,
-    /// twig roots, active bits, proofs and the root are unchanged; nothing
-    /// is punched, so the bytes in `entries.log` stay where the read view's
-    /// offsets point and the report's `bytes_reclaimable` is what stage 3
-    /// will free.
+    /// twig roots, active bits, proofs and the root are unchanged. Nothing is
+    /// punched here: the report names the live keys' moves (for a read view)
+    /// and the ranges left behind, which the caller punches
+    /// ([`Self::punch`]) once no reader can name them.
     ///
     /// A candidate is a full twig whose every slot lies below `below_slot`
     /// and whose last retirement happened before it -- `below_slot` is the
@@ -3276,10 +3286,23 @@ impl QmdbCompatTree {
             if twig_leaf_root(&group.leaves) != expected {
                 return Err(QmdbCompactError::LeafRootMismatch { twig: twig_id });
             }
+            let base = twig_id * TWIG_SIZE;
+            let moved_from = report.moves.len();
+            for slot in (base..base + TWIG_SIZE).filter(|slot| file.is_active(*slot)) {
+                let (Some(key), Some(old)) = (file.key(slot), file.location(slot)) else {
+                    return Err(QmdbCompactError::Store(format!("live slot {slot} has no payload")));
+                };
+                report.moves.push((*key, old, 0));
+            }
             let done = file.append_group(group).map_err(|e| QmdbCompactError::Store(e.to_string()))?;
+            let live = (base..base + TWIG_SIZE).filter(|slot| file.is_active(*slot));
+            for (entry, slot) in report.moves[moved_from..].iter_mut().zip(live) {
+                entry.2 = file.location(slot).unwrap_or(u64::MAX);
+            }
             report.twigs += 1;
             report.bytes_written += done.written;
-            report.bytes_reclaimable += done.reclaimable;
+            report.bytes_reclaimable += done.old.len();
+            report.freed.push((twig_id, done.old));
         }
         Ok(report)
     }

@@ -28,9 +28,9 @@
 //! with every integer little endian and the CRC-32 (IEEE, `crc32fast`) taken
 //! over every byte of the group before the CRC itself, the trailer's tag and
 //! twig included. A slot's offset has bit 63 set when it points into the
-//! relocated file. `entries.log` keeps every slot's original record (nothing
-//! is punched in this stage), so the read view's byte offsets into it stay
-//! valid and a lost group loses nothing.
+//! relocated file. A read view names a relocated live record by the offset
+//! of its key with bit 39 set (`crate::entry_view`), and is told when a
+//! compaction moves the keys it holds.
 
 use std::{
     collections::BTreeMap,
@@ -40,7 +40,9 @@ use std::{
 };
 
 use crate::{
-    Hash, NULL_HASH, TWIG_SIZE, hash_leaf,
+    Hash, NULL_HASH, TWIG_SIZE,
+    entry_view::{RELOCATED_LOCATION, VIEW_MAP_BYTES},
+    hash_leaf,
     offsets::{Offsets, OffsetsReader},
 };
 
@@ -596,11 +598,8 @@ impl LogFile {
 /// A twig whose records were rewritten into `entries.relocated`.
 #[derive(Clone, Debug)]
 struct RelocatedTwig {
-    /// Where `entries.log` holds the twig's slots, for [`FileEntries::offset`]:
-    /// the read view resolves byte offsets into `entries.log`, which keeps
-    /// every record in this stage. 16 KiB a compacted twig; stage 1 (a view
-    /// that resolves slots) and stage 3 (punching) retire it.
-    main: Box<[u64]>,
+    /// Where the twig's latest group starts in `entries.relocated`.
+    group_start: u64,
     /// The length of the twig's latest group in `entries.relocated`,
     /// trailer included.
     group_len: u64,
@@ -608,14 +607,39 @@ struct RelocatedTwig {
     dead: u32,
 }
 
+/// A byte range of one of the entry files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FileRange {
+    /// `entries.relocated` (a previous group of a twig compacted again), else
+    /// `entries.log`.
+    pub relocated: bool,
+    /// The first byte.
+    pub start: u64,
+    /// One past the last byte.
+    pub end: u64,
+}
+
+impl FileRange {
+    /// Its length in bytes.
+    pub const fn len(&self) -> u64 {
+        self.end - self.start
+    }
+
+    /// Whether it holds no byte.
+    pub const fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+}
+
 /// What [`FileEntries::append_group`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Relocation {
     /// The group's bytes, trailer included.
     pub(crate) written: u64,
-    /// The bytes the twig's previous location held: its records in
-    /// `entries.log`, or its previous group. Nothing is punched yet.
-    pub(crate) reclaimable: u64,
+    /// The bytes the twig's records held before: its records in
+    /// `entries.log`, or its previous group. Free to punch once nothing
+    /// can read them (`docs/QMDB_COMPACTION_DESIGN.md` 3.5).
+    pub(crate) old: FileRange,
 }
 
 /// A twig's records laid out as a relocated group
@@ -797,21 +821,32 @@ impl FileEntries {
         self.offsets.reader()
     }
 
-    /// Where `slot`'s record starts in `entries.log`: the main file keeps
-    /// every slot's record in this stage, a compacted one included, so the
-    /// read view's byte offsets stay valid.
-    pub(crate) fn offset(&self, slot: usize) -> Option<u64> {
+    /// `slot`'s location for a read view (`crate::entry_view`): in
+    /// `entries.log` its record's byte offset; in `entries.relocated` the
+    /// offset of its key there with [`RELOCATED_LOCATION`] set, from where
+    /// the record has the main file's shape. `None` past the last slot or
+    /// for a hash-only slot (no payload to read). A main-file offset is
+    /// returned as it is even past the view's 512 GiB (the view refuses it on
+    /// its floor); a relocated one past it is `u64::MAX`, which no key index
+    /// takes.
+    pub(crate) fn location(&self, slot: usize) -> Option<u64> {
         let raw = self.offsets.get(slot)?;
         if raw & RELOCATED_BIT == 0 {
             return Some(raw);
         }
-        self.twigs.get(&(slot / TWIG_SIZE)).map(|twig| twig.main[slot % TWIG_SIZE])
+        let file = self.relocated.as_ref()?;
+        let at = raw & !RELOCATED_BIT;
+        if file.bytes_from(at)[0] != TAG_LIVE {
+            return None;
+        }
+        let key_at = at + RELOCATED_HEAD as u64;
+        Some(if key_at < VIEW_MAP_BYTES { key_at | RELOCATED_LOCATION } else { u64::MAX })
     }
 
     /// `slot`'s key, `None` for a hash-only slot: the key index's
     /// confirmation read, so a record in the main file -- every slot but a
     /// compacted one -- is read without its length.
-    fn key(&self, slot: usize) -> Option<&Hash> {
+    pub(crate) fn key(&self, slot: usize) -> Option<&Hash> {
         let raw = self.offsets.at(slot);
         if raw & RELOCATED_BIT == 0 {
             return Some(as_hash(&self.main.bytes_from(raw)[..KEY_LEN]));
@@ -1196,14 +1231,18 @@ impl FileEntries {
         let twig = group.twig;
         let base = twig * TWIG_SIZE;
         // What the twig's records take where they are now.
-        let reclaimable = match self.twigs.get(&twig) {
-            Some(relocated) => relocated.group_len,
+        let old = match self.twigs.get(&twig) {
+            Some(relocated) => FileRange {
+                relocated: true,
+                start: relocated.group_start,
+                end: relocated.group_start + relocated.group_len,
+            },
             None => {
                 let first = self.offsets.at(base);
                 let last = self.offsets.at(base + TWIG_SIZE - 1);
                 debug_assert_eq!((first | last) & RELOCATED_BIT, 0);
                 let SlotRef::Payload(_, value) = payload_at(self.main.bytes_from(last)) else { unreachable!() };
-                last + (KEY_LEN + LEN_LEN + value.len()) as u64 - first
+                FileRange { relocated: false, start: first, end: last + (KEY_LEN + LEN_LEN + value.len()) as u64 }
             }
         };
         if self.relocated.is_none() {
@@ -1215,16 +1254,12 @@ impl FileEntries {
         let start = file.append_unit(&group.bytes)?;
         // Durable before any slot points at it.
         file.sync()?;
-        let main: Box<[u64]> = match self.twigs.remove(&twig) {
-            Some(relocated) => relocated.main,
-            None => (base..base + TWIG_SIZE).map(|slot| self.offsets.at(slot)).collect(),
-        };
         for (local, at) in group.starts.iter().enumerate() {
             self.offsets.set(base + local, (start + u64::from(*at)) | RELOCATED_BIT);
         }
         let written = group.bytes.len() as u64;
-        self.twigs.insert(twig, RelocatedTwig { main, group_len: written, dead: group.dead });
-        Ok(Relocation { written, reclaimable })
+        self.twigs.insert(twig, RelocatedTwig { group_start: start, group_len: written, dead: group.dead });
+        Ok(Relocation { written, old })
     }
 
     /// Seals the tail now (tests: exercise the chunked reads without
@@ -1370,11 +1405,8 @@ fn open_relocated(
                 continue;
             }
             let main = &mut offsets[base..base + TWIG_SIZE];
-            let entry = twigs.entry(twig).or_insert_with(|| RelocatedTwig {
-                main: main.iter().copied().collect(),
-                group_len: 0,
-                dead: 0,
-            });
+            let entry = twigs.entry(twig).or_insert_with(|| RelocatedTwig { group_start, group_len: 0, dead: 0 });
+            entry.group_start = group_start;
             entry.group_len = at - group_start;
             entry.dead = dead_hash_count;
             for (offset, start) in main.iter_mut().zip(&starts) {
@@ -1610,12 +1642,12 @@ impl Entries {
         }
     }
 
-    /// Where `slot`'s record starts in the entry file; `None` in the heap or
-    /// past the last slot.
+    /// `slot`'s read-view location ([`FileEntries::location`]); `None` in
+    /// the heap, past the last slot, or for a hash-only slot.
     pub(crate) fn file_offset(&self, slot: usize) -> Option<u64> {
         match self {
             Self::Heap(_) => None,
-            Self::File(file) => file.offset(slot),
+            Self::File(file) => file.location(slot),
         }
     }
 
@@ -2038,12 +2070,16 @@ mod tests {
         let group = file.build_group(0, |_| None).unwrap();
         assert_eq!(group.dead as usize, TWIG_SIZE / 2);
         let done = file.append_group(group).unwrap();
-        assert_eq!(done.reclaimable, (TWIG_SIZE * (KEY_LEN + LEN_LEN + 9)) as u64);
+        assert_eq!(done.old, FileRange { relocated: false, start: 0, end: (TWIG_SIZE * (KEY_LEN + LEN_LEN + 9)) as u64 });
         assert!(file.is_hash_only(0) && !file.is_hash_only(1));
         assert_eq!(file.key(1), Some(&key_n(1)));
         assert_eq!(file.value(1), &[1u8; 9]);
-        // The read view's offsets stay in entries.log.
-        assert_eq!(file.offset(1), Some((KEY_LEN + LEN_LEN + 9) as u64));
+        // A read view names a relocated live record by its key's offset in
+        // entries.relocated (after slot 0's dead record and slot 1's head), and
+        // a hash-only slot not at all.
+        assert_eq!(file.location(1), Some((DEAD_RECORD + RELOCATED_HEAD) as u64 | RELOCATED_LOCATION));
+        assert_eq!(file.location(0), None);
+        assert_eq!(file.location(TWIG_SIZE), Some((TWIG_SIZE * (KEY_LEN + LEN_LEN + 9)) as u64));
         let error = file.truncate(TWIG_SIZE - 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(file.len(), 3 * TWIG_SIZE);

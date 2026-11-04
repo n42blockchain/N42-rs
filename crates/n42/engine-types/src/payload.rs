@@ -1787,6 +1787,8 @@ where
         // its tenure (a TC moves the chain on by one view only). `Aborted`
         // is a build that chose not to produce a block; the job logs it at
         // debug and moves on.
+        // The builder's executor borrows `cached_reads` (reth v2.9.0).
+        drop(builder);
         return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
     }
     // The seal gap's first term named (plan v6 6.13, `par_start_ms`): the
@@ -1900,6 +1902,7 @@ where
         }
         if refuse_stale_parent() {
             // See above: never `Cancelled` from here.
+            drop(builder);
             return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
         }
     }
@@ -3812,6 +3815,19 @@ where
                 };
             let qmdb_state = qmdb.clone().expect("checked above");
 
+            // reth v2.9.0: the executor borrows `cached_reads` through its
+            // database; taking the builder apart here (its references left
+            // in place) ends that borrow when the finish consumes the
+            // executor, so the reads can be handed back afterwards.
+            let reth_evm::execute::BasicBlockBuilder {
+                executor: seal_executor,
+                evm_env: seal_evm_env,
+                transactions: seal_transactions,
+                ctx: seal_ctx,
+                ..
+            } = builder;
+            drop((seal_evm_env, seal_transactions, seal_ctx));
+
             // ---- behind the seal ----
             // A failure here is after the proposal: the store's waiters are
             // told at once (`fail`), the engine's own path imports the block
@@ -3821,7 +3837,7 @@ where
             // reth v2.9.0: the executor holds the block's state and hands
             // back the bundle, its reverts merged, with the result.
             let reth_execution_types::BlockExecutionOutput { result: mut execution_result, state: executed_state } =
-                builder.executor.finish().map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+                seal_executor.finish().map_err(|err| PayloadBuilderError::Internal(err.into()))?;
             // Receipts built beside the parallel step: the executor committed
             // none, so its finish reports none and no gas.
             let receipts_late_used = receipts_pending.is_some();

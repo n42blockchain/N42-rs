@@ -374,6 +374,16 @@ Stage 3 as landed (2026-11-03, `feat/qmdb-compact-stage34`), where it differs fr
   sampler also logs one `QMDB entry store` line a minute (per_live, file, relocated, punched, live,
   offsets, rounds, twigs) for a fleet leg to read.
 
+Stage 3 in the field (2026-11-04, `audit-notes/ci/rollkill.log`, `ci/rk-c34{k90,k20,long}/`):
+`rollkill-check.sh` on the branch natives with `N42_QMDB_ENTRY_FILE=1 N42_QMDB_COMPACT=1
+N42_QMDB_COMPACT_RETAIN=8 N42_QMDB_COMPACT_DEAD_FRAC=0.05`, seven nodes at 200 tx/s, members 1-3
+SIGKILLed and restarted in turn. The 90 s and 20 s first-kill legs (the 20 s one before the first
+persistence) passed with zero fault lines but compacted nothing: four senders write ~10 slots a
+block, so no twig filled in 118 blocks. A 1,260 s leg killed at heights 280, 301 and 323, after
+every node had compacted twig 0 (101,879 B into `entries.relocated`, 130,843 B punched): each member
+restarted on the punched files, committed again (zero fault lines), and then compacted and punched
+twig 1 like the members never killed (204,436 B relocated, 261,332 B punched on every node).
+
 Stage 4 as landed: an offsets segment (2^20 slots, 512 twigs, 8 MiB) whose every twig is relocated
 and that lies wholly below the last slot is released (`Offsets::release_segment`, refused while an
 `OffsetsReader` is alive); each of its twigs keeps its slots as `u32` starts from its group's base,

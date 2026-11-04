@@ -399,7 +399,7 @@ mod late_reverts_tests {
     use super::{n42_completed_output, N42PlainReverts};
     use alloy_primitives::Address;
     use reth_execution_types::BlockExecutionOutput;
-    use reth_trie::bundle_state::{states::reverts::Reverts, AccountRevert, BundleState};
+    use reth_trie::bundle_state::{AccountRevert, BundleState, Reverts};
     use std::sync::Arc;
 
     fn reverts(addresses: &[u8]) -> Reverts {

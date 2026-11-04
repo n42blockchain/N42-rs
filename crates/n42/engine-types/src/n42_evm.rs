@@ -526,7 +526,7 @@ mod glamsterdam_execution_tests {
     use evm2::{
         bytecode::Bytecode,
         evm::{
-            db::{CacheDB, EmptyDB},
+            CacheDB, EmptyDB,
             AccountInfo,
         },
         EvmFeatures,

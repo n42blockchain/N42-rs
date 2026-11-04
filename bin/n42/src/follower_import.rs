@@ -803,7 +803,7 @@ fn two_roads<T>(
 /// A sender's account after the parent, from the parent's execution output:
 /// `None` when the parent did not touch it (its state is then the
 /// grandparent's), a default account when the parent destroyed it.
-fn account_after_parent(bundle: &reth_evm::db::BundleState, sender: &Address) -> Option<reth_primitives_traits::Account> {
+fn account_after_parent(bundle: &reth_trie::bundle_state::BundleState, sender: &Address) -> Option<reth_primitives_traits::Account> {
     bundle.account(sender).map(|account| {
         account
             .info
@@ -3652,7 +3652,7 @@ pub const IMPORT_TIMES: usize = 29;
 /// from, and files it under the block's hash.
 fn fill_carry(
     cached: &mut CachedReads,
-    bundle: &reth_evm::db::BundleState,
+    bundle: &reth_trie::bundle_state::BundleState,
     block_hash: B256,
     carry: &CarriedReads,
 ) {
@@ -4045,7 +4045,7 @@ mod merge_mode_tests {
 mod parent_output_tests {
     use super::*;
     use alloy_primitives::U256;
-    use reth_evm::db::BundleState;
+    use reth_trie::bundle_state::BundleState;
     use reth_evm::evm2::evm::AccountInfo;
 
     /// [`PARENT_OUTPUTS`] is one process-wide queue of [`PARENT_OUTPUTS_KEPT`]
@@ -4337,9 +4337,9 @@ mod tests {
     use alloy_primitives::{map::AddressHashMap, Bytes, Signature, TxKind, U256};
     use reth_primitives_traits::{Account, SealedBlock};
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
-    use reth_evm::db::BundleState;
+    use reth_trie::bundle_state::BundleState;
     use evm2::SpecId;
-    use reth_evm::state::AccountInfo;
+    use evm2::evm::AccountInfo;
 
     /// The implementation the fused scan replaced, kept as the oracle the
     /// property tests compare against: a serial pass that grouped the block's

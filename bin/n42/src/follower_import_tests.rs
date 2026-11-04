@@ -13,9 +13,9 @@ use super::parent_output_tests::publishing;
 use super::*;
 use alloy_primitives::U256;
 use reth_provider::test_utils::MockEthProvider;
-use reth_evm::db::BundleState;
+use reth_trie::bundle_state::BundleState;
 use evm2::SpecId;
-use reth_evm::state::AccountInfo;
+use evm2::evm::AccountInfo;
 
 fn info(nonce: u64, balance: u64) -> AccountInfo {
     AccountInfo { nonce, balance: U256::from(balance), ..Default::default() }

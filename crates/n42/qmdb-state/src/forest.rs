@@ -43,6 +43,10 @@ use crate::{BlockChanges, StateError};
 /// shorter) and the bench has used it since.
 pub const DEFAULT_RETAIN_DEPTH: u64 = 16;
 
+/// The most twigs one [`QmdbForest::compact_twigs`] looks at under the lock
+/// (a popcount of 32 words each); the cursor carries the scan to the next.
+const COMPACT_SCAN_TWIGS: usize = 16_384;
+
 /// The most blocks below the head a reader's keep ([`QmdbForest::set_keep_from`])
 /// holds records for by default: the retention depth the fleet ran with before
 /// it was lowered to 16, so a database that far behind costs no more than it
@@ -490,6 +494,8 @@ pub struct QmdbForest {
     /// The lowest block a reader still needs the record of; see
     /// [`Self::set_keep_from`].
     keep_from: Option<u64>,
+    /// Where the next [`Self::compact_twigs`] scan starts.
+    compact_cursor: usize,
     /// How far below the head that keep reaches; see
     /// [`Self::set_reader_keep_cap`].
     reader_keep_cap: u64,
@@ -1007,6 +1013,7 @@ impl QmdbForest {
             head: (number, hash),
             retain_depth: DEFAULT_RETAIN_DEPTH,
             keep_from: None,
+            compact_cursor: 0,
             reader_keep_cap: READER_KEEP_CAP,
             trim_twigs: true,
             dirty_slots: Vec::new(),
@@ -1653,9 +1660,25 @@ impl QmdbForest {
             .map(|undo| undo.prev_next_slot)
             .min();
         let below_slot = below_slot.min(held.unwrap_or(u64::MAX));
-        self.tree
-            .compact_twigs(below_slot, min_dead_fraction, max_twigs)
-            .map_err(|e| StateError::EntryFile(e.to_string()))
+        let report = self
+            .tree
+            .compact_twigs_from(below_slot, min_dead_fraction, max_twigs, self.compact_cursor, COMPACT_SCAN_TWIGS)
+            .map_err(|e| StateError::EntryFile(e.to_string()))?;
+        self.compact_cursor = report.next_twig;
+        Ok(report)
+    }
+
+    /// [`QmdbCompatTree::relocated_sync_handle`] on the forest's tree.
+    pub fn relocated_sync_handle(&mut self) -> Result<Option<std::fs::File>, StateError> {
+        self.tree.relocated_sync_handle().map_err(|e| StateError::EntryFile(e.to_string()))
+    }
+
+    /// [`QmdbCompatTree::punch`] on the forest's tree: frees ranges a
+    /// compaction left once nothing can read them. Refused while the tree is
+    /// leased.
+    pub fn punch_entries(&mut self, ranges: &[(usize, n42_twig_core::entry_store::FileRange)]) -> Result<u64, StateError> {
+        self.refuse_leased()?;
+        self.tree.punch(ranges).map_err(|e| StateError::EntryFile(e.to_string()))
     }
 
     /// The entry store's size (`docs/QMDB_COMPACTION_DESIGN.md` 3.7): a few

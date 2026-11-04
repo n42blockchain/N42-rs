@@ -551,8 +551,9 @@ fn main() {
             // The entry store's growth (`docs/QMDB_COMPACTION_DESIGN.md` 3.7):
             // the entry file's bytes, its slots in all and still live, the
             // offsets' and the key index's heap, the file's sealed chunks, the
-            // compacted twigs' bytes in `entries.relocated`, and
-            // `n42_qmdb_entry_bytes_per_live_slot` ((file + relocated) / live),
+            // compacted twigs' bytes in `entries.relocated`, the bytes punched
+            // (stage 3), and
+            // `n42_qmdb_entry_bytes_per_live_slot` ((file + relocated - punched) / live),
             // logged once at warn level
             // when it passes `N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM` (default
             // 2000, 0 disables). A tick that finds the forest lock held skips
@@ -564,8 +565,10 @@ fn main() {
                     let mut unchecked_seen = false;
                     let bytes_per_live_alarm: u64 = n42_env::parse("N42_QMDB_ENTRY_BYTES_PER_LIVE_ALARM", 2000);
                     let mut bytes_per_live_warned = false;
+                    let mut ticks = 0u64;
                     loop {
                         tick.tick().await;
+                        ticks += 1;
                         // `poisoned()` answers None while the forest lock is held,
                         // so a reason once seen is latched rather than re-read.
                         if !poisoned_seen
@@ -589,7 +592,25 @@ fn main() {
                             metrics::gauge!("n42_qmdb_index_bytes").set(stats.index_bytes as f64);
                             metrics::gauge!("n42_qmdb_entry_chunks").set(stats.chunks as f64);
                             metrics::gauge!("n42_qmdb_entry_relocated_bytes").set(stats.relocated_bytes as f64);
+                            metrics::gauge!("n42_qmdb_entry_punched_bytes").set(stats.punched_bytes as f64);
                             metrics::gauge!("n42_qmdb_entry_bytes_per_live_slot").set(per_live as f64);
+                            // With the entry compaction running (`N42_QMDB_COMPACT=1`), the
+                            // same numbers once a minute in the log, for a fleet leg to read.
+                            let (rounds, twigs, written, punched) = qmdb.entry_compaction_totals();
+                            if rounds > 0 && ticks.is_multiple_of(6) {
+                                info!(
+                                    target: "n42.qmdb",
+                                    per_live,
+                                    file_bytes = stats.file_bytes,
+                                    relocated_bytes = stats.relocated_bytes,
+                                    punched_bytes = stats.punched_bytes,
+                                    live_slots = stats.live_slots,
+                                    total_slots = stats.total_slots,
+                                    offsets_bytes = stats.offsets_bytes,
+                                    rounds, twigs, written, punched,
+                                    "QMDB entry store",
+                                );
+                            }
                             if bytes_per_live_alarm > 0 && per_live > bytes_per_live_alarm && !bytes_per_live_warned {
                                 bytes_per_live_warned = true;
                                 warn!(

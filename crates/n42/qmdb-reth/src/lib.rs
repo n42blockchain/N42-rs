@@ -22,6 +22,7 @@
 //! `n42-engine-types`, since that builder is this repo's code.
 
 pub mod exec_cache;
+pub mod entry_compaction;
 pub mod executed_fields;
 pub mod chainspec;
 pub mod changes;

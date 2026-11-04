@@ -60,20 +60,37 @@ impl Inner {
         Self { directory, segments: AtomicUsize::new(0), len: AtomicUsize::new(0) }
     }
 
-    /// The segment of `slot`, which must be below the allocated segments.
+    /// The segment of `slot`, which must be below the allocated segments;
+    /// `None` once released ([`Offsets::release_segment`]).
     #[inline]
-    fn segment(&self, slot: usize) -> &[AtomicU64] {
+    fn segment(&self, slot: usize) -> Option<&[AtomicU64]> {
         let ptr = self.directory[slot >> OFFSET_SEGMENT_BITS].load(Ordering::Acquire);
-        debug_assert!(!ptr.is_null(), "slot {slot} has no segment");
+        if ptr.is_null() {
+            return None;
+        }
         // SAFETY: a non-null entry points at a live segment of
         // `OFFSET_SEGMENT_SLOTS` atomics (`Offsets::grow`), freed only when
-        // `Inner` is dropped, which the caller's borrow outlives.
-        unsafe { std::slice::from_raw_parts(ptr, OFFSET_SEGMENT_SLOTS) }
+        // `Inner` is dropped or by `Offsets::release_segment`, which the
+        // writer calls only with no `OffsetsReader` alive.
+        Some(unsafe { std::slice::from_raw_parts(ptr, OFFSET_SEGMENT_SLOTS) })
+    }
+
+    /// The segment of `slot`, which the caller knows is allocated and kept.
+    #[inline]
+    #[track_caller]
+    fn kept_segment(&self, slot: usize) -> &[AtomicU64] {
+        match self.segment(slot) {
+            Some(segment) => segment,
+            None => panic!("slot {slot} lies in a released offsets segment"),
+        }
     }
 
     #[inline]
     fn get(&self, slot: usize) -> Option<u64> {
-        (slot < self.len.load(Ordering::Acquire)).then(|| self.segment(slot)[slot & MASK].load(Ordering::Acquire))
+        if slot >= self.len.load(Ordering::Acquire) {
+            return None;
+        }
+        self.segment(slot).map(|segment| segment[slot & MASK].load(Ordering::Acquire))
     }
 }
 
@@ -125,10 +142,17 @@ impl Clone for Offsets {
             // Fresh segments, not the prefault pool's: those are kept for the
             // apply path, and a clone is not on it.
             out.grow_to(slot + run, false).expect("a clone needs no more slots than its original holds");
-            let from = &self.inner.segment(slot)[slot & MASK..][..run];
-            let to = &out.inner.segment(slot)[slot & MASK..][..run];
-            for (to, from) in to.iter().zip(from) {
-                to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+            match self.inner.segment(slot) {
+                Some(from) => {
+                    let to = &out.inner.kept_segment(slot)[slot & MASK..][..run];
+                    for (to, from) in to.iter().zip(&from[slot & MASK..][..run]) {
+                        to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+                    }
+                }
+                // Released in the original: released in the copy.
+                None => {
+                    out.release_segment(slot >> OFFSET_SEGMENT_BITS);
+                }
             }
             slot += run;
         }
@@ -165,15 +189,49 @@ impl Offsets {
         OffsetsReader { inner: Arc::clone(&self.inner) }
     }
 
-    pub(crate) fn get(&self, slot: usize) -> Option<u64> {
-        self.inner.get(slot)
-    }
-
-    /// `slot`'s offset; panics past the length.
+    /// `slot`'s offset; panics past the length or in a released segment.
     #[track_caller]
     pub(crate) fn at(&self, slot: usize) -> u64 {
         assert!(slot < self.len(), "offset {slot} past {} slots", self.len());
-        self.inner.segment(slot)[slot & MASK].load(Ordering::Relaxed)
+        self.inner.kept_segment(slot)[slot & MASK].load(Ordering::Relaxed)
+    }
+
+    /// `slot`'s offset, `None` if its segment was released; panics past the
+    /// length.
+    #[inline]
+    #[track_caller]
+    pub(crate) fn try_at(&self, slot: usize) -> Option<u64> {
+        assert!(slot < self.len(), "offset {slot} past {} slots", self.len());
+        self.inner.segment(slot).map(|segment| segment[slot & MASK].load(Ordering::Relaxed))
+    }
+
+    /// Frees segment `index` (slots `index << OFFSET_SEGMENT_BITS ..`): its
+    /// slots' offsets are kept elsewhere from now on (a compacted twig's
+    /// group base and `u32` starts, `docs/QMDB_COMPACTION_DESIGN.md` stage
+    /// 4). Refused (`false`) while an [`OffsetsReader`] is alive, which could
+    /// hold a pointer into it, and for a segment not allocated.
+    pub(crate) fn release_segment(&mut self, index: usize) -> bool {
+        if Arc::strong_count(&self.inner) != 1 || index >= self.allocated_segments() {
+            return false;
+        }
+        let ptr = self.inner.directory[index].swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !ptr.is_null() {
+            // SAFETY: made by `Box::into_raw` of a segment of
+            // `OFFSET_SEGMENT_SLOTS` atomics in `grow_to`, taken out of the
+            // directory above (so freed once), with no reader alive.
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, OFFSET_SEGMENT_SLOTS)) });
+        }
+        true
+    }
+
+    /// Whether segment `index` was released.
+    pub(crate) fn is_released(&self, index: usize) -> bool {
+        index < self.allocated_segments() && self.inner.directory[index].load(Ordering::Acquire).is_null()
+    }
+
+    /// Segments allocated and not released.
+    pub(crate) fn live_segments(&self) -> usize {
+        (0..self.allocated_segments()).filter(|index| !self.is_released(*index)).count()
     }
 
     /// Replaces `slot`'s offset (a compaction retargeting the slot). A
@@ -182,7 +240,7 @@ impl Offsets {
     #[track_caller]
     pub(crate) fn set(&mut self, slot: usize, offset: u64) {
         assert!(slot < self.len(), "offset {slot} past {} slots", self.len());
-        self.inner.segment(slot)[slot & MASK].store(offset, Ordering::Release);
+        self.inner.kept_segment(slot)[slot & MASK].store(offset, Ordering::Release);
     }
 
     /// Makes sure segments cover slots below `end`, publishing each before
@@ -218,7 +276,7 @@ impl Offsets {
     pub(crate) fn push(&mut self, offset: u64) -> io::Result<()> {
         let slot = self.len();
         self.grow_to(slot + 1, true)?;
-        self.inner.segment(slot)[slot & MASK].store(offset, Ordering::Relaxed);
+        self.inner.kept_segment(slot)[slot & MASK].store(offset, Ordering::Relaxed);
         self.inner.len.store(slot + 1, Ordering::Release);
         Ok(())
     }
@@ -233,7 +291,7 @@ impl Offsets {
         while !rest.is_empty() {
             let at = slot & MASK;
             let run = (OFFSET_SEGMENT_SLOTS - at).min(rest.len());
-            for (cell, offset) in self.inner.segment(slot)[at..at + run].iter().zip(&rest[..run]) {
+            for (cell, offset) in self.inner.kept_segment(slot)[at..at + run].iter().zip(&rest[..run]) {
                 cell.store(*offset, Ordering::Relaxed);
             }
             slot += run;
@@ -266,7 +324,8 @@ impl std::fmt::Debug for OffsetsReader {
 
 impl OffsetsReader {
     /// `slot`'s offset as the tree last stored it; `None` at or past the
-    /// length. Bit 63 set: the record is in `entries.relocated`.
+    /// length (or in a segment released while no reader was alive). Bit 63
+    /// set: the record is in `entries.relocated`.
     #[inline]
     pub fn get(&self, slot: u64) -> Option<u64> {
         usize::try_from(slot).ok().and_then(|slot| self.inner.get(slot))
@@ -379,6 +438,29 @@ mod tests {
         done.store(true, Ordering::Release);
         assert!(watcher.join().expect("the reader thread") > 0);
         assert_eq!(reader.len(), next);
+    }
+
+    /// Stage 4: a released segment frees its memory, reads as released, is
+    /// released in a clone too, and is refused while a reader is alive.
+    #[test]
+    fn a_released_segment_is_gone_from_the_offsets_and_their_clones() {
+        let mut offsets = Offsets::default();
+        let total = 2 * OFFSET_SEGMENT_SLOTS + 10;
+        offsets.extend_from_slice(&(0..total as u64).collect::<Vec<_>>()).expect("room");
+        let reader = offsets.reader();
+        assert!(!offsets.release_segment(0), "a reader is alive");
+        drop(reader);
+        assert!(offsets.release_segment(0));
+        assert!(!offsets.release_segment(5), "not allocated");
+        assert!(offsets.is_released(0) && !offsets.is_released(1));
+        assert_eq!(offsets.live_segments(), 2);
+        assert_eq!(offsets.try_at(3), None);
+        assert_eq!(offsets.try_at(OFFSET_SEGMENT_SLOTS + 3), Some(OFFSET_SEGMENT_SLOTS as u64 + 3));
+        let copy = offsets.clone();
+        assert!(copy.is_released(0));
+        assert_eq!(copy.at(total - 1), total as u64 - 1);
+        offsets.push(7).expect("room");
+        assert_eq!(offsets.at(total), 7);
     }
 
     #[test]

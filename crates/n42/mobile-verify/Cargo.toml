@@ -20,7 +20,7 @@ serde = { workspace = true, features = ["derive"] }
 bincode.workspace = true
 thiserror.workspace = true
 hex.workspace = true
-lru = "0.18"
+lru = "0.19"
 tracing.workspace = true
 
 [dev-dependencies]

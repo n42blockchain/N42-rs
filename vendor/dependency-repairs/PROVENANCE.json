@@ -1,16 +1,6 @@
 [
   {
     "package": "alloy-primitives",
-    "version": "0.8.26",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "upstream_manifest_sha256": "208bc9df7342b0fd928502fca41a53ce93eec43ee2275b6a499fb1d6fe8ccdb9",
-    "path": "vendor/dependency-repairs/alloy-primitives-0.8.26",
-    "modified_files": [
-      "Cargo.toml"
-    ]
-  },
-  {
-    "package": "alloy-primitives",
     "version": "1.7.3",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "upstream_manifest_sha256": "452c09018d3cd93b999cc98e7fc95a020f77b64e3e74409c4e80b52ac5da468a",

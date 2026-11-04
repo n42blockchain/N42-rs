@@ -2535,7 +2535,7 @@ Chain 94's real schedule, for when the fleet is pointed at it
 | pectra | 1746612311 (2025-05-07) |
 | osaka, eof, fusaka | 1765238400 (2025-12-09) |
 | mobileAnchor | 1784372000 (2026-07-18) |
-| glamsterdam | 1798761600 (2027-01-01) |
+| glamsterdam | unscheduled (gov5 7529e2e9 removed 1798761600 / 2027-01-01) |
 
 Note that changing the `hotstuff` block does **not** change the genesis hash —
 it lives in `config`, which the header does not cover. Two chains with different

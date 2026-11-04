@@ -4,7 +4,8 @@ Status: stages 0-4 done (2026-11-02; the table in section 4, "Stage 2 verificati
 verification" at the end). Open:
 
 - a run on chain 94's genesis (all runs so far are on `n42_devnet.json`);
-- packet latency of up to about 1 s for Rust-built blocks, set by the sidecar's head poll;
+- packet latency for Rust-built blocks: up to one 250 ms head poll, or one `newHeads` notification
+  with packetd `-ws` (gov5 8fe815dc; live measurement pending);
 - registry index divergence between nodes when a registration straddles an epoch boundary (each
   node commits on its own timer, as in gov5);
 - the reward model (gov5 item 8);
@@ -486,6 +487,181 @@ Left for stage 3:
 - A run on chain 94's genesis (`crates/chainspec/res/genesis/gov5/`, with its README's
   `--fork-time` step). The device took its ChainConfig from `n42_devnet.json` here, so the
   devnet sufficed for the device and the sidecar.
-- Sidecar latency is set by its 1 s head poll. A phone that reads `/latest` before the packet has
-  landed sees `packet: false` for up to a second.
+- Sidecar latency is set by its head poll. A phone that reads `/latest` before the packet has
+  landed sees `packet: false` for up to one poll. gov5 3d77dec1 cut the poll to 250 ms and stopped
+  sleeping behind a backlog; gov5 8fe815dc (2026-11-02) adds an opt-in `-ws <url>`: packetd subscribes
+  to the node's `newHeads` (`eth_subscribe` over WebSocket, redialled after 1 s on loss) and wakes on
+  every head, with the poll kept as fallback and catch-up, so a missed notification costs at most one
+  poll. Run it as `mobileverify-packetd -rpc http://127.0.0.1:18545 -ws ws://127.0.0.1:18546 -mv …`
+  (the execution layer needs `--ws`). Unit tests: `TestHeadSubscriberWakesOnEveryHeadAndReconnects`,
+  `TestFollowerBuildsOnNewHeadWithoutWaitingForThePoll` (block built 0.6 ms after its notification
+  with a one-minute poll). A live devnet latency measurement with `-ws` is still to run.
 
+
+## Gate verification
+
+Rounds are driven by `scripts/devnet-mobileanchor.sh <tag> [--gov5] [--txload]` (box claim,
+fleet with `MOBILEVERIFY=1` and the packetd sidecar beside validator 0, optional `send_tx` load,
+gov5's `cmd/mobileverify-device` against validator 1, then `scripts/devnet-header-roots.py`,
+per-block hashes on both chains, gov5's errors and per-block packet sources). Evidence under
+`/data/n42-build/audit-notes/devnet/<tag>/` (`run.log`, `fleet.out`, `device.out`, `send_tx.out`,
+`hdrroots*.out`, `hashes.out`, `packets.out`, `NOTES.md`).
+
+**All-Rust, gated** (`n42_devnet_mobileanchor.json`, `glamsterdamTime` = `mobileAnchorTime` = 0):
+`mv4g`, recorded in `HEADER_FIELD_PARITY.md` section 7.1 -- 24-element headers, leader-root check
+120/120, device 20/20 on empty blocks. With transfers (`mv4f`) the sidecar drops every block with
+transactions (receipts root mismatch: gov5's re-execution runs Amsterdam rules, the Rust node does
+not), so the device certifies nothing but empty blocks.
+
+**Mixed, gated** (`mv4h2`, 2026-11-03, three Rust validators + the gov5 member from
+`test/mobileverify-device-genesis` fcd7aa4b, two senders at 2 tx/s): **the gov5 member never
+joins -- the two clients build different genesis blocks.** reth's genesis header has 21 elements
+(through `requestsHash`, hash `0x112489f0…`); gov5's has the same 21 plus `blockAccessListHash` =
+keccak(rlp([])) (`0x1dcc4de8…`) as element 22 and no slot (`0x9e8628a6…`, recomputed from reth's raw
+header). gov5 `internal/genesis_block.go` sets the BAL hash and a slot under `IsGlamsterdam` at
+genesis, although on native chains it never puts the BAL hash in a block above genesis (the Rust
+node's blocks carry an empty element 21, slot 22, root 23). gov5 logs `Peer status mismatch ...
+wrong fork digest version` every 10 s and sits at height 0 in view 1 (no error-level lines); the
+earlier `mv4h` had the same genesis hash. The predicted Amsterdam-execution divergence is
+therefore not reached by the gov5 node, only by its sidecar (packetd dropped all 83 blocks with
+transactions, as in `mv4f`). Consensus carried on with three Rust votes: 89 commits per validator
+over 118 views, 58 view timeouts (the gov5 member's views), EL errors 0; leader-root check 111/111
+(zero root on blocks 1-11, `0xcbc6f248…` from block 12). Device `certified 20/20` with
+`skipped=72`: every certified block is empty. Packet relay: all 28 empty-block packets came from
+the sidecar and reached validator 1; no transaction block had a packet anywhere; gov5 cached none.
+Whether a gov5 leader stamps a registry root is not observable until the genesis agrees.
+Two fixes are needed before a mixed gated round can pass: genesis parity for a chain whose
+`glamsterdamTime` is at genesis (one side must change; the Rust genesis builder adding the empty
+BAL hash, or gov5 dropping it on native chains) and the Amsterdam execution parity of workstream B.
+
+**Chain 94, mixed** (`c94-a`, 2026-11-03): genesis from `scripts/gov5-local-genesis.py`
+(chain 94's file with the devnet's four validators and Shanghai/Cancun at block 1, config only;
+see `crates/chainspec/res/genesis/gov5/README.md` for why the production fork schedule cannot run
+on a fresh fleet). Both clients built genesis `0xa2d2ff5d…`, chain 94's hash. 360 s, two senders
+(validators 0 and 1, funded by the block reward) at 2 tx/s after 40 s, 1,162 sent, 0 rejected.
+Result: **pass.** Heights 159 on both, all 160 hashes equal; gov5 sealed 40 blocks, error-level
+lines 0; Rust validators 159 commits, 0-2 view timeouts, EL errors 0. Headers carry neither slot
+nor root (16-element genesis, 20-element blocks; the local chain lives in 2023, before
+`mobileAnchorTime`, and the round's genesis still carried the since-removed `glamsterdamTime`
+2027-01-01, plan item G2 -- neither is reached locally). Device `devices=2 blocks=20 skipped=0 failures=0 certified(all
+devices)=20/20`, signers 2 each, on blocks with transactions. Packets: the sidecar built all 159
+(one error line, block 0), and every block's packet was in validator 1's and gov5's caches,
+including the 40 gov5-led blocks. The gov5-led blocks carried no transactions (the senders
+submitted to reth's RPC; the Rust leaders sealed them first), so a gov5-built transaction block
+was not exercised.
+
+## Proposal: registry epochs keyed on block timestamps (D6, 2026-11-02; no code)
+
+**Today.** Each node folds its pending registrations into the committed registry on its own
+wall-clock timer: gov5's `EpochCommitter` ticks every `collect_window_sec` (45 s,
+`internal/mobileverify/replication.go` `Start`/`commitOnce`), and the Rust `commit_epochs`
+(`crates/n42/h2-node/src/mobile.rs`) copies it. `CommitEpoch` sorts a batch by BMT key hash, so two
+nodes that commit the *same pending set* assign the same indices and reach the same accumulator root.
+Nothing makes them commit the same set at the same point: a registration gossiped a second before one
+node's tick and a second after another's lands in different epochs, and from then on the two
+registries assign different indices to every later key. The leader stamps *its* `registry.root()` into
+`MobileRegistryRoot` (gov5 `worker.go` `mobileAnchorRoot`, Rust payload attributes); followers on both
+clients check only that the field is present (`HEADER_FIELD_PARITY.md` 7.1), because their own root may
+legitimately differ. Indices matter beyond the root: certificates name signers by index (signer masks),
+so a certificate built on one node can name different devices on another.
+
+**Proposal.** Make the commit a function of the chain, in two steps that can ship separately.
+
+1. *Deterministic commit point.* A chain-config parameter `mobileRegistryEpochSeconds` (E, 45 on
+   today's chains) defines epoch boundaries on the block timestamp: block B closes an epoch when
+   `floor(B.time / E) > floor(parent.time / E)`. Every node commits its pending set when it **commits**
+   (finalises) such a block, never on a timer, and the leader stamps the root committed at the last
+   epoch-closing ancestor. All nodes then commit at the same height; the root in a header is the root
+   at a known chain point. On its own this removes the timer skew (tens of seconds) but not the gossip
+   race (a registration that reached the leader before the boundary block and a follower after it).
+2. *Deterministic content.* The epoch-closing block carries its batch: the leader puts the pubkeys
+   (and PoPs) it commits into the block's body side-channel that both clients already gossip with the
+   block (gov5's `block_gossip` RLP `[header, txs, verifiers, rewards]` gains an optional fifth
+   element, or a zero-value system transaction to a registry address, whichever gov5 prefers). A
+   follower applies exactly that batch at that block (verifying each PoP, ignoring keys already
+   committed, keeping its own unlisted pending keys pending), recomputes the root and **checks the
+   header's value**, not just its presence. Index assignment is then a pure function of the chain.
+
+**What changes.**
+
+| Side | Step 1 | Step 2 |
+| --- | --- | --- |
+| gov5 | `EpochCommitter` driven from the chain-commit hook instead of `time.Ticker`; `mobileAnchorRoot` returns the root at the last epoch-closing ancestor; new `params` field | leader attaches the batch; `verifyHeaderWithBatch` (or import) applies it and compares the root; registry snapshot carries the commit height |
+| n42-rs | `commit_epochs` driven from the validator's commit stream (`h2-node` already sees commits for `/latest`); `header::qmdb` reads the new field; payload attributes name the root at the last boundary | `block_body.rs`/`compact_body.rs` carry the batch; `HotStuffConsensus` gains the value check under the gate (the root stops being presence-only) |
+| Phone / SDK | none (indices and masks keep their format) | none |
+
+**Migration.** Gate both steps on a chain-config time (`mobileRegistryChainEpochTime`, nil = the
+timer, as `unchangedAccountNoOpTime` is gated). At the switch, nodes may already hold divergent
+registries; the first epoch-closing block at or after the time is a *re-base*: every node imports the
+leader's committed registry from the registry snapshot export (the format both clients already
+write, `registry.bin` / gov5's snapshot), and devices re-register only if their key is missing from it.
+Chains without `mobileAnchorTime` need only step 1 (no header root); chain 94 needs both before its
+MobileAnchor + Glamsterdam gate opens (2027-01-01). Nothing is coded until gov5 agrees to the shape;
+this section is the proposal sent with the gov5 PRs.
+
+**Mixed, gated, after A3 and B1** (`mv4h3`, 2026-11-03; Rust 6474989e0, gov5 member fcd7aa4b plus the
+native-chain EIP-8282 fix): the genesis now agrees (`0x9e8628a6…` on both, A3) and gov5 peers, but it
+refuses block 1, an empty block led by validator 1, with `state root mismatch at block 1: proposer
+fdde74e1…, locally computed 19dfd6ad…` and stays at height 0; the Rust validators commit alone (89
+commits). The question of a gov5 leader's registry root therefore stays open. Everything the sidecar
+checks passes: packetd built all 90 packets including the 68 with transactions (the receipts-root oracle
+of `mv4f` now agrees, B1), the device certified 20/20 with nothing skipped, and the leader-root check is
+89/89. Two short trace rounds (`mv4h3-trace`, `mv4h3-trace2`) show that block 1 writes the same four
+accounts and two slots with the same values on both clients, so the mismatch lies in the QMDB commitment
+of those leaves on an Amsterdam block, not in execution.
+
+## Pure-Rust producer: feasibility (D5, 2026-11-03)
+
+**Question.** A StreamPacket's read log is positional: the phone replays it through Go's
+`IntraBlockState`, which asks its reader for each account and slot once per block in its own order. Can
+a Rust producer record that log from revm's `Database` calls instead of running gov5's execution in the
+sidecar?
+
+**Method (throwaway tools, kept in `/data/n42-build/audit-notes/d5-spike/`).**
+
+1. Go (`zz_spike_test.go`, run from gov5 `feat/mobileverify-packetd`): for every packet packetd built in
+   round `mv3b` (139 blocks of `n42_devnet.json`: 100 blocks with 8-14 transfers each, 39 empty), re-execute
+   the block with `packetd.BuildPacket` over the packet's own log (`StreamReplayStateReader`) wrapped in a
+   keyed reader. This names the account or slot behind every positional entry. The rebuilt log is
+   byte-identical to the packet's on all 139 blocks.
+2. Rust (`zz_d5_spike.rs`, an `n42-engine-types` integration test): rebuild the parent state from those
+   keyed values (plus the genesis bytecodes), execute the same block with reth 2.8.1's `EthEvmConfig`
+   (`apply_pre_execution_changes`, then each transaction; recording stops before the withdrawals, which
+   the phone does not execute), and record every `Database::basic` / `storage` call in order. Then encode
+   that order with gov5's read-log codec and compare it with the packet bytes.
+
+**Result** (`d5-spike/d5-rust.out`):
+
+- Gas used equals the header on all 139 blocks.
+- revm reads exactly the same set of accounts and slots as Go: no extra reads, no missing ones. The
+  coinbase is read where Go reads it, after the first transaction's sender and recipient.
+- The order differs in one place only: the block-start system calls. reth runs EIP-2935 (history storage)
+  before EIP-4788 (beacon roots); gov5 runs 4788 first (`ProcessExecutionBlockStart`). Raw revm order
+  equals Go's order on 0/139 blocks.
+- With that prelude swapped back (all 4788 entries, then the 2935 entries, then the transaction reads
+  as revm made them), the revm log is **byte-identical to the sidecar packet's read log on 139/139
+  blocks**.
+
+**Verdict.** For the shapes measured -- plain transfers between existing accounts, the coinbase credit
+and the Prague block-start system calls -- revm's access order can be made identical with one
+deterministic fix: record the two system calls in gov5's order. The withdrawal reward never enters the
+log, because neither the phone nor packetd executes it. This is **not yet a proof for the devnet's full
+shape set**, so nothing is implemented. Untested:
+
+- **Creating-recipient transfers.** `mv3b`'s recipients all exist. Go's `Exist(to)` and revm's
+  target load both read the account once, so they probably agree, but this has not been measured.
+- **Contract calls, reverts and failed transactions.** Go journals and reverts reads differently from
+  revm's checkpoints; the cross-client `stream_packet.json` fixture block is the next case to run.
+- **Amsterdam execution on gated chains.** Main now runs revm `SpecId::AMSTERDAM` there
+  (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`); the EIP-8037 and EIP-7708 paths were not covered.
+- **The 4788 write path.** On native chains gov5 writes the 4788 ring slots directly, even without
+  contract code (`UsesDirectBeaconRootWrites`), while revm executes the contract. On a chain whose
+  genesis lacks the 4788 code the read sets would differ (revm would read only the account). The bundled
+  genesis files all deploy it.
+
+**Next step if wanted.** Rerun the two tools on gov5's
+`test/glamsterdam-native-fixtures` block (11 shapes, creating transfers and contract calls included),
+and on a `mv4h`-style gated round with load. If every shape is byte-identical after the prelude swap, a
+Rust producer can wrap the node's `State` database in a recorder at the follower import, at the cost of
+one extra `Vec` push per cache miss. Until then the sidecar (§3.2 option 2) stays, because its log is
+right by construction.

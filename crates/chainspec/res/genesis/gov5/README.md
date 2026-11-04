@@ -25,3 +25,29 @@ n42-gov5-genesis --chainspec ../N42-gov5/params/chainspecs/mainnet_qmdb_staggere
   --expect-hash 0xa2d2ff5d814552bb9a113b68ad7ed2b824fbb52caed42dbe573068845b57be99 \
   --out crates/chainspec/res/genesis/gov5/mainnet_qmdb_staggered.json
 ```
+
+## Running a local fleet on one of these chains
+
+A fresh fleet cannot replay the production fork schedule: its block timestamps
+are genesis + slot x period, so a local chain-94 fleet lives in March 2023,
+before Shanghai's block 305000, and gov5's block reward (paid by the Rust side as
+withdrawals) would have nowhere to go. The chain's own validator keys are not
+here either. `scripts/gov5-local-genesis.py` makes the local form, changing only
+`config` so the genesis hash stays the chain's:
+
+```
+scripts/gov5-local-genesis.py --chain crates/chainspec/res/genesis/gov5/mainnet_qmdb_staggered.json \
+  --validators-from crates/chainspec/res/genesis/n42_devnet.json \
+  --fork-time shanghai=+1 --fork-time cancun=+1 --out <dir>/c94-local.json
+```
+
+(the devnet's four dev validators; Shanghai and Cancun from block 1 for both
+clients, gov5 reading `IsShanghaiAt(num, time)`; Pectra and mobileAnchor stay
+at the chain's timestamps, beyond the local clock, and chain 94 schedules no
+Glamsterdam, so headers carry neither slot nor registry root).
+
+Both files were regenerated from gov5 main 39cff9ce on 2026-11-03: gov5
+7529e2e9 removed `glamsterdamTime` from chain 94's chainspec (chain 95 never had
+it). Chain 95 (`qs_epoch_test`) takes the alloc
+`internal/allocs/mainnet_qmdb_staggered.json`, timestamp 1678174161, difficulty 0. Run it with
+`DEVNET_GENESIS=<dir>/c94-local.json scripts/devnet-mobileanchor.sh <tag> --gov5`.

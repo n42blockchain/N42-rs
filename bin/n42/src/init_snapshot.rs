@@ -136,8 +136,11 @@ struct RootLine {
 /// Accounts plus storage slots written before a commit.
 const COMMIT_UNITS: usize = 100_000;
 
-/// A header from a file holding its RLP, raw or as hex.
-fn read_header_from_file(path: &std::path::Path) -> eyre::Result<Header> {
+/// A header from a file holding its RLP, raw or as hex. It is decoded as
+/// [`n42_header::N42Header`], so a head that carries gov5's
+/// `mobileRegistryRoot` (element 24, `MobileAnchor` + Glamsterdam) keeps it and
+/// hashes to the chain's block hash; a header without one decodes as before.
+fn read_header_from_file(path: &std::path::Path) -> eyre::Result<n42_header::N42Header> {
     let bytes = fs::read(path).wrap_err("header file")?;
     let text = std::str::from_utf8(&bytes).map(str::trim).unwrap_or("");
     let rlp = if text.starts_with("0x") || text.chars().all(|c| c.is_ascii_hexdigit()) && !text.is_empty() {
@@ -146,7 +149,7 @@ fn read_header_from_file(path: &std::path::Path) -> eyre::Result<Header> {
         bytes
     };
     let mut cursor = rlp.as_slice();
-    let header = <Header as alloy_rlp::Decodable>::decode(&mut cursor).wrap_err("header RLP")?;
+    let header = <n42_header::N42Header as alloy_rlp::Decodable>::decode(&mut cursor).wrap_err("header RLP")?;
     if !cursor.is_empty() {
         bail!("header file has {} trailing bytes", cursor.len());
     }
@@ -176,7 +179,7 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     let Environment { provider_factory, data_dir, .. } =
         args.env.init::<N42Node>(AccessRights::RW, runtime)?;
 
-    let header: Header = read_header_from_file(&args.header)?;
+    let header = read_header_from_file(&args.header)?;
     let hash = header.hash_slow();
     let number = header.number;
     let root = header.state_root;
@@ -188,9 +191,9 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
         let provider_rw = provider_factory.database_provider_rw()?;
         let last = provider_rw.last_block_number()?;
         if last == 0 && number > 0 {
-            // A snapshot head carries no registry root: its header file is decoded as
-            // Ethereum's header (see the decode above).
-            setup_without_evm(&provider_rw, SealedHeader::new(n42_header::N42Header::from(header), hash), |n| {
+            // The head is stored as read, registry root included; the dummy
+            // headers below it are Ethereum's and carry none.
+            setup_without_evm(&provider_rw, SealedHeader::new(header, hash), |n| {
                 n42_header::N42Header::from(Header { number: n, ..Default::default() })
             })?;
             provider_factory.static_file_provider().commit()?;

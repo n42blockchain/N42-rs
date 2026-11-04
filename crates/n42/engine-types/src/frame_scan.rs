@@ -80,6 +80,15 @@ impl FrameScan {
 /// authorizations under this fork -- that its gas limit does not cover, or
 /// `None` if it does. The one definition the check and the summaries share.
 pub fn intrinsic_gas_shortfall(tx: &TransactionSigned, spec: SpecId) -> Option<u64> {
+    intrinsic_gas_shortfall_from(tx, None, spec)
+}
+
+/// [`intrinsic_gas_shortfall`] for a transaction whose sender is known. From
+/// [`SpecId::AMSTERDAM`] on the intrinsic base is EIP-2780's, which depends on
+/// the value and on whether the transaction calls its own sender (12,000 for
+/// a self-transfer, +3,000 for another recipient, +6,000 with value); without
+/// the sender a call is priced as one to another account.
+pub fn intrinsic_gas_shortfall_from(tx: &TransactionSigned, sender: Option<Address>, spec: SpecId) -> Option<u64> {
     use alloy_consensus::Transaction as _;
 
     let (al_accounts, al_storages) = tx
@@ -93,7 +102,10 @@ pub fn intrinsic_gas_shortfall(tx: &TransactionSigned, spec: SpecId) -> Option<u
         al_accounts,
         al_storages,
         tx.authorization_list().map_or(0, |list| list.len() as u64),
-        None,
+        spec.is_enabled_in(SpecId::AMSTERDAM).then(|| reth_revm::context_interface::cfg::gas_params::Eip2780TxInfo {
+            value: tx.value(),
+            is_self_transfer: sender.is_some() && tx.kind().to() == sender.as_ref(),
+        }),
     );
     let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
     (tx.gas_limit() < needed).then_some(needed)

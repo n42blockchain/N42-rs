@@ -10,8 +10,8 @@ exclude.workspace = true
 
 [dependencies]
 reth-ethereum-primitives.workspace = true
-ethereum_serde_utils = "0.7"
-hex-literal = "0.3"
+ethereum_serde_utils = "0.8"
+hex-literal = "1"
 hex = "0.4"
 tree_hash.workspace = true
 tree_hash_derive.workspace = true

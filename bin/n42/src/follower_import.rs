@@ -921,9 +921,21 @@ where
 /// The revm spec the intrinsic gas of a block stamped `timestamp` is
 /// computed under (the forks that change it: Shanghai's init-code word
 /// cost, Prague's calldata floor).
-fn spec_for_intrinsic_gas<ChainSpec: reth_chainspec::EthereumHardforks>(chain_spec: &ChainSpec, timestamp: u64) -> reth_revm::primitives::hardfork::SpecId {
+///
+/// A block under gov5's Amsterdam execution on a native chain is checked under
+/// [`SpecId::AMSTERDAM`] with EIP-2780's intrinsic gas, as gov5's
+/// includability check (`deferred_includable.go`) and the executor price it
+/// (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
+fn spec_for_intrinsic_gas<ChainSpec: reth_chainspec::EthereumHardforks + reth_chainspec::EthChainSpec>(
+    chain_spec: &ChainSpec,
+    timestamp: u64,
+) -> reth_revm::primitives::hardfork::SpecId {
     use reth_revm::primitives::hardfork::SpecId;
-    if chain_spec.is_osaka_active_at_timestamp(timestamp) {
+    if chain_spec.is_amsterdam_active_at_timestamp(timestamp)
+        || reth_chainspec::qmdb::glamsterdam_execution_active_at(chain_spec.genesis(), timestamp)
+    {
+        SpecId::AMSTERDAM
+    } else if chain_spec.is_osaka_active_at_timestamp(timestamp) {
         SpecId::OSAKA
     } else if chain_spec.is_prague_active_at_timestamp(timestamp) {
         SpecId::PRAGUE
@@ -1250,7 +1262,7 @@ fn scan_range(
                     index,
                     message: format!("transaction {index}: nonce {}, {sender} is at {expected}", tx.nonce()),
                 }));
-            } else if let Some(needed) = intrinsic_gas_shortfall(tx, spec) {
+            } else if let Some(needed) = n42_engine_types::frame_scan::intrinsic_gas_shortfall_from(tx, Some(*sender), spec) {
                 run.fault = Some(Box::new(Fault {
                     index,
                     message: format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()),
@@ -1261,14 +1273,6 @@ fn scan_range(
         run.cost = run.cost.saturating_add(n42_engine_types::frame_scan::tx_cost(tx));
     }
     scan
-}
-
-/// The intrinsic gas -- the transaction's kind, calldata, access list and
-/// authorizations under this fork -- that its gas limit does not cover, or
-/// `None` if it does. A block that fails this fails at execution, and the
-/// vote that let it through was wrong.
-fn intrinsic_gas_shortfall(tx: &TransactionSigned, spec: reth_revm::primitives::hardfork::SpecId) -> Option<u64> {
-    n42_engine_types::frame_scan::intrinsic_gas_shortfall(tx, spec)
 }
 
 /// The chunks' runs folded per sender. The chunks are in block order and so
@@ -2201,6 +2205,7 @@ where
         reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), timestamp)
             && exec_early()
             && follower_parallel()
+            && !reth_chainspec::qmdb::glamsterdam_execution_active_at(chain_spec.genesis(), timestamp)
             && n42_engine_types::parallel_transfer::follower_build_path()
             && !n42_tx_types::senders_claimed_at_ingest()
     };
@@ -2232,6 +2237,13 @@ where
     };
 
     let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), head.timestamp);
+    // The parallel transfer paths model the Osaka gas rules (a transfer is
+    // its 21,000 and no log; the block's gas is the sum). A block under gov5's
+    // Amsterdam execution (EIP-8037, EIP-7708) is executed serially, as gov5
+    // does (`ProcessParallel` falls back at Glamsterdam;
+    // `docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
+    let amsterdam_execution = reth_chainspec::qmdb::glamsterdam_execution_active_at(chain_spec.genesis(), head.timestamp);
+    let follower_parallel = || follower_parallel() && !amsterdam_execution;
     // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md): which
     // ancestor's result the header carries, so which one the vote road waits
     // for. The includability check and the execution read the *parent's*
@@ -4431,21 +4443,7 @@ mod tests {
                         // fit the gas limit, or the block fails at execution and
                         // the vote was wrong. Here on the worker pool: serially
                         // it was ~40 ms of the check (loop143).
-                        let (al_accounts, al_storages) = tx
-                            .access_list()
-                            .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
-                            .unwrap_or((0, 0));
-                        let intrinsic = reth_revm::context_interface::cfg::gas::calculate_initial_tx_gas(
-                            spec,
-                            tx.input(),
-                            tx.kind().is_create(),
-                            al_accounts,
-                            al_storages,
-                            tx.authorization_list().map_or(0, |list| list.len() as u64),
-                            None,
-                        );
-                        let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
-                        if tx.gas_limit() < needed {
+                        if let Some(needed) = n42_engine_types::frame_scan::intrinsic_gas_shortfall_from(tx, Some(*sender), spec) {
                             return Err(format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()));
                         }
                         let gas = alloy_primitives::U256::from(tx.gas_limit()) * alloy_primitives::U256::from(tx.max_fee_per_gas());

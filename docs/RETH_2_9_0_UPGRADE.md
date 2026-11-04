@@ -261,6 +261,17 @@ helpers) were dropped and left to evm2. The ported crate (code in c117217eb, loc
 checks and its 48 non-ignored tests pass; the `#[ignore]`d fixture runs were not re-run (no
 fixtures on this host).
 
+### F3 result (2026-11-04)
+
+`cargo check --workspace --keep-going --tests` is clean on the stock evm2 build
+(`audit-notes/ci/f3-check7.log`, head 231e38825); `origin/main` had nothing new to merge. Seven
+check rounds took the count from the first full pass (f3-check2: 10 errors, all in
+`n42-engine-types`) through borrow-check fixes (the block executor now borrows `CachedReads`
+through its database, so a builder must be consumed before the reads are handed back; a
+partially moved builder stays drop-live to the borrow checker) to zero. The
+`legacy-revm-paths` build is not expected to compile: its code still names revm 43's `State`
+(`reth_evm::db::State` is gone), and F5 ports or removes it path by path.
+
 ### Notes for the history
 
 - Commit c117217eb (`fix(storage-overlay): ...`) also carries the ef-tests runner port: the two

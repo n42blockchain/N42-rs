@@ -41,6 +41,12 @@
 //! map (`docs/BREAKTHROUGH_DESIGN.md` 10.14: the v4 fold is bound by the 264
 //! bytes an account it moves). Reads, the view and the merge go through the
 //! index; the results are the v4 fold's (`tests/output_shards.rs`).
+// The stock evm2 build leaves the revm-era paths out (`legacy-revm-paths`): what only they
+// use or mutate reads as dead here until F5 ports or removes them (docs/RETH_2_9_0_UPGRADE.md).
+#![cfg_attr(
+    not(feature = "legacy-revm-paths"),
+    allow(dead_code, unused_mut, unused_variables, unused_assignments, unused_imports)
+)]
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},

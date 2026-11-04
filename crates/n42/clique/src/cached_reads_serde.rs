@@ -44,7 +44,7 @@ struct CachedAccountOwned {
 }
 
 /// Serializes a [`CachedReads`] in the shape the vendored `reth-revm` derived.
-pub fn serialize<S: Serializer>(reads: &CachedReads, serializer: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn serialize<S: Serializer>(reads: &CachedReads, serializer: S) -> Result<S::Ok, S::Error> {
     CachedReadsRef {
         accounts: reads
             .accounts
@@ -60,7 +60,7 @@ pub fn serialize<S: Serializer>(reads: &CachedReads, serializer: S) -> Result<S:
 }
 
 /// Deserializes a [`CachedReads`] written by [`serialize`].
-pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CachedReads, D::Error> {
+pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CachedReads, D::Error> {
     let owned = CachedReadsOwned::deserialize(deserializer)?;
     Ok(CachedReads {
         accounts: owned

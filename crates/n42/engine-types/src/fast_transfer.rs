@@ -25,6 +25,12 @@
 //!
 //! `N42_FAST_TRANSFER=1` turns it on; it is off by default so that a fleet
 //! can measure it against the interpreter on the same binary.
+// The stock evm2 build leaves the revm-era paths out (`legacy-revm-paths`): what only they
+// use or mutate reads as dead here until F5 ports or removes them (docs/RETH_2_9_0_UPGRADE.md).
+#![cfg_attr(
+    not(feature = "legacy-revm-paths"),
+    allow(dead_code, unused_mut, unused_variables, unused_assignments, unused_imports)
+)]
 
 #[cfg(feature = "legacy-revm-paths")]
 use alloy_primitives::{Address, Bytes, U256};

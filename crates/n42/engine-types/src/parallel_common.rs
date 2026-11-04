@@ -7,6 +7,12 @@
 //! `legacy-revm-paths` feature (`crate::legacy_paths`); the revm-era
 //! execution that uses them builds only with it, and re-exports them, so
 //! every `crate::parallel_transfer::*` path keeps working.
+// The stock evm2 build leaves the revm-era paths out (`legacy-revm-paths`): what only they
+// use or mutate reads as dead here until F5 ports or removes them (docs/RETH_2_9_0_UPGRADE.md).
+#![cfg_attr(
+    not(feature = "legacy-revm-paths"),
+    allow(dead_code, unused_mut, unused_variables, unused_assignments, unused_imports)
+)]
 
 use alloy_primitives::{Address, U256};
 use n42_tx_types::Block;

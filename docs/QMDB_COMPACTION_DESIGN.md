@@ -332,7 +332,8 @@ Stage 3 as landed (2026-11-03, `feat/qmdb-compact-stage34`), where it differs fr
   torn record ends the list; a writable open cuts it off.
 - **Open.** The walk of `entries.log` jumps over each punched twig's range and gives its 2048 slots
   placeholder offsets; the walk of `entries.relocated` jumps over punched earlier groups. A group
-  whose CRC fails is skipped, not the end of the walk (later groups may hold punched twigs); a
+  whose CRC fails is skipped, not the end of the walk (later groups may hold punched twigs), and
+  a run of failing groups at the end of the file is a torn tail and is cut; a
   group naming a twig past the kept slots is skipped too, and a writable open disarms it (its CRC
   inverted in place) so a later open that keeps more slots never applies it to the records
   appended in their place (stage 2 cut the file there, which would now lose later groups). A
@@ -342,7 +343,15 @@ Stage 3 as landed (2026-11-03, `feat/qmdb-compact-stage34`), where it differs fr
   offsets and must not be read after the punch; nothing in the node keeps one across rounds. A
   read-only historical open (`from_entry_file_readonly`, the recovery frontier's root of an old
   block) at a block below a punched twig's horizon may refuse (`kills a live slot` group skipped,
-  main range punched): the caller treats it as unavailable.
+  main range punched): the caller treats it as unavailable. A damaged latest group of a twig
+  (a CRC that fails: a torn write, a bad sector) is not applied: the twig falls back to its
+  previous intact group, which is older and holds a superset of the live records (the slots it
+  names live that later died are dead in the checkpoint's bits and read as such), or to its
+  records in `entries.log` when it has no earlier group. When those older bytes are already
+  punched, the open refuses with "a punched twig without a group": the entry store lost data the
+  checkpoint needs, and the node has to be restored (a portable snapshot from a peer, or a
+  resync), not restarted. A thread per state: `initialize` run again on the same state finds the
+  compaction thread running and starts no second one.
 - **Metrics.** `EntryStoreStats::punched_bytes` and the gauge `n42_qmdb_entry_punched_bytes`;
   `bytes_per_live_slot` is (file + relocated - punched) / live. With the compaction on, the 10 s
   sampler also logs one `QMDB entry store` line a minute (per_live, file, relocated, punched, live,

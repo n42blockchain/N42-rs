@@ -3816,17 +3816,14 @@ where
             let qmdb_state = qmdb.clone().expect("checked above");
 
             // reth v2.9.0: the executor borrows `cached_reads` through its
-            // database; taking the builder apart here (its references left
-            // in place) ends that borrow when the finish consumes the
-            // executor, so the reads can be handed back afterwards.
-            let reth_evm::execute::BasicBlockBuilder {
-                executor: seal_executor,
-                evm_env: seal_evm_env,
-                transactions: seal_transactions,
-                ctx: seal_ctx,
-                ..
-            } = builder;
-            drop((seal_evm_env, seal_transactions, seal_ctx));
+            // database. The builder is consumed in a block of its own (a
+            // partially moved local stays drop-live to the borrow checker
+            // until the function ends), so the borrow ends when the finish
+            // consumes the executor and the reads can be handed back.
+            let seal_executor = {
+                let seal_builder = builder;
+                seal_builder.executor
+            };
 
             // ---- behind the seal ----
             // A failure here is after the proposal: the store's waiters are

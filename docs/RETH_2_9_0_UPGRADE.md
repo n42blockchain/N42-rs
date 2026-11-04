@@ -260,3 +260,15 @@ test name, a forced empty coinbase before Spurious Dragon, the hand-written 6-bl
 helpers) were dropped and left to evm2. The ported crate (code in c117217eb, lock in 7774ff867)
 checks and its 48 non-ignored tests pass; the `#[ignore]`d fixture runs were not re-run (no
 fixtures on this host).
+
+### Notes for the history
+
+- Commit c117217eb (`fix(storage-overlay): ...`) also carries the ef-tests runner port: the two
+  were made in parallel in one worktree and that commit swept the staged ef-tests files in. The
+  branch was already pushed, so it was not rewritten; the ef-tests subsection above describes
+  that part of it.
+- Engine defaults (the reth-bump rule): `TreeConfig` (`crates/engine/primitives/src/config.rs`)
+  and `EngineArgs` (`crates/node/core/src/args/engine.rs`) have no default that differs between
+  upstream v2.8.1 and v2.9.0; the vendored `EngineArgs` differs from upstream only by N42's
+  `--engine.state-trie-overlay`. `roll --kill` (including a kill before the first persistence)
+  still runs in F4.

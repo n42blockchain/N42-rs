@@ -2852,7 +2852,7 @@ where
                     });
                     let early_root = {
                         let (shards, residual, qmdb) = (Arc::clone(&shards), Arc::clone(&residual), qmdb.clone());
-                        let prague = chain_spec.is_prague_active_at_timestamp(head.timestamp);
+                        let prague = n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, head.timestamp);
                         root_slot.start(move || {
                             let overlaps = shards.overlaps(&residual.state);
                             let view = shards.view(&residual.state, &overlaps);
@@ -3143,7 +3143,7 @@ where
     // engine's hand-off read it (made aside by now, under the execution).
     let recovered = Arc::clone(late.get()?);
     drop(late);
-    let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
+    let prague = n42_qmdb_reth::system_caller_leaf_at(chain_spec, recovered.timestamp);
     let on_parent_output = executed_parent.is_some();
     // The build path runs the post-execution checks beside its merge, and
     // (with the pass on) builds the hashed post-state from the shards' view.

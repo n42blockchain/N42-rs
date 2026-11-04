@@ -2378,7 +2378,16 @@ where
             if chain_spec.is_cancun_active_at_timestamp(attributes.timestamp) {
                 // A block of transfers carries no blobs.
                 header.blob_gas_used = Some(0);
-                header.excess_blob_gas = group_env.block.blob_excess_gas_and_price.as_ref().map(|b| b.excess_blob_gas);
+                // evm2's block env keeps only the blob base fee; the excess
+                // comes from the parent, as reth's `EthBlockAssembler` derives it.
+                header.excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(parent_header.timestamp) {
+                    alloy_consensus::BlockHeader::maybe_next_block_excess_blob_gas(
+                        parent_header.header(),
+                        chain_spec.blob_params_at_timestamp(attributes.timestamp),
+                    )
+                } else {
+                    Some(alloy_eips::eip7840::BlobParams::cancun().next_block_excess_blob_gas_osaka(0, 0, 0))
+                };
             }
             // A block of transfers produces no EIP-7685 requests; the finish
             // behind the seal says so loudly if that ever stops being true.

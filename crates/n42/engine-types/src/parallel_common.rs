@@ -9,6 +9,8 @@
 //! every `crate::parallel_transfer::*` path keeps working.
 
 use alloy_primitives::{Address, U256};
+use n42_tx_types::Block;
+use reth_primitives_traits::RecoveredBlock;
 use reth_trie::bundle_state::{AccountRevert, BundleState};
 
 /// The block executor factory of a node with the transfer path: what

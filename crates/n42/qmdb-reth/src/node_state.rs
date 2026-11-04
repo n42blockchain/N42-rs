@@ -714,6 +714,8 @@ fn poisoned_forest_guard<'a>(
 
 struct Inner {
     forest: Mutex<Option<QmdbForest>>,
+    /// The entry-file compaction's schedule (`crate::entry_compaction`).
+    entry_compaction: Arc<crate::entry_compaction::EntryCompaction>,
     /// Serialises the bounded checkpoint-parent sidecar's atomic replacements.
     frontier_write: Mutex<()>,
     #[allow(clippy::type_complexity)] // hot-path callback field; its type is kept inline
@@ -1238,6 +1240,9 @@ impl QmdbNodeState {
         Self {
             inner: Arc::new(Inner {
                 forest: Mutex::new(None),
+                entry_compaction: Arc::new(crate::entry_compaction::EntryCompaction::new(
+                    crate::entry_compaction::EntryCompactConfig::from_env(),
+                )),
                 frontier_write: Mutex::new(()),
                 durable_head_reader: Mutex::new(None),
                 forest_holder: Mutex::new(""),
@@ -1353,6 +1358,9 @@ impl QmdbNodeState {
     /// until then (`QmdbForest::set_keep_from`), and drops the keep once the
     /// view is invalid.
     pub fn on_persisted(&self, blocks: &[(u64, B256)]) {
+        if let Some(last) = blocks.iter().map(|(number, _)| *number).max() {
+            self.inner.entry_compaction.note_persisted(last, blocks.len() as u64);
+        }
         let Some(view) = self.inner.read_view.get() else { return };
         // Called ahead of the batch's commit: the database's readers stay at
         // the view's head until then, however far the view advances here.
@@ -2623,7 +2631,13 @@ impl QmdbNodeState {
             if self.inner.read_view_wanted.load(std::sync::atomic::Ordering::Relaxed) {
                 self.build_read_view(&mut forest, head);
             }
+            if cursor.head == forest.head().1 {
+                self.inner.entry_compaction.note_logged(forest.head().0, cursor.next_slot);
+            }
             *guard = Some(forest);
+            if self.inner.entry_compaction.config().enabled {
+                self.spawn_entry_compaction();
+            }
             return Ok(());
         }
         let path = self.snapshot_path();
@@ -3446,6 +3460,7 @@ impl QmdbNodeState {
                 for delta in &deltas {
                     cursor.log_len = append_delta(&self.delta_log_path(), cursor.log_len, delta)?;
                     cursor.next_slot = delta.next_slot;
+                    self.inner.entry_compaction.note_logged(delta.head_number, delta.next_slot);
                     cursor.head = delta.head_hash;
                     logged += 1;
                     debug!(
@@ -3507,6 +3522,7 @@ impl QmdbNodeState {
         cursor.head = block_hash;
         cursor.next_slot = delta.next_slot;
         cursor.log_len = written;
+        self.inner.entry_compaction.note_logged(delta.head_number, delta.next_slot);
         self.record_head_roots(&[(delta.head_number, block_hash, root)]);
         debug!(
             target: "n42.qmdb",
@@ -3562,6 +3578,119 @@ impl QmdbNodeState {
             handle.sync_data().map_err(|source| NodeStateError::Io { path: self.entry_file_path(), source })?;
         }
         Ok(())
+    }
+
+    /// Starts the entry compaction's thread (`crate::entry_compaction`): a
+    /// round each time the database persists, or every second while ranges
+    /// wait for the read view. It holds the state weakly and ends with it.
+    fn spawn_entry_compaction(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        let schedule = Arc::clone(&self.inner.entry_compaction);
+        let spawned = std::thread::Builder::new().name("n42-qmdb-entcompact".into()).spawn(move || {
+            apply_compact_nice();
+            loop {
+                // Waits holding only the schedule, so a dropped state is
+                // gone at once, its files closed, and the thread ends here.
+                let woken = schedule.wait(std::time::Duration::from_secs(1));
+                let Some(inner) = weak.upgrade() else { return };
+                let state = Self { inner };
+                let waiting = !schedule.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty();
+                if woken || waiting {
+                    let budget = if woken { schedule.take_budget() } else { 0 };
+                    if let Err(error) = state.compact_entries_round(budget) {
+                        warn!(target: "n42.qmdb", %error, "an entry compaction round failed");
+                    }
+                }
+            }
+        });
+        match spawned {
+            Ok(handle) => {
+                *self.inner.entry_compaction.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+                info!(target: "n42.qmdb", config = ?self.inner.entry_compaction.config(), "QMDB entry compaction is on");
+            }
+            Err(error) => warn!(target: "n42.qmdb", %error, "could not start the QMDB entry compaction thread"),
+        }
+    }
+
+    /// One round of the entry compaction (`crate::entry_compaction`, steps
+    /// 1-4) rewriting at most `max_twigs` twigs, with the configured dead
+    /// fraction; the thread's body, and what a test calls instead.
+    pub fn compact_entries_round(&self, max_twigs: usize) -> Result<crate::entry_compaction::EntryCompactRound, NodeStateError> {
+        use crate::entry_compaction::{EntryCompactRound, PendingPunch};
+        let schedule = &self.inner.entry_compaction;
+        let mut round = EntryCompactRound { horizon: schedule.horizon(), ..Default::default() };
+        if let Some(horizon) = round.horizon.filter(|_| max_twigs > 0 && self.inner.entry_file) {
+            let fraction = schedule.config().dead_fraction;
+            let (report, handle) = self.with_forest("entry_compact", |forest| {
+                let report = forest.compact_twigs(horizon, fraction, max_twigs)?;
+                let handle = if report.twigs > 0 { forest.relocated_sync_handle()? } else { None };
+                Ok((report, handle))
+            })?;
+            if let Some(handle) = handle {
+                handle.sync_data().map_err(|source| NodeStateError::Io { path: self.entry_file_path(), source })?;
+            }
+            if report.twigs > 0 {
+                let moved = self
+                    .inner
+                    .read_view
+                    .get()
+                    .filter(|view| view.is_valid())
+                    .map(|view| view.retarget(&report.moves));
+                round.twigs = report.twigs;
+                round.bytes_written = report.bytes_written;
+                round.moves = report.moves.len();
+                schedule.twigs.fetch_add(report.twigs as u64, std::sync::atomic::Ordering::Relaxed);
+                schedule.written.fetch_add(report.bytes_written, std::sync::atomic::Ordering::Relaxed);
+                schedule.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(PendingPunch { moved, freed: report.freed });
+            }
+        }
+        let ready: Vec<_> = {
+            let mut pending = schedule.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut ready = Vec::new();
+            while let Some(front) = pending.front() {
+                let unreachable = match front.moved {
+                    None => true,
+                    Some(moved) => self.inner.read_view.get().is_none_or(|view| view.moved_unreachable(moved)),
+                };
+                if !unreachable {
+                    break;
+                }
+                ready.extend(pending.pop_front().expect("a front").freed);
+            }
+            round.waiting = pending.iter().map(|punch| punch.freed.len()).sum();
+            ready
+        };
+        if !ready.is_empty() {
+            match self.with_forest("entry_punch", |forest| forest.punch_entries(&ready)) {
+                Ok(bytes) => {
+                    round.punched_ranges = ready.len();
+                    round.punched_bytes = bytes;
+                    schedule.punched.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                }
+                // The ranges stay where they are, unpunched: nothing points at
+                // them, so they cost disk and nothing else.
+                Err(error) => warn!(target: "n42.qmdb", %error, ranges = ready.len(), "could not punch compacted entry ranges"),
+            }
+        }
+        let rounds = schedule.rounds.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if round.twigs > 0 || round.punched_ranges > 0 {
+            debug!(target: "n42.qmdb", ?round, rounds, "QMDB entry compaction round");
+        }
+        Ok(round)
+    }
+
+    /// Replaces the entry compaction's knobs (`N42_QMDB_COMPACT*` otherwise);
+    /// `enabled` decides whether `initialize` starts its thread.
+    pub fn set_entry_compact_config(&self, config: crate::entry_compaction::EntryCompactConfig) {
+        self.inner.entry_compaction.set_config(config);
+    }
+
+    /// `(rounds, twigs rewritten, bytes written to entries.relocated, bytes
+    /// punched)` since start.
+    pub fn entry_compaction_totals(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let schedule = &self.inner.entry_compaction;
+        (schedule.rounds.load(Relaxed), schedule.twigs.load(Relaxed), schedule.written.load(Relaxed), schedule.punched.load(Relaxed))
     }
 
     /// The checkpoint, rewritten at `block_hash` = the log's head: from the
@@ -5123,6 +5252,13 @@ mod tests {
         // Its export is the full slot history, dead entries included.
         let portable = again.portable_export(1143, chain.genesis_hash()).unwrap();
         assert!(!portable.is_empty());
+        // And a fresh file-mode node initialised from it stands at the same root.
+        let imported_dir = scratch("entry-file-portable-import");
+        let imported = QmdbNodeState::new_with_entry_file(chain.clone(), &imported_dir, true);
+        imported.initialize_from_portable(&portable, 1143, chain.genesis_hash(), (41, hash41), root41).unwrap();
+        assert_eq!(imported.state_root(), root41);
+        drop(imported);
+        let _ = std::fs::remove_dir_all(&imported_dir);
     }
 
     /// A file-mode node whose tree was compacted restarts on the two entry
@@ -5180,6 +5316,110 @@ mod tests {
         let error = refused.unwrap_err();
         assert!(matches!(error, NodeStateError::PortableCompacted { .. }), "{error}");
         assert!(error.to_string().contains("compaction off"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 3 end to end: a node with its read view compacts below the
+    /// persisted head, the view is retargeted and answers the same, the old
+    /// bytes wait until the view's journals let go and are then punched, and
+    /// the node restarts on the punched files at the same root with a view
+    /// that reads the moved keys from `entries.relocated`.
+    #[test]
+    fn an_entry_compaction_round_retargets_the_view_then_punches_and_restarts() {
+        use crate::entry_compaction::EntryCompactConfig;
+        use alloy_primitives::{Address, U256};
+        use n42_qmdb_state::AccountState;
+        let chain = qmdb_chain();
+        let dir = scratch("entry-compaction-round");
+        let config = EntryCompactConfig { enabled: false, dead_fraction: 0.5, twigs_per_block: 4, retain: 2 };
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        state.set_read_view_wanted(true);
+        state.set_entry_compact_config(config);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let view = state.read_view().expect("the view is built at initialisation");
+        let address = |i: u64| Address::from_word(B256::from(U256::from(i)));
+        // 2,100 accounts, then 1,500 of them rewritten: most of twig 0 dies.
+        let mut parent = chain.genesis_hash();
+        let mut hashes = vec![parent];
+        for (number, range) in [(1u64, 100..2200u64), (2, 100..1600)] {
+            let mut changes = BlockChanges::new();
+            for i in range {
+                changes.set_account(address(i), AccountState { nonce: number, balance: U256::from(i), code_hash: B256::ZERO });
+            }
+            let hash = B256::from(U256::from(number) << 64);
+            let prepared = state.compute(parent, &changes).unwrap();
+            state.insert(hash, number, prepared).unwrap();
+            state.on_canonical(hash).unwrap();
+            parent = hash;
+            hashes.push(hash);
+        }
+        // Blocks 3..=99 follow, the database persisting 30 blocks behind
+        // (within the forest's 64-block keep for the view).
+        let mut root = B256::ZERO;
+        let persist_to = |state: &QmdbNodeState, hashes: &[B256], from: u64, to: u64| {
+            for number in from..=to {
+                state.on_persisted(&[(number, hashes[number as usize])]);
+            }
+        };
+        for number in 3..=60 {
+            let (hash, r) = advance(&state, number, parent);
+            parent = hash;
+            root = r;
+            hashes.push(hash);
+            // The forest trims the records below the view's keep at the
+            // next block, as it does on a running node.
+            if number > 30 {
+                persist_to(&state, &hashes, number - 30, number - 30);
+            }
+        }
+        let nonce = |i: u64| if i < 1600 { 2 } else { 1 };
+        let check = |view: &crate::read_view::QmdbReadView, at: u64| {
+            for i in (100..2200).step_by(13) {
+                assert_eq!(view.account(&address(i), at).map(|a| a.map(|a| a.nonce)), Some(Some(nonce(i))), "account {i} at {at}");
+            }
+        };
+        // The database is through block 30; the round compacts below 28.
+        assert!(view.is_valid());
+        let round = state.compact_entries_round(8).unwrap();
+        assert!(round.horizon.is_some() && round.twigs >= 1 && round.moves > 0, "{round:?}");
+        assert!(round.waiting >= 1 && round.punched_ranges == 0, "the view's journals still name twig 0: {round:?}");
+        assert!(view.is_valid());
+        check(&view, 30);
+        assert_eq!(state.state_root(), root);
+        // The chain goes on to 99 and the database to 97: the journals filed
+        // before the move fall out of the view's 64, and the next round punches.
+        for number in 61..=99 {
+            let (hash, r) = advance(&state, number, parent);
+            parent = hash;
+            root = r;
+            hashes.push(hash);
+            persist_to(&state, &hashes, number - 30, number - 30);
+        }
+        persist_to(&state, &hashes, 70, 97);
+        let punched = state.compact_entries_round(0).unwrap();
+        assert!(punched.punched_ranges >= 1 && punched.punched_bytes > 0 && punched.waiting == 0, "{punched:?}");
+        assert!(view.is_valid());
+        check(&view, 97);
+        let stats = state.entry_stats().unwrap();
+        assert_eq!(stats.punched_bytes, punched.punched_bytes);
+        assert_eq!(state.state_root(), root);
+        assert_eq!(state.entry_compaction_totals().3, punched.punched_bytes);
+        state.wait_for_compaction();
+        drop(view);
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        restarted.set_read_view_wanted(true);
+        restarted.initialize((99, parent)).unwrap();
+        assert_eq!(restarted.state_root(), root);
+        assert_eq!(restarted.entry_stats().unwrap().punched_bytes, punched.punched_bytes);
+        check(&restarted.read_view().expect("rebuilt on the punched files"), 99);
+        // A compacted node is a pruned node to the v1 format (design 6).
+        assert!(matches!(
+            restarted.portable_export(1143, chain.genesis_hash()),
+            Err(NodeStateError::PortableCompacted { .. })
+        ));
+        drop(restarted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1523,6 +1523,11 @@ pub enum QmdbUndoError {
 }
 
 
+/// Relocated twigs an offsets segment (512 twigs) needs before its other
+/// twigs are compacted whatever their dead share (stage 4 of
+/// `docs/QMDB_COMPACTION_DESIGN.md`): three quarters.
+pub const SEGMENT_MOP_UP_TWIGS: usize = 384;
+
 /// What [`QmdbCompatTree::compact_twigs`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompactReport {
@@ -1541,6 +1546,8 @@ pub struct CompactReport {
     /// punch once no reader can still name them
     /// (`docs/QMDB_COMPACTION_DESIGN.md` 3.5).
     pub freed: Vec<(usize, crate::entry_store::FileRange)>,
+    /// Where an incremental scan resumes ([`QmdbCompatTree::compact_twigs_from`]).
+    pub next_twig: usize,
 }
 
 /// Why [`QmdbCompatTree::compact_twigs`] stopped. Twigs compacted before the
@@ -3224,8 +3231,9 @@ impl QmdbCompatTree {
 
     /// Rewrites up to `max_twigs` mostly dead twigs into `entries.relocated`
     /// (`docs/QMDB_COMPACTION_DESIGN.md` 3.4): each as one group in slot
-    /// order -- a live slot's payload, a dead slot's leaf hash -- made
-    /// durable before its 2048 offsets are pointed at it. Slots, leaves,
+    /// order -- a live slot's payload, a dead slot's leaf hash -- written to
+    /// the file before its 2048 offsets are pointed at it, and made durable
+    /// by the caller (`relocated_sync_handle`) or by `punch`. Slots, leaves,
     /// twig roots, active bits, proofs and the root are unchanged. Nothing is
     /// punched here: the report names the live keys' moves (for a read view)
     /// and the ranges left behind, which the caller punches
@@ -3256,23 +3264,45 @@ impl QmdbCompatTree {
         min_dead_fraction: f64,
         max_twigs: usize,
     ) -> Result<CompactReport, QmdbCompactError> {
+        self.compact_twigs_from(below_slot, min_dead_fraction, max_twigs, 0, usize::MAX)
+    }
+
+    /// [`Self::compact_twigs`] looking at no more than `max_scan` twigs,
+    /// starting at twig `from` and wrapping around to twig 0: the
+    /// incremental scan of a scheduler that keeps the cursor
+    /// (`CompactReport::next_twig`) between rounds, so a round under the
+    /// forest's lock costs its budget and not the whole tree.
+    pub fn compact_twigs_from(
+        &mut self,
+        below_slot: u64,
+        min_dead_fraction: f64,
+        max_twigs: usize,
+        from: usize,
+        max_scan: usize,
+    ) -> Result<CompactReport, QmdbCompactError> {
         let mut report = CompactReport::default();
         let Entries::File(file) = &mut self.entries else {
             return Ok(report);
         };
         let full = (below_slot.min(self.next_slot) as usize / TWIG_SIZE).min(self.twigs.len());
         let threshold = (min_dead_fraction.clamp(0.0, 1.0) * TWIG_SIZE as f64).ceil() as u32;
-        for twig_id in 0..full {
+        let from = if from < full { from } else { 0 };
+        report.next_twig = from;
+        for twig_id in (from..full).chain(0..from).take(max_scan) {
             if report.twigs >= max_twigs {
                 break;
             }
+            report.next_twig = twig_id + 1;
             let twig = &self.twigs[twig_id];
             if twig.last_retired_at >= below_slot {
                 continue;
             }
             let dead = file.dead_in_twig(twig_id);
             let eligible = match file.relocated_dead(twig_id) {
-                None => dead >= threshold,
+                // Stage 4: the last twigs of a mostly compacted offsets
+                // segment go whatever their dead share, so the segment can be
+                // released (`entry_store`'s per-twig starts).
+                None => dead >= threshold || file.relocated_in_segment(twig_id) >= SEGMENT_MOP_UP_TWIGS,
                 Some(before) => {
                     let since = dead.saturating_sub(before);
                     since > 0 && since >= threshold
@@ -3294,7 +3324,7 @@ impl QmdbCompatTree {
                 };
                 report.moves.push((*key, old, 0));
             }
-            let done = file.append_group(group).map_err(|e| QmdbCompactError::Store(e.to_string()))?;
+            let done = file.append_group_durable(group, false).map_err(|e| QmdbCompactError::Store(e.to_string()))?;
             let live = (base..base + TWIG_SIZE).filter(|slot| file.is_active(*slot));
             for (entry, slot) in report.moves[moved_from..].iter_mut().zip(live) {
                 entry.2 = file.location(slot).unwrap_or(u64::MAX);
@@ -3305,6 +3335,30 @@ impl QmdbCompatTree {
             report.freed.push((twig_id, done.old));
         }
         Ok(report)
+    }
+
+    /// A handle on `entries.relocated` with every compacted group written to
+    /// it, for the caller to `fsync` outside its lock (`compact_twigs` leaves
+    /// that to it; `punch` syncs again before it frees anything). `None` in
+    /// the heap or with nothing relocated.
+    pub fn relocated_sync_handle(&mut self) -> std::io::Result<Option<std::fs::File>> {
+        match &mut self.entries {
+            Entries::File(file) => file.relocated_sync_handle(),
+            Entries::Heap(_) => Ok(None),
+        }
+    }
+
+    /// Punches `ranges` (a compaction's `freed`, `docs/QMDB_COMPACTION_DESIGN.md`
+    /// 3.5): recorded in `entries.punched`, made durable, then freed on disk.
+    /// The caller vouches that no reader can still name them (a read view's
+    /// `moved_unreachable`); a clone of this tree taken before the
+    /// compaction still names them and must not be read after. Nothing to do
+    /// in the heap. Returns the bytes punched.
+    pub fn punch(&mut self, ranges: &[(usize, crate::entry_store::FileRange)]) -> std::io::Result<u64> {
+        match &mut self.entries {
+            Entries::File(file) => file.punch(ranges),
+            Entries::Heap(_) => Ok(0),
+        }
     }
 
     /// Bytes of `entries.relocated` in complete groups (0 in the heap): what

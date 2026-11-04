@@ -3584,6 +3584,12 @@ impl QmdbNodeState {
     /// round each time the database persists, or every second while ranges
     /// wait for the read view. It holds the state weakly and ends with it.
     fn spawn_entry_compaction(&self) {
+        // One thread per state: a second initialisation (a rebuild, a
+        // re-init) finds the first one running and leaves it be.
+        let mut thread = self.inner.entry_compaction.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if thread.is_some() {
+            return;
+        }
         let weak = Arc::downgrade(&self.inner);
         let schedule = Arc::clone(&self.inner.entry_compaction);
         let spawned = std::thread::Builder::new().name("n42-qmdb-entcompact".into()).spawn(move || {
@@ -3605,7 +3611,7 @@ impl QmdbNodeState {
         });
         match spawned {
             Ok(handle) => {
-                *self.inner.entry_compaction.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+                *thread = Some(handle);
                 info!(target: "n42.qmdb", config = ?self.inner.entry_compaction.config(), "QMDB entry compaction is on");
             }
             Err(error) => warn!(target: "n42.qmdb", %error, "could not start the QMDB entry compaction thread"),
@@ -5316,6 +5322,25 @@ mod tests {
         let error = refused.unwrap_err();
         assert!(matches!(error, NodeStateError::PortableCompacted { .. }), "{error}");
         assert!(error.to_string().contains("compaction off"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second initialisation of a state with entry compaction on finds
+    /// the thread running and starts no second one.
+    #[test]
+    fn a_second_initialisation_starts_no_second_compaction_thread() {
+        use crate::entry_compaction::EntryCompactConfig;
+        let chain = qmdb_chain();
+        let dir = scratch("entry-compaction-one-thread");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        state.set_entry_compact_config(EntryCompactConfig { enabled: true, dead_fraction: 0.5, twigs_per_block: 4, retain: 2 });
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let first = state.inner.entry_compaction.thread.lock().unwrap().as_ref().map(|handle| handle.thread().id());
+        assert!(first.is_some());
+        state.spawn_entry_compaction();
+        let second = state.inner.entry_compaction.thread.lock().unwrap().as_ref().map(|handle| handle.thread().id());
+        assert_eq!(first, second);
+        drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

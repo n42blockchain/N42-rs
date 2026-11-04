@@ -1,9 +1,11 @@
 # QMDB entry-file compaction: a root-neutral design
 
 Status: design, 2026-10-27, amended 2026-10-28 (3.2 consequence, stage order). Item 6.2 of
-`docs/MATURITY_HARDENING_2026_10.md`. Stage 0 is implemented, and stage 2 (with no production
-caller) on `design/qmdb-compact-stage2`; the stages at the end say what lands first and how each
-is verified.
+`docs/MATURITY_HARDENING_2026_10.md`. Stages 0 and 2 are on main (c992a5ee4, 2026-10-30); the
+slot-resolving view of stage 1 was measured at 2-4% and replaced, on 2026-11-03, by a view that
+keeps locations (section 5, "Stage 1 as landed"); stages 3 and 4 landed with it on
+`feat/qmdb-compact-stage34`, behind `N42_QMDB_COMPACT=1` (default off). Section 6 is the v2
+portable snapshot proposed to gov5 (plan row E2 of `docs/PLAN_OPEN_ITEMS_2026_11.md`).
 
 ## 1. The problem, restated with the code's numbers
 
@@ -177,10 +179,82 @@ QMDB-counter log to put it in (the read view's lag line is about the view, not t
 | stage | change | verification |
 | --- | --- | --- |
 | 0 | metrics of 3.7 (done in 301f82916) | unit tests; one fleet leg shows the growth rates in the table of section 1 |
-| 1 | read view resolves slots through atomic `Offsets` (3.3), no relocation yet | existing read-view and proof tests; an X22 control pair (the hot read path changes: expect noise) |
+| 1 | read view resolves slots through atomic `Offsets` (3.3), no relocation yet. Measured at 2-4% (below) and replaced by a view that keeps locations and is retargeted by a compaction ("Stage 1 as landed") | existing read-view and proof tests; an X22 control pair (the hot read path changes: expect noise) |
 | 2 | `entries.relocated`, tagged records, `open_existing` from two files, `Offsets` top bit, checkpoint fields; compaction runs but never punches (landed on `design/qmdb-compact-stage2`: d0f98a5d6 refactor, 721c9e744 file and records, 7f96f529c `compact_twigs`, 4b07c285d checkpoint v2 and forest, be7b4e93a export refusal and gauge; differences from this design below the table) | tests: compact, restart, same root and same proofs; same portable snapshot bytes before and after; undo across a compacted boundary refused by construction (3.4a) and tested |
-| 3 | scheduler on the pruner thread, epoch-deferred punching, `punched` in the checkpoint | tests with a fake epoch; a fleet leg reads `entry_bytes_per_live_slot` falling to a plateau; `roll --kill` under load restarts on a punched file |
-| 4 | per-twig `base + u32` offsets for compacted twigs | heap growth per slot halves on the metric; control pair |
+| 3 | scheduler on its own thread, epoch-deferred punching, the punched ranges in `entries.punched` ("Stage 3 as landed") | tests with a fake epoch; a fleet leg reads `entry_bytes_per_live_slot` falling to a plateau; `roll --kill` under load restarts on a punched file |
+| 4 | per-twig `base + u32` offsets for compacted twigs ("Stage 4 as landed") | heap growth per slot halves on the metric; control pair |
+
+Stage 1 cost (measured 2026-10-30 on `design/qmdb-compact-stage1-view`, which was not merged):
+
+- **Fleet pairs (X22, win1 M/s).** Stage fx VS (wt-integ 20d3df758 against main): branch
+  4.920 / 4.947 against 4.947. The branch also held the tree lease longer (11.3 / 12.1 ms a block
+  against 10.0-10.9 on every other leg): dropping the per-slot offsets list had also dropped the
+  `rayon::join` that kept `delta_of_applied` on the pool, and the leasing thread (`qmdb-root`, the
+  builder's scoped root thread) is outside it. Fixed in 5713db709. VS2 (5713db709 against main):
+  lease 10.34 / 11.19 against 10.69 / 10.78 ms, but win1 4.800 / 4.847 against 5.033 / 5.000 and
+  rounds 437.2 / 438.6M against 452.8 / 453.0M. All four branch legs (4.800-4.947) lie below all
+  five controls (4.947-5.033): a real 2-4% cost.
+- **Where it goes.** Per view read, main takes two dependent random misses: the index bucket
+  (key -> byte offset) and the record. The branch takes three: the bucket (key -> slot), the
+  slot's 8-byte cell in `Offsets` (8 B for every slot ever written, far past the last-level cache,
+  and a likely TLB miss), then the record. The directory pointer stays cached; the second resolve
+  of the same slot hits the cache.
+- **Micro-benchmark.** `read_view::bench_concurrent_reads` at 50M keys
+  (`N42_BENCH_VIEW_KEYS=50000000`), 160k distinct reads, release, pinned to cores 112-127, two
+  runs of each tree, us a read of pool time (cold / warm):
+
+  | threads | at | main 9cd355183 | stage 1 | delta |
+  | --- | --- | --- | --- | --- |
+  | 1 | head | 0.451-0.465 / 0.452-0.454 | 0.623-0.639 / 0.630-0.660 | +0.17-0.19 |
+  | 4 | head | 0.538-0.549 / 0.514-0.520 | 0.728-0.735 / 0.663-0.681 | +0.15-0.19 |
+  | 16 | head | 0.548-0.591 / 0.553-0.627 | 0.849-0.864 / 0.693-0.731 | +0.07-0.30 |
+  | 1 | 16 behind | 2.049-2.069 / 2.101-2.110 | 2.258-2.283 / 2.259-2.297 | +0.15-0.21 |
+  | 16 | 16 behind | 2.437-2.475 / 2.404 (4.090 outlier) | 2.653-2.654 / 2.456-2.603 | +0.05-0.22 |
+
+  The index-and-record read alone (`raw warm`, 1 thread) goes from 0.434-0.445 to 0.590-0.605 us.
+  So every read pays about 0.16-0.19 us more, about one DRAM miss and a page walk: 35-40% on a read
+  at the head. The hardware counters (`perf stat` of LLC and dTLB misses per read) were not taken:
+  `perf_event_paranoid` was 4 on the host and needs 1.
+- **Fix options, ranked.**
+  1. Keep main's hot path. The index stores locations again (key -> byte offset), and a compaction
+     rewrites the view's entries for a relocated twig: about 2,048 re-inserts of its live keys, done
+     on the view's advance path under every reader slot's write lock, which is also stage 3's reader
+     epoch. Journals keep their old offsets, which stay readable until the journals let go, which
+     `punch_after` has to wait for anyway. The cost: one of the index value's 40 bits must say "this
+     is in `entries.relocated`", which leaves 39 bits of byte offset, so each file is limited to
+     2^39 B = 512 GiB. Past 512 GiB the view invalidates itself as it did past 1 TiB before stage 1
+     (about 45 minutes of the fleet's ~200 MB/s): the limit comes back, halved, until stage 3's
+     punching keeps the live span of `entries.log` bounded, or offsets become relative to a moving
+     base.
+  2. A variant: relocated entries hold their slot (flagged), and only those reads, which are old
+     and cold keys, pay the `Offsets` cell. The same 39-bit limit for the main file.
+  3. Mitigations that keep the slot index: transparent huge pages on the `Offsets` segments (cuts
+     the page walk, not the miss), and prefetching the cell after the bucket in the batched build
+     prefetch. Neither removes the dependent miss.
+  4. Not useful: caching (slot, offset) in the index (a bucket is one `u64`, already full), or a
+     per-view snapshot of `Offsets` (still one cell load per read).
+
+Stage 1 as landed (2026-11-03, option 1 above), where it differs from 3.3:
+
+- **The index keeps locations.** A key-index value is a *location*: bit 39 clear, the byte offset
+  of the record in `entries.log`; set, the byte offset of a live record's key in
+  `entries.relocated` (`twig_core::entry_view::RELOCATED_LOCATION`), from where a relocated live
+  record has the main file's `[key][len][value]` shape. `EntryViewFiles` maps both files (512 GiB
+  of address space each, `VIEW_MAP_BYTES`) and resolves a location with one branch and no memory
+  read, so a read is the index bucket and the record, as on main before compaction. Past 512 GiB of
+  `entries.log` the view invalidates itself as it did past 1 TiB (`past_view`): the limit is
+  halved, and stage 3's punching does not lift it (a punched file keeps its length).
+- **Retargeting.** `compact_twigs` reports each live key of a compacted twig with its location
+  before and after (`CompactReport::moves`); `QmdbReadView::retarget` replaces the index entries
+  under the view's advance lock (an entry the index does not hold at the old location invalidates
+  the view) and publishes to every reader slot, which waits out every read that loaded an old
+  location. Journals keep the old locations; `moved_unreachable` is true once every journal kept
+  was filed after the retarget, which is when the old bytes may be punched. A step back through a
+  journal filed before a retarget invalidates the view (undoing it would put an old location back).
+- **The stage-2 copy is retired**, and `OffsetsReader` has no caller (it stays, and blocks stage 4's
+  segment release while one is alive).
+- **The extra miss is gone.** `read_view::bench_concurrent_reads` (release, pinned, 50M keys,
+  `N42_BENCH_VIEW_KEYS=50000000`): see "Stage 1 fix measured" below.
 
 Stage 2 as landed, where it differs from or adds to the text above:
 
@@ -229,3 +303,113 @@ stage 1 (slot-resolving view) is what stage 3's punching requires, and its bench
 the host's power supply (`docs/MATURITY_HARDENING_2026_10.md` 8.3). Stage 2 ships the mechanism
 (`compact_twigs` on the tree, the second file, the two-file open, the checkpoint field, the
 `relocated_bytes` gauge) with no production caller: stage 3 adds the scheduler.
+
+Stage 3 as landed (2026-11-03, `feat/qmdb-compact-stage34`), where it differs from 3.4-3.6:
+
+- **Schedule.** `qmdb-reth::entry_compaction`: with `N42_QMDB_COMPACT=1` a file-mode node runs
+  thread `n42-qmdb-entcompact` (niced like the log's fold, `N42_QMDB_COMPACT_NICE`), woken by every
+  `on_persisted` and once a second while punches wait. A round's budget is
+  `N42_QMDB_COMPACT_TWIGS_PER_BLOCK` (4) per block persisted since the last round, at most 64; the
+  dead share is `N42_QMDB_COMPACT_DEAD_FRAC` (0.5). The horizon is the slot count after the newest
+  block in the delta log at or below `min(database persisted, logged) - N42_QMDB_COMPACT_RETAIN`
+  (256 blocks): a restart stands at the database's head or above, so it never meets a group whose
+  dead records name a kill its checkpoint does not hold (such a group is skipped at open, which
+  would leave a punched twig unreadable). The forest clamps it further to its undo records, as in
+  stage 2. The scan is incremental: a cursor in the forest, at most 16,384 twigs looked at a round.
+- **Under the lock, no `fsync`.** `compact_twigs` writes the groups to `entries.relocated` (so the
+  view's mapping sees them) and retargets the slots; the round syncs the file through a second
+  handle after the lock is released, and `punch` syncs it again before it frees anything. A crash
+  before the sync loses groups whose old bytes are all still in place.
+- **The reader epoch** is the read view's: the round hands the moves to `QmdbReadView::retarget`
+  and keeps the freed ranges with the returned ticket; a later round punches them, oldest first,
+  once `moved_unreachable` says no journal can name them (with the default 64 journals, about 64
+  persisted blocks later). Without a valid view a range is punched in the same round.
+- **`entries.punched`, not the checkpoint.** The punched ranges are a file of their own beside the
+  entry files (29-byte records: file, twig, start, end, CRC-32; `twig_core::punched`), appended and
+  synced before the punch. Every opening reads it -- a restart, but also a read-only open at an
+  archived checkpoint older than the latest punch, which the checkpoint would not have told -- and
+  the checkpoint format is unchanged (still version 2, `relocated_len` still recorded only). A
+  torn record ends the list; a writable open cuts it off.
+- **Open.** The walk of `entries.log` jumps over each punched twig's range and gives its 2048 slots
+  placeholder offsets; the walk of `entries.relocated` jumps over punched earlier groups. A group
+  whose CRC fails is skipped, not the end of the walk (later groups may hold punched twigs); a
+  group naming a twig past the kept slots is skipped too, and a writable open disarms it (its CRC
+  inverted in place) so a later open that keeps more slots never applies it to the records
+  appended in their place (stage 2 cut the file there, which would now lose later groups). A
+  punched twig left without a group, or a prefix that ends inside one, refuses the open. A writable
+  open that keeps fewer slots drops the main-file holes past them from `entries.punched`.
+- **Limits.** A clone of the tree (`try_clone`) taken before a compaction still names the old
+  offsets and must not be read after the punch; nothing in the node keeps one across rounds. A
+  read-only historical open (`from_entry_file_readonly`, the recovery frontier's root of an old
+  block) at a block below a punched twig's horizon may refuse (`kills a live slot` group skipped,
+  main range punched): the caller treats it as unavailable.
+- **Metrics.** `EntryStoreStats::punched_bytes` and the gauge `n42_qmdb_entry_punched_bytes`;
+  `bytes_per_live_slot` is (file + relocated - punched) / live. With the compaction on, the 10 s
+  sampler also logs one `QMDB entry store` line a minute (per_live, file, relocated, punched, live,
+  offsets, rounds, twigs) for a fleet leg to read.
+
+Stage 4 as landed: an offsets segment (2^20 slots, 512 twigs, 8 MiB) whose every twig is relocated
+and that lies wholly below the last slot is released (`Offsets::release_segment`, refused while an
+`OffsetsReader` is alive); each of its twigs keeps its slots as `u32` starts from its group's base,
+4 B a slot. A slot's offset is read from its cell as before when its segment is kept (no extra
+load on the hot path: the segment pointer is loaded anyway), and from its twig's starts when the
+segment is gone. So that segments do fill, a twig is a candidate whatever its dead share once 384
+of the 512 twigs of its segment are relocated (`SEGMENT_MOP_UP_TWIGS`): such a twig is rewritten
+for the heap, not the disk. Released segments are released again at open. `offsets_bytes` counts
+the live segments at 8 MiB and each released twig's starts at 8 KiB.
+
+## 6. A v2 portable snapshot with tombstones (proposal to gov5, plan row E2)
+
+Why: a v1 portable snapshot (`QmdbPortableSnapshot`, `verify_portable_stream`, gov5's
+`lib/qmdb` portable codec) is the complete positional slot log -- every slot, dead ones included,
+as `[slot u64][active u8][key 32][len u32][value]` -- and its verifier hashes `hash_leaf(key,
+value)` for each. A compacting node has dropped the payload of its compacted twigs' dead slots and
+keeps only their leaf hashes, so it cannot produce v1 (`portable_export` refuses,
+`NodeStateError::PortableCompacted`), and today only a node with compaction off can serve a
+bootstrap. Nothing below changes the root or what a verifier proves; it changes what a slot record
+may carry.
+
+**Format.** Header as v1 with the magic's version byte bumped (`N42QMDB\x02`, v1 is
+`N42QMDB\x01`) and one more header field after `entry_count`: `tombstones u64`, the number of records of
+kind 2 and 3 below (so a reader can size and a v1-only reader stops at the magic). Each slot record
+starts `[slot u64][kind u8]`:
+
+| kind | rest of the record | meaning | verifier |
+| --- | --- | --- | --- |
+| 0 | `[key 32][len u32][value]` | dead slot with its payload (as v1 `active = 0`) | leaf = `hash_leaf(key, value)`, bit 0 |
+| 1 | `[key 32][len u32][value]` | live slot (as v1 `active = 1`) | leaf = `hash_leaf(key, value)`, bit 1 |
+| 2 | `[leaf_hash 32]` | tombstone: a dead slot whose payload was dropped | leaf = `leaf_hash`, bit 0 |
+| 3 | `[count u16][leaf_root 32]` | a run of `count` dead slots filling the rest of a twig from this slot, all tombstones | the twig's leaf tree root is `leaf_root`, every bit of the run 0; the next record's slot is `slot + count` |
+
+Kind 3 lets a twig that died entirely (rare under transfers, `docs/QMDB_UPGRADE_PLAN.md` 4b, but
+common under contract churn) cost 43 bytes. It is optional: an exporter may always write kind 2.
+A kind 3 run may only start a twig (`slot % 2048 == 0`, `count == 2048`), so the verifier sets the
+twig's leaf root directly instead of rebuilding 2048 leaves; partial runs are written as kind 2.
+Records stay contiguous by slot (`slot` = the expected next slot, as v1), the value bound stays
+`MAX_PORTABLE_VALUE_SIZE`, and the trailing Blake3 digest still covers every byte before it,
+header included.
+
+**Verification.** The streaming verifier keeps one twig: for kinds 0 and 1 it hashes as v1; for
+kind 2 it sets the leaf to the stored hash; for kind 3 it sets the twig's leaf root and clears its
+bits; the twig root, the fold of twig roots and the root check are v1's. A tombstone cannot be
+checked on its own -- it is a hash -- but it is committed to by the twig root like every leaf, so a
+wrong tombstone fails the root comparison exactly as a wrong value does. `live_count` counts kind 1.
+A tombstone with the active bit set is not representable (kinds 2 and 3 are dead by definition).
+
+**Import.** Both clients rebuild a tree whose tombstoned slots are hash-only. On the Rust side that
+exists: `QmdbSnapshot` entries with `leaf_hash`, and `set_entry_file` writing such a twig as a
+relocated group (stage 2). gov5 needs the equivalent in its entry store (a slot that holds a leaf
+hash and no payload, refused by any path that needs the key: undo, revival, a v1 export).
+
+**Who writes which.** An archive node (compaction off) keeps writing v1; a compacting node writes
+v2 (or refuses v1, as now). A verifier accepts both magics. `n42-qmdb-export` / `n42-init-snapshot
+export` gain `--format v2`; `init` reads either.
+
+**Migration and cross-client contract.** v1 is unchanged and stays the default until gov5 ships a
+v2 reader. The proposal goes to gov5 as a fixture set under `crates/n42/twig-core/testdata/`
+(a small tree with live, dead-with-payload, tombstoned and whole-dead twigs, its v1 export from the
+uncompacted copy and its v2 export from the compacted one, both verifying to the same root), checked
+by SHA-256 of the raw bytes like the other cross-client fixtures. Until both clients read v2, a
+fleet that compacts must keep at least one archive node (compaction off) to serve bootstraps. No
+code is written for this section until gov5 agrees the layout.
+

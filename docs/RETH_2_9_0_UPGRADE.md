@@ -243,3 +243,20 @@ Decisions, as briefed:
   alloy-evm's revm-era RPC env types; node-core, `bin/n42` and `bin/reth` re-export
   `reth-rpc-convert` as upstream does. `crates/n42/reth-rpc` (not a member, disabled since
   v1.9.3) is left as it is.
+
+### ef-tests runner
+
+`crates/n42/ef-tests` no longer hand-rolls block execution on revm's `State`. Upstream v2.9.0's
+`testing/ef-tests` runs every block through reth's executor, so ours does too, over an evm2
+`InMemoryDB` instead of upstream's MDBX provider: blockchain tests decode each block's RLP (or
+build it from an Engine API payload) and call `EthEvmConfig::executor(&mut db).execute`, then commit
+the bundle into the db and record the block hash for `BLOCKHASH`; the hand-written EIP-4788 /
+EIP-2935 storage writes, withdrawal crediting and 2 ETH PoW reward are gone (the executor applies
+the real system calls, withdrawals and fork-correct rewards), and a block that fails to execute now
+fails the test instead of being logged and skipped. State tests decode the variant's signed
+`txbytes`, build the EVM from `evm_env` of a header made from the test environment, `transact_commit`
+and merge the EVM's state cache back. The revm-era heuristics (precompile accounts guessed from the
+test name, a forced empty coinbase before Spurious Dragon, the hand-written 6-blob cap and blob-fee
+helpers) were dropped and left to evm2. The ported crate (code in c117217eb, lock in 7774ff867)
+checks and its 48 non-ignored tests pass; the `#[ignore]`d fixture runs were not re-run (no
+fixtures on this host).

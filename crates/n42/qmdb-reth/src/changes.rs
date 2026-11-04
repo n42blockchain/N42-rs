@@ -79,7 +79,9 @@ pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
 /// it executed in.
 ///
 /// `prague_active` adds the one leaf revm's bundle cannot show: see
-/// [`with_prague_system_caller`].
+/// [`with_prague_system_caller`]. Pass [`system_caller_leaf_at`], not bare
+/// Prague activation: under Glamsterdam gov5 makes no value transfer from the
+/// system address (`internal/blockhelp.go:94`) and writes no such leaf.
 pub fn changes_from_execution(bundle: &BundleState, prague_active: bool) -> BlockChanges {
     let mut changes = changes_from_bundle(bundle);
     if prague_active {
@@ -287,6 +289,11 @@ pub const PRAGUE_SYSTEM_CALLER: Address = address!("ffffffffffffffffffffffffffff
 ///
 /// EIP-4788 and EIP-2935 do not contribute it: gov5 writes those slots
 /// directly (`SetState`, `StoreParentBlockHash`) rather than through a call.
+///
+/// Only before Glamsterdam: under `IsGlamsterdam` gov5's `SysCallContract`
+/// (`internal/blockhelp.go:94`) makes no value transfer from the system
+/// address, so it is never touched and its leaf is never written. Callers
+/// decide with [`system_caller_leaf_at`].
 pub fn with_prague_system_caller(changes: &mut BlockChanges) {
     changes.set_account_initialised(
         PRAGUE_SYSTEM_CALLER,
@@ -296,6 +303,24 @@ pub fn with_prague_system_caller(changes: &mut BlockChanges) {
             code_hash: alloy_primitives::KECCAK256_EMPTY,
         },
     );
+}
+
+/// Whether a block at `timestamp` writes the system caller's leaf
+/// ([`with_prague_system_caller`]): Prague is active and gov5's
+/// `IsGlamsterdam` is not. This is the flag every `prague_active` parameter
+/// in this module takes.
+///
+/// gov5 drops the leaf under Glamsterdam on every chain, native ones
+/// included: its end-of-block system calls then make no value transfer from
+/// `SYSTEM_ADDRESS` (`internal/blockhelp.go:94`, "the system address is then
+/// never touched and stays out of the EIP-7928 block access list"). Writing
+/// it anyway was the whole block-1 root split of the mv4h3 mixed round.
+pub fn system_caller_leaf_at<C>(chain_spec: &C, timestamp: u64) -> bool
+where
+    C: reth_chainspec::EthereumHardforks + reth_chainspec::EthChainSpec + ?Sized,
+{
+    chain_spec.is_prague_active_at_timestamp(timestamp)
+        && !reth_chainspec::qmdb::glamsterdam_active_at(chain_spec.genesis(), timestamp)
 }
 
 pub use n42_qmdb_state::changes_from_alloc;
@@ -437,6 +462,93 @@ mod tests {
         assert_eq!(bob.code_hash, KECCAK_EMPTY, "no code means the empty-code hash");
         assert!(!changes.storage.contains_key(&BOB));
     }
+
+    /// Block 1 of the mv4h3 mixed round (`n42_devnet_mobileanchor.json`, an
+    /// empty block led by a Rust validator): the faucet and coinbase rewards,
+    /// the EIP-2935 parent hash and the EIP-4788 timestamp. The parent beacon
+    /// root is zero, so its slot does not change and is no leaf.
+    fn mv4h3_block1() -> BundleState {
+        let contract = |code_hash: B256| AccountInfo { nonce: 1, code_hash, ..Default::default() };
+        let history = address!("0000F90827F1C53a10cb7A02335B175320002935");
+        let beacon_roots = address!("000F3df6D732807Ef1319fB7B8bB8522d0Beac02");
+        let genesis_hash = U256::from_be_bytes(
+            alloy_primitives::b256!("9e8628a6dae0ce078dbd21b2e0d91c3f4389272aa597efae3a499b5ac62ffc95").0,
+        );
+        let coinbase = U256::from_be_bytes(
+            alloy_primitives::b256!("1111111200000000000000000000000000000000000000000de0b6b3a763ffff").0,
+        );
+        BundleBuilder::new(1..=1)
+            .state_present_account_info(
+                address!("42e9819036f61bF665D5f727E8C03121f12f586e"),
+                AccountInfo { balance: U256::from(10u64).pow(U256::from(18u64)), ..info(0, 0) },
+            )
+            .state_present_account_info(
+                address!("70997970C51812dc3A010C7d01b50e0d17dc79C8"),
+                AccountInfo { balance: coinbase, ..info(0, 0) },
+            )
+            .state_present_account_info(
+                history,
+                contract(alloy_primitives::b256!("6e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d")),
+            )
+            .state_storage(history, std::iter::once((U256::ZERO, (U256::ZERO, genesis_hash))).collect())
+            .state_present_account_info(
+                beacon_roots,
+                contract(alloy_primitives::b256!("f57acd40259872606d76197ef052f3d35588dadf919ee1f0e3cb9b62d3f4b02c")),
+            )
+            .state_storage(
+                beacon_roots,
+                std::iter::once((U256::from(0xb68u64), (U256::ZERO, U256::from(1_738_984_984u64)))).collect(),
+            )
+            .build()
+    }
+
+    fn mobileanchor_spec(glamsterdam_time: u64) -> reth_chainspec::ChainSpec {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../../../chainspec/res/genesis/n42_devnet_mobileanchor.json"))
+                .expect("the bundled genesis parses");
+        json["config"]["glamsterdamTime"] = glamsterdam_time.into();
+        let genesis: alloy_genesis::Genesis = serde_json::from_value(json).expect("a genesis");
+        reth_chainspec::ChainSpec::from(genesis)
+    }
+
+    /// gov5 writes no system caller leaf on a Glamsterdam block
+    /// (`internal/blockhelp.go:94`): the same block is 7 operations before
+    /// `glamsterdamTime` and 6 from it, and the 6 give the root gov5 computed
+    /// for mv4h3's block 1 while the 7 give the one the Rust leader sealed
+    /// (`audit-notes/devnet/mv4h3-trace2`).
+    #[test]
+    fn glamsterdam_blocks_write_no_system_caller_leaf() {
+        const TIMESTAMP: u64 = 1_738_984_984;
+        let bundle = mv4h3_block1();
+        let roots = |spec: &reth_chainspec::ChainSpec| {
+            let leaf = system_caller_leaf_at(spec, TIMESTAMP);
+            let ops = sorted_operations_from_execution(&bundle, leaf);
+            assert_eq!(ops.len(), changes_from_execution(&bundle, leaf).operations().len());
+            let alloc = changes_from_alloc(&reth_chainspec::EthChainSpec::genesis(spec).alloc);
+            let mut forest = n42_qmdb_state::QmdbForest::genesis(B256::ZERO, &alloc).expect("the genesis forest");
+            assert_eq!(
+                forest.root(),
+                alloy_primitives::b256!("7b6c2f95e3dbb93a6419dddc7d609cf93cb2042b78efe87f896e5eaf924a3d0e"),
+            );
+            let len = ops.len();
+            (len, forest.compute_operations(B256::ZERO, ops).expect("block 1 applies").root)
+        };
+
+        let before = mobileanchor_spec(TIMESTAMP + 1);
+        assert!(system_caller_leaf_at(&before, TIMESTAMP));
+        assert_eq!(
+            roots(&before),
+            (7, alloy_primitives::b256!("fdde74e11142de98afb80d8e46c75456c0cb98b29d404f574e0e4c27a2bb7e36")),
+        );
+
+        let from = mobileanchor_spec(TIMESTAMP);
+        assert!(!system_caller_leaf_at(&from, TIMESTAMP));
+        assert_eq!(
+            roots(&from),
+            (6, alloy_primitives::b256!("19dfd6adf18753bbb1e500c273e3f8bb90d30b199105a9098693cd04eb145b03")),
+        );
+    }
+
 }
 
 #[cfg(test)]

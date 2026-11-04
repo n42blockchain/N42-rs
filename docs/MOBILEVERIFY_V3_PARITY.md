@@ -607,8 +607,36 @@ commits). The question of a gov5 leader's registry root therefore stays open. Ev
 checks passes: packetd built all 90 packets including the 68 with transactions (the receipts-root oracle
 of `mv4f` now agrees, B1), the device certified 20/20 with nothing skipped, and the leader-root check is
 89/89. Two short trace rounds (`mv4h3-trace`, `mv4h3-trace2`) show that block 1 writes the same four
-accounts and two slots with the same values on both clients, so the mismatch lies in the QMDB commitment
-of those leaves on an Amsterdam block, not in execution.
+accounts and two slots with the same values on both clients. An offline recompute over the genesis forest
+named the difference: the Rust node also wrote the Prague system caller `0xffff…fffe` as an empty account
+(7 operations, root `fdde74e1…`), which gov5 leaves out once `IsGlamsterdam` holds, because its system
+calls then make no value transfer from that address (`internal/blockhelp.go:94`; 6 operations, root
+`19dfd6ad…`). Fixed in 3984881bf (`system_caller_leaf_at`).
+
+**Rerun with the fix** (`mv4h3-fix`, 2026-11-04; Rust 3984881bf, same gov5 member, same driver and load):
+block 1 and every later block agree. Heights 89 on both chains, all 90 hashes the same, gov5 imports and
+commits all 89 blocks and casts its vote on each of them (90 "casting deferred vote after import"), and it
+logs no root error; its only error lines are 36 start-up dial retries. Device 20/20 with nothing skipped,
+packetd 90/90 packets, leader-root check 89/89, 1,082 transfers sent. One new difference shows up: the
+30 blocks gov5 seals in its own views are refused by the Rust execution layers with `slot number 0 is not
+the block number`. gov5's miner leaves `SlotNumber` unset on a native block and writes a zero there to
+reach `mobileRegistryRoot` at position 23, while the Rust header profile requires the slot to equal the
+block number. Those 30 views time out (TC), and the Rust leaders carry the chain. So a gov5 leader's
+registry root is still unverified, and the slot rule needs a decision.
+
+**gov5 stamping the slot** (`mv4h4`, 2026-11-04; Rust 3984881bf, gov5 member `integ/mvdev-slot`
+d4a00b01 = gov5 `b2f7f04f` from `design/header-field-parity` on top of the 8282 fix): the Rust profile
+was already the port of that commit, so only gov5 changed.
+- gov5 sealed 20 blocks in its own views and every one committed: 80 views, 80 commits, no TC, and zero
+  `slot number` errors on the Rust execution layers.
+- Reading the Rust datadir back gives slot == number on 72/72 headers, and all 72 hashes are among gov5's
+  committed hashes.
+- A gov5 leader's registry root is verified for the first time. Of the 18 gov5-sealed blocks in range,
+  9 carry the zero root from before the first registry epoch. The other 9 carry `0xe9625166…`, the root
+  the Rust members committed. The Rust leaders' roots check out 54/54, and the device certified 20/20.
+- The round was cut at about 3 minutes (80 blocks): another lane's fleet7 runner (`run-loop351.sh`)
+  cleans up between legs with `kill -9` on every `n42 node` and `h2_validator` on the box, and it killed
+  the Rust members. Everything above is from those 80 blocks.
 
 ## Pure-Rust producer: feasibility (D5, 2026-11-03)
 

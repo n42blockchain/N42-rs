@@ -17,7 +17,7 @@ or `audit-notes/ci/`; research notes in English under `docs/`.
 
 | # | Item | Decision | Owner stream | Verification | Status |
 | --- | --- | --- | --- | --- | --- |
-| A1 | Mixed gated devnet round (3 Rust + gov5 member, `n42_devnet_mobileanchor.json`, transfer load) — the `mv4h` round the session loss killed | run it; before B lands it documents the divergence, after B lands it must reach the same hashes | A | 360 s round: Rust and gov5 heads equal, gov5 errors 0, device 20/20 | blocked: `mv4h3` (2026-11-03, Rust 6474989e0 = B1+A3+G2, gov5 fcd7aa4b+8282 fix): genesis agrees and gov5 peers, but gov5 refuses block 1 (empty) on the QMDB state root; identical block-1 write sets on both sides (trace rounds), so the gap is in the root commitment under Amsterdam, not execution. Sidecar receipts parity 90/90, device 20/20 |
+| A1 | Mixed gated devnet round (3 Rust + gov5 member, `n42_devnet_mobileanchor.json`, transfer load) — the `mv4h` round the session loss killed | run it; before B lands it documents the divergence, after B lands it must reach the same hashes | A | 360 s round: Rust and gov5 heads equal, gov5 errors 0, device 20/20 | done (`mv4h4`, 2026-11-04: Rust 3984881bf, gov5 `integ/mvdev-slot` d4a00b01 = header-field-parity b2f7f04f + 8282 fix): no `slot number` errors; gov5 sealed 20 blocks and all committed with no TC; hashes equal (72/72 read back); gov5-leader registry roots 9 zero (before the first epoch) and 9 equal to the Rust members' committed root; Rust leaders 54/54; device 20/20. Round cut at 80 blocks by another lane's fleet7 runner killing every `n42 node`/`h2_validator` (`run-loop351.sh:199`). Earlier: `mv4h3-fix` fixed the block-1 root (system-caller leaf) |
 | A2 | Chain-94 genesis run (`crates/chainspec/res/genesis/gov5/`, needs the `--fork-time` step; gate off until 2027-01-01) | run it | A | mixed fleet on chain 94 genesis: same hashes, `/mobileverify` device certifies through the sidecar | done: `c94-a` (2026-11-03) 160/160 hashes, gov5 errors 0, device 20/20 |
 | B1 | Glamsterdam execution parity: gov5 runs `transitionAmsterdam` on any `IsGlamsterdam` chain, N42-native included; the Rust node treats `glamsterdamTime` as header-only | implement: Amsterdam EVM rules from gov5's `glamsterdamTime` on native chains, header/payload rules unchanged (no EIP-7928 on native chains, as gov5) | B | rule-set audit doc; unit tests; gated devnet with transfers: packetd receipts root equals the header's (the mv4f oracle); mixed round A1 same hashes | implemented, unit + gov5-fixture tests pass; G1 (EIP-8282) decided 2026-11-03: gov5 skips 8282 on native chains (gov5 `fix/native-no-eip8282`); field oracle `mv4b2` (2026-11-03) pass: packetd built packets for 120/120 blocks (110 with transactions), device 20/20 skipped 0, 1,322 transfers 0 rejected; A1 rerun `mv4h3` pending |
 | B2 | Rule-set audit: gov5 `transitionAmsterdam` / `IntrinsicGas` / `eips_amsterdam.go` against revm 43 `SpecId::AMSTERDAM` (both: 8037, 8038, 7708, 7843, 7981, 7954, 2780; revm also 7976, 8246, 7825, 7928, 7778, 7873, 7907; gov5 also 8024) | write `docs/GLAMSTERDAM_EXECUTION_PARITY.md`; parity with gov5 is the rule, every difference named with its effect on N42 transaction shapes | B | the doc, reviewed | done: `docs/GLAMSTERDAM_EXECUTION_PARITY.md`, reviewed and accepted 2026-11-03 |
@@ -131,3 +131,16 @@ builds.
   = genesis hash; 4788 slot 0xb68 = 1738984984); nothing at the 8282 addresses, the system address or
   7002/7251. The state agrees; the QMDB root over it does not, which points at the commitment step
   (leaf encoding or order on an Amsterdam block), not at execution. Fix decision is the coordinator's.
+- 2026-11-04 (A): the offline recompute named it. With the system caller `0xff…fe` added, the block-1 root over the
+  mobileanchor genesis is `fdde74e1` (7 operations, the Rust proposer's root); without it, `19dfd6ad` (6, gov5's root).
+  gov5 drops that leaf under `IsGlamsterdam` (`internal/blockhelp.go:94`: no value transfer from the system address).
+  Fix 3984881bf gates the leaf on Prague and not Glamsterdam (`system_caller_leaf_at`; test
+  `glamsterdam_blocks_write_no_system_caller_leaf`). Rerun `mv4h3-fix` (`audit-notes/devnet/mv4h3-fix`, NOTES.md,
+  DEVNET_BIN mobile-target/debug from 3984881bf): heights 89/89, all hashes equal, gov5 votes on all 89 commits,
+  device 20/20, packetd 90/90. New finding: gov5's 30 own-sealed blocks carry slot 0 and the Rust ELs refuse them
+  (header profile wants slot = number), so those views end in a TC.
+- 2026-11-04 (A): `mv4h4` with gov5 `integ/mvdev-slot` (d4a00b01, b2f7f04f cherry-picked onto 6a16934a, pushed to
+  the gov5 remote): zero slot errors, all 20 gov5-sealed blocks committed with no TC, 72/72 hashes equal,
+  gov5-leader roots 9 zero + 9 equal to the Rust registry root, Rust leaders 54/54, device 20/20
+  (`audit-notes/devnet/mv4h4`). The round was cut at 80 blocks because the wt-compact fleet7 runner's leg
+  cleanup (`kill -9` of every `n42 node` / `h2_validator`) ran while this lane held the box claim.

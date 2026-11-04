@@ -253,8 +253,25 @@ Stage 1 as landed (2026-11-03, option 1 above), where it differs from 3.3:
   journal filed before a retarget invalidates the view (undoing it would put an old location back).
 - **The stage-2 copy is retired**, and `OffsetsReader` has no caller (it stays, and blocks stage 4's
   segment release while one is alive).
-- **The extra miss is gone.** `read_view::bench_concurrent_reads` (release, pinned, 50M keys,
-  `N42_BENCH_VIEW_KEYS=50000000`): see "Stage 1 fix measured" below.
+- **The extra miss is gone** (measured below).
+
+Stage 1 fix measured (2026-11-04, `audit-notes/ci/c34-bench.log`): `read_view::bench_concurrent_reads`
+(release, 2M keys, 160k distinct reads, the configuration main's copy of the bench has) on the
+branch (0d097c98e), on the branch with half the keys moved into `entries.relocated`
+(`N42_BENCH_VIEW_RELOCATED=1`) and on main (9002ca80e), two interleaved rounds, microseconds of
+pool time per read:
+
+| leg | 1 thread at head (cold / warm) | 16 threads at head | 1 thread 16 blocks back |
+| --- | --- | --- | --- |
+| main | 0.401-0.405 / 0.392-0.395 | 0.564-0.582 / 0.570-0.583 | 1.970-1.983 |
+| branch | 0.405-0.406 / 0.389-0.393 | 0.582-0.586 / 0.561-0.578 | 1.944-1.962 |
+| branch, relocated keys | 0.400-0.405 / 0.392-0.399 | 0.565-0.573 / 0.554-0.571 | 1.935-1.940 |
+
+The stage-1 view on `design/qmdb-compact-stage1-view` read 0.17-0.27 us slower here; with the
+index holding locations the branch reads at main's level, and a key whose record moved to
+`entries.relocated` costs the same as one in `entries.log`. (Round 1's branch leg read 3.4-4.3 us
+on the journal walk at 16 blocks back, outside every other leg's 1.9-2.8: the box's load was 8
+with another lane building; round 2 reads level.)
 
 Stage 2 as landed, where it differs from or adds to the text above:
 

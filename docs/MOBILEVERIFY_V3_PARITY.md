@@ -624,6 +624,20 @@ reach `mobileRegistryRoot` at position 23, while the Rust header profile require
 block number. Those 30 views time out (TC), and the Rust leaders carry the chain. So a gov5 leader's
 registry root is still unverified, and the slot rule needs a decision.
 
+**gov5 stamping the slot** (`mv4h4`, 2026-11-04; Rust 3984881bf, gov5 member `integ/mvdev-slot`
+d4a00b01 = gov5 `b2f7f04f` from `design/header-field-parity` on top of the 8282 fix): the Rust profile
+was already the port of that commit, so only gov5 changed.
+- gov5 sealed 20 blocks in its own views and every one committed: 80 views, 80 commits, no TC, and zero
+  `slot number` errors on the Rust execution layers.
+- Reading the Rust datadir back gives slot == number on 72/72 headers, and all 72 hashes are among gov5's
+  committed hashes.
+- A gov5 leader's registry root is verified for the first time. Of the 18 gov5-sealed blocks in range,
+  9 carry the zero root from before the first registry epoch. The other 9 carry `0xe9625166…`, the root
+  the Rust members committed. The Rust leaders' roots check out 54/54, and the device certified 20/20.
+- The round was cut at about 3 minutes (80 blocks): another lane's fleet7 runner (`run-loop351.sh`)
+  cleans up between legs with `kill -9` on every `n42 node` and `h2_validator` on the box, and it killed
+  the Rust members. Everything above is from those 80 blocks.
+
 ## Pure-Rust producer: feasibility (D5, 2026-11-03)
 
 **Question.** A StreamPacket's read log is positional: the phone replays it through Go's

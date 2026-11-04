@@ -750,7 +750,24 @@ mod glamsterdam_execution_tests {
             assert_eq!(info.balance, s(&account["balance"]).parse::<U256>().expect("balance"), "{address} balance");
             assert_eq!(info.nonce, u(&account["nonce"]), "{address} nonce");
             let code = bytes(&account["code"]);
-            assert_eq!(info.code.as_ref().map(|c| c.original_bytes()).unwrap_or_default(), code, "{address} code");
+            // evm2's bundle keeps an account's code by hash in its contracts
+            // (the info carries it only when the block deployed it).
+            let got_code = info
+                .code
+                .clone()
+                .or_else(|| (!info.is_empty_code_hash()).then(|| out.state.bytecode(&info.code_hash)).flatten())
+                .map(|c| c.original_bytes())
+                .unwrap_or_else(|| {
+                    // Code the block did not touch: the pre-state's, when
+                    // the account's code hash still names it.
+                    fx["pre"]
+                        .as_array()
+                        .and_then(|pre| pre.iter().find(|pre| addr(&pre["address"]) == address))
+                        .map(|pre| bytes(&pre["code"]))
+                        .filter(|pre_code| alloy_primitives::keccak256(pre_code) == info.code_hash)
+                        .unwrap_or_default()
+                });
+            assert_eq!(got_code, code, "{address} code");
             let slot0 = out.state.account(&address).and_then(|a| a.storage.get(&U256::ZERO)).map(|slot| slot.present_value);
             let want = account
                 .get("storage")

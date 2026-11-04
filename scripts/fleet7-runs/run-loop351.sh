@@ -15,6 +15,14 @@ NAT=$WT/target/native/release
 UPG=/data/n42-build/upgrade-native/release
 SIMD=$WT/target/native-simd/release
 CLAIM=/data/blockchain/.box-claim-rust; CLAIM2=/data/blockchain/wr-logs/.box-claim-rust
+# The fleet processes this runner started, and only those: a node, validator or flood whose binary
+# lives under a bench tree's target/ (wt-main, the qc tree of LOOP351_QC_BIN, wt-docs). Another
+# lane's devnet on the same box (2026-11-04: stream A's mv4h4, killed at 07:59:25Z by the bare
+# pattern) runs binaries from its own tree and is never touched.
+own_fleet() { local p exe; for p in $(pgrep -f '/n4[2] node --chain'; pgrep -f 'h2_validato[r]'; pgrep -f 'tx_floo[d]'); do
+    exe=$(readlink /proc/$p/exe 2>/dev/null) || continue
+    case "$exe" in /data/n42-build/wt-main/target/*|/data/n42-build/wt-docs/target/*|${LOOP351_QC_BIN:-/nonexistent}/*|${LOOP351_MAIN_BIN:-/nonexistent}/*) echo $p;; esac
+  done; }
 cleanup() {
   # a dry run (LOOP351_DRY=1) owns no fleet: on 2026-10-08 a dry run of stage c, exited while stage a held the box, killed the running leg (S13P50) through this trap
   [ "${LOOP351_DRY:-0}" = 1 ] && return 0
@@ -23,7 +31,7 @@ cleanup() {
   # seven nodes and seven validators running for four and a half hours on
   # 2026-09-19: they held the box against this runner's own quiet check and
   # against whoever claimed it next.
-  for p in $(pgrep -f '/n4[2] node --chain'; pgrep -f 'h2_validato[r]'; pgrep -f 'tx_floo[d]'); do kill $p 2>/dev/null; done
+  for p in $(own_fleet); do kill $p 2>/dev/null; done
 }
 trap cleanup EXIT
 [ -n "${LOOP351_NAT:-}" ] && NAT=$LOOP351_NAT   # a dry run from another checkout plans with the real binaries
@@ -59,7 +67,7 @@ fi
 WAITED_FROM=$(date -u +%s)
 good() { local cpus; cpus=$(nproc)
   [ "$(pgrep -fc 'bin/n42-[a-z]+ --chai[n]')" = "0" ] && [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" = "0" ] \
-    && [ "$(pgrep -fc '/n4[2] node --chain')" = "0" ] && [ "$(pgrep -fc 'n42-dat[c]')" = "0" ] && [ "$(pgrep -fc 'eth-el-frame[d]')" = "0" ] \
+    && [ "$(pgrep -fc '/n4[2] node --chain')" = "0" ] && [ "$(pgrep -fc 'h2_validato[r]')" = "0" ] && [ "$(pgrep -fc 'devnet-fleet.s[h]|audit-notes/scripts/devne[t]')" = "0" ] && [ "$(pgrep -fc 'n42-dat[c]')" = "0" ] && [ "$(pgrep -fc 'eth-el-frame[d]')" = "0" ] \
     && { [ "$(pgrep -fc 'txfloo[d]')" = "0" ] || [ $(( $(date -u +%s) - ${WAITED_FROM:-0} )) -gt 600 ]; } \
     && [ "$(free -g | awk '/Mem:/{print $7}')" -ge 80 ] \
     && [ "$(awk '{printf "%d", $1}' /proc/loadavg)" -lt $(( cpus / 4 )) ]; }
@@ -243,7 +251,7 @@ PYEOF
   if [ "$tag" = loop351A2 ]; then echo "== read-back check of $tag (layer still up) from $(date +%H:%M:%S)"; timeout 1500 python3 scripts/fleet7-runs/check340.py $tag 8700 2 2>&1 | cut -c1-420 | tee $S/check340-$tag.out; [ "${PIPESTATUS[0]}" = 1 ] && STOPNOW=1; echo "== settlement tags of $tag"; python3 scripts/fleet7-runs/settle346.py $tag 2>&1 | cut -c1-300 | tee $S/settle346-$tag.out; [ "${PIPESTATUS[0]}" = 1 ] && STOPNOW=1; echo "== read-back check done $(date +%H:%M:%S)"; fi
   case $tag in G*) python3 scripts/fleet7-runs/gossip344.py $tag 2>&1 | cut -c1-420 ;; esac
   if [ "$tag" = loop351NEVER ]; then echo "== kill-and-restart check of $tag from $(date +%H:%M:%S)"; timeout 900 python3 scripts/fleet7-runs/restart344.py $tag 2>&1 | cut -c1-420 | tee $S/restart344-$tag.out; echo "== restart check done $(date +%H:%M:%S)"; fi
-  for p in $(pgrep -f '/n4[2] node --chain'; pgrep -f 'h2_validato[r]'; pgrep -f 'tx_floo[d]'); do kill -9 $p 2>/dev/null; done; sleep 2
+  for p in $(own_fleet); do kill -9 $p 2>/dev/null; done; sleep 2
   if [ "$STOPNOW" = 1 ]; then echo "READ-BACK CHECK FAILED on $tag: stopping the round (datadirs kept as evidence)"; cleanup; echo "released at $(date +%H:%M)"; echo ALLDONE; exit 1; fi
 }
 # FV must report fields_mismatches 0 with checks made; otherwise nothing after it is run and the lines are the hand-back.

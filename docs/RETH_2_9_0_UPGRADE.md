@@ -1142,10 +1142,140 @@ the sealed own block instead of falling back to the committed head. It shows on 
 start-up fork, not on the fleet (E11: tc 7, no stall). It is noted for the coordinator and not
 fixed here.
 
+#### E12, after g4
+
+The fx pair E12 (20:35-20:49Z, natives of 648c03ba4 against main,
+`/data/blockchain/rust-fleet7-bench/bench-loop351D2S12P30T64X11T16E12{a,0}MEMF`, runner log
+`ci/pairs-queue.log`) ran one pair only: the runner's body gate stopped on the control leg
+(`proposals_given_up=3`, a teardown artifact).
+- **Throughput.** The branch read 2,846,133 TPS at a 0.070 s cycle, against the control's 4,833,333
+  (0.041 s). The gap is 1.7x, down from 2.3x.
+- **Items 3-5 did their job.** tx_root 30 -> 3, sealed 30 -> 3, give_back 21 -> 2 (E11 -> E12).
+- **What is left.** sealed_at 63-67 against 37, and the next build's `state_wait` 11-14 ms on the
+  parent's `output` (control ~2): the branch filed its shards at seal + 15-22 ms
+  (`seal_to_shards_ready_us`), the control at seal + 2.4-3.8 ms. The plan body was never taken
+  (`commit_body_ahead_used=false` on every build).
+
+#### g5, the tenure stall after a timed-out view (F5g5)
+
+**What happened** (f5g4-x22, validator 0's log and its execution layer's, 20:29:52-20:33Z):
+1. At view 31 (leader 3) validator 0 checked and voted for block 19 `0x38da…`. As the next leader
+   it at once asked its execution layer for a build ahead on that block. That build's forkchoice
+   made `0x38da…` canonical, although it had no QC.
+2. View 31 timed out, and the TC sent view 32 to validator 0 on its high-QC block 18 `0xeae…`.
+3. The block it built ahead on 18 was refused at the finish as a stale parent, "below the
+   canonical head 19". Every later build of the tenure on 18 was refused the same way. The
+   validator logged `could not build a block to propose err=missing payload` and each view timed
+   out at 24-30 s.
+
+So the parent was right: the driver builds on the high-QC block, as it must. The refusal came from
+the QMDB stale-build guard (`QmdbForest::check_build_parent`, 5d9fa0349, loop351 X9j). That guard
+measures "stale" against the canonical head, and the canonical head had run ahead of consensus onto
+an uncertified block. reth itself builds on a canonical ancestor at or above the finalized block;
+the guard was the only obstacle.
+
+**The fix.**
+- The guard gets the committed block's number (`QmdbNodeState::set_committed_source`,
+  `QmdbForest::check_build_parent_above`). A parent at or above the committed block is not
+  refused, even when the canonical head is past it. A parent below it is still refused, which is
+  the X9j case: a build ahead on 1020 after 1021 was committed.
+- bin/n42 gives the committed number as the forkchoice's `safe` plus the deferred-execution depth.
+  Under the default `split` settlement tags, `safe` is the block whose execution a committed child
+  carries.
+- Under `legacy` tags `safe` is the committed block itself, so the floor is one block stricter.
+  The guard then refuses exactly what it refused before, never more.
+- With no source, or a source that does not know the safe block, the guard behaves as before.
+
+**Main has it too** (f5g5-main, 20:58-21:03Z, main 0f3cb36e7's natives from
+`/data/n42-build/wt-docs/target/native/release`, the same deferred genesis and X22 profile,
+`/data/n42-build/audit-notes/devnet/f5g5-main`). The chain stopped at height 19 (the late member at 18,
+blocks 1-18 identical). The execution layer logged the same refusal at 20:59:50Z: "the finish behind
+the seal FAILED number=19 err=refused a build on block 18 (0x7ee6…): it is below the canonical head
+19 (persisted 12), a stale parent". Validator 0 then logged `could not build a block to propose
+err=missing payload` seven times, for views 33 onward. 40 timeouts in 300 s. So the stall predates
+the port: it comes with the stale guard (5d9fa0349), which main carries. The fix is made on this
+branch, and main gets it with the F6 merge. It is listed under the F6 leftovers below until then.
+
+**The fix round** (f5g5-fix, 21:40-21:45Z, branch natives of f7fa91058, the same genesis, profile and
+knobs, `devnet/f5g5-fix`):
+- Height 57, against main's 19. The late member is also at 57, blocks 1-57 are identical, and 1002
+  transactions landed in 33 blocks.
+- Execution-layer errors 0, `after_seal_failed` 0, and no `could not build a block to propose` on any
+  validator.
+- The start-up fork still happens, and so do the forks after it. 33 times a canonical block was
+  replaced at its height, by a build ahead on an uncertified block followed by the certified one:
+  block 1 at 21:40:55Z after the view-1 TC, block 11 twice (21:41:37Z, 21:41:49Z), and others. The
+  build on the high-QC parent below the head was never refused.
+- 68 timeouts in 300 s, against main's 40 in a run that stopped at 19. This is the devnet's usual
+  leader rotation with idle validators.
+
+#### g6, the plan body on evm2 (F5g6)
+
+**Why it never ran.** `frame_blocks::plan_ahead_body_wanted` opened only when the revm-era paths
+were built (`LEGACY_REVM_PATHS`) and the block sealed on its counters. On the stock evm2 build that
+gate was always closed, so the queue's plan-ahead hook was never installed, `take_prepared_body`
+found nothing, and every E12 build fell back to the body made at the seal (F5g4's 3-5 ms on the
+build pool) plus the keys made serially before the batches. The gate is now
+`plan_body_gate(legacy, seal_on_counters, body, plan_ahead, by_frames)`: on evm2 it needs only the
+knobs (`N42_PLAN_AHEAD_BODY`, plan-ahead, pull by frames), all set by X22. Unit test
+`the_plan_body_gate_opens_on_evm2_without_the_counted_seal`.
+
+**Why the puller stop did not show.** On the fleet the build takes the frames' bulk vector, and a
+bulk take has no puller (`best_txs` stays on the build thread when `bulk.is_some()`), so there was
+nothing to stop. The phases field is now `puller_at_pull` = `stopped` (stopped at the pull),
+`kept` (a puller, stopped at the seal) or `none` (the bulk take or the direct iterator); E13
+should read `none` on full blocks.
+
+**Cost** (`plan_body_prep_bound`, release, 200,000 0x50 transfers from 400 senders, medians of 5):
+- the hook on the plan body's pool, off the build: 11.4 ms;
+- what the build did inline without it: keys 8.4 ms (serial, before the batches), partition 0.8 ms,
+  body 4.7 ms (at the seal, on the build pool), about 13.9 ms on the build's path.
+With the gate open, a block that is its plan's whole take reads all of these from the plan
+(`commit_body_ahead_used=true`, `par_prep_ms` 0). The devnet never fills, so the fields flipping are
+for E13.
+
+#### g7, the shards filed at the finish's end, the receipts behind it (F5g7)
+
+**What the child waited on.** On the evm2 shard path the seal is followed by the freeze (on its
+own thread, `freeze_late=true`), then `commit_run`, then the executor's finish, and only then are
+the shards filed (`shards_ready`). `commit_run` committed the 200,000 receipts one by one through
+the executor (`commit_transaction` with an empty write set), 11.9 ms on the bench
+(`evm2_step_bound`, shard path `commit_ms`) and the whole of the E12 `par_fold_ms` 14-21 and
+`seal_to_shards_ready` 15-22. The finish itself, the block's end alone, is 0.2 ms.
+
+**What the child reads before the parent's finish.** Its open reads the frozen shards and the
+residual. The residual is the executor's bundle after the finish: the beneficiary's summed credit
+and the withdrawal recipients (both split off the batches' bundles into the run's small `merged`
+and folded at the finish), plus the post-block system calls' and the withdrawals' own writes. Those
+last two exist only after the finish, so a residual filed before the finish would be incomplete.
+The fix keeps the filing after the finish and takes the receipts off the path in front of it.
+
+**The fix** (`N42_EVM2_RECEIPTS_LATE`, default on, `0` restores the commit):
+- On a block sealed at the execution's end with its output in shards, and with nothing committed
+  before the step, `commit_run` gets no results (the cache half and the pending fold only).
+- The receipts are built on a thread (`parallel_build::late_receipts`, 5.3 ms off the path on the
+  bench) and joined where they are first read: the receipts root beside the QMDB root, as
+  `N42_SHARDS_BEFORE_RECEIPTS` does on the revm-era step. `receipts_late=true` in the phases line.
+- The finish reads no receipt it would miss: transfers have no logs, so the deposit requests are
+  empty either way, and `gas_used` is replaced by the late receipts' total at the join.
+- Bench: commit + finish before the filing 12.1 -> 0.0 ms. Expected on the fleet:
+  `seal_to_shards_ready` about 2-3 ms and `state_wait` near the control's 2.
+
+**Equivalence.** `the_late_receipts_equal_the_committed_ones` (unit test): receipts, gas, requests,
+bundle and reverts equal the sequential execution's. `evm2_step_bound` keeps its shard-path check
+(the shards under the residual equal the fold path's bundle) and adds a late leg: the late receipts
+equal the committed ones, gas and requests equal, and the shards under the late residual equal the
+committed residual's.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:
 
+- **The tenure stall after a timed-out view, on main** (F5g5). Main 0f3cb36e7 stalls at height 19
+  on the deferred devnet (f5g5-main): the stale-build guard refuses the build on the high-QC
+  block once a build ahead has made an uncertified block canonical. The fix (020cb0de5, a committed
+  floor for the guard) is on this branch and reaches main with the F6 merge. A main release
+  before that merge needs it cherry-picked.
 - **The parallel step on an Amsterdam chain.** The step (builder F5c, follower F5d) does not run on
   a chain with reth's Amsterdam or gov5's Glamsterdam execution: the block access list would lack
   the batch accounts' entries. fleet7 is Osaka. Chain 94 flips on 2027-01-01, so this is needed

@@ -1035,6 +1035,113 @@ transfers (~0.27 and ~0.44 us a transfer). The merge is the part the shards remo
   batch would cut it further, and that is a design decision. With the merge gone, the step is
   within the ~30 ms target in the bench, so no change was made there for now.
 
+#### E11, after g3
+
+The fx pair E11 (19:35-20:00Z, natives of bcb193399 against main, `wt-main/target/fleet-runs/loop351fx-E11.launch.out`,
+legs `strip-loop351D2S12P30T64X11T16E11{a,0,b,0b}MEMF`):
+- **Throughput.** The branch read 2,100,000 / 2,140,000 TPS (E11a / E11b) at a 0.093-0.095 s cycle,
+  against the control's 4,873,333 / 4,993,333. The gap is 2.3x, down from 4.6x.
+- **Health.** `sharded_total` 989: every full block took the shard path. Fold refusals 0, serial
+  rebuilds 0, invalid 0, tc 7.
+
+Medians (E11a), branch against control, ms:
+
+| state_wait | par_exec | par_fold | tx_root | give_back | sealed | sealed_at | merge | state_ready | roots | finish |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 13 / 2 | 26 / 27 | 16 (behind the seal) | 30 / 2 | 21 / 0 | 30 / 3 | 92 / 37 | 0 / 0 | 25 / 81 | 21 / 29 | 25 / 100 |
+
+- **Exec is at parity.** par_exec is 26 against 27, so the evm2 per-transfer cost does not bind on
+  the fleet. No journal bypass.
+- **The rest of the gap is the seal.** The transactions root (30), the seal (30) and the give-back
+  (21) make up 81 of the 92 ms to the seal. The target after items 3-5 is a sealed_at of about
+  35-40.
+
+#### g4, the seal: transactions root, body, give-back (items 3-5)
+
+**Items 3-4, the root and the body ahead.**
+- On evm2 the plan-ahead hook (`make_prepared_build`, `N42_PLAN_AHEAD_BODY`) made only the keys,
+  the hashes and the partition. The evm2 seal then:
+  - cloned each executed transaction into the builder one by one (`to_consensus`);
+  - split them into transactions and senders serially at the seal;
+  - collected the 200,000 hashes again;
+  - found the frame layout and root there.
+  That is E10's tx_root 26 and sealed 26.
+- The hook now makes what the control's makes, on the plan body's own pool: the transactions,
+  their senders and, under `N42_PLAN_AHEAD_PARTS=1` with frame blocks, the frame layout and root of
+  the hashes on that plan (`frame_blocks::root_ahead`).
+- At the seal the evm2 step takes that body when the block is every candidate in pull order and the
+  plan's hashes are the pulled set's (`body_matches_pull`: length plus first, middle and last
+  hash). The seal then carries the root (`seal_root_carried`), so `seal_hashes_ahead`,
+  `seal_root_ahead` and `commit_body_ahead_used` read true on the phases line.
+- Otherwise (no plan, a different set, a skipped transfer) the body, senders and hashes are made
+  from the executed candidates on the build pool in one pass. The seal then finds the frame root
+  over those hashes, as before.
+- A chain without frame blocks keeps the MPT root at the seal. The bench's 45 ms MPT root is that
+  case; the fleet seals frame roots.
+
+Code: d66e939ea (item 4, the body ahead) and 698091538 (item 3, the root carried).
+
+Bench (`evm2_step_bound`, `ci/f5g4-bench1.log`, 200,000 transfers, 32 threads, medians of 4): the
+seal-side body (transactions, senders, hashes) takes 48.4 ms as the evm2 seal made it (a clone into
+the builder per transaction, the serial split and the hash collect), against 3.1 ms on the build
+pool (the fallback). On the plan path it is a move at the seal.
+
+The frame root carried from the hook is the control's mechanism (its tx_root is 2 ms on the fleet).
+The bench has no frame plan, so the fleet number for it comes from E12. The rest of the bench is
+unchanged: shard exec 29.6 ms, freeze 3.2 ms, finish 0.2 ms.
+
+**Item 5, the give-back.**
+- What runs before the seal:
+  - the lookahead's return: each transaction beyond the budget is sent back to the puller as a
+    refusal;
+  - the puller's drop: stop, drop the receiver, join the thread. The thread applies the refusals
+    and, as it ends, the pool walk gives back what it took.
+- Both have to be complete before the seal. The chained build pulls at the seal, and loop232/233
+  found its lanes holed both when the lookahead was still checked out and when the puller's walk
+  was still ending. So neither part moves behind the seal.
+- The phases line now times them apart (`seal_lookahead_us`, `seal_puller_join_us`).
+- What did change is when they start. With `N42_PULLER_STOP_AT_PULL` (default on; `0` restores the
+  old order), a full pull on a block that can seal at the execution's end returns the lookahead and
+  stops the puller right after the pull (`Puller::stop`: done flag and receiver, no join). The
+  walk's wind-down then runs beside the batches, and the seal keeps only the join, which by then
+  should be ~0.
+  - A block that afterwards does not seal (a skipped transfer) builds on without the lookahead and
+    the walk. It is a slightly emptier block, never a lost transaction: the given-back
+    transactions are back in the queue.
+  - `puller_stopped_at_pull` on the phases line says which order ran.
+
+Code: 20df09470. There is no bench for this one: the 21 ms is the pool walk's wind-down under the
+fleet's ingest. E12's `seal_lookahead_us` / `seal_puller_join_us` say which part it was and
+whether the stop at the pull took it off the seal's path. On the devnet, blocks are never full at
+the pull, so the stop does not engage there.
+
+Gate for d66e939ea, 698091538 and 20df09470 (`ci/f5g4-gate.log`): workspace check rc 0, clippy
+(engine-types, n42, with tests) rc 0, and tests rc 0 with `--no-fail-fast` (engine-types 278,
+qmdb-reth 126 and the rest).
+
+Natives for E12: `/data/n42-build/reth29-native/release`, built from 20df09470 with
+`RUSTFLAGS="-C target-cpu=native"` (`ci/f5g4-natives.log`).
+
+Devnet round **f5g4-x22** (`ci/f5d-gate.log`, `devnet/f5g4-x22`) ran on those natives, with the
+g3 shape:
+- hashes equal 18/18 on both execution layers;
+- imports parallel 18 and 8, fold refusals 0, serial rebuilds 0;
+- `sharded_total` 8 + 3.
+
+It went only to height 19 in 300 s, as g1's f5g1-x22b did (height 19, commits 18). The cause is
+older than items 3-5:
+- Validator 0, leading an 8-view tenure, proposed a block 19 built ahead on its own block 18.
+- Its execution layer's finish behind the seal refused that block as a stale parent, because
+  another block 19 was already head there.
+- The EL then no longer held own block 19, and every remaining view of the tenure logged
+  `could not build a block to propose err=missing payload`, timing out at 24-30 s each. The run
+  ended inside that tenure.
+
+This is a recovery gap in the validator after a `failed_after_seal`: it keeps asking for a build on
+the sealed own block instead of falling back to the committed head. It shows on the devnet's
+start-up fork, not on the fleet (E11: tc 7, no stall). It is noted for the coordinator and not
+fixed here.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

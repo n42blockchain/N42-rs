@@ -28,9 +28,9 @@
 //! with every integer little endian and the CRC-32 (IEEE, `crc32fast`) taken
 //! over every byte of the group before the CRC itself, the trailer's tag and
 //! twig included. A slot's offset has bit 63 set when it points into the
-//! relocated file. `entries.log` keeps every slot's original record (nothing
-//! is punched in this stage), so the read view's byte offsets into it stay
-//! valid and a lost group loses nothing.
+//! relocated file. A read view names a relocated live record by the offset
+//! of its key with bit 39 set (`crate::entry_view`), and is told when a
+//! compaction moves the keys it holds.
 
 use std::{
     collections::BTreeMap,
@@ -40,7 +40,10 @@ use std::{
 };
 
 use crate::{
-    Hash, NULL_HASH, TWIG_SIZE, hash_leaf,
+    Hash, NULL_HASH, TWIG_SIZE,
+    prefault::OFFSET_SEGMENT_SLOTS,
+    entry_view::{RELOCATED_LOCATION, VIEW_MAP_BYTES},
+    hash_leaf,
     offsets::{Offsets, OffsetsReader},
 };
 
@@ -259,14 +262,17 @@ pub struct EntryStoreStats {
     /// Bytes of `entries.relocated` that belong to complete groups (the
     /// compacted twigs, `docs/QMDB_COMPACTION_DESIGN.md` 3.7); 0 in the heap.
     pub relocated_bytes: u64,
+    /// Bytes of both files punched (stage 3, `entries.punched`): freed on
+    /// disk, still counted in the files' lengths.
+    pub punched_bytes: u64,
 }
 
 impl EntryStoreStats {
-    /// Entry bytes per live slot, `(file_bytes + relocated_bytes) /
-    /// max(live_slots, 1)`: the growth compaction would bound. Nothing is
-    /// punched yet (stage 3), so a compaction raises it until then.
+    /// Entry bytes per live slot, `(file_bytes + relocated_bytes -
+    /// punched_bytes) / max(live_slots, 1)`: what the files hold on disk per
+    /// live slot, the growth compaction bounds.
     pub fn bytes_per_live_slot(&self) -> u64 {
-        (self.file_bytes + self.relocated_bytes) / self.live_slots.max(1)
+        (self.file_bytes + self.relocated_bytes).saturating_sub(self.punched_bytes) / self.live_slots.max(1)
     }
 }
 
@@ -596,11 +602,11 @@ impl LogFile {
 /// A twig whose records were rewritten into `entries.relocated`.
 #[derive(Clone, Debug)]
 struct RelocatedTwig {
-    /// Where `entries.log` holds the twig's slots, for [`FileEntries::offset`]:
-    /// the read view resolves byte offsets into `entries.log`, which keeps
-    /// every record in this stage. 16 KiB a compacted twig; stage 1 (a view
-    /// that resolves slots) and stage 3 (punching) retire it.
-    main: Box<[u64]>,
+    /// Where the twig's latest group starts in `entries.relocated`.
+    group_start: u64,
+    /// Each slot's record start within the group, once the offsets segment
+    /// that held the twig is released (stage 4); `None` while it is kept.
+    starts: Option<Box<[u32]>>,
     /// The length of the twig's latest group in `entries.relocated`,
     /// trailer included.
     group_len: u64,
@@ -608,14 +614,39 @@ struct RelocatedTwig {
     dead: u32,
 }
 
+/// A byte range of one of the entry files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FileRange {
+    /// `entries.relocated` (a previous group of a twig compacted again), else
+    /// `entries.log`.
+    pub relocated: bool,
+    /// The first byte.
+    pub start: u64,
+    /// One past the last byte.
+    pub end: u64,
+}
+
+impl FileRange {
+    /// Its length in bytes.
+    pub const fn len(&self) -> u64 {
+        self.end - self.start
+    }
+
+    /// Whether it holds no byte.
+    pub const fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+}
+
 /// What [`FileEntries::append_group`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Relocation {
     /// The group's bytes, trailer included.
     pub(crate) written: u64,
-    /// The bytes the twig's previous location held: its records in
-    /// `entries.log`, or its previous group. Nothing is punched yet.
-    pub(crate) reclaimable: u64,
+    /// The bytes the twig's records held before: its records in
+    /// `entries.log`, or its previous group. Free to punch once nothing
+    /// can read them (`docs/QMDB_COMPACTION_DESIGN.md` 3.5).
+    pub(crate) old: FileRange,
 }
 
 /// A twig's records laid out as a relocated group
@@ -645,6 +676,12 @@ pub(crate) struct FileEntries {
     offsets: Offsets,
     /// One bit per slot.
     active: Vec<u64>,
+    /// The ranges punched so far (`entries.punched`).
+    punched: Vec<crate::punched::Punched>,
+    /// Their bytes.
+    punched_bytes: u64,
+    /// The append side of `entries.punched`; `None` on a read-only handle.
+    punch_log: Option<crate::punched::PunchLog>,
 }
 
 impl std::fmt::Debug for FileEntries {
@@ -668,7 +705,18 @@ impl FileEntries {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        Ok(Self { main, relocated: None, twigs: BTreeMap::new(), offsets: Offsets::default(), active: Vec::new() })
+        let punched = crate::punched::punched_path(path);
+        crate::punched::PunchLog::remove(&punched)?;
+        Ok(Self {
+            main,
+            relocated: None,
+            twigs: BTreeMap::new(),
+            offsets: Offsets::default(),
+            active: Vec::new(),
+            punched: Vec::new(),
+            punched_bytes: 0,
+            punch_log: Some(crate::punched::PunchLog::new(punched, 0)),
+        })
     }
 
     /// Opens the file at `path` as it was left, keeping at most `slots`
@@ -689,6 +737,15 @@ impl FileEntries {
     fn open_existing_mode(path: &Path, slots: u64, active: &[u64], truncate: bool) -> io::Result<(Self, u64)> {
         let mut file = OpenOptions::new().read(true).write(truncate).open(path)?;
         let len = file.metadata()?.len();
+        // The punched ranges (stage 3): a hole reads as zeros, so the walks
+        // jump over them; a punched twig of `entries.log` gets placeholder
+        // offsets that its relocated group replaces.
+        let punched_path = crate::punched::punched_path(path);
+        let (punched, punched_good) = crate::punched::read(&punched_path)?;
+        let mut main_holes: Vec<crate::punched::Punched> =
+            punched.iter().copied().filter(|p| !p.range.relocated).collect();
+        main_holes.sort_unstable_by_key(|p| p.range.start);
+        let mut holes = main_holes.iter().peekable();
         // Walk the record headers: a scan of the whole file's bytes, in
         // 64 MB pieces so the tree's rebuild does not hold the file twice.
         use std::io::Read;
@@ -697,7 +754,36 @@ impl FileEntries {
         let mut header = [0u8; KEY_LEN + LEN_LEN];
         file.seek(io::SeekFrom::Start(0))?;
         let mut reader = std::io::BufReader::with_capacity(8 << 20, &mut file);
-        while (offsets.len() as u64) < slots && at + (KEY_LEN + LEN_LEN) as u64 <= len {
+        // Twigs whose `entries.log` records are punched, inside the kept slots.
+        let mut punched_twigs = Vec::new();
+        while (offsets.len() as u64) < slots {
+            while holes.peek().is_some_and(|hole| hole.range.start < at) {
+                holes.next();
+            }
+            if let Some(hole) = holes.peek().filter(|hole| hole.range.start == at) {
+                let first = hole.twig * TWIG_SIZE;
+                if offsets.len() != first || hole.range.end > len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}: punched twig {} does not start at slot {}", path.display(), hole.twig, offsets.len()),
+                    ));
+                }
+                if slots < (first + TWIG_SIZE) as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}: the kept slots ({slots}) end inside punched twig {}", path.display(), hole.twig),
+                    ));
+                }
+                offsets.extend(std::iter::repeat_n(at, TWIG_SIZE));
+                punched_twigs.push(hole.twig);
+                reader.seek_relative((hole.range.end - at) as i64)?;
+                at = hole.range.end;
+                holes.next();
+                continue;
+            }
+            if at + (KEY_LEN + LEN_LEN) as u64 > len {
+                break;
+            }
             reader.read_exact(&mut header)?;
             let value_len = u32::from_le_bytes([header[32], header[33], header[34], header[35]]) as u64;
             let end = at + (KEY_LEN + LEN_LEN) as u64 + value_len;
@@ -719,16 +805,48 @@ impl FileEntries {
         // Everything on disk is sealed into chunks; the tail starts empty.
         main.seal_existing(&offsets)?;
         let mut twigs = BTreeMap::new();
-        let relocated = open_relocated(&relocated_path(path), &mut offsets, active, &mut twigs, truncate)?;
+        let mut relocated_holes: Vec<FileRange> = punched.iter().filter(|p| p.range.relocated).map(|p| p.range).collect();
+        relocated_holes.sort_unstable_by_key(|range| range.start);
+        let relocated =
+            open_relocated(&relocated_path(path), &mut offsets, active, &mut twigs, &relocated_holes, truncate)?;
+        if let Some(twig) = punched_twigs.iter().find(|twig| !twigs.contains_key(twig)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: twig {twig} is punched in the main file and has no relocated group to read", path.display()),
+            ));
+        }
+        // A hole of the main file past the kept slots goes with them: the
+        // file is cut there and its next appends land where it was.
+        let kept_twigs = kept as usize / TWIG_SIZE;
+        let (kept_holes, dropped): (Vec<_>, Vec<_>) =
+            punched.iter().copied().partition(|p| p.range.relocated || p.twig < kept_twigs);
+        let mut punch_log = crate::punched::PunchLog::new(punched_path, punched_good);
+        if truncate {
+            if dropped.is_empty() {
+                punch_log.cut_to_good()?;
+            } else {
+                punch_log.rewrite(&kept_holes)?;
+            }
+        }
+        let punched_bytes = kept_holes.iter().map(|p| p.range.len()).sum();
         let mut store = Self {
             main,
             relocated,
             twigs,
             offsets: Offsets::from_vec(offsets)?,
             active: vec![0u64; (kept as usize).div_ceil(64)],
+            punched: kept_holes,
+            punched_bytes,
+            punch_log: truncate.then_some(punch_log),
         };
         for (word, bits) in store.active.iter_mut().zip(active) {
             *word = *bits;
+        }
+        // Stage 4: the segments whose every twig is relocated keep their
+        // twigs' starts instead.
+        let segments = (kept as usize) / OFFSET_SEGMENT_SLOTS;
+        for segment in 0..segments {
+            store.release_segment_if_relocated(segment);
         }
         // Bits past the kept slots are cleared.
         for slot in kept as usize..store.active.len() * 64 {
@@ -745,10 +863,12 @@ impl FileEntries {
             total_slots: self.offsets.len() as u64,
             live_slots: live as u64,
             file_bytes: self.main.len_bytes,
-            offsets_bytes: (self.offsets.allocated_segments() * crate::prefault::OFFSET_SEGMENT_SLOTS * 8) as u64,
+            offsets_bytes: (self.offsets.live_segments() * OFFSET_SEGMENT_SLOTS * 8) as u64
+                + self.twigs.values().filter(|twig| twig.starts.is_some()).count() as u64 * (TWIG_SIZE * 4) as u64,
             index_bytes: 0,
             chunks: self.main.chunks.len() as u64,
             relocated_bytes: self.relocated_len(),
+            punched_bytes: self.punched_bytes,
         }
     }
 
@@ -771,7 +891,7 @@ impl FileEntries {
     /// its own length field, not from the next slot's offset, which may
     /// point into the other file.
     pub(crate) fn read(&self, slot: usize) -> SlotRef<'_> {
-        let raw = self.offsets.at(slot);
+        let raw = self.raw(slot);
         if raw & RELOCATED_BIT == 0 {
             return payload_at(self.main.bytes_from(raw));
         }
@@ -792,27 +912,104 @@ impl FileEntries {
         self.offsets.len()
     }
 
+    /// `slot`'s offset (bit 63: in `entries.relocated`), from its offsets
+    /// cell, or -- its segment released (stage 4) -- from its twig's group
+    /// base and `u32` start. One more branch on the cell's segment pointer,
+    /// which the cell's read loads anyway; panics past the length.
+    #[inline]
+    fn raw(&self, slot: usize) -> u64 {
+        match self.offsets.try_at(slot) {
+            Some(raw) => raw,
+            None => self.released_raw(slot),
+        }
+    }
+
+    #[cold]
+    fn released_raw(&self, slot: usize) -> u64 {
+        let twig = self.twigs.get(&(slot / TWIG_SIZE));
+        match twig.and_then(|twig| Some((twig.group_start, twig.starts.as_ref()?))) {
+            Some((base, starts)) => (base + u64::from(starts[slot % TWIG_SIZE])) | RELOCATED_BIT,
+            None => unreachable!("slot {slot}'s offsets segment was released without its twig's starts"),
+        }
+    }
+
+    /// Releases offsets segment `segment` once every one of its twigs is
+    /// relocated and it lies wholly below the last slot: each twig keeps its
+    /// slots as `u32` starts from its group's base (4 B a slot, against 8 B
+    /// in the segment; `docs/QMDB_COMPACTION_DESIGN.md` stage 4). Returns
+    /// whether it was released now.
+    fn release_segment_if_relocated(&mut self, segment: usize) -> bool {
+        let per_segment = OFFSET_SEGMENT_SLOTS / TWIG_SIZE;
+        let first = segment * per_segment;
+        if (segment + 1) * OFFSET_SEGMENT_SLOTS > self.offsets.len()
+            || self.offsets.is_released(segment)
+            || self.twigs.range(first..first + per_segment).count() != per_segment
+        {
+            return false;
+        }
+        let starts: Vec<(usize, Box<[u32]>)> = (first..first + per_segment)
+            .map(|twig| {
+                let base = self.twigs[&twig].group_start;
+                let starts = (twig * TWIG_SIZE..(twig + 1) * TWIG_SIZE)
+                    .map(|slot| {
+                        let raw = self.offsets.at(slot);
+                        debug_assert_ne!(raw & RELOCATED_BIT, 0);
+                        u32::try_from((raw & !RELOCATED_BIT) - base).expect("a group under 4 GiB")
+                    })
+                    .collect();
+                (twig, starts)
+            })
+            .collect();
+        if !self.offsets.release_segment(segment) {
+            return false;
+        }
+        for (twig, starts) in starts {
+            if let Some(entry) = self.twigs.get_mut(&twig) {
+                entry.starts = Some(starts);
+            }
+        }
+        true
+    }
+
+    /// Twigs relocated in `twig`'s offsets segment.
+    pub(crate) fn relocated_in_segment(&self, twig: usize) -> usize {
+        let per_segment = OFFSET_SEGMENT_SLOTS / TWIG_SIZE;
+        let first = twig / per_segment * per_segment;
+        self.twigs.range(first..first + per_segment).count()
+    }
+
     /// A lock-free reader of the slots' offsets (`crate::offsets`).
     pub(crate) fn offsets_reader(&self) -> OffsetsReader {
         self.offsets.reader()
     }
 
-    /// Where `slot`'s record starts in `entries.log`: the main file keeps
-    /// every slot's record in this stage, a compacted one included, so the
-    /// read view's byte offsets stay valid.
-    pub(crate) fn offset(&self, slot: usize) -> Option<u64> {
-        let raw = self.offsets.get(slot)?;
+    /// `slot`'s location for a read view (`crate::entry_view`): in
+    /// `entries.log` its record's byte offset; in `entries.relocated` the
+    /// offset of its key there with [`RELOCATED_LOCATION`] set, from where
+    /// the record has the main file's shape. `None` past the last slot or
+    /// for a hash-only slot (no payload to read). A main-file offset is
+    /// returned as it is even past the view's 512 GiB (the view refuses it on
+    /// its floor); a relocated one past it is `u64::MAX`, which no key index
+    /// takes.
+    pub(crate) fn location(&self, slot: usize) -> Option<u64> {
+        let raw = (slot < self.offsets.len()).then(|| self.raw(slot))?;
         if raw & RELOCATED_BIT == 0 {
             return Some(raw);
         }
-        self.twigs.get(&(slot / TWIG_SIZE)).map(|twig| twig.main[slot % TWIG_SIZE])
+        let file = self.relocated.as_ref()?;
+        let at = raw & !RELOCATED_BIT;
+        if file.bytes_from(at)[0] != TAG_LIVE {
+            return None;
+        }
+        let key_at = at + RELOCATED_HEAD as u64;
+        Some(if key_at < VIEW_MAP_BYTES { key_at | RELOCATED_LOCATION } else { u64::MAX })
     }
 
     /// `slot`'s key, `None` for a hash-only slot: the key index's
     /// confirmation read, so a record in the main file -- every slot but a
     /// compacted one -- is read without its length.
-    fn key(&self, slot: usize) -> Option<&Hash> {
-        let raw = self.offsets.at(slot);
+    pub(crate) fn key(&self, slot: usize) -> Option<&Hash> {
+        let raw = self.raw(slot);
         if raw & RELOCATED_BIT == 0 {
             return Some(as_hash(&self.main.bytes_from(raw)[..KEY_LEN]));
         }
@@ -1138,7 +1335,58 @@ impl FileEntries {
             twigs: self.twigs.clone(),
             offsets: self.offsets.clone(),
             active: self.active.clone(),
+            punched: self.punched.clone(),
+            punched_bytes: self.punched_bytes,
+            punch_log: None,
         })
+    }
+
+    /// Punches `ranges` (twig, range), each a range a compaction left
+    /// (`Relocation::old`): recorded durably in `entries.punched` first, then
+    /// freed with `PUNCH_HOLE` (`docs/QMDB_COMPACTION_DESIGN.md` 3.5). The
+    /// caller vouches that nothing can still read them (a read view has let
+    /// go of them, `QmdbReadView::moved_unreachable`); the store checks that
+    /// no slot of the twig points into them and that they are written to the
+    /// file. Returns the bytes punched.
+    pub(crate) fn punch(&mut self, ranges: &[(usize, FileRange)]) -> io::Result<u64> {
+        self.main.writable()?;
+        if self.punch_log.is_none() {
+            return Err(refused(format!("{}: a store without its punch log cannot punch", self.main.path.display())));
+        }
+        let mut records = Vec::with_capacity(ranges.len());
+        for &(twig, range) in ranges {
+            let Some(current) = self.twigs.get(&twig) else {
+                return Err(refused(format!("twig {twig} is not relocated; its records cannot be punched")));
+            };
+            let file = if range.relocated { self.relocated.as_ref() } else { Some(&self.main) };
+            let written = file.map_or(0, |file| file.sealed_len + file.written as u64);
+            let still_read = range.relocated && current.group_start == range.start;
+            if range.is_empty() || range.end > written || still_read || self.punched.iter().any(|p| p.range == range) {
+                return Err(refused(format!("twig {twig}: {range:?} is not a range a compaction left")));
+            }
+            records.push(crate::punched::Punched { twig, range });
+        }
+        // The groups that replaced these ranges are durable before the ranges go.
+        if let Some(relocated) = self.relocated.as_mut() {
+            relocated.sync()?;
+        }
+        let Some(log) = self.punch_log.as_mut() else { unreachable!("checked above") };
+        log.append(&records)?;
+        let mut bytes = 0;
+        for record in &records {
+            let file = if record.range.relocated {
+                self.relocated.as_ref().map(|file| &file.file)
+            } else {
+                Some(&self.main.file)
+            };
+            if let Some(file) = file {
+                crate::punched::punch_hole(file, record.range)?;
+            }
+            bytes += record.range.len();
+        }
+        self.punched.extend_from_slice(&records);
+        self.punched_bytes += bytes;
+        Ok(bytes)
     }
 
     /// Lays `twig`'s 2048 slots out as a relocated group (module doc): a
@@ -1192,18 +1440,31 @@ impl FileEntries {
     /// left complete in the file by one is applied by the next open, which
     /// is harmless, since it holds what the slots hold.
     pub(crate) fn append_group(&mut self, group: Group) -> io::Result<Relocation> {
+        self.append_group_durable(group, true)
+    }
+
+    /// [`Self::append_group`], written to the file but with its `fsync` left
+    /// to the caller when `durable` is false (a compaction under the forest's
+    /// lock: [`Self::relocated_sync_handle`] syncs it outside). The slots
+    /// point at it at once; nothing may punch their old bytes before it is
+    /// durable, which [`Self::punch`] makes sure of.
+    pub(crate) fn append_group_durable(&mut self, group: Group, durable: bool) -> io::Result<Relocation> {
         self.main.writable()?;
         let twig = group.twig;
         let base = twig * TWIG_SIZE;
         // What the twig's records take where they are now.
-        let reclaimable = match self.twigs.get(&twig) {
-            Some(relocated) => relocated.group_len,
+        let old = match self.twigs.get(&twig) {
+            Some(relocated) => FileRange {
+                relocated: true,
+                start: relocated.group_start,
+                end: relocated.group_start + relocated.group_len,
+            },
             None => {
                 let first = self.offsets.at(base);
                 let last = self.offsets.at(base + TWIG_SIZE - 1);
                 debug_assert_eq!((first | last) & RELOCATED_BIT, 0);
                 let SlotRef::Payload(_, value) = payload_at(self.main.bytes_from(last)) else { unreachable!() };
-                last + (KEY_LEN + LEN_LEN + value.len()) as u64 - first
+                FileRange { relocated: false, start: first, end: last + (KEY_LEN + LEN_LEN + value.len()) as u64 }
             }
         };
         if self.relocated.is_none() {
@@ -1213,18 +1474,37 @@ impl FileEntries {
         }
         let Some(file) = self.relocated.as_mut() else { unreachable!("created above") };
         let start = file.append_unit(&group.bytes)?;
-        // Durable before any slot points at it.
-        file.sync()?;
-        let main: Box<[u64]> = match self.twigs.remove(&twig) {
-            Some(relocated) => relocated.main,
-            None => (base..base + TWIG_SIZE).map(|slot| self.offsets.at(slot)).collect(),
-        };
-        for (local, at) in group.starts.iter().enumerate() {
-            self.offsets.set(base + local, (start + u64::from(*at)) | RELOCATED_BIT);
+        if durable {
+            // Durable before any slot points at it.
+            file.sync()?;
+        } else {
+            // In the file, for a read view's mapping, before any slot points at it.
+            file.flush()?;
+        }
+        let released = self.offsets.is_released(base / OFFSET_SEGMENT_SLOTS);
+        if !released {
+            for (local, at) in group.starts.iter().enumerate() {
+                self.offsets.set(base + local, (start + u64::from(*at)) | RELOCATED_BIT);
+            }
         }
         let written = group.bytes.len() as u64;
-        self.twigs.insert(twig, RelocatedTwig { main, group_len: written, dead: group.dead });
-        Ok(Relocation { written, reclaimable })
+        let starts = released.then_some(group.starts);
+        self.twigs.insert(twig, RelocatedTwig { group_start: start, starts, group_len: written, dead: group.dead });
+        self.release_segment_if_relocated(base / OFFSET_SEGMENT_SLOTS);
+        Ok(Relocation { written, old })
+    }
+
+    /// A second handle on `entries.relocated`, its appends written, for the
+    /// caller to `fsync` outside whatever lock guards this store; `None`
+    /// without a relocated file.
+    pub(crate) fn relocated_sync_handle(&mut self) -> io::Result<Option<File>> {
+        match self.relocated.as_mut() {
+            None => Ok(None),
+            Some(file) => {
+                file.flush()?;
+                file.file.try_clone().map(Some)
+            }
+        }
     }
 
     /// Seals the tail now (tests: exercise the chunked reads without
@@ -1260,8 +1540,11 @@ fn read_whole(reader: &mut impl std::io::Read, buf: &mut [u8]) -> io::Result<boo
 /// it, in file order, so the latest group of a twig wins; `twigs` records
 /// each relocated twig with its `entries.log` offsets.
 ///
-/// The walk stops at the first group that is torn (a short read; any other
-/// read error fails the open), fails its CRC, is not
+/// A group whose CRC fails is skipped, not applied, and the walk goes on (the
+/// groups after it may hold twigs whose main records are punched); a run of
+/// such groups at the end of the file is a torn tail and is cut. The walk
+/// stops at the first group that is torn (a short read; any other read error
+/// fails the open), is not
 /// exactly one twig's 2048 slots in order, or names a twig not wholly within
 /// the kept slots (an open that keeps a shorter prefix, or a main file cut
 /// short); with `truncate` the file is cut there, as a torn tail of the main
@@ -1280,6 +1563,7 @@ fn open_relocated(
     offsets: &mut [u64],
     active: &[u64],
     twigs: &mut BTreeMap<usize, RelocatedTwig>,
+    holes: &[FileRange],
     truncate: bool,
 ) -> io::Result<Option<LogFile>> {
     let mut file = match OpenOptions::new().read(true).write(truncate).open(path) {
@@ -1290,13 +1574,30 @@ fn open_relocated(
     let len = file.metadata()?.len();
     let mut good = 0u64;
     let mut group_starts = Vec::new();
+    // Groups that name a twig past the kept slots: skipped, and with
+    // `truncate` disarmed (their CRC broken in place) once the walk is done,
+    // so a later open that keeps more slots never applies them to the records
+    // appended in their place.
+    let mut stale: Vec<u64> = Vec::new();
+    // The end of the last group whose CRC holds, and the group count then: a
+    // run of failing groups at the end of the file is a torn tail and is cut.
+    let mut sound = (0u64, 0usize);
     {
         file.seek(io::SeekFrom::Start(0))?;
         let mut reader = std::io::BufReader::with_capacity(8 << 20, &mut file);
         let mut starts = vec![0u64; TWIG_SIZE];
         let mut value = Vec::new();
         let is_active = |slot: usize| active.get(slot / 64).is_some_and(|word| word >> (slot % 64) & 1 == 1);
+        let mut holes = holes.iter().peekable();
         'groups: loop {
+            // An earlier group of a twig compacted again, punched (stage 3).
+            while let Some(hole) = holes.peek().filter(|hole| hole.start <= good) {
+                if hole.start == good && hole.end <= len {
+                    reader.seek_relative((hole.end - good) as i64)?;
+                    good = hole.end;
+                }
+                holes.next();
+            }
             let group_start = good;
             let mut at = good;
             let mut crc = crc32fast::Hasher::new();
@@ -1353,28 +1654,36 @@ fn open_relocated(
                 break;
             }
             crc.update(&trailer[..9]);
-            if trailer[0] != TAG_END
-                || u64::from_le_bytes(trailer[1..9].try_into().expect("8 bytes")) != twig as u64
-                || u32::from_le_bytes(trailer[9..13].try_into().expect("4 bytes")) != crc.finalize()
-            {
-                break;
-            }
-            let base = twig * TWIG_SIZE;
-            if base + TWIG_SIZE > offsets.len() {
+            if trailer[0] != TAG_END || u64::from_le_bytes(trailer[1..9].try_into().expect("8 bytes")) != twig as u64 {
                 break;
             }
             at += TRAILER as u64;
+            // A whole group whose CRC fails (one disarmed below, or a damaged
+            // one) is skipped, not the end of the file: the groups after it
+            // may hold twigs whose main records are punched. A twig left
+            // without its group is refused by the caller if it needs one.
+            let base = twig * TWIG_SIZE;
+            if u32::from_le_bytes(trailer[9..13].try_into().expect("4 bytes")) != crc.finalize() {
+                group_starts.push(group_start);
+                good = at;
+                continue;
+            }
+            sound = (at, group_starts.len() + 1);
+            if base + TWIG_SIZE > offsets.len() {
+                stale.push(at - 4);
+                group_starts.push(group_start);
+                good = at;
+                continue;
+            }
             if kills_a_live_slot {
                 group_starts.push(group_start);
                 good = at;
                 continue;
             }
             let main = &mut offsets[base..base + TWIG_SIZE];
-            let entry = twigs.entry(twig).or_insert_with(|| RelocatedTwig {
-                main: main.iter().copied().collect(),
-                group_len: 0,
-                dead: 0,
-            });
+            let entry =
+                twigs.entry(twig).or_insert_with(|| RelocatedTwig { group_start, starts: None, group_len: 0, dead: 0 });
+            entry.group_start = group_start;
             entry.group_len = at - group_start;
             entry.dead = dead_hash_count;
             for (offset, start) in main.iter_mut().zip(&starts) {
@@ -1384,8 +1693,24 @@ fn open_relocated(
             good = at;
         }
     }
+    if sound.0 < good {
+        good = sound.0;
+        group_starts.truncate(sound.1);
+    }
     if truncate && good < len {
         file.set_len(good)?;
+    }
+    if truncate && !stale.is_empty() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            for crc_at in &stale {
+                let mut crc = [0u8; 4];
+                file.read_exact_at(&mut crc, *crc_at)?;
+                file.write_all_at(&[!crc[0], !crc[1], !crc[2], !crc[3]], *crc_at)?;
+            }
+            file.sync_data()?;
+        }
     }
     let mut log = LogFile::new(path.to_path_buf(), file, good, false);
     log.seal_existing(&group_starts)?;
@@ -1610,12 +1935,12 @@ impl Entries {
         }
     }
 
-    /// Where `slot`'s record starts in the entry file; `None` in the heap or
-    /// past the last slot.
+    /// `slot`'s read-view location ([`FileEntries::location`]); `None` in
+    /// the heap, past the last slot, or for a hash-only slot.
     pub(crate) fn file_offset(&self, slot: usize) -> Option<u64> {
         match self {
             Self::Heap(_) => None,
-            Self::File(file) => file.offset(slot),
+            Self::File(file) => file.location(slot),
         }
     }
 
@@ -2023,6 +2348,157 @@ mod tests {
         }
     }
 
+    /// Stage 3: a twig compacted twice has both earlier ranges punched (its
+    /// `entries.log` records and its first group); the holes read as zeros,
+    /// a second punch of either or of the live group is refused, and a
+    /// reopen skips the holes and reads every slot from the latest group.
+    #[test]
+    fn punched_ranges_read_as_zeros_and_a_reopen_skips_them() {
+        let name = "punch-reopen";
+        let path = scratch(name);
+        let mut file = FileEntries::create(&path).unwrap();
+        for i in 0..3 * TWIG_SIZE as u64 {
+            file.push(&key_n(i), &[(i % 250) as u8; 20]).unwrap();
+        }
+        for slot in (0..TWIG_SIZE).filter(|slot| slot % 3 != 0) {
+            file.set_active(slot, false);
+        }
+        let group = file.build_group(0, |_| None).unwrap();
+        let first = file.append_group_durable(group, false).unwrap();
+        assert!(!first.old.relocated);
+        // Not written to the main file yet: refused.
+        assert!(file.punch(&[(0, first.old)]).is_err());
+        file.sync().unwrap();
+        for slot in (0..TWIG_SIZE).filter(|slot| slot % 6 == 0) {
+            file.set_active(slot, false);
+        }
+        let group = file.build_group(0, |_| None).unwrap();
+        let second = file.append_group(group).unwrap();
+        assert!(second.old.relocated);
+        let live_group = FileRange { relocated: true, start: second.old.end, end: second.old.end + second.written };
+        assert!(file.punch(&[(0, live_group)]).is_err(), "the live group");
+        assert!(file.punch(&[(1, FileRange { relocated: false, start: 0, end: 10 })]).is_err(), "twig 1 is not relocated");
+        let punched = file.punch(&[(0, first.old), (0, second.old)]).unwrap();
+        assert_eq!(punched, first.old.len() + second.old.len());
+        assert!(file.punch(&[(0, first.old)]).is_err(), "punched already");
+        let main = std::fs::read(&path).unwrap();
+        assert!(main[first.old.start as usize..first.old.end as usize].iter().all(|b| *b == 0));
+        assert_eq!(main[first.old.end as usize..][..32], key_n(TWIG_SIZE as u64), "the next twig's first key");
+        let moved = std::fs::read(relocated_path(&path)).unwrap();
+        assert!(moved[..second.old.end as usize].iter().all(|b| *b == 0));
+        let active = file.active_bits().to_vec();
+        let expected: Vec<_> = (0..3 * TWIG_SIZE).map(|slot| (file.is_active(slot), file.read(slot).leaf_hash())).collect();
+        assert_eq!(file.stats(0).punched_bytes, punched);
+        drop(file);
+
+        let (reopened, kept) = FileEntries::open_existing(&path, 3 * TWIG_SIZE as u64, &active).unwrap();
+        assert_eq!(kept, 3 * TWIG_SIZE as u64);
+        for (slot, expected) in expected.iter().enumerate() {
+            assert_eq!((reopened.is_active(slot), reopened.read(slot).leaf_hash()), *expected, "slot {slot}");
+        }
+        assert_eq!(reopened.stats(0).punched_bytes, punched);
+        let dead = (0..TWIG_SIZE).filter(|slot| !(slot % 3 == 0 && slot % 6 != 0)).count();
+        assert_eq!(reopened.relocated_dead(0), Some(dead as u32));
+        drop(reopened);
+        // A prefix that ends inside the punched twig cannot be read.
+        assert!(FileEntries::open_existing_readonly(&path, (TWIG_SIZE / 2) as u64, &active).is_err());
+        // A read-only prefix of two twigs reads twig 0 from its group.
+        let (prefix, kept) = FileEntries::open_existing_readonly(&path, 2 * TWIG_SIZE as u64, &active).unwrap();
+        assert_eq!(kept, 2 * TWIG_SIZE as u64);
+        assert_eq!(prefix.read(3).leaf_hash(), expected[3].1);
+        drop(prefix);
+        remove_scratch(name);
+    }
+
+    /// Stage 4: once every twig of an offsets segment is relocated, the
+    /// segment is released and its twigs keep `u32` starts from their group's
+    /// base (4 B a slot); reads, a second compaction of one of its twigs, a
+    /// punch and a reopen all go through them.
+    #[test]
+    fn a_fully_relocated_segment_keeps_u32_starts_and_reads_the_same() {
+        let name = "release-segment";
+        let path = scratch(name);
+        let mut file = FileEntries::create(&path).unwrap();
+        let slots = OFFSET_SEGMENT_SLOTS + TWIG_SIZE;
+        for i in 0..slots as u64 {
+            file.push(&key_n(i), &[(i % 199) as u8; 3]).unwrap();
+        }
+        for slot in (0..OFFSET_SEGMENT_SLOTS).filter(|slot| slot % 2 == 1) {
+            file.set_active(slot, false);
+        }
+        file.sync().unwrap();
+        let sample: Vec<usize> = (0..slots).step_by(97).chain([0, OFFSET_SEGMENT_SLOTS - 1, OFFSET_SEGMENT_SLOTS]).collect();
+        // A live slot keeps a location through the compaction; a dead one is
+        // hash-only after it.
+        let before: Vec<_> = sample.iter().map(|slot| (file.read(*slot).leaf_hash(), file.is_active(*slot))).collect();
+        let kept_bytes = file.stats(0).offsets_bytes;
+        let twigs = OFFSET_SEGMENT_SLOTS / TWIG_SIZE;
+        let mut freed = Vec::new();
+        for twig in 0..twigs {
+            assert!(!file.offsets.is_released(0), "released before twig {twig}");
+            let group = file.build_group(twig, |_| None).unwrap();
+            freed.push((twig, file.append_group_durable(group, false).unwrap().old));
+        }
+        assert!(file.offsets.is_released(0));
+        let stats = file.stats(0);
+        assert_eq!(stats.offsets_bytes, kept_bytes - (OFFSET_SEGMENT_SLOTS * 8) as u64 + (OFFSET_SEGMENT_SLOTS * 4) as u64);
+        let check = |file: &FileEntries| {
+            for (slot, expected) in sample.iter().zip(&before) {
+                assert_eq!((file.read(*slot).leaf_hash(), file.location(*slot).is_some()), *expected, "slot {slot}");
+            }
+        };
+        check(&file);
+        // A twig of the released segment compacted again moves its starts.
+        file.set_active(4, false);
+        let group = file.build_group(0, |_| None).unwrap();
+        freed.push((0, file.append_group(group).unwrap().old));
+        assert!(file.location(4).is_none() && file.location(6).is_some());
+        file.punch(&freed).unwrap();
+        let active = file.active_bits().to_vec();
+        let after: Vec<_> = sample.iter().map(|slot| file.read(*slot).leaf_hash()).collect();
+        drop(file);
+        let (reopened, kept) = FileEntries::open_existing(&path, slots as u64, &active).unwrap();
+        assert_eq!(kept, slots as u64);
+        assert!(reopened.offsets.is_released(0));
+        for (slot, expected) in sample.iter().zip(&after) {
+            assert_eq!(reopened.read(*slot).leaf_hash(), *expected, "slot {slot} after the reopen");
+        }
+        drop(reopened);
+        remove_scratch(name);
+    }
+
+    /// A group whose CRC fails in the middle of `entries.relocated` is
+    /// skipped, not the end of the walk: a later group still applies.
+    #[test]
+    fn a_failing_group_mid_file_is_skipped_and_later_groups_apply() {
+        let name = "crc-mid";
+        let path = scratch(name);
+        let mut file = FileEntries::create(&path).unwrap();
+        for i in 0..3 * TWIG_SIZE as u64 {
+            file.push(&key_n(i), &[7u8; 12]).unwrap();
+        }
+        for slot in (0..2 * TWIG_SIZE).filter(|slot| slot % 2 == 0) {
+            file.set_active(slot, false);
+        }
+        let group = file.build_group(0, |_| None).unwrap();
+        let first = file.append_group(group).unwrap();
+        let group = file.build_group(1, |_| None).unwrap();
+        file.append_group(group).unwrap();
+        file.sync().unwrap();
+        let active = file.active_bits().to_vec();
+        drop(file);
+        // Break a byte of the first group's CRC.
+        let mut bytes = std::fs::read(relocated_path(&path)).unwrap();
+        bytes[first.written as usize - 1] ^= 0xff;
+        std::fs::write(relocated_path(&path), &bytes).unwrap();
+        let (reopened, _) = FileEntries::open_existing(&path, 3 * TWIG_SIZE as u64, &active).unwrap();
+        assert_eq!(reopened.relocated_dead(0), None, "the broken group is not applied");
+        assert_eq!(reopened.relocated_dead(1), Some(TWIG_SIZE as u32 / 2), "the one after it is");
+        assert_eq!(reopened.value(TWIG_SIZE + 1), &[7u8; 12]);
+        drop(reopened);
+        remove_scratch(name);
+    }
+
     /// A truncation into a relocated twig is refused by the store itself,
     /// and one above it goes through.
     #[test]
@@ -2038,12 +2514,16 @@ mod tests {
         let group = file.build_group(0, |_| None).unwrap();
         assert_eq!(group.dead as usize, TWIG_SIZE / 2);
         let done = file.append_group(group).unwrap();
-        assert_eq!(done.reclaimable, (TWIG_SIZE * (KEY_LEN + LEN_LEN + 9)) as u64);
+        assert_eq!(done.old, FileRange { relocated: false, start: 0, end: (TWIG_SIZE * (KEY_LEN + LEN_LEN + 9)) as u64 });
         assert!(file.is_hash_only(0) && !file.is_hash_only(1));
         assert_eq!(file.key(1), Some(&key_n(1)));
         assert_eq!(file.value(1), &[1u8; 9]);
-        // The read view's offsets stay in entries.log.
-        assert_eq!(file.offset(1), Some((KEY_LEN + LEN_LEN + 9) as u64));
+        // A read view names a relocated live record by its key's offset in
+        // entries.relocated (after slot 0's dead record and slot 1's head), and
+        // a hash-only slot not at all.
+        assert_eq!(file.location(1), Some((DEAD_RECORD + RELOCATED_HEAD) as u64 | RELOCATED_LOCATION));
+        assert_eq!(file.location(0), None);
+        assert_eq!(file.location(TWIG_SIZE), Some((TWIG_SIZE * (KEY_LEN + LEN_LEN + 9)) as u64));
         let error = file.truncate(TWIG_SIZE - 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(file.len(), 3 * TWIG_SIZE);

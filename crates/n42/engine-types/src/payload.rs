@@ -1022,12 +1022,14 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
 /// candidates in plan order, their transfer keys and hashes and the
 /// partition at the beneficiary this node builds for, made on the plan
 /// body's own pool -- what the evm2 parallel step reads -- and the body the
-/// evm2 seal lays its header over (F5g item 4): the transactions and
-/// their senders. `None` when not every candidate is a plain transfer.
+/// evm2 seal lays its header over (F5g items 3-4): the transactions and
+/// their senders, and with `N42_PLAN_AHEAD_PARTS=1` the frame layout and
+/// transactions root of the hashes on this plan. `None` when not every
+/// candidate is a plain transfer.
 #[cfg(not(feature = "legacy-revm-paths"))]
 fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     segments: &[(n42_tx_queue::FrameTxs<P>, usize)],
-    _plan: &n42_tx_queue::FramePlan,
+    plan: &n42_tx_queue::FramePlan,
 ) -> Option<crate::frame_blocks::PreparedBuild<P>> {
     use rayon::prelude::*;
     let at = std::time::Instant::now();
@@ -1049,6 +1051,11 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
+    // `N42_PLAN_AHEAD_PARTS=1`: the body's frame layout and transactions
+    // root, found here with the plan rather than at the seal.
+    let root_ahead = (crate::frame_blocks::plan_ahead_parts() && crate::frame_blocks::active())
+        .then(|| pool.install(|| crate::frame_blocks::root_ahead(plan, &hashes)))
+        .flatten();
     Some(crate::frame_blocks::PreparedBuild {
         segments: segments.to_vec(),
         cands,
@@ -1058,7 +1065,7 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         hashes,
         groups,
         made_us: at.elapsed().as_micros() as u64,
-        root_ahead: None,
+        root_ahead,
     })
 }
 
@@ -2667,9 +2674,10 @@ where
                                 && body_matches_pull(hashes, &cands, |hash| *hash, |tx| *tx.hash())
                         });
                         match made {
-                            Some((transactions, senders, hashes, _)) => {
+                            Some((transactions, senders, hashes, root)) => {
                                 direct_body = Some((transactions, senders));
                                 direct_hashes = Some(hashes);
+                                direct_root_ahead = root;
                                 commit_body_ahead_used = true;
                             }
                             None => {

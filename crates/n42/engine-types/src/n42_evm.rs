@@ -52,6 +52,162 @@ impl ReceiptBuilder for N42ReceiptBuilder {
     }
 }
 
+/// reth's [`EthBlockExecutor`] with the parallel step's bundle half
+/// (`docs/RETH_2_9_0_UPGRADE.md`, F5c): a merge of the batches handed over
+/// with [`Self::set_pending_fold`] is folded into the bundle `finish` returns
+/// ([`crate::graft_fold::fold_into`]), before anything downstream (the hashed
+/// post-state, the QMDB root, the assembler) reads it. Without a pending
+/// fold it is the inner executor, method for method; it derefs to it, so the
+/// inner executor's fields (`receipts`, `cumulative_gas_used`, `evm`) read
+/// as before.
+#[allow(missing_debug_implementations)]
+pub struct N42BlockExecutor<'a, T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync>> {
+    inner: EthBlockExecutor<'a, T, &'a N42ReceiptBuilder>,
+    pending_fold: Option<crate::graft_fold::MergedBatches>,
+}
+
+impl<'a, T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync>> N42BlockExecutor<'a, T> {
+    /// Wraps `inner` with no pending fold.
+    pub const fn new(inner: EthBlockExecutor<'a, T, &'a N42ReceiptBuilder>) -> Self {
+        Self { inner, pending_fold: None }
+    }
+
+    /// Hands over the batches' merge for `finish` to fold into the block's
+    /// bundle. The caller has written its accounts into the EVM's overlay
+    /// (the cache half) and committed the batches' receipts.
+    pub fn set_pending_fold(&mut self, merged: crate::graft_fold::MergedBatches) {
+        self.pending_fold = Some(merged);
+    }
+
+    /// Whether a fold is pending.
+    pub const fn has_pending_fold(&self) -> bool {
+        self.pending_fold.is_some()
+    }
+
+    fn fold(
+        pending: Option<crate::graft_fold::MergedBatches>,
+        state: &mut reth_trie::bundle_state::BundleState,
+    ) -> Result<(), reth_evm::BlockExecutionError> {
+        if let Some(merged) = pending {
+            crate::graft_fold::fold_into(state, merged).map_err(reth_evm::BlockExecutionError::other)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a, T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync>> std::ops::Deref
+    for N42BlockExecutor<'a, T>
+{
+    type Target = EthBlockExecutor<'a, T, &'a N42ReceiptBuilder>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a, T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync>> std::ops::DerefMut
+    for N42BlockExecutor<'a, T>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<'a, T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync>> reth_evm::execute::BlockExecutor
+    for N42BlockExecutor<'a, T>
+{
+    type Transaction = <EthBlockExecutor<'a, T, &'a N42ReceiptBuilder> as reth_evm::execute::BlockExecutor>::Transaction;
+    type Receipt = <EthBlockExecutor<'a, T, &'a N42ReceiptBuilder> as reth_evm::execute::BlockExecutor>::Receipt;
+    type Evm = <EthBlockExecutor<'a, T, &'a N42ReceiptBuilder> as reth_evm::execute::BlockExecutor>::Evm;
+    type TransactionResultWithState =
+        <EthBlockExecutor<'a, T, &'a N42ReceiptBuilder> as reth_evm::execute::BlockExecutor>::TransactionResultWithState;
+    type BlockAccessList = <EthBlockExecutor<'a, T, &'a N42ReceiptBuilder> as reth_evm::execute::BlockExecutor>::BlockAccessList;
+
+    fn evm(&self) -> &Self::Evm {
+        self.inner.evm()
+    }
+    fn evm_mut(&mut self) -> &mut Self::Evm {
+        self.inner.evm_mut()
+    }
+    fn set_state_hook(&mut self, hook: impl FnMut(reth_evm::StateUpdate) + Send + 'static) -> bool {
+        self.inner.set_state_hook(hook)
+    }
+    fn convert_block_access_list(
+        block_access_list: &alloy_eip7928::BlockAccessList,
+    ) -> Result<Self::BlockAccessList, reth_evm::BlockExecutionError> {
+        <EthBlockExecutor<'a, T, &'a N42ReceiptBuilder> as reth_evm::execute::BlockExecutor>::convert_block_access_list(
+            block_access_list,
+        )
+    }
+    fn set_block_access_list(&mut self, block_access_list: Arc<Self::BlockAccessList>) {
+        self.inner.set_block_access_list(block_access_list)
+    }
+    fn set_block_access_index(&mut self, index: alloy_eip7928::BlockAccessIndex) {
+        self.inner.set_block_access_index(index)
+    }
+    fn enable_block_access_list_builder(&mut self) {
+        self.inner.enable_block_access_list_builder()
+    }
+    fn take_block_access_list(&mut self) -> Option<alloy_eip7928::BlockAccessList> {
+        self.inner.take_block_access_list()
+    }
+    fn apply_pre_execution_changes(&mut self) -> Result<(), reth_evm::BlockExecutionError> {
+        self.inner.apply_pre_execution_changes()
+    }
+    fn into_state(self) -> reth_trie::bundle_state::BundleState {
+        let mut state = self.inner.into_state();
+        if let Some(merged) = self.pending_fold {
+            // A refusal here leaves the serial part's state, as a caller of
+            // `into_state` (a partial execution) gets it without the batches.
+            let _ = crate::graft_fold::fold_into(&mut state, merged);
+        }
+        state
+    }
+    fn validate_transaction_gas_limit(&mut self, gas_limit: u64) -> Result<(), reth_evm::BlockExecutionError> {
+        self.inner.validate_transaction_gas_limit(gas_limit)
+    }
+    fn execute_transaction_with_commit_condition(
+        &mut self,
+        transaction: impl reth_evm::execute::ExecutorTx<Self>,
+        f: impl FnOnce(&evm2::TxResult<T>) -> reth_evm::CommitChanges,
+    ) -> Result<Option<reth_evm::GasOutput>, reth_evm::BlockExecutionError> {
+        // The inner executor's own path (it commits without detaching).
+        self.inner.execute_transaction_with_commit_condition(transaction, f)
+    }
+    fn execute_transaction_without_commit(
+        &mut self,
+        transaction: impl reth_evm::execute::ExecutorTx<Self>,
+    ) -> Result<Self::TransactionResultWithState, reth_evm::BlockExecutionError> {
+        self.inner.execute_transaction_without_commit(transaction)
+    }
+    fn commit_transaction(
+        &mut self,
+        output: Self::TransactionResultWithState,
+    ) -> Result<reth_evm::GasOutput, reth_evm::BlockExecutionError> {
+        self.inner.commit_transaction(output)
+    }
+    fn receipts(&self) -> &[Self::Receipt] {
+        self.inner.receipts()
+    }
+    fn finish_with_block_access_list(
+        self,
+    ) -> Result<
+        (reth_evm::BlockExecutionOutput<Self::Receipt>, Option<alloy_eip7928::BlockAccessList>),
+        reth_evm::BlockExecutionError,
+    > {
+        let (mut output, bal) = self.inner.finish_with_block_access_list()?;
+        Self::fold(self.pending_fold, &mut output.state)?;
+        Ok((output, bal))
+    }
+    fn finish_with_prepared_block_access_list(
+        self,
+    ) -> Result<(reth_evm::BlockExecutionOutput<Self::Receipt>, Option<evm2::evm::Bal>), reth_evm::BlockExecutionError>
+    {
+        let (mut output, bal) = self.inner.finish_with_prepared_block_access_list()?;
+        Self::fold(self.pending_fold, &mut output.state)?;
+        Ok((output, bal))
+    }
+}
+
 /// The block executor factory of [`N42EvmConfig`]: reth's
 /// `EthBlockExecutorFactory` without its `Header = alloy Header` bound on the
 /// chain spec (the executor reads only hardforks and the deposit contract
@@ -103,7 +259,7 @@ where
     where
         Self: 'a;
     type Executor<'a>
-        = EthBlockExecutor<'a, F::Types, &'a N42ReceiptBuilder>
+        = N42BlockExecutor<'a, F::Types>
     where
         Self: 'a;
 
@@ -111,7 +267,7 @@ where
     where
         Self: 'a,
     {
-        EthBlockExecutor::new(evm, ctx, self.chain_spec.as_ref(), &self.receipt_builder)
+        N42BlockExecutor::new(EthBlockExecutor::new(evm, ctx, self.chain_spec.as_ref(), &self.receipt_builder))
     }
 
     fn evm_factory(&self) -> &Self::EvmFactory {

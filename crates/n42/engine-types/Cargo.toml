@@ -87,6 +87,8 @@ tracing = "0.1.41"
 # ethereum
 alloy-rlp.workspace = true
 alloy-primitives.workspace = true
+# The block access list types in the N42 block executor's trait methods.
+alloy-eip7928.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 evm2 = { workspace = true, features = ["std"] }
@@ -112,7 +114,6 @@ legacy-revm-paths = ["dep:revm", "dep:alloy-evm"]
 tikv-jemallocator = { workspace = true, features = ["unprefixed_malloc_on_supported_platforms"] }
 libc.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
-alloy-eip7928.workspace = true
 # `claimed_build`'s tests sign the transactions they check the claim of.
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
 secp256k1.workspace = true

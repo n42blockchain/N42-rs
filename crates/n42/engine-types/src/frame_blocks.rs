@@ -271,9 +271,24 @@ pub fn plan_ahead_body() -> bool {
 /// Whether the build asks for the plan's prepared body: the switch and every
 /// switch it stands on.
 pub fn plan_ahead_body_wanted() -> bool {
-    // The prepared body is the parallel step's (`legacy-revm-paths`).
-    crate::legacy_paths::LEGACY_REVM_PATHS
-        && plan_ahead_body() && n42_tx_queue::plan_ahead() && pull_by_frames() && crate::payload::seal_on_counters()
+    // The revm-era step reads the prepared body only on its counted seal
+    // (`N42_SEAL_ON_COUNTERS`); the evm2 step takes it for its keys and
+    // partition and lays its seal over it (F5g items 4 and 7), with no
+    // counters to stand on. This gate used to be revm-only, so the evm2
+    // hook was never installed and no fleet block took the plan body (E12).
+    plan_body_gate(
+        crate::legacy_paths::LEGACY_REVM_PATHS,
+        crate::payload::seal_on_counters(),
+        plan_ahead_body(),
+        n42_tx_queue::plan_ahead(),
+        pull_by_frames(),
+    )
+}
+
+/// [`plan_ahead_body_wanted`] over its switches: the plan body and every
+/// switch it stands on, and on the revm-era step its counted seal too.
+const fn plan_body_gate(legacy: bool, seal_on_counters: bool, body: bool, plan_ahead: bool, by_frames: bool) -> bool {
+    (!legacy || seal_on_counters) && body && plan_ahead && by_frames
 }
 
 /// What the plan-ahead hook makes of a prepared plan (`N42_PLAN_AHEAD_BODY=1`):
@@ -1261,6 +1276,19 @@ pub fn root_of_hashes(hashes: &[B256], counts: &[usize]) -> Option<B256> {
 
 #[cfg(test)]
 mod claimed_root_tests {
+    /// F5g item 7: the evm2 step takes the plan body under X22's switches
+    /// (plan body, plan ahead, pull by frames) with no counted seal; the
+    /// revm-era step still needs its counted seal.
+    #[test]
+    fn the_plan_body_gate_opens_on_evm2_without_the_counted_seal() {
+        assert!(super::plan_body_gate(false, false, true, true, true), "evm2, X22's switches");
+        assert!(!super::plan_body_gate(true, false, true, true, true), "revm era without the counted seal");
+        assert!(super::plan_body_gate(true, true, true, true, true), "revm era with it");
+        for (body, ahead, frames) in [(false, true, true), (true, false, true), (true, true, false)] {
+            assert!(!super::plan_body_gate(false, true, body, ahead, frames), "{body} {ahead} {frames}");
+        }
+    }
+
     use super::*;
 
     /// A block whose description was refused here (its frames not held) is

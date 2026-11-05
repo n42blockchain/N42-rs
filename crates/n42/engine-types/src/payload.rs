@@ -2228,7 +2228,9 @@ where
     // (`N42_PULLER_STOP_AT_PULL`), its wind-down then beside the batches.
     let mut seal_lookahead_us = 0u64;
     let mut seal_puller_join_us = 0u64;
-    let mut puller_stopped_at_pull = false;
+    // "stopped" (at the pull), "kept" (stopped at the seal), "none" (no
+    // puller: the frames' bulk take or the direct iterator).
+    let mut puller_at_pull: &'static str = "none";
     // The leader's seal chain between its named terms (step 7a): the prep's
     // end to the batches' start (the prefetch's scope, the shards and the
     // threads set up, the partition, the deferred state's open, the slots),
@@ -2559,7 +2561,9 @@ where
             }
             puller.stop();
             seal_lookahead_us = at.elapsed().as_micros() as u64;
-            puller_stopped_at_pull = true;
+            puller_at_pull = "stopped";
+        } else if pulled.is_some() {
+            puller_at_pull = "kept";
         }
         open_deferred_state!()?;
         let beneficiary = group_env.block.beneficiary;
@@ -5117,7 +5121,7 @@ where
                     puller_drop_us,
                     seal_lookahead_us,
                     seal_puller_join_us,
-                    puller_stopped_at_pull,
+                    puller_at_pull,
                     par_hook_us,
                     state_pre_changes_us,
                     sealed_ms,
@@ -7533,5 +7537,136 @@ mod includability_tests {
         let (accounts, txs) = balance_case();
         let block = build(false, &accounts, txs);
         assert_eq!(block.body().transactions.len(), 4, "reth's rule: both of sender 1's transfers execute");
+    }
+}
+
+/// The evm2 plan-ahead body's cost (F5g6): what `make_prepared_build` takes
+/// off the build, and what the build does inline without it.
+#[cfg(all(test, not(feature = "legacy-revm-paths")))]
+mod plan_body_evm2_tests {
+    use super::*;
+    use alloy_primitives::{Address, Bytes};
+    use n42_tx_types::{AltSigTx, N42TxEnvelope, TxAltSig, ALG_ED25519};
+    use reth_primitives_traits::Recovered;
+    use reth_transaction_pool::{
+        identifier::{SenderId, TransactionId},
+        TransactionOrigin, ValidPoolTransaction,
+    };
+
+    type Cand = Arc<ValidPoolTransaction<crate::N42PooledTransaction>>;
+
+    fn address(i: u64) -> Address {
+        let mut a = [0u8; 20];
+        a[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+        a[12..].copy_from_slice(&i.to_be_bytes());
+        Address::from(a)
+    }
+
+    /// `senders` frames of `run` 0x50 transfers each, recipients drawn from
+    /// `space`.
+    fn frames(senders: u64, run: u64, space: u64) -> Vec<(n42_tx_queue::FrameTxs<crate::N42PooledTransaction>, usize)> {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut out = Vec::new();
+        for s in 0..senders {
+            let sender = address(100 + s);
+            let mut pubkey = [0u8; 32];
+            pubkey[..8].copy_from_slice(&s.to_be_bytes());
+            let mut frame: Vec<Cand> = Vec::new();
+            for k in 0..run {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let tx = TxAltSig {
+                    chain_id: 1,
+                    nonce: k,
+                    max_priority_fee_per_gas: 1_000_000_000,
+                    max_fee_per_gas: 10_000_000_000,
+                    gas_limit: 21_000,
+                    to: address(1_000_000 + seed % space),
+                    value: U256::from(1_000 + k),
+                    input: Bytes::new(),
+                    access_list: Default::default(),
+                    alg_type: ALG_ED25519,
+                    pubkey: Bytes::copy_from_slice(&pubkey),
+                };
+                let mut signature = [0u8; 64];
+                signature[..8].copy_from_slice(&seed.to_be_bytes());
+                let envelope = N42TxEnvelope::AltSig(AltSigTx::new(tx, Bytes::copy_from_slice(&signature)));
+                let encoded = alloy_eips::eip2718::Encodable2718::encode_2718_len(&envelope);
+                let pooled = crate::N42PooledTransaction::new(Recovered::new_unchecked(envelope, sender), encoded);
+                frame.push(Arc::new(ValidPoolTransaction {
+                    transaction: pooled,
+                    transaction_id: TransactionId::new(SenderId::from(s), k),
+                    propagate: false,
+                    timestamp: std::time::Instant::now(),
+                    origin: TransactionOrigin::External,
+                    authority_ids: None,
+                }));
+            }
+            let len = frame.len();
+            out.push((Arc::from(frame), len));
+        }
+        out
+    }
+
+    /// 200,000 transfers (400 senders of 500, recipients from 2,000,000):
+    /// the hook's whole cost on the plan body's pool (off the build), against
+    /// what the build does on its own thread without it -- the keys, the
+    /// partition at the beneficiary, and the seal's body made on the build
+    /// pool (F5g4's fallback). Ignored:
+    ///
+    /// ```text
+    /// cargo test --release -p n42-engine-types --lib plan_body_prep_bound -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing"]
+    fn plan_body_prep_bound() {
+        use rayon::prelude::*;
+        let rounds = std::env::var("F5G_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(5usize);
+        let beneficiary = address(1);
+        crate::frame_blocks::note_beneficiary(beneficiary);
+        let segments = frames(400, 500, 2_000_000);
+        let mut plan = n42_tx_queue::FramePlan::default();
+        for (txs, taken) in &segments {
+            let frame_hashes: Vec<B256> = txs.iter().map(|tx| *tx.hash()).collect();
+            plan.frames.push(n42_tx_queue::PlannedFrame { id: n42_tx_types::frame_root(&frame_hashes), len: txs.len(), taken: *taken });
+            plan.push_hashes(Arc::from(frame_hashes), *taken);
+        }
+        let cands: Vec<Cand> = segments.iter().flat_map(|(txs, taken)| txs[..*taken].to_vec()).collect();
+        let median = |mut v: Vec<u128>| {
+            v.sort_unstable();
+            v[v.len() / 2] as f64 / 1000.0
+        };
+        let (mut hook, mut keys_ms, mut part_ms, mut body_ms) = (vec![], vec![], vec![], vec![]);
+        for _ in 0..rounds {
+            let at = std::time::Instant::now();
+            let made = make_prepared_build(&segments, &plan).expect("every candidate a transfer");
+            hook.push(at.elapsed().as_micros());
+            assert_eq!(made.cands.len(), cands.len());
+            assert!(made.groups.is_some());
+            drop(made);
+            let at = std::time::Instant::now();
+            let keys = cands.iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>().expect("transfers");
+            keys_ms.push(at.elapsed().as_micros());
+            let at = std::time::Instant::now();
+            let groups = crate::parallel_transfer::partition_by_sender(&keys, beneficiary).expect("a partition");
+            part_ms.push(at.elapsed().as_micros());
+            drop(groups);
+            let at = std::time::Instant::now();
+            #[allow(clippy::type_complexity)]
+            let body: (Vec<TransactionSigned>, (Vec<Address>, Vec<B256>)) = crate::parallel_transfer::build_pool().install(|| {
+                cands.par_iter().with_min_len(1024).map(|tx| (pooled_consensus(tx).clone(), (tx.sender(), *tx.hash()))).unzip()
+            });
+            body_ms.push(at.elapsed().as_micros());
+            drop(body);
+        }
+        eprintln!(
+            "plan_body_prep_bound medians over {rounds}: txs={} hook_ms={:.1} (plan body pool, off the build) | inline: keys_ms={:.1} partition_ms={:.1} body_ms={:.1}",
+            cands.len(),
+            median(hook),
+            median(keys_ms),
+            median(part_ms),
+            median(body_ms),
+        );
     }
 }

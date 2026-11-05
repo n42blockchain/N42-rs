@@ -23,6 +23,14 @@
 #      cache, gov5 cache, by leader);
 #   6. stops every process the round started (anchored pkill on our own binary paths).
 #
+# Before step 1 the round takes the Rust streams' round lock
+# ($ROUND_LOCK, /data/n42-build/audit-notes/devnet/.round.lock) and waits until the
+# devnet ports are free and no other fleet's validators or nodes run: box-gate separates
+# lanes with different BOX_ME names, not two rounds of the same lane, and on 2026-11-04 two
+# such rounds shared the ports and each read the other's execution layer (a "genesis
+# mismatch" that was no mismatch). A caller that already holds the lock through flock(1)
+# is recognised by FLOCKER and not locked again.
+#
 # Environment (defaults in brackets):
 #   SECS [360]  DEVNET_GENESIS [crates/chainspec/res/genesis/n42_devnet_mobileanchor.json]
 #   DEVNET_BIN [/data/n42-build/mobile-target/debug]
@@ -71,6 +79,25 @@ stop_round() {
   pkill -9 -f "^$BIN/n42 node --chain $GENESIS " 2>/dev/null
   pkill -9 -f "^$GOV5/build/bin/n42 --chain private --profile n42 --data.dir $F/gov5 " 2>/dev/null
 }
+
+ROUND_LOCK=${ROUND_LOCK:-/data/n42-build/audit-notes/devnet/.round.lock}
+if [ "${FLOCKER:-}" != "$ROUND_LOCK" ]; then
+  exec 9>"$ROUND_LOCK"
+  flock -n 9 || { say "round lock held by another round, waiting"; flock 9; }
+  say "round lock taken"
+fi
+# The ports every round binds (two execution layers, four validators, two phone surfaces).
+PORTS="18545 18551 19000 19001 19002 19003 21010 21011 28545 30313"
+busy_ports() { ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | /usr/bin/grep -xF -f <(printf '%s\n' $PORTS) | sort -un | tr '\n' ' '; }
+foreign_fleet() { ps -eo args | /usr/bin/grep -E '^[^ ]*/(examples/h2_validator|n42 node) --chain |^[^ ]*/n42 --chain private ' | /usr/bin/grep -vE "^$BIN/|^$GOV5/build/bin/n42 --chain private --profile n42 --data.dir $F/gov5 " | head -3; }
+waited=0
+while :; do
+  bp=$(busy_ports); ff=$(foreign_fleet)
+  [ -z "$bp" ] && [ -z "$ff" ] && break
+  [ $((waited % 600)) -eq 0 ] && say "waiting: ports in use [$bp] foreign fleet [${ff:0:160}]"
+  sleep 30; waited=$((waited + 30))
+done
+[ "$waited" -gt 0 ] && say "ports free after ${waited}s"
 
 if [ "${NO_BOX_GATE:-}" != 1 ]; then
   export BOX_ME=rust BOX_LOG=$LOG

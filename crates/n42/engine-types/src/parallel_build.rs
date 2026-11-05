@@ -994,4 +994,123 @@ mod tests {
         assert_eq!(install_cache(&mut overlay, &run.merged), Ok(run.merged.len()));
         assert_eq!(overlay.account_info(&addr(2)).map(|i| i.balance), run.merged.get(&addr(2)).map(|i| i.balance));
     }
+
+    /// Where an evm2 leader's 200,000-transfer block goes (F5g): the
+    /// batches, the transactions root the seal needs, the cache half and
+    /// receipts (`commit_run`, both scopes), and the executor's finish with
+    /// the fold. Senders and recipients in the replay set's shape (400
+    /// senders of 500, recipients drawn from 2,000,000, nearly all created);
+    /// the parent is an in-memory map, so the reads are a lower bound on
+    /// the node's (QMDB view and overlay). Ignored; the pool's thread count
+    /// is `N42_PARALLEL_BUILD_THREADS`:
+    ///
+    /// ```text
+    /// N42_PARALLEL_BUILD_THREADS=32 cargo test --release -p n42-engine-types --lib \
+    ///   evm2_step_bound -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing"]
+    fn evm2_step_bound() {
+        use std::time::Instant;
+        let rounds = std::env::var("F5G_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize);
+        let senders = 400u64;
+        let per_sender = 500u64;
+        let sender = |s: u64| addr(0x10_0000 + s);
+        let mut base = CacheDB::new(EmptyDB::default());
+        for s in 0..senders {
+            base.insert_account_info(&sender(s), AccountInfo { balance: U256::from(FUND), ..Default::default() });
+        }
+        base.insert_account_info(&addr(BENEFICIARY), AccountInfo { balance: U256::from(1u64), ..Default::default() });
+        let c = config();
+        let mut header = alloy_consensus::Header {
+            number: 5,
+            timestamp: 1_000,
+            gas_limit: 21_000 * senders * per_sender,
+            base_fee_per_gas: Some(7),
+            beneficiary: addr(BENEFICIARY),
+            ..Default::default()
+        };
+        header.gas_limit += 21_000;
+        let env = c.evm_env(&n42_header::N42Header::from(header)).expect("env");
+        let w = withdrawals();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let median = |mut v: Vec<u128>| {
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        let (mut exec, mut root, mut fold_all, mut fold_only, mut finish) = (vec![], vec![], vec![], vec![], vec![]);
+        for round in 0..rounds {
+            let mut txs = Vec::with_capacity((senders * per_sender) as usize);
+            for s in 0..senders {
+                for n in 0..per_sender {
+                    let to = addr(0x100_0000 + next() % 2_000_000);
+                    let mut t = transfer(0, n, to, 1 + round as u64);
+                    t = Recovered::new_unchecked(t.into_inner(), sender(s));
+                    txs.push(t);
+                }
+            }
+            let keys = keys(&txs);
+            let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);
+            let open = || Some(base.clone());
+            let at = Instant::now();
+            let run = execute_batches(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env())
+                .expect("the batches run");
+            exec.push(at.elapsed().as_micros());
+            assert_eq!(run.executed.len(), txs.len(), "skipped {}", run.skipped.len());
+            let at = Instant::now();
+            let signed: Vec<N42TxEnvelope> = txs.iter().map(|t| t.inner().clone()).collect();
+            let _ = crate::assembler::parallel_transaction_root(&signed);
+            root.push(at.elapsed().as_micros());
+            let accounts = run.merged.len();
+            let mut first = Some(run);
+            for only in [false, true] {
+                let run = match first.take() {
+                    Some(run) => run,
+                    None => execute_batches(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env())
+                        .expect("again"),
+                };
+                let ParallelRun { executed, merged, .. } = run;
+                let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(base.clone(), env.clone()), ctx(&w));
+                ex.apply_pre_execution_changes().expect("pre");
+                let recipients: Vec<Address> = w.iter().map(|w| w.address).collect();
+                let scope = if only { CacheScope::Only(&recipients) } else { CacheScope::All };
+                let at = Instant::now();
+                let results = executed.into_iter().map(|e| (e.result, <N42TxEnvelope as alloy_consensus::TransactionEnvelope>::tx_type(&signed[e.index])));
+                commit_run(&mut ex, results, merged, scope).expect("the commit");
+                let took = at.elapsed().as_micros();
+                if only { fold_only.push(took) } else { fold_all.push(took) }
+                let at = Instant::now();
+                let out = ex.finish().expect("the finish");
+                if only {
+                    finish.push(at.elapsed().as_micros());
+                }
+                assert_eq!(out.result.receipts.len(), txs.len());
+                drop(out);
+            }
+            eprintln!(
+                "round {round}: txs={} accounts={accounts} exec_us={} root_us={} commit_all_us={} commit_only_us={} finish_us={}",
+                txs.len(),
+                exec[round],
+                root[round],
+                fold_all[round],
+                fold_only[round],
+                finish[round]
+            );
+        }
+        eprintln!(
+            "evm2_step_bound medians over {rounds}: threads={} exec_ms={:.1} root_ms={:.1} commit_all_ms={:.1} commit_only_ms={:.1} finish_ms={:.1}",
+            build_pool().current_num_threads(),
+            median(exec) as f64 / 1000.0,
+            median(root) as f64 / 1000.0,
+            median(fold_all) as f64 / 1000.0,
+            median(fold_only) as f64 / 1000.0,
+            median(finish) as f64 / 1000.0,
+        );
+    }
 }

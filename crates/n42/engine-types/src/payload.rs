@@ -2231,6 +2231,18 @@ where
     // "stopped" (at the pull), "kept" (stopped at the seal), "none" (no
     // puller: the frames' bulk take or the direct iterator).
     let mut puller_at_pull: &'static str = "none";
+    // The evm2 step's span before `execute_batches` starts and after it
+    // ends, by part (F5g8), us: the open of the deferred state, the prepared
+    // build's take (and why it missed), the keys made inline, the output
+    // shards' set-up; after it, the run's indices and fees, the body.
+    let mut evm2_pre_exec_us = 0u64;
+    let mut evm2_open_us = 0u64;
+    let mut evm2_prepared_us = 0u64;
+    let mut evm2_prepared_miss: String = String::from("none");
+    let mut evm2_keys_us = 0u64;
+    let mut evm2_shards_new_us = 0u64;
+    let mut evm2_setup_us = 0u64;
+    let mut evm2_fees_us = 0u64;
     // The leader's seal chain between its named terms (step 7a): the prep's
     // end to the batches' start (the prefetch's scope, the shards and the
     // threads set up, the partition, the deferred state's open, the slots),
@@ -2565,11 +2577,32 @@ where
         } else if pulled.is_some() {
             puller_at_pull = "kept";
         }
+        let open_at = std::time::Instant::now();
         open_deferred_state!()?;
+        evm2_open_us = open_at.elapsed().as_micros() as u64;
+        let prepared_at = std::time::Instant::now();
         let beneficiary = group_env.block.beneficiary;
         // `N42_PLAN_AHEAD_BODY=1`: the keys and the partition made with the
-        // plan, when they are for exactly these candidates.
-        let prepared = prepared_build.take().filter(|made| made.keys.len() == cands.len() && made.cands.len() == cands.len());
+        // plan, when they are for exactly these candidates. The selection
+        // moved the plan's candidates into the bulk vector (`made.cands` is
+        // empty then): the take is the plan's when the bulk vector came with
+        // it and was not cut (F5g8: E13 missed on every block on the
+        // `made.cands` length).
+        let prepared_miss = match prepared_build.as_ref() {
+            None => Some(String::from("no_plan")),
+            Some(made) if made.keys.len() != cands.len() => Some(format!("keys_len {}!={}", made.keys.len(), cands.len())),
+            Some(made) if !made.cands.is_empty() && made.cands.len() != cands.len() => {
+                Some(format!("cands_len {}!={}", made.cands.len(), cands.len()))
+            }
+            Some(_) if made_cands_cut(from_bulk, bulk_len, cands.len()) => Some(format!("bulk_cut {}!={}", bulk_len, cands.len())),
+            Some(made) if made.transactions.len() != cands.len() => {
+                Some(format!("transactions_len {}!={}", made.transactions.len(), cands.len()))
+            }
+            Some(_) => None,
+        };
+        let prepared = if prepared_miss.is_none() { prepared_build.take() } else { None };
+        prep_from_plan = prepared.is_some();
+        evm2_prepared_miss = prepared_miss.unwrap_or_else(|| String::from("none"));
         // The body made with the plan (transactions, senders, hashes, the
         // root ahead), for the seal when it seals exactly these candidates.
         #[allow(clippy::type_complexity)]
@@ -2588,8 +2621,15 @@ where
                 }
                 (Some(std::mem::take(&mut made.keys)), groups)
             }
-            None => (cands.iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>(), None),
+            None => {
+                let keys_at = std::time::Instant::now();
+                let keys = cands.iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>();
+                evm2_keys_us = keys_at.elapsed().as_micros() as u64;
+                (keys, None)
+            }
         };
+        exec_prepared_groups = groups.is_some();
+        evm2_prepared_us = prepared_at.elapsed().as_micros().saturating_sub(u128::from(evm2_keys_us)) as u64;
         let refused: Option<&'static str> = if cands.is_empty() {
             Some("no-candidates")
         } else if !builder.transactions.is_empty() {
@@ -2622,6 +2662,7 @@ where
             // residual (`ShardedParent`), the root and the hashed post-state
             // read both, and the block's one bundle is merged behind them or
             // elided (`N42_MERGE_ELIDE`), as on the revm-era step.
+            let shards_at = std::time::Instant::now();
             let shard_count = crate::output_shards::output_shards();
             let mut sharded = (shard_count > 0
                 && seal_at_exec()
@@ -2629,6 +2670,7 @@ where
                 && block_blob_count == 0
                 && early_seal.is_some())
             .then(|| crate::output_shards::OutputShards::new(beneficiary, keys.len(), shard_count));
+            evm2_shards_new_us = shards_at.elapsed().as_micros() as u64;
             let shard_sink = sharded.as_ref().map(|shards| move |bundle: reth_trie::bundle_state::BundleState| shards.add(bundle));
             let sink = shard_sink.as_ref().map(|sink| sink as &(dyn Fn(reth_trie::bundle_state::BundleState) + Sync));
             // The accounts the block's end reads stay out of the shards: the
@@ -2639,6 +2681,8 @@ where
             } else {
                 Vec::new()
             };
+            evm2_setup_us = exec_at.elapsed().as_micros().saturating_sub(u128::from(evm2_shards_new_us)) as u64;
+            evm2_pre_exec_us = par_at.elapsed().as_micros() as u64;
             let run = crate::parallel_build::execute_batches_into(
                 &evm_config,
                 &group_env,
@@ -5170,6 +5214,14 @@ where
                     seal_lookahead_us,
                     seal_puller_join_us,
                     puller_at_pull,
+                    evm2_pre_exec_us,
+                    evm2_open_us,
+                    evm2_prepared_us,
+                    evm2_prepared_miss = %evm2_prepared_miss,
+                    evm2_keys_us,
+                    evm2_shards_new_us,
+                    evm2_setup_us,
+                    evm2_fees_us,
                     par_hook_us,
                     state_pre_changes_us,
                     sealed_ms,
@@ -6752,6 +6804,12 @@ fn puller_stop_at_pull() -> bool {
     *ON.get_or_init(|| n42_env::flag("N42_PULLER_STOP_AT_PULL", true))
 }
 
+/// Whether the build's candidates are not the plan's whole take: they did
+/// not come as the selection's bulk vector, or it was cut to the budget.
+const fn made_cands_cut(from_bulk: bool, bulk_len: usize, cands: usize) -> bool {
+    !from_bulk || bulk_len != cands
+}
+
 /// `N42_EVM2_RECEIPTS_LATE` (default on; `0` commits the receipts before the
 /// finish, as before F5g7): the evm2 step's receipts on a block sealed at the
 /// execution's end with its output in shards are built behind the seal on a
@@ -7597,6 +7655,22 @@ mod includability_tests {
     }
 }
 
+/// The prepared build's take on evm2 (F5g8).
+#[cfg(test)]
+mod prepared_take_tests {
+    use super::made_cands_cut;
+
+    /// The selection moves the plan's candidates into the bulk vector: an
+    /// uncut bulk take of the plan's length is the plan's, a cut one or a
+    /// take without the bulk vector is not.
+    #[test]
+    fn the_prepared_build_is_the_plans_only_on_its_uncut_bulk_take() {
+        assert!(!made_cands_cut(true, 200_000, 200_000));
+        assert!(made_cands_cut(true, 200_500, 200_000), "cut to the budget");
+        assert!(made_cands_cut(false, 0, 200_000), "pulled, not the bulk vector");
+    }
+}
+
 /// The evm2 plan-ahead body's cost (F5g6): what `make_prepared_build` takes
 /// off the build, and what the build does inline without it.
 #[cfg(all(test, not(feature = "legacy-revm-paths")))]
@@ -7695,6 +7769,8 @@ mod plan_body_evm2_tests {
             v[v.len() / 2] as f64 / 1000.0
         };
         let (mut hook, mut keys_ms, mut part_ms, mut body_ms) = (vec![], vec![], vec![], vec![]);
+        let (mut shards_new, mut fees_serial, mut fees_pool) = (vec![], vec![], vec![]);
+        let base_fee = 1_000_000_000u64;
         for _ in 0..rounds {
             let at = std::time::Instant::now();
             let made = make_prepared_build(&segments, &plan).expect("every candidate a transfer");
@@ -7716,6 +7792,29 @@ mod plan_body_evm2_tests {
             });
             body_ms.push(at.elapsed().as_micros());
             drop(body);
+            // The step's other pre-execution part: the output shards' set-up.
+            let at = std::time::Instant::now();
+            let shards = crate::output_shards::OutputShards::new(beneficiary, cands.len(), 16);
+            shards_new.push(at.elapsed().as_micros());
+            drop(shards);
+            // After the execution: the fees over the executed set, serial
+            // (before F5g8) and on the build pool.
+            let at = std::time::Instant::now();
+            let mut fees = U256::ZERO;
+            for tx in &cands {
+                fees += U256::from(pooled_consensus(tx).effective_tip_per_gas(base_fee).unwrap_or_default()) * U256::from(21_000u64);
+            }
+            fees_serial.push(at.elapsed().as_micros());
+            let at = std::time::Instant::now();
+            let pooled: U256 = crate::parallel_transfer::build_pool().install(|| {
+                cands
+                    .par_iter()
+                    .with_min_len(4096)
+                    .map(|tx| U256::from(pooled_consensus(tx).effective_tip_per_gas(base_fee).unwrap_or_default()) * U256::from(21_000u64))
+                    .reduce(|| U256::ZERO, |a, b| a + b)
+            });
+            fees_pool.push(at.elapsed().as_micros());
+            assert_eq!(fees, pooled);
         }
         eprintln!(
             "plan_body_prep_bound medians over {rounds}: txs={} hook_ms={:.1} (plan body pool, off the build) | inline: keys_ms={:.1} partition_ms={:.1} body_ms={:.1}",
@@ -7724,6 +7823,12 @@ mod plan_body_evm2_tests {
             median(keys_ms),
             median(part_ms),
             median(body_ms),
+        );
+        eprintln!(
+            "plan_body_prep_bound step split medians: shards_new_ms={:.1} fees_serial_ms={:.1} fees_pool_ms={:.1}",
+            median(shards_new),
+            median(fees_serial),
+            median(fees_pool),
         );
     }
 }

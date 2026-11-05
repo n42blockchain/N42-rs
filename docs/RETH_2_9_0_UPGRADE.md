@@ -484,6 +484,127 @@ Gate: `ci/f5-b-gate.log`. `cargo check --workspace --keep-going --tests` is clea
 (263 including the 9 new tests), n42-qmdb-reth, n42-qmdb-state and n42-testing: 464 passed,
 0 failed.
 
+### F5c, the leader's parallel builder (2026-11-05)
+
+- **Rewritten, not renamed.** The revm-era step (`parallel_transfer::execute_for_build*`, slots,
+  output shards, the staged/streamed/indexed grafts) stays under `legacy-revm-paths` until F6. The
+  evm2 step is new code: `parallel_build.rs`, a wrapper in `n42_evm.rs`, and a block in
+  `default_n42_payload` under `cfg(not(legacy-revm-paths))`.
+- **`parallel_build::execute_batches`.** It partitions the candidates by sender (or takes the
+  partition the plan made), packs the groups into batches (`Dispatch::from_env`:
+  `N42_BUILD_BATCHES` / `N42_BUILD_ONE_WAVE`) and runs each batch on the build pool
+  (`N42_PARALLEL_BUILD_THREADS`). A batch has its own evm2 `Evm` over its own view of the parent,
+  and every transfer goes through the stock handler (`evm.transact`, `BatchState::commit`,
+  `evm.commit_state`).
+  - A transfer the EVM refuses is skipped with its sender's later ones and given back at the end,
+    as the revm-era step did.
+  - Under deferred execution, each sender's summed worst case is kept within its parent balance
+    (`includability::RunLedger`, audit R3-E1). The balance comes from the first transfer's
+    `AccountChanges::original`, and the check runs before the commit.
+  - The batches' bundles are merged with `merge_batches` (F5b).
+- **The cache half: `install_cache`.** It writes the merged accounts into the block executor's
+  overlay (`CacheDB::insert_account_info`) at their post-batch values. It first refuses, writing
+  nothing (`Refused::Cache`), if the overlay already holds one of them at a value other than the
+  batches' original, for example an account a pre-execution system call touched.
+- **The receipts: `commit_run`.** It commits each executed transfer in candidate order through the
+  stock `commit_transaction`, with an empty write set (`TxResultWithState { result, pending_state:
+  empty }`). The executor counts the gas and builds the receipt as for any transaction, so
+  cumulative gas, receipts and the EIP-8037 split come out as in a serial build. The state is in
+  the merge.
+- **The bundle half: `N42BlockExecutor`.** reth's `EthBlockExecutor` plus a pending merge
+  (`set_pending_fold`). `finish_with_block_access_list` and
+  `finish_with_prepared_block_access_list` fold the merge into the bundle with `fold_into`
+  before anything reads it (hashed post-state, QMDB root, assembler). Every other method delegates,
+  including `execute_transaction_with_commit_condition`, so the serial loop keeps the stock path.
+  The factory's `Executor` is this type on every chain; with no merge pending it is the inner
+  executor.
+- **When the payload builder takes the step.** With `N42_PARALLEL_BUILD=1`, on a chain without
+  reth's Amsterdam or gov5's Glamsterdam execution: the BAL index and the separate block gas
+  counters are private to the executor, and the existing gate already sends Glamsterdam blocks to
+  the serial path.
+  - The candidates come from the puller, the frames' bulk vector, or the pool's iterator. The
+    iterator source is new: the devnet has no puller or queue.
+  - The step runs only when every candidate is a plain transfer and nothing executed before it.
+    Otherwise the candidates go to the serial loop in candidate order.
+  - A fix outside the step: the serial loop now takes the step's hand-back (`lookahead`) before the
+    pool's iterator when `N42_BUILDER_PREFETCH` is 0. Before, those candidates were lost. The
+    revm-era step had the same hole for a bulk vector without a puller.
+- **The refusal rule, end to end.**
+  - A refusal before the cache half (partition, unsupported change, merge, cache conflict) gives
+    the block to the serial loop in the same build.
+  - A refusal at `finish` surfaces as `BlockExecutionError::Internal(Other(FoldRefused))`. The
+    payload builder (`finish_or_rebuild!`) then executes the same transactions again, in order,
+    on a fresh executor over the parent, and finishes that block.
+  - The transactions are copied for this only on a build with a merge pending: a cost the A/B
+    should watch, and one to remove once refusals at `finish` are shown to be unreachable.
+  - Counters: `graft_fold::refused_count()`, `parallel_build::serial_rebuilds()`,
+    `parallel_build::committed_runs()`.
+- **One line per build** (target `n42::parallel_build`, info): `parallel`, `txs`, `skipped`,
+  `batches`, `refused` (`no-candidates`, `transactions-before`, `not-all-transfers`,
+  `not-parallel`, `unsupported-change`, `merge-refused`, `cache-conflict`), the two refusal
+  counters, and pull/exec/commit milliseconds.
+- **Knobs.**
+  - Dropped from `legacy_paths::KNOBS`: `N42_PARALLEL_BUILD`, `N42_PARALLEL_BUILD_THREADS`,
+    `N42_BUILD_BATCHES`, `N42_BUILD_ONE_WAVE`, `N42_FREEZE_POOL(_THREADS)` and
+    `N42_PLAN_AHEAD_BODY(_THREADS)`.
+  - `FREEZE_POOL=own` now only frees the candidates behind the build: the receipts it moved off
+    the seal are committed on the builder's thread.
+  - `PLAN_AHEAD_BODY` installs an evm2 plan hook that makes the candidates, keys, hashes and
+    partition. The revm-era body parts are not made.
+  - `N42_BUILD_COLLECT_IN_PLACE` stays listed: the evm2 step collects per batch and has no slots,
+    so it has no effect yet.
+  - The output shards' `take_cached` / `into_staged` stay legacy, and so does `N42_OUTPUT_SHARDS`
+    (not in `KNOBS`; inert on evm2). They are the sharded alternative to the merge, worth porting
+    only if the A/B says the merge is the cost.
+- **Tests (11 new).** `parallel_build` (5):
+  - a mixed block (batched transfers with shared recipients and a created recipient, then a serial
+    tail that spends batch credits, a batch sender's next nonce, the created account's first spend,
+    a transfer to the beneficiary and a storage-writing contract call, then two withdrawals) gives
+    the receipts, gas, bundle state, reverts and contracts of the sequential stock execution;
+  - batched transfers alone, the same;
+  - a refused transfer and its sender's later ones are skipped;
+  - the worst-case ledger;
+  - the cache half's refusal writes nothing.
+
+  `payload` (2):
+  - the parallel build's header equals the serial build's (state, transactions and receipts roots
+    included), and a fold made to refuse at `finish` (a test-only hook) is rebuilt serially in the
+    same build to the same header;
+  - a deferred parallel build keeps each sender's worst case within its balance and passes the
+    follower's verdict.
+
+  The test addresses sit clear of the precompiles: a 21,000-gas value transfer to 0x02 runs out of
+  gas and moves nothing, which first looked like a lost credit.
+  Amsterdam gas is covered only by refusal: the step does not run there.
+
+Gate: `ci/f5-c-gate.log`. `cargo check --workspace --keep-going --tests` is clean.
+n42-engine-types (270 including the new tests), n42-qmdb-reth, n42-qmdb-state and n42-testing:
+471 passed, 0 failed. `clippy -p n42-engine-types --lib` is clean. `--features legacy-revm-paths`
+still does not compile on v2.9.0, as before F5.
+
+**Devnet (`ci/f5c-gate.log`, `scripts/f5c-gate.sh` in audit-notes).** Three all-Rust 300 s rounds
+of `devnet-fleet.sh` on a native release build of dabac1694, under the round lock and the box gate.
+Member 3 ran on its own execution layer (`LATE_VALIDATOR=3`), so a second EL re-executed every block
+the first one built, and the other way round. Two `send_tx` senders ran at 2 tx/s each (1,002
+transactions, 0 rejected).
+
+| round | knobs | blocks main = late | blocks with txs | parallel / no-candidates (main + late EL) | batches | fold refused / rebuilds | EL ERROR / WARN |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| f5c-par | `PARALLEL_BUILD=1 THREADS=8 FREEZE_POOL=own PLAN_AHEAD_BODY=1` | 100 / 100 same hash | 82 | 64 + 18 / 13 + 5 | 1 each | 0 / 0 | 0 / 6, 0 / 5 |
+| f5c-par2 | the same + `BUILD_BATCHES=2` | 100 / 100 same hash | 84 | 64 + 20 / 13 + 3 | 2 each | 0 / 0 | 0 / 6, 0 / 5 |
+| f5c-ser | none | 100 / 100 same hash | 85 | (no step) | - | - | 0 / 6, 0 / 5 |
+
+- Every block with transactions went parallel. The others had no candidates.
+- The WARN lines are the same in all three rounds and all start-up notes (global thread pool,
+  `N42_BUILT_KEEP`, the orchestrator's idle branch). Nothing came from `n42::graft` or
+  `n42::parallel_build`.
+- Consensus looked the same with and without the step: 98 commits and 4 view timeouts on members
+  0-2, 93 commits on the late member.
+- At devnet load, two senders make two groups. The default dispatch packs them into one batch;
+  f5c-par2 forces two.
+- Open: the A/B against v2.8.1 waits for F5f. The equivalence on a fleet7-sized block is still
+  unmeasured.
+
 ### Notes for the history
 
 - Commit c117217eb (`fix(storage-overlay): ...`) also carries the ef-tests runner port: the two

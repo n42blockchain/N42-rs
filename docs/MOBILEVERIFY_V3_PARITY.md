@@ -646,8 +646,18 @@ ports, and packetd, the transfers and the device all followed the other node. pa
 blocks 85-89 of that chain. It re-executed them under this genesis's Glamsterdam schedule, but the
 chain was built without Glamsterdam, so this is a schedule mismatch and not a divergence
 (`audit-notes/devnet/mv4h4b/NOTES.md`). The driver now refuses a round when the ports are taken after
-the claim, and it bounds the device step (a35a6bfb6). `mv4h4` remains the field evidence until a clean
-rerun.
+the claim, and it bounds the device step (a35a6bfb6). 
+
+`mv4h4b2` (2026-11-05, `audit-notes/devnet/mv4h4b2/`), the clean full-length rerun on main
+6d373bbbe's round script (same binaries as `mv4h4`, gov5 `integ/mvdev-slot` d4a00b01), **passed**:
+159 blocks in 360 s, both chains at height 159 with 160/160 hashes equal and no first difference;
+gov5 member sealed 40 blocks and committed 199 views with 0 errors and 0 warnings; the Rust
+header-root read-back is clean (Rust-led blocks 119/119 leader-root ok, the 40 gov5-led blocks
+carry the zero root before the first registry epoch (4) and the members' committed registry root
+after it (36)); device 20/20 certified on both devices, 0 failures; packetd 159 packets, the only
+dropped block being genesis ("no parent state"); 1,322 transfers landed. The one start-up view
+timeout on v0 is the usual first-view TC. This round replaces `mv4h4` as the field evidence for the
+header-field-parity PR.
 
 ## Pure-Rust producer: feasibility (D5, 2026-11-03)
 

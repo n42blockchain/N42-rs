@@ -637,3 +637,12 @@ was already the port of that commit, so only gov5 changed.
 - The round was cut at about 3 minutes (80 blocks): another lane's fleet7 runner (`run-loop351.sh`)
   cleans up between legs with `kill -9` on every `n42 node` and `h2_validator` on the box, and it killed
   the Rust members. Everything above is from those 80 blocks.
+
+`mv4h4b` (2026-11-04), the full-length rerun, is void. Another lane started its own devnet on the same
+ports without a box claim, two minutes before ours was granted. Our execution layer never bound its
+ports, and packetd, the transfers and the device all followed the other node. packetd then dropped
+blocks 85-89 of that chain. It re-executed them under this genesis's Glamsterdam schedule, but the
+chain was built without Glamsterdam, so this is a schedule mismatch and not a divergence
+(`audit-notes/devnet/mv4h4b/NOTES.md`). The driver now refuses a round when the ports are taken after
+the claim, and it bounds the device step (a35a6bfb6). `mv4h4` remains the field evidence until a clean
+rerun.

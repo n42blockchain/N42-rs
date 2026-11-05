@@ -86,6 +86,13 @@ impl std::error::Error for FoldRefused {}
 
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the next [`fold_into`] on this thread refuse: how a test drives
+    /// the payload builder's serial rebuild.
+    pub(crate) static REFUSE_NEXT_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// How many blocks the bundle half has refused in this process.
 pub fn refused_count() -> u64 {
     REFUSED.load(Ordering::Relaxed)
@@ -204,6 +211,12 @@ impl MergedBatches {
         self.accounts.get(address).map(|m| &m.info)
     }
 
+    /// An account's parent value as the batches loaded it (`Some(None)`: the
+    /// parent did not have it), if they changed it.
+    pub fn original(&self, address: &Address) -> Option<Option<&AccountInfo>> {
+        self.accounts.get(address).map(|m| m.original.as_ref())
+    }
+
     /// Every account the batches changed at its post-batch value: what the
     /// cache half writes into the executor's overlay.
     pub fn accounts(&self) -> impl Iterator<Item = (&Address, &AccountInfo)> {
@@ -250,6 +263,10 @@ pub struct FoldStats {
 /// `finish` returned, after checking every account the two share (see the
 /// module docs). Nothing is changed when it refuses.
 pub fn fold_into(block: &mut BundleState, merged: MergedBatches) -> Result<FoldStats, FoldRefused> {
+    #[cfg(test)]
+    if REFUSE_NEXT_FOLD.with(|next| next.replace(false)) {
+        return refuse(FoldRefused::Stale(Address::ZERO));
+    }
     // Checks first: the block is left as it was on a refusal.
     for (address, m) in &merged.accounts {
         if let Some(serial) = block.state.get(address) {

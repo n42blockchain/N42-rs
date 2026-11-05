@@ -88,6 +88,14 @@ else
   trap 'stop_round' EXIT
 fi
 
+# A lane that runs a fleet without the gate still holds the round's ports. Starting anyway
+# points packetd, send_tx and the device at its node (mv4h4b): refuse instead.
+BUSY=$(ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | /usr/bin/grep -xE '1900[0-6]|18545|18551|28545|30313|2101[0-9]' | sort -u | tr '\n' ' ')
+if [ -n "$BUSY" ]; then
+  say "ABORT: ports in use before the fleet starts: $BUSY"
+  exit 3
+fi
+
 rm -rf "$F"; mkdir -p "$F"
 FLEET_FLAGS=; [ -n "$WITH_GOV5" ] && FLEET_FLAGS=--gov5
 N42_FLEET_DIR=$F DEVNET_GENESIS=$GENESIS DEVNET_BIN=$BIN MOBILEVERIFY=1 PACKETD=$PACKETD N42_GOV5=$GOV5 \
@@ -119,7 +127,8 @@ say "packetd so far: $(/usr/bin/grep -ac 'packetd: packet ' "$F/packetd-$TAG.log
 for i in 1 0; do say "latest v$i: $(j http://127.0.0.1:2101$i/mobileverify/latest)"; done
 
 # shellcheck disable=SC2086
-"$DEVICE" -mv http://127.0.0.1:21011 -rpc http://127.0.0.1:18545 $DEVICE_ARGS -devices 2 -blocks 20 \
+# Bounded: a device waiting on a chain that never certifies held the box 18 h (mv4h4b).
+timeout "$SECS" "$DEVICE" -mv http://127.0.0.1:21011 -rpc http://127.0.0.1:18545 $DEVICE_ARGS -devices 2 -blocks 20 \
   -commit-wait 150s -settle 30s -skip-no-packet -packet-wait 3s > "$EV/device.out" 2>&1
 say "device rc=$?: $(/usr/bin/grep -a SUMMARY "$EV/device.out")"
 for n in $(/usr/bin/grep -a '^.* block [0-9]* certs=' "$EV/device.out" | sed 's/.* block \([0-9]*\) certs=.*/\1/'); do

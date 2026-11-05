@@ -822,6 +822,111 @@ it runs), the late EL 1,002 times; none was handed over, since the load is trans
 existing accounts, so the hand-over path is covered by the unit tests only. Speed is the A/B's
 question; the devnet carries 3-4 transfers a block.
 
+### F5g, the X22 leader gap on evm2 (2026-11-05)
+
+**The A/B failed.** Stage fx, tag E9, 2026-11-05 16:12-16:39Z (`wt-main/target/fleet-runs/loop351fx-E9.launch.out`;
+one shared EL, import once, seven validators, the 600M replay set, 30 ms pacing):
+
+| leg | binaries | win1 TPS | win2 | win3 | cycle |
+| --- | --- | --- | --- | --- | --- |
+| E9a | branch 5e582b610 | 673,333 | 640k | 673k | 0.297 s |
+| E9b | branch 5e582b610 | 664k | 673k | 667k | 0.297 s |
+| E90 | main 0f3cb36e7 | 4,910,033 | | | 0.040-0.041 s |
+| E90b | main 0f3cb36e7 | 4,940,000 | | | 0.040-0.041 s |
+
+A 7.3x gap, not noise: invalid_blocks=0, tc=7 and the hashes are fine on the branch, but the binding
+wait is the seal on every block (299 ms). On a full block (980) the branch logs
+`parallel step … txs=200000 batches=128 pull_ms=0 exec_ms=83 commit_ms=52`, then `a build did not
+seal early … why="the parallel step built nothing" par_txs=0` (81 of 81 full blocks), then
+`payload build phases … par_exec_ms=83 par_fold_ms=52 par_ms=151 loop_ms=154 finish_ms=116
+assemble_ms=10 total_ms=297 open_layers=6 open_kept_accounts=1162067`. No `seal-first build phases`
+line exists on the branch. The control's full block (1178): `seal-first build phases … par_ms=37
+par_exec_ms=27 par_fold_ms=3 direct_receipts=true tx_root_ms=1 sealed_at_ms=34 state_ready_ms=56
+roots_ms=29 merge_ms=0`.
+
+**Root cause, plainly.** F5e checked that every knob X22 sets is recognised on evm2. It did not port
+the code those knobs select. The X22 leader pipeline is the revm-era step in `payload.rs` (the
+`#[cfg(feature = "legacy-revm-paths")]` block: seal at the execution's end, the body ahead, direct
+receipts, the output shards' freeze, shard mix and live-index defer, the fields at the seal, root
+ops ahead, fused receipts), plus the legacy parts of `output_shards.rs` and `direct_build.rs`. The
+evm2 step (F5c) executes and folds and pushes the block's transactions into the builder, but it never
+set `par_txs`. The early-seal gate (`no_seal_why`) therefore read every block as "the parallel step
+built nothing", and every block sealed only after the whole ordinary finish: 83 ms of execution,
+52 ms of fold, 116 ms of finish. F5e's devnet round could not show this, because the devnet genesis
+has no deferred execution and so no early seal at all.
+
+#### g1, the early seal on evm2 (bc280fba2)
+
+- **The gate's inputs.** The evm2 step sets `par_txs` and `par_groups` when its commit succeeds, so
+  `no_seal_why`, the `a build did not seal early` line and the phases lines see what it built.
+  Without `N42_SEAL_AT_EXEC` a full block now seals at the gate, after the fold but before the
+  finish.
+- **Seal before the fold** (`N42_SEAL_AT_EXEC=1`, which X22 sets). The seal happens right after the
+  batches when all of these hold: the conditions behind `seal_early_possible`, no blobs, at least one
+  transfer executed, and the block full on the batches' own gas (`gas_left < 21,000`, the queue
+  drained, or within `seal_shortfall`). The gate below uses the same test. In that order:
+  - the transactions go into the builder and the fees are credited;
+  - the lookahead goes back to the queue and the puller is dropped, as on the revm-era step;
+  - `seal_block!` computes the transactions root (the frame tree on a frameBlocks chain), takes the
+    parent's carried fields and hands the payload to the `EarlySeal` hook;
+  - the frames' bulk vector, when it was executed whole, is noted as the build's whole take.
+- **Behind the proposal.** `commit_run` (the cache half and the receipts), the fold at `finish`, and
+  the finish itself all run after the proposal goes out.
+  - A block sealed this way installs only the withdrawal recipients in the executor's cache
+    (`CacheScope::Only`, the follower's rule for a block without a serial tail). After the batches
+    only the block's end runs, and it reads no batch account.
+  - Any refusal from `commit_run` after the seal returns `failed_after_seal`, which tells the store's
+    waiters and logs at error level. A refusal at the finish already failed loudly on this path. A
+    block sealed early is never rebuilt serially into a different block.
+
+Per-step cost of a 200,000-transfer block on evm2 (`parallel_build::tests::evm2_step_bound`,
+release, 4 rounds, medians, `ci/f5g1-bench.log`). The shape is the replay set's: 400 senders of 500,
+recipients drawn from 2,000,000, ~190,800 accounts touched. The parent is an in-memory map, so the
+reads are a lower bound on the node's.
+
+| threads | exec | tx root (MPT) | commit, cache All | commit, cache Only | finish (fold, block end) |
+| --- | --- | --- | --- | --- | --- |
+| 32 | 92.1 ms | 45.7 ms | 42.9 ms | 12.6 ms | 94.3 ms |
+| 16 | 100.7 ms | 43.8 ms | 42.2 ms | 14.0 ms | 94.2 ms |
+
+- **Execution is not a read cost.** The batches take 92 ms with every read from memory, against
+  83 ms on the fleet. That is g2's target: the evm2 per-transaction work, not the state stack.
+- **The tx root on the fleet is not this MPT.** fleet7's genesis has frameBlocks, so the seal takes
+  the frame tree over the known frame layout; the control logs `tx_root_ms=1`. The MPT figure applies
+  only to a chain without frames.
+- **What moves.** The seal now waits only for exec plus the root. The commit (12.6 ms with the narrow
+  cache instead of 42.9) and the finish (94 ms) run behind the proposal and become the next build's
+  state wait: g3 and g4.
+- **Expected leader cycle.** About pull + exec + seal: 83 ms of execution on the fleet plus a few ms
+  of frame root and the carried fields, against 297 ms in E9. The fleet number is the fx pair's
+  (E10).
+
+Gate (`ci/f5g1-gate.log`): workspace check rc 0, clippy (engine-types, n42) rc 0, tests rc 0 with
+503 passed. The natives for E10 are in `/data/n42-build/reth29-native/release`, built from 2d687b583
+with `RUSTFLAGS="-C target-cpu=native"` as `branch-natives.sh` builds. The cargo build itself took
+1 min 36 s; with the box queue it took 6 min 10 s.
+**E9's branch binaries were built without `target-cpu=native`**, while main's natives had it. That is
+a confound, although it cannot explain a 7.3x gap.
+
+Devnet check of the seal path (`ci/f5d-gate.log`, `devnet/f5g1-*`):
+- **The devnet genesis cannot reach the seal path as it ships.** It has no deferred execution
+  (`audit-notes/devnet/n42_devnet_deferred.json` adds `deferredExecutionTime: 0`), round-robin
+  leaders give no build on an own block (`hotstuff.leaderTenure: 8` added), and the own-block
+  build needs the fleet's `N42_HASHED_TABLES=off`.
+- **f5g1-x22b** (that genesis, X22 plus the fleet's state knobs): hashes equal 18/18 on both ELs,
+  imports parallel 18 and 8, fold refusals 0, serial rebuilds 0.
+  - One early-sealed block's finish failed loudly: block 19 was built ahead on the leader's own block
+    18 after a foreign empty block 19 had already been committed. The QMDB stale-parent refusal is the
+    right outcome there; the error line and `failed_after_seal` fired, and the chain was not affected.
+  - The run had X22's devnet timeouts (40 per validator, as in f5e-x22).
+  - The seal-first phases line prints only for blocks of 1,000 transactions or more, so the devnet
+    shows no count of early seals.
+- **f5g1-seal2** (deferred, tenure 8, seal-at-exec, no X22) stalled at block 1. It was a start-up race:
+  validator 0 proposed block 1 before the others were up, its own block became the EL's canonical
+  head, and every later build on genesis was refused as stale. All builds in it were empty
+  (`no-candidates`), so the evm2 seal path never ran. This is not a g1 effect; it is noted for the
+  devnet's deferred start-up.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

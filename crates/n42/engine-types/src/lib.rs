@@ -45,6 +45,7 @@ pub mod engine_validator;
 pub mod claimed_build;
 pub mod legacy_paths;
 pub mod fast_transfer;
+pub mod fast_handler;
 pub mod frame_blocks;
 pub mod frame_scan;
 pub mod includability;

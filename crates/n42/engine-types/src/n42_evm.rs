@@ -245,7 +245,7 @@ impl<C, F> N42BlockExecutorFactory<C, F> {
 impl<C, F> reth_evm::BlockExecutorFactory for N42BlockExecutorFactory<C, F>
 where
     C: EthChainSpec + EthereumHardforks,
-    F: EvmFactory,
+    F: TxRegistrySource,
     <F::Types as evm2::EvmTypesHost>::Tx: alloy_eips::eip2718::Typed2718,
 {
     type EvmFactory = F;
@@ -281,12 +281,33 @@ where
         // reth's `EthBlockExecutorFactory::build_evm`, which is crate-private.
         let spec = env.spec;
         let config = self.evm_factory.execution_config(spec, env.version);
-        let registry = self.evm_factory.tx_registry(spec);
+        let registry = self.evm_factory.n42_tx_registry(spec);
         let precompiles = self.evm_factory.precompiles(spec);
         let mut evm =
             evm2::Evm::<F::Types>::new_with_execution_config(config, spec, env.block, registry, db, precompiles);
         self.evm_factory.configure_evm(&mut evm);
         evm
+    }
+}
+
+/// The transaction registry an [`N42BlockExecutorFactory`] gives its EVMs:
+/// the factory's own, or with the fast transfer handler
+/// ([`crate::fast_handler`]) when [`crate::fast_handler::wanted`] says so.
+pub trait TxRegistrySource: EvmFactory {
+    /// The registry for `spec`.
+    fn n42_tx_registry(&self, spec: Self::SpecId) -> evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>> {
+        self.tx_registry(spec)
+    }
+}
+
+impl TxRegistrySource for RethEvmFactory {
+    fn n42_tx_registry(&self, spec: Self::SpecId) -> evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>> {
+        let base = self.tx_registry(spec);
+        if crate::fast_handler::wanted() {
+            crate::fast_handler::registry(spec, base)
+        } else {
+            base
+        }
     }
 }
 
@@ -467,7 +488,7 @@ fn blob_basefee(excess_blob_gas: Option<u64>, blob_params: Option<BlobParams>) -
 impl<C, EvmF> ConfigureEvm for N42EvmConfig<C, EvmF>
 where
     C: EthChainSpec + EthereumHardforks + Hardforks + 'static,
-    EvmF: EvmFactory,
+    EvmF: TxRegistrySource,
     <EvmF::Types as evm2::EvmTypesHost>::Tx: alloy_eips::eip2718::Typed2718
         + reth_evm::FromTxWithEncoded<N42TxEnvelope>
         + reth_evm::TransactionEnvMut,
@@ -567,7 +588,7 @@ where
 impl<C, EvmF> ConfigureEngineEvm<ExecutionData> for N42EvmConfig<C, EvmF>
 where
     C: EthChainSpec + EthereumHardforks + Hardforks + 'static,
-    EvmF: EvmFactory,
+    EvmF: TxRegistrySource,
     <EvmF::Types as evm2::EvmTypesHost>::Tx: alloy_eips::eip2718::Typed2718
         + reth_evm::FromTxWithEncoded<N42TxEnvelope>
         + reth_evm::FromRecoveredTx<N42TxEnvelope>

@@ -272,6 +272,63 @@ partially moved builder stays drop-live to the borrow checker) to zero. The
 `legacy-revm-paths` build is not expected to compile: its code still names revm 43's `State`
 (`reth_evm::db::State` is gone), and F5 ports or removes it path by path.
 
+### F4 result (2026-11-05)
+
+F4 ran on 43b07fbf8, the branch with `origin/main` 1ccfcae30 merged in. That merge brought in the
+system-caller leaf fix (3984881bf). Its one conflict was the QMDB changes call in the payload
+builder's root path: the branch's `outcome.execution_state` is kept and the flag is main's
+`system_caller_leaf_at`. Every run below used the stock evm2 handler (`legacy-revm-paths` off),
+on native release binaries from `/data/n42-build/reth29-native/release`. The field gate was driven
+by `audit-notes/scripts/f4-gate.sh`, log `audit-notes/ci/f4-gate.log`, done 07:33:52Z.
+
+Code gate:
+
+- Workspace tests: 1207 passed on the first run (`ci/f4-tests1.log`). The one failure was the
+  gov5 Amsterdam parity test, which read code from the account info; it was fixed in 287f8d32c
+  and passes on rerun (`ci/f4-tests2.log`). After the merge, n42-qmdb-reth, n42-engine-types and
+  n42 ran 554 passed, 0 failed (`ci/f4-merge1.log`), and `cargo check --workspace
+  --keep-going --tests` was clean.
+- The ported-crate fixture tests (bmt-core, twig-core, h2-*, mobile-verify, h2-net,
+  h2-execution) passed in the workspace run.
+- Clippy on the N42 crates is clean (`ci/f4-clippy2.log`).
+
+Field gate (evidence under `audit-notes/devnet/` and `audit-notes/ci/`):
+
+- **All-Rust devnet** (`f4b-rust`, four members, 300 s, `devnet/f4b-rust.out`): 100 views.
+  Every validator shows commits=100, views=100, timeouts=0. The execution layer shows
+  newPayload=400, qmdb_roots=100, err=0. Height 100.
+- **Devnet with a gov5 member** (`f4b-gov5`, three Rust members plus gov5 `integ/mvdev-slot`
+  d4a00b01, 300 s, `devnet/f4b-gov5.out`): 133 views. The three Rust members show
+  commits=133 and timeouts=0. v0's "timeouts=2" is the single view-1 start-up TC, logged twice.
+  gov5 shows sealed=33, committed=166, errors=0, height 133. The block 133 hash (0x024e983f…)
+  is the same on both clients. EL err=0.
+- **Mixed gated MobileAnchor round** (`f4-mv`, `scripts/devnet-mobileanchor.sh f4-mv --gov5
+  --txload`, 360 s, `devnet/f4-mv/`): 160 blocks, both heights 160, 161 hashes the same, no
+  first difference.
+  - gov5: sealed=40, committed=200, errors=0, warns=0.
+  - Leader-root check: the Rust leaders' roots are ok=120, mismatch=0. Of the 40 gov5-led
+    blocks, 4 carry the zero root (before the first registry epoch) and 36 the committed root.
+  - Device: 2 devices, 20/20 certified, 0 failures.
+  - packetd: 160 packets; its only warning is about the genesis.
+  - send_tx: 1322 sent, 0 rejected. v0's timeouts=2 is again the view-1 start-up TC.
+  - This is the same shape as `mv4h4b2` on main.
+- **`roll --kill` on the seven-node fleet7 shape** (`rollkill-check.sh`, lean profile,
+  `ci/rollkill.log` tags `rollkill-f4k90` / `rollkill-f4k20`, raw outputs
+  `ci/f4k{90,20}-rollkill-*.out`). The first kill came at 90 s, and in the second run at 20 s,
+  before the first persistence.
+  - In both runs, every one of rolls 1, 2 and 3 with `--kill` committed again (commits since
+    restart 2), with 0 fault lines in el.log.
+  - The 360 s watch read 118 and 117 blocks (0.328 and 0.325 per s against the 0.333 target).
+  - At the end all seven nodes agree on a common height with equal head hashes.
+  - Each node's el.log carries one error line, `N42_TX_INGEST is not an address`, with an empty
+    address. It comes from fleet7.sh passing an empty `N42_TX_INGEST` when `F7_INGEST` is unset.
+    October logs have the same line, so it predates the port and is not part of F4.
+
+What evm2 changed in behaviour: nothing visible in the field gate. Blocks, QMDB roots, the
+MobileAnchor registry roots and the hashes are identical to gov5's across all three shapes, and
+SIGKILL recovery on QMDB holds, including a kill before the first persistence. The engine
+defaults are unchanged from 2.8.1 (see the notes below).
+
 ### Notes for the history
 
 - Commit c117217eb (`fix(storage-overlay): ...`) also carries the ef-tests runner port: the two

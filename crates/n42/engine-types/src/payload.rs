@@ -2243,6 +2243,8 @@ where
     let mut evm2_shards_new_us = 0u64;
     let mut evm2_setup_us = 0u64;
     let mut evm2_fees_us = 0u64;
+    // Inside the evm2 batches by part (F5g9).
+    let mut evm2_inside = crate::parallel_build::BatchInside::default();
     // The leader's seal chain between its named terms (step 7a): the prep's
     // end to the batches' start (the prefetch's scope, the shards and the
     // threads set up, the partition, the deferred state's open, the slots),
@@ -2705,7 +2707,9 @@ where
                     warn!(target: "n42::parallel_build", number = header.number, %err, "the parallel step refused; the block is built serially");
                 }
                 Ok(run) => {
-                    let crate::parallel_build::ParallelRun { mut executed, skipped, merged, batches, groups, split } = run;
+                    let crate::parallel_build::ParallelRun { mut executed, skipped, merged, batches, groups, split, spans, inside } = run;
+                    par_batch_spans = spans;
+                    evm2_inside = inside;
                     let fees_at = std::time::Instant::now();
                     let indices: Vec<usize> = executed.iter().map(|e| e.index).collect();
                     // The fees and gas over the executed set on the build
@@ -5233,6 +5237,14 @@ where
                     evm2_shards_new_us,
                     evm2_setup_us,
                     evm2_fees_us,
+                    evm2_batch_reads_us = evm2_inside.reads_us,
+                    evm2_batch_reads_sampled = evm2_inside.reads_sampled,
+                    evm2_batch_transact_us = evm2_inside.transact_us,
+                    evm2_batch_commit_us = evm2_inside.commit_us,
+                    evm2_batch_shard_add_us = evm2_inside.shard_add_us,
+                    evm2_exec_before_us = evm2_inside.before_us,
+                    evm2_exec_gather_us = evm2_inside.gather_us,
+                    evm2_exec_merge_us = evm2_inside.merge_us,
                     par_hook_us,
                     state_pre_changes_us,
                     sealed_ms,

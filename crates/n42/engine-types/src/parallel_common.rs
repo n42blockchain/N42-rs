@@ -232,7 +232,7 @@ pub struct BatchSpan {
 }
 
 impl BatchSpan {
-    fn close(start_us: u64, mark: ThreadMark, txs: usize, batches_at: std::time::Instant) -> Self {
+    pub(crate) fn close(start_us: u64, mark: ThreadMark, txs: usize, batches_at: std::time::Instant) -> Self {
         let now = ThreadMark::now();
         Self {
             start_us,
@@ -251,7 +251,7 @@ impl BatchSpan {
     }
 
     /// The span with its open's time set.
-    fn with_open_us(mut self, open_us: u64) -> Self {
+    pub(crate) fn with_open_us(mut self, open_us: u64) -> Self {
         self.open_us = open_us;
         self
     }

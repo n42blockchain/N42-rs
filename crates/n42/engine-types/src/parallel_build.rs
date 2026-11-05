@@ -70,6 +70,100 @@ pub struct ParallelRun<C: ConfigureEvm> {
     /// With a sink ([`execute_batches_into`]): each batch's own bundle of the
     /// beneficiary, which `merged` is made of. Empty otherwise.
     pub split: Vec<reth_trie::bundle_state::BundleState>,
+    /// The batches' spans on the pool (start, end, CPU, open), as the
+    /// revm-era step reports them on the phases line (F5g9).
+    pub spans: crate::parallel_common::BatchSpans,
+    /// Inside the batches, by part, summed over the batches (F5g9).
+    pub inside: BatchInside,
+}
+
+/// The evm2 batches' time by part, microseconds summed over every batch
+/// (F5g9). The per-transaction parts are sampled, one transaction in
+/// [`INSIDE_STRIDE`], and scaled to the batch's count; the shard add is
+/// measured on every batch.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BatchInside {
+    /// In the parent state's reads (`Database` calls under the EVM).
+    pub reads_us: u64,
+    /// In `transact`, the reads included.
+    pub transact_us: u64,
+    /// In the batch state's and the EVM's commits.
+    pub commit_us: u64,
+    /// The beneficiary's split-off and the bundle's add to its shards.
+    pub shard_add_us: u64,
+    /// Parent-state reads, sampled transactions only (unscaled).
+    pub reads_sampled: u64,
+    /// Before the batches: the partition (when not made ahead) and the
+    /// batching, wall.
+    pub before_us: u64,
+    /// After the batches: the executed sets gathered into candidate order,
+    /// wall.
+    pub gather_us: u64,
+    /// After the batches: the split-off bundles copied and merged, wall.
+    pub merge_us: u64,
+}
+
+/// One transaction in this many is timed by part inside a batch.
+pub const INSIDE_STRIDE: usize = 16;
+
+std::thread_local! {
+    /// Whether the current transaction on this thread is a sampled one, and
+    /// the parent reads it made with their time (ns).
+    static READ_TIMING: std::cell::Cell<(bool, u64, u64)> = const { std::cell::Cell::new((false, 0, 0)) };
+}
+
+/// A parent state whose reads, on a sampled transaction, are timed into
+/// [`READ_TIMING`] (F5g9).
+#[derive(Debug)]
+pub struct TimedDb<D>(pub D);
+
+impl<D: evm2::evm::Database> evm2::evm::Database for TimedDb<D> {
+    type Error = D::Error;
+
+    fn get_account(&mut self, address: &Address) -> Result<Option<AccountInfo>, Self::Error> {
+        timed_read(|| self.0.get_account(address))
+    }
+
+    fn get_code_by_hash(&mut self, code_hash: &alloy_primitives::B256) -> Result<evm2::bytecode::Bytecode, Self::Error> {
+        timed_read(|| self.0.get_code_by_hash(code_hash))
+    }
+
+    fn get_storage(&mut self, address: &Address, index: &alloy_primitives::U256) -> Result<alloy_primitives::U256, Self::Error> {
+        timed_read(|| self.0.get_storage(address, index))
+    }
+
+    fn get_block_hash(&mut self, number: &alloy_primitives::U256) -> Result<alloy_primitives::B256, Self::Error> {
+        timed_read(|| self.0.get_block_hash(number))
+    }
+}
+
+fn timed_read<T>(read: impl FnOnce() -> T) -> T {
+    let (sampled, count, ns) = READ_TIMING.with(std::cell::Cell::get);
+    if !sampled {
+        return read();
+    }
+    let at = std::time::Instant::now();
+    let out = read();
+    READ_TIMING.with(|cell| cell.set((true, count + 1, ns + at.elapsed().as_nanos() as u64)));
+    out
+}
+
+/// Logs once which pool the evm2 batches run on, its threads and the CPUs
+/// its threads may run on (F5g9).
+fn log_pool_once(pool: &rayon::ThreadPool) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let cpus = pool.install(n42_core_layout::current_thread_cpus).map(|c| n42_core_layout::format_cpu_list(&c)).unwrap_or_default();
+        let name = pool.install(|| std::thread::current().name().map(str::to_owned)).unwrap_or_default();
+        tracing::info!(
+            target: "n42::parallel_build",
+            threads = pool.current_num_threads(),
+            thread = %name,
+            cpus = %cpus,
+            layout = n42_core_layout::label(),
+            "evm2 batches' pool"
+        );
+    });
 }
 
 /// Why the parallel step gave the block to the serial loop.
@@ -335,11 +429,13 @@ where
     D: evm2::evm::Database + Send + 'static,
     evm2::TxResult<TypesOf<C>>: Send,
 {
+    let before_at = std::time::Instant::now();
     let groups = match groups {
         Some(groups) => groups,
         None => partition_by_sender(keys, beneficiary).map_err(Refused::NotParallel)?,
     };
     let pool = build_pool();
+    log_pool_once(pool);
     let workers = pool.current_num_threads().max(1);
     let batches = match dispatch {
         Dispatch::OneWave => batch_groups_one_wave(&groups, keys.len(), workers),
@@ -347,10 +443,22 @@ where
         Dispatch::Halves => batch_groups(&groups, keys.len(), workers),
     };
     let order = largest_first(&batches.iter().map(|b| b.iter().map(|g| g.len()).sum()).collect::<Vec<usize>>());
-    type BatchOut<C> = Result<(Vec<Executed<C>>, Vec<usize>, reth_trie::bundle_state::BundleState), Refused>;
+    type BatchOut<C> = Result<
+        (Vec<Executed<C>>, Vec<usize>, reth_trie::bundle_state::BundleState, crate::parallel_common::BatchSpan, BatchInside),
+        Refused,
+    >;
+    let batches_at = std::time::Instant::now();
+    let before_us = before_at.elapsed().as_micros() as u64;
     let split_off: Vec<Address> = std::iter::once(beneficiary).chain(kept.iter().copied().filter(|a| *a != beneficiary)).collect();
     let run_batch = |members: &Vec<&Vec<usize>>| -> BatchOut<C> {
-        let db = open().ok_or(Refused::NotParallel(NotParallel::NoState))?;
+        let start_us = batches_at.elapsed().as_micros() as u64;
+        let mark = crate::parallel_common::ThreadMark::now();
+        let open_at = std::time::Instant::now();
+        let db = TimedDb(open().ok_or(Refused::NotParallel(NotParallel::NoState))?);
+        let open_us = open_at.elapsed().as_micros() as u64;
+        let mut inside = BatchInside::default();
+        let mut sampled_txs = 0u64;
+        let mut seen = 0usize;
         // The batch's EVM carries the fast transfer handler (as the revm-era
         // batches always did) unless `N42_BATCH_FAST_TRANSFER=0`.
         let mut evm = crate::fast_handler::as_batch(|| config.evm_with_env(db, env.clone()));
@@ -369,7 +477,21 @@ where
                     continue;
                 }
                 let tx = convert(i);
-                match evm.transact(&tx) {
+                let sample = seen % INSIDE_STRIDE == 0;
+                seen += 1;
+                let transact_at = sample.then(|| {
+                    READ_TIMING.with(|cell| cell.set((true, 0, 0)));
+                    std::time::Instant::now()
+                });
+                let transacted = evm.transact(&tx);
+                if let Some(at) = transact_at {
+                    inside.transact_us += at.elapsed().as_nanos() as u64;
+                    let (_, count, ns) = READ_TIMING.with(|cell| cell.replace((false, 0, 0)));
+                    inside.reads_us += ns;
+                    inside.reads_sampled += count;
+                    sampled_txs += 1;
+                }
+                match transacted {
                     Ok(out) => {
                         // Checked before the commit: a transfer refused here
                         // leaves the batch's state as it was. One that used
@@ -395,8 +517,12 @@ where
                             }
                         }
                         first = false;
+                        let commit_at = sample.then(std::time::Instant::now);
                         state.commit(&out.pending_state).map_err(Refused::Unsupported)?;
                         evm.commit_state(&out.pending_state);
+                        if let Some(at) = commit_at {
+                            inside.commit_us += at.elapsed().as_nanos() as u64;
+                        }
                         executed.push(Executed { index: i, result: out.result });
                     }
                     Err(_) => {
@@ -406,16 +532,26 @@ where
                 }
             }
         }
+        // The sampled parts scaled to the batch's count, in microseconds
+        // (accumulated in nanoseconds).
+        let scale = |ns: u64| if sampled_txs == 0 { 0 } else { ns.saturating_mul(seen as u64) / sampled_txs / 1000 };
+        inside.transact_us = scale(inside.transact_us);
+        inside.reads_us = scale(inside.reads_us);
+        inside.commit_us = scale(inside.commit_us);
         let bundle = state.take_bundle();
-        Ok(match sink {
+        let own = match sink {
             Some(sink) => {
+                let add_at = std::time::Instant::now();
                 let mut bundle = bundle;
                 let own = split_accounts(&mut bundle, &split_off);
                 sink(bundle);
-                (executed, skipped, own)
+                inside.shard_add_us = add_at.elapsed().as_micros() as u64;
+                own
             }
-            None => (executed, skipped, bundle),
-        })
+            None => bundle,
+        };
+        let span = crate::parallel_common::BatchSpan::close(start_us, mark, seen, batches_at).with_open_us(open_us);
+        Ok((executed, skipped, own, span, inside))
     };
     let slots: Vec<std::sync::OnceLock<BatchOut<C>>> = (0..batches.len()).map(|_| std::sync::OnceLock::new()).collect();
     pool.scope(|scope| {
@@ -426,20 +562,35 @@ where
             });
         }
     });
+    let total_us = batches_at.elapsed().as_micros() as u64;
+    let gather_at = std::time::Instant::now();
     let (mut executed, mut skipped, mut bundles) = (Vec::with_capacity(keys.len()), Vec::new(), Vec::with_capacity(batches.len()));
+    let mut spans = Vec::with_capacity(batches.len());
+    let mut inside = BatchInside::default();
     for slot in slots {
-        let (e, s, bundle) = slot.into_inner().unwrap_or(Err(Refused::NotParallel(NotParallel::NoState)))?;
+        let (e, s, bundle, span, part) = slot.into_inner().unwrap_or(Err(Refused::NotParallel(NotParallel::NoState)))?;
         executed.extend(e);
         skipped.extend(s);
         bundles.push(bundle);
+        spans.push(span);
+        inside.reads_us += part.reads_us;
+        inside.transact_us += part.transact_us;
+        inside.commit_us += part.commit_us;
+        inside.shard_add_us += part.shard_add_us;
+        inside.reads_sampled += part.reads_sampled;
     }
+    let spans = crate::parallel_common::BatchSpans::of(&mut spans, total_us);
+    inside.before_us = before_us;
     executed.sort_unstable_by_key(|e| e.index);
     skipped.sort_unstable();
+    inside.gather_us = gather_at.elapsed().as_micros() as u64;
+    let merge_at = std::time::Instant::now();
     let split = if sink.is_some() { bundles.clone() } else { Vec::new() };
     let merged = merge_batches(bundles).map_err(Refused::Fold)?;
+    inside.merge_us = merge_at.elapsed().as_micros() as u64;
     let count = batches.len();
     drop(batches);
-    Ok(ParallelRun { executed, skipped, merged, batches: count, groups, split })
+    Ok(ParallelRun { executed, skipped, merged, batches: count, groups, split, spans, inside })
 }
 
 /// `addresses`' accounts and reverts taken out of `bundle` into a bundle of
@@ -1297,6 +1448,15 @@ mod tests {
             let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink), &recipients)
                 .expect("the sharded batches run");
             shard_exec.push(at.elapsed().as_micros());
+            eprintln!(
+                "round {round} shard batches: batches={} threads={} median_ms={} max_ms={} min_ms={} skew_ms={} last_start_us={} last_end_us={} open_sum_us={} txs_max={} txs_min={} wall_sum_us={} cpu_sum_us={} minflt={} vcsw={} ivcsw={} executed_size={} | inside us: reads={} transact={} commit={} shard_add={} reads_sampled={}",
+                run.spans.batches, run.spans.threads, run.spans.median_ms, run.spans.max_ms, run.spans.min_ms, run.spans.start_skew_ms,
+                run.spans.last_start_us, run.spans.last_end_us, run.spans.open_sum_us, run.spans.txs_max, run.spans.txs_min,
+                run.spans.wall_sum_us, run.spans.cpu_sum_us, run.spans.minflt, run.spans.vcsw, run.spans.ivcsw,
+                std::mem::size_of::<Executed<Config>>(),
+                run.inside.reads_us, run.inside.transact_us, run.inside.commit_us, run.inside.shard_add_us, run.inside.reads_sampled,
+            );
+            eprintln!("round {round} outside the batches us: before={} gather={} merge={}", run.inside.before_us, run.inside.gather_us, run.inside.merge_us);
             let at = Instant::now();
             let frozen = shards.freeze();
             freeze.push(at.elapsed().as_micros());

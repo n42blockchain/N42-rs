@@ -677,6 +677,37 @@ files; the one warning left is the existing unused `Header` import in `engine_ex
 Clippy is clean on `-p n42-engine-types -p n42 --lib --bins`. n42-engine-types (275), n42-qmdb-reth,
 n42-qmdb-state and n42-testing: 476 passed, 0 failed.
 
+**Devnet (`ci/f5d-gate.log`, `scripts/f5d-gate.sh` in audit-notes).** 300 s rounds of
+`devnet-fleet.sh` on a native release build of 9a4200b10, under the round lock and the box gate,
+with the F5c load: two `send_tx` senders at 2 tx/s, 1,002 transactions. One member ran on its own
+execution layer (`LATE_VALIDATOR`), so a second EL imported every block.
+- The follower import runs only behind the raw payload channel (`N42_PAYLOAD_SERVE`, with
+  `N42_FOLLOWER_DIRECT_IMPORT=1`). The devnet had no channel, so `DEVNET_PAYLOAD_SERVE=1` was added
+  to `devnet-fleet.sh` (main EL on 18571, the late EL on 18581).
+- Every round, the control included, ran with the channel and direct import, so in the control the
+  same path imports serially.
+- A first f5d-par without the channel never reached the step and was stopped.
+
+| round | knobs | blocks main = late | parallel imports (main + late EL) | refused / fold refused | builder steps (main + late) | EL ERROR |
+| --- | --- | --- | --- | --- | --- | --- |
+| f5d-par | `FOLLOWER_PARALLEL=1` + F5c builder knobs | 100 / 100 same hash | 155 + 64 | 0 / 0 | 64 + 9 parallel, 0 rebuilds | 0, 0 |
+| f5d-ser | none (direct import, serial) | 100 / 100 same hash | (no step; 77 direct imports on the late EL) | - | - | 0, 0 |
+| f5d-gov5b | `FOLLOWER_PARALLEL=1`, `--gov5`, `LATE_VALIDATOR=2` | 131 / 131 same hash, gov5 head hash equal | 115 + 58 | 0 / 0 | - | 0, 0 |
+
+- Every block with transactions went parallel: 1 batch each, `tail=0`, since every devnet
+  transaction is a plain transfer.
+- The main EL counts above its 73-85 distinct blocks because several validators share it and each
+  hands it the same block (no `N42_IMPORT_ONCE`).
+- The WARN lines are the engine loop's idle-branch notes, in every round.
+- gov5 (`gov5-wt-mvdev8282`) sealed 33 blocks, committed 162, logged 0 errors, and its block 129
+  hash equals reth's.
+- The first f5d-gov5 sent all load to the Rust EL, so all 33 gov5 blocks were empty. f5d-gov5b put
+  the second sender on gov5's RPC (28545). Only 3 gov5-sealed blocks then carried transactions (13
+  of them): gov5 gossips its pool to the Rust members, whose leaders included most of the load
+  first. All 3 went through the parallel import on both ELs with equal hashes.
+- Open: the A/B against v2.8.1 waits for F5f. No devnet block had a serial tail or more than one
+  batch; those shapes are covered only by the unit tests.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

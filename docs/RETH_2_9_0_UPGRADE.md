@@ -1323,6 +1323,64 @@ pre-execution changes, plus the set-up. The post-execution span is the indices, 
 body's move and match, and the seal. E14 is to show `evm2_pre_exec_us` at 2-3 ms or less and
 `exec_end_to_seal_us` at about 3 ms.
 
+#### E14, after g8
+
+The fx pairs E14 (22:42-23:08Z, natives eb1859ed6 against main, two pairs,
+`wt-main/target/fleet-runs/strip-loop351D2S12P30T64X11T16E14{a,0,b,0b}MEMF/el.log`):
+- **Throughput.** The branch read 4,158,133 / 4,333,333 TPS (cycle 0.046-0.048 s) against the
+  control's 4,900,000 / 4,906,667 (0.041 s), -12..-15%.
+- **g8 worked.** evm2_prepared_miss=none and commit_body_ahead_used=true on 1957 of 1969 blocks.
+  evm2_pre_exec_us 879 (open 763), exec_end_to_seal_us 1580, sealed_ms 1, tx_root 1.
+- **What is left is the execution.** par_exec p10/p50/p90 was 33/39/49 on the branch against
+  24/28/38 on the control, and sealed_at 37/43/54 against 35-37. The evm2 path had no per-batch
+  fields.
+
+#### g9, the evm2 batches (F5g9)
+
+**Instrumentation** (`execute_batches_into`, on the phases line):
+- The revm-era step's batch fields, same names and meaning: `batch_median/max/min_ms`,
+  `batch_start_skew_ms`, `batch_last_start_us`, `batch_last_end_us`, `batch_open_sum_us`,
+  `batch_txs_max/min`, `batch_threads`, `batch_wall_sum_us`, `batch_cpu_sum_us`, faults, switches.
+- Inside the batches, summed: `evm2_batch_reads_us` (the parent state's `Database` calls),
+  `evm2_batch_transact_us` (reads included), `evm2_batch_commit_us`, `evm2_batch_shard_add_us`.
+  The per-transaction parts are sampled, one transaction in 16, and scaled.
+- Outside the batches: `evm2_exec_before_us` (partition and batching), `evm2_exec_gather_us` (the
+  executed sets into candidate order), `evm2_exec_merge_us`.
+- The batches' pool is logged once ("evm2 batches' pool": threads, thread name, CPUs, layout).
+
+**The hypotheses**, in the order given:
+- **(a) The pool.** No. `execute_batches_into` runs on `parallel_common::build_pool()`, the same
+  pool the revm-era step uses (`parallel_transfer` re-exports it). Both E14 legs' per-thread CPU
+  (`tidcpu-*.tsv`) shows 32 `n42-build` threads. The E9a "Failed to build global thread pool" is
+  rayon's global pool, already initialised, and the batches do not use it. Per block, the build
+  pool's CPU is about 11% higher on the branch (38,671 at 0.849x the control's blocks, against
+  40,959), not the 1.4x the wall time shows.
+- **(b) The per-batch open.** The open is the same as the control's: `StateProviderDatabase` over
+  `open_parent_state()`, once per batch, in both. reth's evm2 `Database` impl reads exactly as the
+  revm one does. The fleet's cost per batch comes with E15 (`batch_open_sum_us`,
+  `evm2_batch_reads_us`). On the bench the reads are 8-10% of transact.
+- **(c) The shard add.** Small: 2.6 ms summed over 128 batches on the bench, about 20 us a batch.
+- **(d) The dispatch.** The same as the control's (`N42_BUILD_BATCHES=128`, largest first). On the
+  bench, 128 batches of 1,500-2,000 transfers on 32 threads give a start skew of 11 ms, 3 ms per
+  batch: four waves, as on the control.
+
+**The top finding: the gather.** After the batches, one thread put the 200,000 results (120 bytes
+each) into one vector and sorted them by candidate index. On the bench that was 5.5 ms of the
+20 ms execution (`evm2_exec_gather_us`), on top of the 14 ms the batches took. Each batch now writes
+each result into its candidate's slot, on its own thread, as the revm-era step's slots did
+(`ScatterSlots`). With nothing skipped, the slots become the vector in place with no copy; with
+holes, the written ones are taken in order. Unit test
+`the_scatter_slots_give_the_executed_set_in_candidate_order` covers in-place, holes, and dropping
+each value exactly once.
+
+**Bench** (`evm2_step_bound`, release, 32 threads, `N42_BUILD_BATCHES=128`, three rounds):
+- gather 5.5 -> 0.08 ms;
+- shard-path execution 20.1 -> 15.3 ms;
+- outside the batches, besides the gather: partition and batching 1.0 ms (made from the plan on the
+  fleet), merge 0.14 ms.
+
+E15 is to read par_exec against the control's 28, with the batch fields to name any rest.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

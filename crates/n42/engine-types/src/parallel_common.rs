@@ -1357,6 +1357,10 @@ pub(crate) fn sort_reverts(reverts: &mut [(Address, AccountRevert)]) {
 /// pool as soon as the block's senders are known, beside the includability
 /// check and the wait for the parent, instead of inside the execution gate.
 pub fn follower_partition_ahead() -> bool {
+    // A revm-era path: the evm2 follower import partitions inside its call.
+    if !crate::legacy_paths::LEGACY_REVM_PATHS {
+        return false;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARTITION_AHEAD", false))
 }
@@ -1472,6 +1476,10 @@ pub fn follower_batch_state() -> bool {
 /// sink and no graft -- instead of [`execute_transfers_with_plan`]. Off by
 /// default.
 pub fn follower_build_path() -> bool {
+    // A revm-era path (`legacy-revm-paths`); not ported to evm2.
+    if !crate::legacy_paths::LEGACY_REVM_PATHS {
+        return false;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_BUILD_PATH", false))
 }

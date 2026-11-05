@@ -2584,7 +2584,7 @@ where
                     let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&cands[e.index]));
                     (e.result, tx_type)
                 });
-                let gas = crate::parallel_build::commit_run(&mut builder.executor, results, merged)?;
+                let gas = crate::parallel_build::commit_run(&mut builder.executor, results, merged, crate::parallel_build::CacheScope::All)?;
                 Ok((indices, skipped, batches, gas, fees))
             });
             match committed {
@@ -7153,6 +7153,58 @@ mod includability_tests {
         assert_eq!(crate::parallel_build::serial_rebuilds(), rebuilds + 1, "the refused fold rebuilt the block");
         assert_eq!(rebuilt.header(), serial.header(), "the serial rebuild's block");
         assert_eq!(rebuilt.body().transactions.len(), 20);
+    }
+
+    /// Build path = follower path = serial (the legacy tree's test, on
+    /// evm2): the block the parallel builder (F5c) seals, imported by the
+    /// parallel follower (F5d), gives the stock serial import's receipts,
+    /// gas, bundle and QMDB root, and the gas its header carries.
+    #[cfg(not(feature = "legacy-revm-paths"))]
+    #[test]
+    fn a_parallel_built_block_imports_in_parallel_as_it_imports_serially() {
+        use reth_evm::execute::Executor as _;
+        let accounts: Vec<_> = (11..=20).map(|s| (address(s), 0, RICH)).collect();
+        let txs: Vec<Candidate> = (11..=20).flat_map(|s| [transfer(s, 0, 21_000), transfer(s, 1, 21_000)]).collect();
+        let runs = crate::parallel_build::committed_runs();
+        let block = build_with(true, false, false, &accounts, &txs);
+        assert!(crate::parallel_build::committed_runs() > runs, "the block was built in parallel");
+        assert_eq!(block.body().transactions.len(), 20);
+        let config = crate::n42_evm::N42EvmConfig::new(Arc::new(n42_header::N42ChainSpec::from((*chain(false)).clone())));
+        let parent = || {
+            let mut db = evm2::evm::CacheDB::new(evm2::evm::EmptyDB::default());
+            for (address, nonce, balance) in &accounts {
+                db.insert_account_info(address, evm2::evm::AccountInfo { nonce: *nonce, balance: *balance, ..Default::default() });
+            }
+            db
+        };
+        let (ours, stats) = crate::parallel_build::import_block(&config, &block, parent(), &|| Some(parent()), crate::parallel_transfer::Dispatch::LargestFirst(4))
+            .expect("the parallel import");
+        assert_eq!((stats.txs, stats.tail), (20, 0), "{stats:?}");
+        assert!(stats.batches >= 2, "{stats:?}");
+        let stock = config.executor(parent()).execute(&block).expect("the serial import");
+        assert_eq!(ours.result.receipts, stock.result.receipts, "receipts");
+        assert_eq!(ours.result.gas_used, stock.result.gas_used, "gas used");
+        assert_eq!(ours.result.gas_used, block.header().gas_used, "the header's gas");
+        assert_eq!(ours.state.state, stock.state.state, "state");
+        assert_eq!(ours.state.contracts, stock.state.contracts, "contracts");
+        let reverts = |out: &reth_evm::BlockExecutionOutput<n42_tx_types::Receipt>| {
+            out.state
+                .reverts
+                .iter()
+                .map(|block| {
+                    let mut v: Vec<_> = block.iter().map(|(a, r)| (*a, format!("{r:?}"))).collect();
+                    v.sort_by_key(|(a, _)| *a);
+                    v
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(reverts(&ours), reverts(&stock), "reverts");
+        let root = |out: &reth_evm::BlockExecutionOutput<n42_tx_types::Receipt>| {
+            n42_qmdb_state::QmdbState::new()
+                .apply_block(block.header().number, &n42_qmdb_reth::changes_from_execution(&out.state, true))
+                .expect("the QMDB root")
+        };
+        assert_eq!(root(&ours), root(&stock), "QMDB root");
     }
 
     /// Under deferred execution the parallel step keeps each sender's

@@ -119,3 +119,5 @@ ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"]
 secp256k1.workspace = true
 # `bench_build_prefetch` serves its state from a QMDB read view over an entry file it writes.
 n42-twig-core.workspace = true
+# `parallel_build`'s import tests compare QMDB roots.
+n42-qmdb-state.workspace = true

@@ -7323,6 +7323,7 @@ dependencies = [
  "n42-header",
  "n42-primitives",
  "n42-qmdb-reth",
+ "n42-qmdb-state",
  "n42-sharded-output",
  "n42-twig-core",
  "n42-tx-queue",

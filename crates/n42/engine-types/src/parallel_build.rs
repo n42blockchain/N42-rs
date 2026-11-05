@@ -142,9 +142,18 @@ fn same_account(a: &AccountInfo, b: &AccountInfo) -> bool {
 /// other than the parent's the batches started from: the batches' changes
 /// would then not be the block's.
 pub fn install_cache<X>(overlay: &mut evm2::evm::CacheDB<X>, merged: &MergedBatches) -> Result<usize, Address> {
-    for (address, _) in merged.accounts() {
-        if let Some(held) = overlay.cache.accounts.get(address) {
-            let original = merged.original(address).flatten();
+    let addresses: Vec<Address> = merged.accounts().map(|(address, _)| *address).collect();
+    install_entries(overlay, merged, addresses.iter().copied())
+}
+
+fn install_entries<X>(
+    overlay: &mut evm2::evm::CacheDB<X>,
+    merged: &MergedBatches,
+    addresses: impl Iterator<Item = Address> + Clone,
+) -> Result<usize, Address> {
+    for address in addresses.clone() {
+        let Some(original) = merged.original(&address) else { continue };
+        if let Some(held) = overlay.cache.accounts.get(&address) {
             let agrees = match (held.as_ref(), original) {
                 (Some(held), Some(original)) => same_account(held, original),
                 (None, None) => true,
@@ -153,14 +162,42 @@ pub fn install_cache<X>(overlay: &mut evm2::evm::CacheDB<X>, merged: &MergedBatc
                 (None, Some(original)) => original.is_empty(),
             };
             if !agrees {
-                return Err(*address);
+                return Err(address);
             }
         }
     }
-    for (address, info) in merged.accounts() {
-        overlay.insert_account_info(address, info.clone());
+    let mut written = 0;
+    for address in addresses {
+        if let Some(info) = merged.get(&address) {
+            overlay.insert_account_info(&address, info.clone());
+            written += 1;
+        }
     }
-    Ok(merged.len())
+    Ok(written)
+}
+
+/// The intrinsic gas of a plain transfer: what every transfer the batches
+/// keep used.
+pub const TRANSFER_GAS: u64 = 21_000;
+
+/// Which merged accounts the cache half writes into the executor's overlay.
+#[derive(Debug, Clone, Copy)]
+pub enum CacheScope<'a> {
+    /// Every one: whatever runs after the batches may read any of them (the
+    /// leader's serial loop).
+    All,
+    /// Only these (the follower's `keep_cache = false`, ported from the
+    /// revm-era import: after the batches only the block's end runs, which
+    /// reads the withdrawal recipients and the system contracts -- never a
+    /// batch account, the merge refuses code). An account the end reads
+    /// that is not written here makes the fold refuse (`Stale`), and the
+    /// block is imported serially.
+    Only(&'a [Address]),
+}
+
+/// [`install_cache`] for the merged accounts among `addresses` only.
+pub fn install_cache_only<X>(overlay: &mut evm2::evm::CacheDB<X>, merged: &MergedBatches, addresses: &[Address]) -> Result<usize, Address> {
+    install_entries(overlay, merged, addresses.iter().copied())
 }
 
 /// Hands a run to the block executor: the cache half ([`install_cache`]),
@@ -173,12 +210,20 @@ pub fn commit_run<'a, T>(
     executor: &mut N42BlockExecutor<'a, T>,
     executed: impl IntoIterator<Item = (evm2::TxResult<T>, n42_tx_types::N42TxType)>,
     merged: MergedBatches,
+    cache: CacheScope<'_>,
 ) -> Result<u64, Refused>
 where
     T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync + Default>,
 {
     use reth_evm::execute::BlockExecutor as _;
-    install_cache(executor.evm_mut().overlay_db_mut(), &merged).map_err(Refused::Cache)?;
+    match cache {
+        CacheScope::All => {
+            install_cache(executor.evm_mut().overlay_db_mut(), &merged).map_err(Refused::Cache)?;
+        }
+        CacheScope::Only(addresses) => {
+            install_cache_only(executor.evm_mut().overlay_db_mut(), &merged, addresses).map_err(Refused::Cache)?;
+        }
+    }
     let mut gas = 0u64;
     for (result, tx_type) in executed {
         let detached = evm2::evm::TxResultWithState::<T> { result, ..Default::default() };
@@ -254,7 +299,14 @@ where
                 match evm.transact(&tx) {
                     Ok(out) => {
                         // Checked before the commit: a transfer refused here
-                        // leaves the batch's state as it was.
+                        // leaves the batch's state as it was. One that used
+                        // more than the intrinsic gas ran code, and code may
+                        // read what another batch changes: not the batches'.
+                        if out.result.tx_gas_used() != TRANSFER_GAS {
+                            broken = true;
+                            skipped.push(i);
+                            continue;
+                        }
                         if let Some(cost) = worst_case {
                             let sender = keys[i].0;
                             let before = out
@@ -305,6 +357,142 @@ where
     Ok(ParallelRun { executed, skipped, merged, batches: batches.len() })
 }
 
+static IMPORTS_PARALLEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IMPORTS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Follower imports that went parallel, since start.
+pub fn imports_parallel() -> u64 {
+    IMPORTS_PARALLEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Follower imports the parallel step refused (each then imported
+/// serially by the caller), since start.
+pub fn imports_refused() -> u64 {
+    IMPORTS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What a parallel import did, for its log line.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImportStats {
+    /// Transfers executed in batches (the block's leading plain transfers).
+    pub txs: usize,
+    /// Transactions executed after them by the block's executor.
+    pub tail: usize,
+    /// Batches they ran in.
+    pub batches: usize,
+    /// Accounts the batches changed.
+    pub accounts: usize,
+    /// Of those, written into the executor's overlay (`keep_cache = false`:
+    /// the withdrawal recipients among them; every one when a tail follows).
+    pub cached: usize,
+    /// The batches' wall time, microseconds.
+    pub batches_us: u64,
+    /// The executor's part (pre-execution, receipts, the block's end and
+    /// the fold), microseconds.
+    pub finish_us: u64,
+}
+
+/// A transaction's (sender, recipient) when the batches take it: a call
+/// with no input, no access list, no blobs and no authorizations.
+fn import_key(tx: &n42_tx_types::N42TxEnvelope, sender: Address) -> Option<(Address, Address)> {
+    use alloy_consensus::Transaction as _;
+    (tx.input().is_empty()
+        && tx.access_list().is_none_or(|list| list.is_empty())
+        && tx.blob_versioned_hashes().is_none()
+        && tx.authorization_list().is_none())
+    .then(|| tx.to())
+    .flatten()
+    .map(|to| (sender, to))
+}
+
+/// The follower's parallel import on evm2 (F5d): `block`'s leading plain
+/// transfers -- every transaction up to the first that is not one or that
+/// names the beneficiary -- executed in sender batches over the parent
+/// ([`execute_batches`], `open` yields one view of the parent per batch),
+/// then the block's own executor over `main_db` (the same parent): its
+/// pre-execution changes, the transfers' receipts with the cache half, the
+/// rest of the block transaction by transaction, the block's end and the
+/// fold. A block of transfers only installs just the withdrawal recipients
+/// in the executor's cache (`keep_cache = false`, [`CacheScope::Only`]); a
+/// block with a serial tail installs every batch account, which the tail
+/// may read. `Err` names why the block is not imported this way, with
+/// nothing of it kept: the caller imports it serially, and a block that is
+/// genuinely invalid is refused there with the stock executor's error.
+pub fn import_block<C, M, D>(
+    config: &C,
+    block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>,
+    main_db: M,
+    open: &(dyn Fn() -> Option<D> + Sync),
+    dispatch: Dispatch,
+) -> Result<(reth_evm::BlockExecutionOutput<n42_tx_types::Receipt>, ImportStats), Refused>
+where
+    C: ConfigureEvm<Primitives = n42_tx_types::N42Primitives, BlockExecutorFactory = crate::parallel_common::FastExecutorFactory> + Sync,
+    EvmEnvFor<C>: Sync,
+    M: evm2::evm::Database,
+    D: evm2::evm::Database + Send + 'static,
+{
+    let refused = |why: Refused| {
+        IMPORTS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        why
+    };
+    let commit_err = |err: &dyn std::fmt::Display| Refused::Commit(err.to_string());
+    let transactions = &block.body().transactions;
+    let senders = block.senders();
+    let env = config.evm_env(block.header()).map_err(|err| refused(commit_err(&err)))?;
+    let beneficiary = env.block.beneficiary;
+    let keys: Vec<(Address, Address)> = transactions
+        .iter()
+        .zip(senders)
+        .map_while(|(tx, sender)| import_key(tx, *sender).filter(|(from, to)| *from != beneficiary && *to != beneficiary))
+        .collect();
+    if keys.is_empty() {
+        return Err(refused(Refused::NotParallel(NotParallel::NotATransfer(0))));
+    }
+    let tail = keys.len()..transactions.len();
+    let tail_len = tail.len();
+    let convert = |i: usize| Recovered::new_unchecked(evm2::ethereum::TxEnvelope::from(transactions[i].clone()), senders[i]);
+    let batches_at = std::time::Instant::now();
+    let run = execute_batches(config, &env, &keys, None, &convert, open, None, beneficiary, dispatch).map_err(refused)?;
+    let batches_us = batches_at.elapsed().as_micros() as u64;
+    if let Some(&i) = run.skipped.first() {
+        return Err(refused(Refused::NotParallel(NotParallel::Failed(i, "refused by the EVM on the batches' view".to_owned()))));
+    }
+    let finish_at = std::time::Instant::now();
+    let ParallelRun { executed, merged, batches, .. } = run;
+    let accounts = merged.len();
+    let withdrawals: Vec<Address> = block.body().withdrawals.as_ref().map_or_else(Vec::new, |w| w.iter().map(|w| w.address).collect());
+    let (scope, cached) = if tail.is_empty() {
+        (CacheScope::Only(&withdrawals), withdrawals.iter().filter(|a| merged.get(a).is_some()).count())
+    } else {
+        (CacheScope::All, accounts)
+    };
+    let ctx = config.context_for_block(block.sealed_block()).map_err(|err| refused(commit_err(&err)))?;
+    let evm = config.evm_with_env(main_db, env);
+    use reth_evm::{execute::BlockExecutor as _, BlockExecutorFactory as _};
+    let mut executor = config.block_executor_factory().create_executor(evm, ctx);
+    executor.apply_pre_execution_changes().map_err(|err| refused(commit_err(&err)))?;
+    let txs = executed.len();
+    let results = executed.into_iter().map(|e| {
+        let tx_type = <n42_tx_types::N42TxEnvelope as alloy_consensus::TransactionEnvelope>::tx_type(&transactions[e.index]);
+        (e.result, tx_type)
+    });
+    commit_run(&mut executor, results, merged, scope).map_err(refused)?;
+    for i in tail {
+        executor
+            .execute_transaction(Recovered::new_unchecked(&transactions[i], senders[i]))
+            .map_err(|err| refused(commit_err(&err)))?;
+    }
+    let output = executor.finish().map_err(|err| match &err {
+        reth_evm::BlockExecutionError::Internal(internal) => match internal.downcast_other::<FoldRefused>() {
+            Some(fold) => refused(Refused::Fold(*fold)),
+            None => refused(commit_err(&err)),
+        },
+        _ => refused(commit_err(&err)),
+    })?;
+    IMPORTS_PARALLEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok((output, ImportStats { txs, tail: tail_len, batches, accounts, cached, batches_us, finish_us: finish_at.elapsed().as_micros() as u64 }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +535,7 @@ mod tests {
         for i in 1..=40 {
             db.insert_account_info(&addr(i), AccountInfo { balance: U256::from(FUND), ..Default::default() });
         }
+        db.insert_account_info(&alt_sender(), AccountInfo { balance: U256::from(FUND), ..Default::default() });
         db.insert_account_info(&addr(BENEFICIARY), AccountInfo { balance: U256::from(1u64), ..Default::default() });
         // PUSH1 0 CALLDATALOAD PUSH1 0 SSTORE STOP
         let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x35, 0x60, 0x00, 0x55, 0x00]));
@@ -484,7 +673,7 @@ mod tests {
             let tx_type = n42_tx_types::N42TxType::try_from(batch[e.index].ty()).expect("a type");
             (e.result, tx_type)
         });
-        commit_run(&mut ex, results, run.merged).expect("the cache half");
+        commit_run(&mut ex, results, run.merged, CacheScope::All).expect("the cache half");
         for t in serial {
             ex.execute_transaction(t.clone()).expect("the transaction executes");
         }
@@ -550,6 +739,165 @@ mod tests {
         assert_eq!(run.skipped, vec![1]);
         assert_eq!(run.executed.len(), 2);
         assert!(run_batches(&txs, None).expect("the batches run").skipped.is_empty(), "the EVM alone takes both");
+    }
+
+    fn alt_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x50; 32])
+    }
+
+    /// The 0x50 (Ed25519) transfer's sender, funded in [`parent`].
+    fn alt_sender() -> Address {
+        alt_transfer(0).signer()
+    }
+
+    /// A signed 0x50 transfer of [`alt_sender`] at `nonce`.
+    fn alt_transfer(nonce: u64) -> Recovered<N42TxEnvelope> {
+        let key = alt_key();
+        let tx = n42_tx_types::TxAltSig {
+            chain_id: 1,
+            nonce,
+            max_priority_fee_per_gas: 3,
+            max_fee_per_gas: 100,
+            gas_limit: 21_000,
+            to: addr(21),
+            value: U256::from(5u64),
+            input: Bytes::new(),
+            access_list: Default::default(),
+            alg_type: n42_tx_types::ALG_ED25519,
+            pubkey: Bytes::copy_from_slice(key.verifying_key().as_bytes()),
+        }
+        .sign_ed25519(&key);
+        let sender = tx.sender();
+        Recovered::new_unchecked(N42TxEnvelope::AltSig(tx), sender)
+    }
+
+    /// `txs` as a block at [`env`]'s header, with [`withdrawals`].
+    fn block_of(txs: &[Recovered<N42TxEnvelope>]) -> reth_primitives_traits::RecoveredBlock<n42_tx_types::Block> {
+        let header = n42_header::N42Header::from(alloy_consensus::Header {
+            number: 5,
+            timestamp: 1_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(7),
+            beneficiary: addr(BENEFICIARY),
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            ..Default::default()
+        });
+        let body = n42_tx_types::BlockBody {
+            transactions: txs.iter().map(|t| t.inner().clone()).collect(),
+            ommers: Vec::new(),
+            withdrawals: Some(withdrawals().into()),
+        };
+        reth_primitives_traits::RecoveredBlock::new_unhashed(n42_tx_types::Block::new(header, body), txs.iter().map(|t| t.signer()).collect())
+    }
+
+    /// The stock import: the block through the stock executor over the parent.
+    fn stock_import(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Output {
+        use reth_evm::execute::Executor as _;
+        config().executor(parent()).execute(block).expect("the stock import")
+    }
+
+    fn import(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Result<(Output, ImportStats), Refused> {
+        import_block(&config(), block, parent(), &|| Some(parent()), Dispatch::LargestFirst(4))
+    }
+
+    /// The QMDB root of an output's bundle over an empty tree: the state
+    /// root's function of the bundle, the parent being the same.
+    fn qmdb_root(out: &Output) -> B256 {
+        n42_qmdb_state::QmdbState::new()
+            .apply_block(5, &n42_qmdb_reth::changes_from_execution(&out.state, false))
+            .expect("the QMDB root")
+    }
+
+    fn receipts_root(out: &Output) -> B256 {
+        use alloy_consensus::TxReceipt as _;
+        alloy_consensus::proofs::calculate_receipt_root(&out.result.receipts.iter().map(|r| r.with_bloom_ref()).collect::<Vec<_>>())
+    }
+
+    fn assert_same_import(ours: &Output, stock: &Output) {
+        assert_same(ours, stock);
+        assert_eq!(receipts_root(ours), receipts_root(stock), "receipts root");
+        assert_eq!(qmdb_root(ours), qmdb_root(stock), "QMDB root");
+    }
+
+    /// A mixed block -- batched transfers (shared recipients, a created
+    /// recipient, a 0x50 sender), then a serial tail that spends what the
+    /// batches credited, sends from a batch sender again, pays the
+    /// beneficiary and calls a contract that writes storage, then the
+    /// withdrawals (one to a batch recipient) -- imported in parallel gives
+    /// the stock import's receipts, receipts root, bundle and QMDB root.
+    #[test]
+    fn the_parallel_import_of_a_mixed_block_equals_the_stock_import() {
+        // The tail opens with the contract call: the transfers after it are
+        // the tail's, not the batches'.
+        let mut tail = serial_part();
+        tail.rotate_right(1);
+        let txs: Vec<_> = batch_part().into_iter().chain([alt_transfer(0)]).chain(tail).collect();
+        let block = block_of(&txs);
+        let stock = stock_import(&block);
+        let parallel = imports_parallel();
+        let (ours, stats) = import(&block).expect("the parallel import");
+        // Process-wide, and the tests run beside each other.
+        assert!(imports_parallel() > parallel);
+        assert_eq!((stats.txs, stats.tail), (8, 5), "{stats:?}");
+        assert!(stats.batches >= 2, "{stats:?}");
+        assert_eq!(stats.cached, stats.accounts, "a tail follows: every batch account cached");
+        assert_same_import(&ours, &stock);
+        assert!(!ours.state.state[&addr(STORE)].storage.is_empty());
+        assert_eq!(ours.state.state[&addr(FRESH)].original_info, None);
+    }
+
+    /// Leading transfers that spend in-block credits: a recipient with a
+    /// parent balance of its own spends on the batches' view and the merge
+    /// adds the credit to the debit, as the stock import does; an account
+    /// the block creates has nothing on that view, so the batches skip its
+    /// spend and the block is left to the serial import.
+    #[test]
+    fn leading_transfers_that_spend_in_block_credits_import_or_refuse() {
+        let block = block_of(&[transfer(1, 0, addr(2), 100), transfer(2, 0, addr(9), 50), transfer(9, 0, addr(1), 7)]);
+        let (ours, stats) = import(&block).expect("the parallel import");
+        assert_eq!((stats.txs, stats.tail), (3, 0), "{stats:?}");
+        assert_same_import(&ours, &stock_import(&block));
+        let created = block_of(&[transfer(3, 0, addr(FRESH), 100_000_000_000_000_000), transfer(FRESH, 0, addr(11), 10)]);
+        assert!(matches!(import(&created), Err(Refused::NotParallel(NotParallel::Failed(1, _)))));
+    }
+
+    /// A block of transfers only caches just the withdrawal recipients
+    /// among the batch accounts (`keep_cache = false`) and still equals the
+    /// stock import.
+    #[test]
+    fn a_block_of_transfers_imports_with_only_the_withdrawal_recipients_cached() {
+        let txs: Vec<_> = batch_part().into_iter().chain([alt_transfer(0), alt_transfer(1)]).collect();
+        let block = block_of(&txs);
+        let stock = stock_import(&block);
+        let (ours, stats) = import(&block).expect("the parallel import");
+        assert_eq!((stats.txs, stats.tail), (9, 0), "{stats:?}");
+        assert_eq!(stats.cached, 2, "addr(7) and the created recipient, both withdrawal recipients");
+        assert!(stats.accounts > stats.cached);
+        assert_same_import(&ours, &stock);
+    }
+
+    /// The fallback: a fold refused at finish refuses the import, counted,
+    /// and the caller's serial import of the same block is the stock one;
+    /// a block that opens with a contract call is not the batches' at all.
+    #[test]
+    fn a_refused_import_leaves_the_block_to_the_serial_import() {
+        let block = block_of(&batch_part());
+        let stock = stock_import(&block);
+        let refused = imports_refused();
+        let folds = crate::graft_fold::refused_count();
+        crate::graft_fold::REFUSE_NEXT_FOLD.with(|next| next.set(true));
+        let err = import(&block).expect_err("the fold refused");
+        crate::graft_fold::REFUSE_NEXT_FOLD.with(|next| next.set(false));
+        assert!(matches!(err, Refused::Fold(_)), "{err:?}");
+        assert!(imports_refused() > refused);
+        assert!(crate::graft_fold::refused_count() > folds);
+        assert_same_import(&stock_import(&block), &stock);
+        let call_first: Vec<_> = serial_part().into_iter().rev().collect();
+        assert!(matches!(import(&block_of(&call_first)), Err(Refused::NotParallel(NotParallel::NotATransfer(0)))));
+        // A transfer to a contract runs code: skipped on the batches, so the
+        // block goes serial.
+        let to_contract = vec![transfer(1, 0, addr(2), 1), tx(4, 0, addr(STORE), 0, 100_000, Bytes::new())];
+        assert!(matches!(import(&block_of(&to_contract)), Err(Refused::NotParallel(NotParallel::Failed(1, _)))));
     }
 
     /// The cache half refuses, writing nothing, when the executor already

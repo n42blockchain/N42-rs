@@ -2738,7 +2738,7 @@ where
         // A sender, a recipient a transfer and the beneficiary, sized
         // once: growing from empty rehashed the map a dozen times a
         // batch.
-        let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
+        let mut state = crate::batch_state_legacy::BatchState::with_capacity(db, txs + txs / 4 + 1);
         let mut skipped = Vec::new();
         // The batch's count, gas and fees, kept as it executes.
         let mut counted = RunCounters { fees: tip_of.map(|_| U256::ZERO), ..Default::default() };
@@ -3188,7 +3188,7 @@ where
 {
     let count = members.iter().map(|group| group.len()).sum::<usize>();
     // A sender and a recipient a transfer at most, the beneficiary once.
-    let mut state = crate::batch_state::BatchState::with_capacity(db, 2 * count + 1);
+    let mut state = crate::batch_state_legacy::BatchState::with_capacity(db, 2 * count + 1);
     let mut gas = Vec::with_capacity(count);
     {
         let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());

@@ -777,7 +777,7 @@ fn every_path_with_withdrawals_to_conflicts_and_the_beneficiary_equals_the_direc
 /// same output either way, whatever order each bundle's map iterates in.
 #[test]
 fn the_batch_states_bundles_equal_the_states_through_the_index() {
-    use n42_engine_types::batch_state::BatchState;
+    use n42_engine_types::batch_state_legacy::BatchState;
     let db = parent();
     let (mut theirs, mut ours) = (Vec::new(), Vec::new());
     for b in 0..BATCHES {

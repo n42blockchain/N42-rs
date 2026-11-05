@@ -48,8 +48,10 @@ pub mod fast_transfer;
 pub mod frame_blocks;
 pub mod frame_scan;
 pub mod includability;
-#[cfg(feature = "legacy-revm-paths")]
 pub mod batch_state;
+/// The revm-era batch state the legacy parallel paths still use (F5c/F5d port them).
+#[cfg(feature = "legacy-revm-paths")]
+pub mod batch_state_legacy;
 pub mod parallel_common;
 #[cfg(feature = "legacy-revm-paths")]
 pub mod parallel_transfer;

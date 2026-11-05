@@ -76,7 +76,7 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
     /// [`Self::transfer`] with the three accounts' changes handed back as
     /// they were computed ([`PlainTransfer`]) rather than as revm's
     /// `EvmState`: the build's batches apply them to their
-    /// [`crate::batch_state::BatchState`] directly, without the map and the
+    /// [`crate::batch_state_legacy::BatchState`] directly, without the map and the
     /// three boxed original infos per transfer that the `EvmState` costs.
     pub(crate) fn transfer_plain(
         &mut self,

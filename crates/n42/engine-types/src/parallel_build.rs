@@ -148,6 +148,79 @@ fn timed_read<T>(read: impl FnOnce() -> T) -> T {
     out
 }
 
+/// One slot a candidate, written once by the batch that executed it, on
+/// that batch's thread (F5g9): the executed set comes out in candidate order
+/// without a gather and a sort of 200,000 results on one thread after the
+/// batches (5.5 ms on the bench, `evm2_exec_gather_us`).
+struct ScatterSlots<T> {
+    data: Box<[std::cell::UnsafeCell<std::mem::MaybeUninit<T>>]>,
+    filled: Box<[std::sync::atomic::AtomicBool]>,
+}
+
+// SAFETY: a slot is written by one thread only (`put` claims it through its
+// flag first), and read only after every writer is joined (`into_ordered`
+// and `drop` take `self` by value or `&mut`).
+unsafe impl<T: Send> Sync for ScatterSlots<T> {}
+
+impl<T> ScatterSlots<T> {
+    fn new(len: usize) -> Self {
+        Self {
+            data: (0..len).map(|_| std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit())).collect(),
+            filled: (0..len).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+        }
+    }
+
+    /// Writes `value` into slot `i`; a slot already written (never, with
+    /// candidates in one batch each) keeps its value and `value` is dropped.
+    fn put(&self, i: usize, value: T) {
+        if self.filled[i].swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        // SAFETY: the flag's swap made this thread the slot's only writer,
+        // and no reader runs before the writers are joined.
+        unsafe { (*self.data[i].get()).write(value) };
+    }
+
+    /// The written slots' values in slot order. Every slot written (a run
+    /// with nothing skipped): the slots become the vector in place, no copy.
+    fn into_ordered(mut self) -> Vec<T> {
+        if self.filled.iter_mut().all(|f| *f.get_mut()) {
+            let data = std::mem::take(&mut self.data);
+            for f in self.filled.iter_mut() {
+                *f.get_mut() = false;
+            }
+            let len = data.len();
+            let raw = Box::into_raw(data) as *mut T;
+            // SAFETY: `UnsafeCell<MaybeUninit<T>>` has `T`'s layout (both are
+            // `repr(transparent)`), every element is initialised (its flag
+            // was set), and the flags are cleared so `drop` reads nothing;
+            // the allocation came from a `Box<[_]>` of `len` elements.
+            return unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(raw, len)) }.into_vec();
+        }
+        let mut out = Vec::with_capacity(self.data.len());
+        for i in 0..self.data.len() {
+            if std::mem::replace(self.filled[i].get_mut(), false) {
+                // SAFETY: the slot was written (its flag was set) and its
+                // flag is cleared here, so it is read once and not dropped
+                // again.
+                out.push(unsafe { self.data[i].get_mut().assume_init_read() });
+            }
+        }
+        out
+    }
+}
+
+impl<T> Drop for ScatterSlots<T> {
+    fn drop(&mut self) {
+        for i in 0..self.data.len().min(self.filled.len()) {
+            if *self.filled[i].get_mut() {
+                // SAFETY: the slot was written and not read out.
+                unsafe { self.data[i].get_mut().assume_init_drop() };
+            }
+        }
+    }
+}
+
 /// Logs once which pool the evm2 batches run on, its threads and the CPUs
 /// its threads may run on (F5g9).
 fn log_pool_once(pool: &rayon::ThreadPool) {
@@ -443,14 +516,12 @@ where
         Dispatch::Halves => batch_groups(&groups, keys.len(), workers),
     };
     let order = largest_first(&batches.iter().map(|b| b.iter().map(|g| g.len()).sum()).collect::<Vec<usize>>());
-    type BatchOut<C> = Result<
-        (Vec<Executed<C>>, Vec<usize>, reth_trie::bundle_state::BundleState, crate::parallel_common::BatchSpan, BatchInside),
-        Refused,
-    >;
+    type BatchOut = Result<(Vec<usize>, reth_trie::bundle_state::BundleState, crate::parallel_common::BatchSpan, BatchInside), Refused>;
+    let executed_slots: ScatterSlots<Executed<C>> = ScatterSlots::new(keys.len());
     let batches_at = std::time::Instant::now();
     let before_us = before_at.elapsed().as_micros() as u64;
     let split_off: Vec<Address> = std::iter::once(beneficiary).chain(kept.iter().copied().filter(|a| *a != beneficiary)).collect();
-    let run_batch = |members: &Vec<&Vec<usize>>| -> BatchOut<C> {
+    let run_batch = |members: &Vec<&Vec<usize>>| -> BatchOut {
         let start_us = batches_at.elapsed().as_micros() as u64;
         let mark = crate::parallel_common::ThreadMark::now();
         let open_at = std::time::Instant::now();
@@ -464,7 +535,7 @@ where
         let mut evm = crate::fast_handler::as_batch(|| config.evm_with_env(db, env.clone()));
         let txs = members.iter().map(|g| g.len()).sum::<usize>();
         let mut state = BatchState::with_capacity(txs * 2 + 1);
-        let (mut executed, mut skipped) = (Vec::with_capacity(txs), Vec::new());
+        let mut skipped = Vec::new();
         let mut ledger = crate::includability::RunLedger::new();
         for group in members {
             // A sender's transfers in nonce order; once one is refused the
@@ -477,7 +548,7 @@ where
                     continue;
                 }
                 let tx = convert(i);
-                let sample = seen % INSIDE_STRIDE == 0;
+                let sample = seen.is_multiple_of(INSIDE_STRIDE);
                 seen += 1;
                 let transact_at = sample.then(|| {
                     READ_TIMING.with(|cell| cell.set((true, 0, 0)));
@@ -523,7 +594,7 @@ where
                         if let Some(at) = commit_at {
                             inside.commit_us += at.elapsed().as_nanos() as u64;
                         }
-                        executed.push(Executed { index: i, result: out.result });
+                        executed_slots.put(i, Executed { index: i, result: out.result });
                     }
                     Err(_) => {
                         broken = true;
@@ -534,7 +605,7 @@ where
         }
         // The sampled parts scaled to the batch's count, in microseconds
         // (accumulated in nanoseconds).
-        let scale = |ns: u64| if sampled_txs == 0 { 0 } else { ns.saturating_mul(seen as u64) / sampled_txs / 1000 };
+        let scale = |ns: u64| ns.saturating_mul(seen as u64).checked_div(sampled_txs).unwrap_or(0) / 1000;
         inside.transact_us = scale(inside.transact_us);
         inside.reads_us = scale(inside.reads_us);
         inside.commit_us = scale(inside.commit_us);
@@ -551,9 +622,9 @@ where
             None => bundle,
         };
         let span = crate::parallel_common::BatchSpan::close(start_us, mark, seen, batches_at).with_open_us(open_us);
-        Ok((executed, skipped, own, span, inside))
+        Ok((skipped, own, span, inside))
     };
-    let slots: Vec<std::sync::OnceLock<BatchOut<C>>> = (0..batches.len()).map(|_| std::sync::OnceLock::new()).collect();
+    let slots: Vec<std::sync::OnceLock<BatchOut>> = (0..batches.len()).map(|_| std::sync::OnceLock::new()).collect();
     pool.scope(|scope| {
         for &b in &order {
             let (members, slot, run_batch) = (&batches[b], &slots[b], &run_batch);
@@ -564,12 +635,11 @@ where
     });
     let total_us = batches_at.elapsed().as_micros() as u64;
     let gather_at = std::time::Instant::now();
-    let (mut executed, mut skipped, mut bundles) = (Vec::with_capacity(keys.len()), Vec::new(), Vec::with_capacity(batches.len()));
+    let (mut skipped, mut bundles) = (Vec::new(), Vec::with_capacity(batches.len()));
     let mut spans = Vec::with_capacity(batches.len());
     let mut inside = BatchInside::default();
     for slot in slots {
-        let (e, s, bundle, span, part) = slot.into_inner().unwrap_or(Err(Refused::NotParallel(NotParallel::NoState)))?;
-        executed.extend(e);
+        let (s, bundle, span, part) = slot.into_inner().unwrap_or(Err(Refused::NotParallel(NotParallel::NoState)))?;
         skipped.extend(s);
         bundles.push(bundle);
         spans.push(span);
@@ -581,7 +651,7 @@ where
     }
     let spans = crate::parallel_common::BatchSpans::of(&mut spans, total_us);
     inside.before_us = before_us;
-    executed.sort_unstable_by_key(|e| e.index);
+    let executed = executed_slots.into_ordered();
     skipped.sort_unstable();
     inside.gather_us = gather_at.elapsed().as_micros() as u64;
     let merge_at = std::time::Instant::now();
@@ -1074,6 +1144,33 @@ mod tests {
         let reference = sequential(&batch);
         let (ours, _) = parallel(&batch, &[]);
         assert_same(&ours, &reference);
+    }
+
+    /// The batches' slots (F5g9): every slot written comes back in slot
+    /// order in place; with holes (skipped candidates) the written ones in
+    /// order; values neither read out nor kept are dropped exactly once.
+    #[test]
+    fn the_scatter_slots_give_the_executed_set_in_candidate_order() {
+        let live = std::sync::Arc::new(());
+        let slots = ScatterSlots::new(5);
+        for i in [3usize, 0, 4, 1, 2] {
+            slots.put(i, (i, std::sync::Arc::clone(&live)));
+        }
+        let all = slots.into_ordered();
+        assert_eq!(all.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+        drop(all);
+        let slots = ScatterSlots::new(5);
+        for i in [4usize, 1] {
+            slots.put(i, (i, std::sync::Arc::clone(&live)));
+        }
+        slots.put(1, (9, std::sync::Arc::clone(&live)));
+        let some = slots.into_ordered();
+        assert_eq!(some.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 4]);
+        drop(some);
+        let slots = ScatterSlots::new(3);
+        slots.put(2, (2, std::sync::Arc::clone(&live)));
+        drop(slots);
+        assert_eq!(std::sync::Arc::strong_count(&live), 1, "every value dropped once");
     }
 
     /// The late receipts (F5g7, `N42_EVM2_RECEIPTS_LATE`): the batches'

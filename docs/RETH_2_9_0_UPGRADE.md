@@ -422,6 +422,68 @@ enough. evm2 has no interpreter-free transfer path of its own.
 - Is the follower's `keep_cache = false` still worth keeping, given that the cache half is cheap?
   To be measured.
 
+### F5b, the shared layer (2026-11-05)
+
+- **`parallel_common.rs`** was already EVM-free and built on the stock build since F3: nothing to
+  port. Its knobs stay in `legacy_paths::KNOBS` until the paths that read them work (F5c/F5d).
+- **`batch_state.rs`: rewritten (b7af797c8).** On evm2, an `Evm` owns and caches its database,
+  so the batch state is no longer the batch's database. It is only the accumulator.
+  - `BatchState::commit(&PendingState)` folds each finalised transaction's `account_changes()`
+    into `TransitionAccount`s by the rule of `BlockState::commit_account_changes`, and
+    `take_bundle` is `apply_transitions_and_create_reverts(Reverts)`. So its bundle is the stock
+    accumulator's by construction.
+  - It refuses (`Unsupported`): storage, a storage wipe, new code, creation, selfdestruct, and an
+    account left absent or empty.
+  - The revm-era file is kept as `batch_state_legacy.rs` under `legacy-revm-paths` for the legacy
+    parallel paths until F5c/F5d port them.
+  - Dropped and not yet replaced:
+    - `commit_transfer(PlainTransfer)`: the evm2 fast handler (F5f) applies its changes through
+      the state, so they arrive in the same stream.
+    - The in-place `take_bundle` optimisation (loop283): a baseline first.
+    - `hint_account` / `prefetch_account` (`N42_BUILD_MLP`): F5e, with the read layers.
+  - Tests (4): its bundle equals reth's `BlockState::into_bundle()` field for field on transfers
+    with repeated senders, a recipient that later sends, a recipient that did not exist, the
+    beneficiary, and a legacy transfer. A storage write and a creation are refused.
+- **`graft_fold.rs`: new (b387237b7), the graft's bundle half from the F5 design.**
+  - `merge_batches` merges the batch bundles. Credits from different batches are added together;
+    at most one batch may debit an account (the `TwoDebits` refusal). It refuses storage, code
+    (in the info or in contracts), destroyed or absent accounts, and different originals.
+  - `MergedBatches::accounts()` is what the cache half writes into the executor's overlay.
+  - `fold_into` checks first and changes nothing on a refusal. The refusals are serial storage on
+    a batch account, and `Stale`: the serial original differs from the batches' final info. That
+    is the real check that the cache half held the account; it covers the beneficiary and every
+    withdrawal recipient.
+  - Then the fold: the final info is the serial one when the serial part touched the account,
+    otherwise the batches'. The original is the batches'. The status and the revert are recomputed
+    from (batch original, final) through a `TransitionAccount`. Batch reverts go into the block's
+    revert set (`append_reverts`, sorted by address, the serial revert to the post-batch value
+    dropped), as `graft_bundles_direct` placed them.
+  - A refusal logs one warn line (target `n42::graft`), counts (`refused_count()`) and returns
+    `FoldRefused`.
+  - Tests (5):
+    - two batches sharing a recipient and the beneficiary, plus a serial tail spending from that
+      recipient, a batch sender and a batch-created account, run over the cache half: the fold
+      equals the sequential execution, and `revert_latest` on the folded bundle gives back the
+      parent;
+    - a serial `Changed` over a batch-created account folds to `InMemoryChange` with a `DeleteIt`
+      revert;
+    - a serial change back to the parent value: see below;
+    - a stale account (a withdrawal recipient the cache half missed) is refused, the bundle is
+      unchanged and the counter goes up;
+    - the merge's refusals (storage, two debits, different originals) and the merging of a debit
+      with a credit.
+- **One point differs from the brief: a change back to the parent's value.** reth's accumulator
+  treats an account that a block changed and changed back as unchanged:
+  `update_and_create_revert` returns no revert for it (`AccountRevert::is_empty`), and
+  `apply_transitions_and_create_reverts` then leaves it out of the bundle. The stock sequential
+  execution does the same, so the fold drops such an account and the serial part's revert along
+  with it, rather than keep it as `Changed`. The test pins this. Changing only the balance back
+  while the nonce moved is still a change.
+
+Gate: `ci/f5-b-gate.log`. `cargo check --workspace --keep-going --tests` is clean. n42-engine-types
+(263 including the 9 new tests), n42-qmdb-reth, n42-qmdb-state and n42-testing: 464 passed,
+0 failed.
+
 ### Notes for the history
 
 - Commit c117217eb (`fix(storage-overlay): ...`) also carries the ef-tests runner port: the two

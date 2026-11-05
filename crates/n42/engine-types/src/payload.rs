@@ -2222,6 +2222,13 @@ where
     let mut tx_root_wait_ms = 0u64;
     // The lookahead and the puller given back before the ahead seal, ms.
     let mut give_back_ms = 0u64;
+    // Of it on the evm2 step (F5g item 5): the lookahead's return to the
+    // puller and the puller's stop and join (its walk's own give-back), us;
+    // and whether the puller was stopped at the pull's end
+    // (`N42_PULLER_STOP_AT_PULL`), its wind-down then beside the batches.
+    let mut seal_lookahead_us = 0u64;
+    let mut seal_puller_join_us = 0u64;
+    let mut puller_stopped_at_pull = false;
     // The leader's seal chain between its named terms (step 7a): the prep's
     // end to the batches' start (the prefetch's scope, the shards and the
     // threads set up, the partition, the deferred state's open, the slots),
@@ -2528,6 +2535,32 @@ where
             }
         }
         par_pull_ms = par_at.elapsed().as_millis() as u64;
+        // `N42_PULLER_STOP_AT_PULL` (default on, F5g item 5): a full pull
+        // on a block that can seal at the execution's end gives the
+        // lookahead back and stops the puller now, so its walk's own
+        // give-back runs beside the batches. Both still complete before the
+        // seal (its join stays in front of it, loop232/233); only the wait
+        // leaves the seal's path. A block that then does not seal builds on
+        // without them (a slightly emptier block, never a lost transaction).
+        if puller_stop_at_pull()
+            && !par_drained
+            && seal_at_exec()
+            && seal_early_possible
+            && block_blob_count == 0
+            && early_seal.is_some()
+            && let Some(puller) = pulled.as_mut()
+        {
+            let at = std::time::Instant::now();
+            for pool_tx in std::mem::take(&mut lookahead).into_iter().rev() {
+                puller.refuse(Refusal::Invalid(
+                    Arc::clone(&pool_tx),
+                    InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
+                ));
+            }
+            puller.stop();
+            seal_lookahead_us = at.elapsed().as_micros() as u64;
+            puller_stopped_at_pull = true;
+        }
         open_deferred_state!()?;
         let beneficiary = group_env.block.beneficiary;
         // `N42_PLAN_AHEAD_BODY=1`: the keys and the partition made with the
@@ -2700,14 +2733,19 @@ where
                         // What the puller took ahead and this block did not
                         // build goes back to the queue before the proposal,
                         // as on the revm-era step: the chained build pulls at
-                        // the seal.
+                        // the seal. Timed apart: the lookahead's return, then
+                        // the puller's join (its walk's give-back).
+                        let lookahead_at = std::time::Instant::now();
                         for pool_tx in std::mem::take(&mut lookahead).into_iter().rev() {
                             refuse!(
                                 &pool_tx,
                                 InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
                             );
                         }
+                        seal_lookahead_us += lookahead_at.elapsed().as_micros() as u64;
+                        let join_at = std::time::Instant::now();
                         drop(pulled.take());
+                        seal_puller_join_us = join_at.elapsed().as_micros() as u64;
                         give_back_ms = seal_at.elapsed().as_millis() as u64;
                         let sealed = seal_block!(hook, seal_at, None);
                         sealed_ahead_id = Some((sealed.2, sealed.3));
@@ -5077,6 +5115,9 @@ where
                     pulled_drop_us,
                     giveback_us,
                     puller_drop_us,
+                    seal_lookahead_us,
+                    seal_puller_join_us,
+                    puller_stopped_at_pull,
                     par_hook_us,
                     state_pre_changes_us,
                     sealed_ms,
@@ -6564,6 +6605,18 @@ struct Puller<T: reth_transaction_pool::PoolTransaction> {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// The puller's batches: after [`Puller::stop`] every receive fails, as
+/// when the walk has ended.
+struct PulledBatches<'a, T: reth_transaction_pool::PoolTransaction>(
+    Option<&'a std::sync::mpsc::Receiver<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>>,
+);
+
+impl<T: reth_transaction_pool::PoolTransaction> PulledBatches<'_, T> {
+    fn recv(&self) -> Result<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<T>>>, std::sync::mpsc::RecvError> {
+        self.0.ok_or(std::sync::mpsc::RecvError)?.recv()
+    }
+}
+
 impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
     fn start(
         mut best: Box<dyn BestTransactions<Item = Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>,
@@ -6609,8 +6662,16 @@ impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
         Self { batches: Some(batches), refusals, done, thread }
     }
 
-    fn batches(&self) -> &std::sync::mpsc::Receiver<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<T>>>> {
-        self.batches.as_ref().expect("the puller's receiver is taken only on drop")
+    fn batches(&self) -> PulledBatches<'_, T> {
+        PulledBatches(self.batches.as_ref())
+    }
+
+    /// Ends the walk without waiting for it: the thread applies the
+    /// refusals sent so far and gives back what it holds as it ends. The
+    /// drop still joins it.
+    fn stop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(self.batches.take());
     }
 
     fn refuse(&self, refusal: Refusal<T>) {
@@ -6630,6 +6691,13 @@ impl<T: reth_transaction_pool::PoolTransaction> Drop for Puller<T> {
             let _ = thread.join();
         }
     }
+}
+
+/// `N42_PULLER_STOP_AT_PULL` (default on; `0` keeps the stop at the seal):
+/// see the evm2 parallel step.
+fn puller_stop_at_pull() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| n42_env::flag("N42_PULLER_STOP_AT_PULL", true))
 }
 
 fn builder_prefetch() -> usize {

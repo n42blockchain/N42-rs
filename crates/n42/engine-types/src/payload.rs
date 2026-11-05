@@ -1709,7 +1709,7 @@ where
         assembler = assembler.with_qmdb_root(crate::assembler::QmdbRootJob {
             state: state.clone(),
             parent: parent_header.hash(),
-            prague: chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
+            prague: n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp),
             out: qmdb_root.clone(),
         });
     }
@@ -3469,7 +3469,7 @@ where
                     // root job adds the residual's to them.
                     if root_ops_ahead() && sealing_early && let Some(shards) = output_shards.as_ref() {
                         let shards = Arc::clone(shards);
-                        let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+                        let prague = n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp);
                         let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
                             n42_core_layout::enter(n42_core_layout::Set::Critical);
                             let empty = reth_trie::bundle_state::BundleState::default();
@@ -3917,7 +3917,7 @@ where
                 let frozen = Arc::new(frozen);
                 if root_ops_ahead() {
                     let shards = Arc::clone(&frozen);
-                    let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+                    let prague = n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp);
                     let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
                         n42_core_layout::enter(n42_core_layout::Set::Critical);
                         let empty = reth_trie::bundle_state::BundleState::default();
@@ -3997,7 +3997,7 @@ where
             // `N42_FIELDS_AT_SEAL=verify`: what the fields were published
             // from, compared behind `Complete` with the late derivation.
             let mut early_inputs;
-            let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+            let prague = n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp);
             // `N42_OUTPUT_SHARDS`: the executor's bundle holds only what it
             // changed after the batches. The next build is let go on it laid
             // over the shards; the QMDB root and the hashed post-state read
@@ -5578,7 +5578,7 @@ where
                         parent_header.hash(),
                         &changes_from_execution(
                             &outcome.execution_state,
-                            chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
+                            n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp),
                         ),
                     )
                     .map_err(PayloadBuilderError::other)?,

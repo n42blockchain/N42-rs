@@ -255,6 +255,24 @@ where
     Ok(gas)
 }
 
+/// The receipts of `executed` (each transfer's result with its type) in
+/// block order, with their cumulative gas from zero, and the block's gas:
+/// what [`commit_run`] has the executor build one by one when nothing was
+/// committed before (`N42ReceiptBuilder`), built off the executor (F5g7,
+/// `N42_EVM2_RECEIPTS_LATE`).
+pub fn late_receipts<X>(
+    executed: impl IntoIterator<Item = (evm2::TxResultExt<X>, n42_tx_types::N42TxType)>,
+) -> (Vec<n42_tx_types::Receipt>, u64) {
+    let executed = executed.into_iter();
+    let mut receipts = Vec::with_capacity(executed.size_hint().0);
+    let mut cumulative = 0u64;
+    for (result, tx_type) in executed {
+        cumulative += result.tx_gas_used();
+        receipts.push(n42_tx_types::Receipt { tx_type, success: result.status, cumulative_gas_used: cumulative, logs: result.logs });
+    }
+    (receipts, cumulative)
+}
+
 /// Runs the candidates' transfers in batches on the build pool, each batch on
 /// an EVM from `config` with `env` over a database `open` returns (a view of
 /// the block's parent). `keys` are the candidates' (sender, recipient);
@@ -907,6 +925,33 @@ mod tests {
         assert_same(&ours, &reference);
     }
 
+    /// The late receipts (F5g7, `N42_EVM2_RECEIPTS_LATE`): the batches'
+    /// merge handed to an executor that commits no receipt, its finish the
+    /// block's end alone, and the receipts built off it, give the receipts,
+    /// gas, requests and bundle of the sequential execution.
+    #[test]
+    fn the_late_receipts_equal_the_committed_ones() {
+        use alloy_consensus::Typed2718 as _;
+        let batch = batch_part();
+        let reference = sequential(&batch);
+        let run = run_batches(&batch, None).expect("the batches run");
+        assert!(run.skipped.is_empty(), "skipped {:?}", run.skipped);
+        let c = config();
+        let w = withdrawals();
+        let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(parent(), env()), ctx(&w));
+        commit_run(&mut ex, std::iter::empty(), run.merged, CacheScope::All).expect("the cache half");
+        let mut out = ex.finish().expect("the block finishes with the fold");
+        assert!(out.result.receipts.is_empty());
+        let (receipts, gas) = late_receipts(run.executed.into_iter().map(|e| {
+            let tx_type = n42_tx_types::N42TxType::try_from(batch[e.index].ty()).expect("a type");
+            (e.result, tx_type)
+        }));
+        out.result.receipts = receipts;
+        out.result.gas_used = gas;
+        assert_same(&out, &reference);
+        assert_eq!(out.result.requests, reference.result.requests, "requests");
+    }
+
     /// A transfer the EVM refuses (a nonce ahead of the sender's) is
     /// skipped with its sender's later ones; the rest execute.
     #[test]
@@ -1164,6 +1209,7 @@ mod tests {
         let (mut exec, mut root, mut fold_all, mut fold_only, mut finish) = (vec![], vec![], vec![], vec![], vec![]);
         let (mut shard_exec, mut freeze, mut shard_commit, mut shard_finish) = (vec![], vec![], vec![], vec![]);
         let (mut body_serial, mut body_pool) = (vec![], vec![]);
+        let (mut late_finish, mut late_build) = (vec![], vec![]);
         for round in 0..rounds {
             let mut reference: Option<BundleState> = None;
             let mut txs = Vec::with_capacity((senders * per_sender) as usize);
@@ -1267,6 +1313,38 @@ mod tests {
             let out = ex.finish().expect("the sharded finish");
             shard_finish.push(at.elapsed().as_micros());
             assert_eq!(out.result.receipts.len(), txs.len());
+            // The late receipts (F5g7): the same run, its receipts built off
+            // the executor, which commits none and finishes with the block's
+            // end alone. Receipts, gas and bundle must be the committed ones.
+            {
+                let shards2 = crate::output_shards::OutputShards::new(addr(BENEFICIARY), keys.len(), shard_count);
+                let sink2 = |bundle: BundleState| shards2.add(bundle);
+                let recipients2: Vec<Address> = w.iter().map(|w| w.address).collect();
+                let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink2), &recipients2)
+                    .expect("the late-receipts run");
+                let frozen2 = shards2.freeze();
+                let ParallelRun { executed, merged, .. } = run;
+                let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(base.clone(), env.clone()), timing_ctx(&w));
+                ex.apply_pre_execution_changes().expect("pre");
+                let types: Vec<_> = executed.iter().map(|e| <N42TxEnvelope as alloy_consensus::TransactionEnvelope>::tx_type(&signed[e.index])).collect();
+                let at = Instant::now();
+                commit_run(&mut ex, std::iter::empty(), merged, CacheScope::Only(&only)).expect("the late commit");
+                let late_out = ex.finish().expect("the late finish");
+                late_finish.push(at.elapsed().as_micros());
+                let at = Instant::now();
+                let (receipts, gas) = late_receipts(executed.into_iter().zip(types).map(|(e, t)| (e.result, t)));
+                late_build.push(at.elapsed().as_micros());
+                assert_eq!(receipts, out.result.receipts, "the late receipts");
+                assert_eq!(gas, out.result.gas_used, "the late gas");
+                assert_eq!(late_out.result.requests, out.result.requests, "the requests");
+                let late_whole = frozen2.merged(&late_out.state);
+                let whole = frozen.merged(&out.state);
+                assert_eq!(late_whole.state.len(), whole.state.len(), "the late accounts");
+                for (address, account) in &whole.state {
+                    let got = late_whole.state.get(address).expect("the account under the late residual");
+                    assert_eq!((&got.info, &got.status), (&account.info, &account.status), "{address}");
+                }
+            }
             // The shards under the residual are the bundle the fold leaves.
             let whole = frozen.merged(&out.state);
             let reference = reference.take().expect("the fold path's bundle");
@@ -1311,6 +1389,11 @@ mod tests {
             median(freeze) as f64 / 1000.0,
             median(shard_commit) as f64 / 1000.0,
             median(shard_finish) as f64 / 1000.0,
+        );
+        eprintln!(
+            "evm2_step_bound late receipts medians: commit_and_finish_ms={:.1} receipts_ms={:.1}",
+            median(late_finish) as f64 / 1000.0,
+            median(late_build) as f64 / 1000.0,
         );
         eprintln!(
             "evm2_step_bound seal body medians: serial_ms={:.1} build_pool_ms={:.1}",

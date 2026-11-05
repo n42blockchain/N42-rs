@@ -298,7 +298,7 @@ where
         NextBlockEnvCtx = NextBlockEnvAttributes,
         BlockAssembler = crate::assembler::N42HeaderAssembler<Client::ChainSpec>,
         BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
-    >,
+    > + 'static,
     Client: StateProviderFactory
         + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec>
         + Clone,
@@ -1586,7 +1586,7 @@ where
         NextBlockEnvCtx = NextBlockEnvAttributes,
         BlockAssembler = crate::assembler::N42HeaderAssembler<Client::ChainSpec>,
         BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
-    >,
+    > + 'static,
     Client: StateProviderFactory
         + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
@@ -2661,7 +2661,7 @@ where
                     warn!(target: "n42::parallel_build", number = header.number, %err, "the parallel step refused; the block is built serially");
                 }
                 Ok(run) => {
-                    let crate::parallel_build::ParallelRun { executed, skipped, merged, batches, groups, split } = run;
+                    let crate::parallel_build::ParallelRun { mut executed, skipped, merged, batches, groups, split } = run;
                     let indices: Vec<usize> = executed.iter().map(|e| e.index).collect();
                     let mut fees = U256::ZERO;
                     let mut gas = 0u64;
@@ -2839,13 +2839,63 @@ where
                     } else {
                         crate::parallel_build::CacheScope::All
                     };
-                    let results = executed.into_iter().map(|e| {
-                        let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&cands[e.index]));
-                        (e.result, tx_type)
-                    });
+                    // `N42_EVM2_RECEIPTS_LATE` (default on, F5g7): on a block
+                    // sealed here whose output stays in its shards, the
+                    // receipts are built on a thread of their own and joined
+                    // where they are first read (the receipts root, beside the
+                    // QMDB root), as `N42_SHARDS_BEFORE_RECEIPTS` does on the
+                    // revm-era step. The executor commits none of them, so its
+                    // finish is the block's end alone (the withdrawals and the
+                    // post-block system calls) and the shards are filed at
+                    // about seal + 2 ms, not behind 200,000 commits (E12:
+                    // seal_to_shards_ready 15-22 ms, the child's state_wait
+                    // 11-14 ms). The finish reads no receipt it would miss: a
+                    // transfer has no logs, so the deposit requests parsed from
+                    // them are empty either way. Only when nothing was
+                    // committed before the step, so the step's receipts are
+                    // the block's.
+                    let receipts_late_here = sealed_here
+                        && refused.is_none()
+                        && (frozen.is_some() || pending_freeze.is_some())
+                        && builder.executor.receipts.is_empty()
+                        && evm2_receipts_late();
+                    // The skipped candidates, taken before the late receipts'
+                    // thread takes the candidates with it.
+                    let mut skipped_txs: Option<Vec<_>> = Some(skipped.iter().map(|&i| Arc::clone(&cands[i])).collect());
                     let committed = match refused {
                         Some(err) => Err(err),
-                        None => crate::parallel_build::commit_run(&mut builder.executor, results, merged, scope),
+                        None if receipts_late_here => {
+                            let executed = std::mem::take(&mut executed);
+                            let late_cands = std::mem::take(&mut cands);
+                            let spawned = std::thread::Builder::new().name("n42-receipts-late".into()).spawn(move || {
+                                let receipts = crate::parallel_build::late_receipts(executed.into_iter().map(|e| {
+                                    let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(
+                                        pooled_consensus(&late_cands[e.index]),
+                                    );
+                                    (e.result, tx_type)
+                                }));
+                                crate::parallel_transfer::behind_pool().spawn(move || drop(late_cands));
+                                receipts
+                            });
+                            match spawned {
+                                Ok(handle) => {
+                                    receipts_pending = Some(handle);
+                                    crate::parallel_build::commit_run(&mut builder.executor, std::iter::empty(), merged, scope)
+                                        .map(|_| gas)
+                                }
+                                Err(error) => Err(crate::parallel_build::Refused::Commit(format!(
+                                    "no thread for the late receipts: {error}"
+                                ))),
+                            }
+                        }
+                        None => {
+                            let results = std::mem::take(&mut executed).into_iter().map(|e| {
+                                let tx_type =
+                                    <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&cands[e.index]));
+                                (e.result, tx_type)
+                            });
+                            crate::parallel_build::commit_run(&mut builder.executor, results, merged, scope)
+                        }
                     };
                     match committed {
                         Ok(committed_gas) => {
@@ -2871,9 +2921,7 @@ where
                             par_groups = groups.len();
                             par_batches = batches;
                             par_skipped = skipped.len();
-                            for i in skipped {
-                                deferred.push(Arc::clone(&cands[i]));
-                            }
+                            deferred.extend(skipped_txs.take().unwrap_or_default());
                             line = (indices.len(), par_skipped, batches, None);
                             // Freed behind the build (`N42_FREEZE_POOL=own`: on
                             // its own pool) rather than on the builder's thread.
@@ -6702,6 +6750,15 @@ impl<T: reth_transaction_pool::PoolTransaction> Drop for Puller<T> {
 fn puller_stop_at_pull() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_PULLER_STOP_AT_PULL", true))
+}
+
+/// `N42_EVM2_RECEIPTS_LATE` (default on; `0` commits the receipts before the
+/// finish, as before F5g7): the evm2 step's receipts on a block sealed at the
+/// execution's end with its output in shards are built behind the seal on a
+/// thread of their own. Read once.
+fn evm2_receipts_late() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| n42_env::flag("N42_EVM2_RECEIPTS_LATE", true))
 }
 
 fn builder_prefetch() -> usize {

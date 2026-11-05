@@ -751,6 +751,77 @@ Each row has the matching note in `docs/KNOBS.md`. The ported, subsumed and reti
 `KNOBS`, so a node started with X22 on evm2 logs no "not available on evm2" line for them.
 The legacy-until-A/B ones X22 does not set.
 
+Devnet round f5e-x22 (`ci/f5d-gate.log`, `devnet/f5e-x22`, binaries of e91c15be9): every launch
+with `N42_PROFILE=x22` on the F5c/F5d load, second EL, payload channel.
+
+- Both ELs and all four validators logged "N42_PROFILE=x22 set 100 knob(s)"; the 13 frameBlocks
+  knobs (`N42_PLAN_AHEAD`, `N42_PLAN_AHEAD_WAIT_MS`, `N42_FRAME_*` ...) were withdrawn, because the
+  devnet genesis has no frameBlocks, so PLAN_AHEAD is not exercised on the devnet.
+- Hashes equal 28/28 on both ELs; parallel imports 39 (main EL, all 2 batches) and 12 (late EL,
+  all `planned=true`); builder parallel steps 36; refused 0, fold refusals 0, serial rebuilds 0,
+  EL ERROR 0; no "not available on evm2" line in any log.
+- **Only 28 blocks in 300 s, 58 view timeouts per validator** (blocks of two leaders out of four time
+  out: the proposal goes out with its body elided and `peers=0`, the others wait in "import-gated
+  vote: waiting for execution validation" until the view ends). The control is the same round on
+  main's v2.8.1 binaries that carry the profile (`wt-docs` native build of 2026-11-04, copied to
+  `/data/n42-build/f5e-control`), round f5e-x22-main2: **28 blocks, 58 timeouts per validator,
+  28/28 hashes**, the same picture. So it is the X22 profile on the devnet's shape (three validators
+  on one EL, a genesis without frameBlocks or deferred execution), not evm2. The without-profile
+  rounds read 98 blocks and 4 timeouts. (A first control, f5e-x22-main, used the 2026-10-24
+  binaries, which predate `N42_PROFILE` and ran the stock configuration: void.)
+
+### F5f, the fast transfer as an evm2 registry handler (2026-11-05)
+
+`crates/n42/engine-types/src/fast_handler.rs`, as designed in F5a.
+
+- **What it is.** `fast_handler::registry` re-registers transaction types 0, 1 and 2 on the
+  stock registry (0x50 executes as type 2). Each prepare closure records the transaction's shape,
+  then calls the stock prepare, so validation (nonce, intrinsic gas, fee, balance for the fee) is
+  the stock handler's. Each execute closure tries `transfer` and falls back to the stock
+  `execute_prepared`.
+- **What it takes.** A call with empty input and an empty access list, on Prague or Osaka, no
+  inspector, recipient not the caller, not the beneficiary (nor the caller the beneficiary), not
+  a precompile, codeless, not an empty account receiving zero value, and a caller balance that
+  covers the value after the fee. It moves the value with `State::transfer`, builds the Stop result
+  with the stock gas tracker, and settles through `settle_initial_frame_gas` and the stock
+  `settle_transaction` hooks, so refunds, the EIP-7623 floor and the fee split are the stock ones.
+- **Amsterdam is refused.** `covers(spec)` is Prague and Osaka only; on Amsterdam the handler hands
+  every transaction to the stock one (F6 leftover below).
+- **Equivalence tests**, transaction by transaction against the stock handler (result `Debug` and
+  the sorted account changes), on Prague and Osaka:
+  - taken: 1559 to an existing account, 1559 creating the recipient, gas limit over the intrinsic,
+    legacy, 2930 with an empty access list, 0x50, zero value to an existing account;
+  - handed over (equal and not counted as hits): zero value to an empty account, a contract, a
+    precompile, self, the beneficiary, with input, 2930 with an access list, value lacking after
+    the fee, nonce ahead, gas limit under the intrinsic.
+- **Where it runs.** The parallel build and import batches' EVMs carry it unconditionally, as the
+  revm-era batches did (`fast_handler::as_batch` in `parallel_build::run_batch`);
+  `N42_BATCH_FAST_TRANSFER=0` turns it off for the stock-handler data point. `N42_FAST_TRANSFER=1`
+  puts it on every EVM the node makes (`TxRegistrySource::n42_tx_registry` on `RethEvmFactory`),
+  and leaves `legacy_paths::KNOBS`. The per-build and per-import lines carry
+  `fast_hits_total` / `fast_delegated_total`.
+
+Gate (`ci/f5-f-gate.log`): workspace check rc 0, clippy (engine-types, n42) rc 0, tests 427 passed
+and 1 failed: the qmdb-reth timing test
+`a_rename_while_the_tree_is_leased_is_followed_and_tree_readers_wait_for_it` (`tree_waits >= 1`
+under the gate's load; untouched code, 3/3 passing alone, `ci/f5-f-flaky.log`). The
+`legacy-revm-paths` feature does not build on evm2 (reth_evm `eth`, `db`, `EvmFactory` are gone);
+that is the state since F4, not new.
+
+Devnet pair (`ci/f5d-gate.log`, `devnet/f5f-*`, binaries of 5e582b610, follower and builder knobs,
+second EL, payload channel):
+
+| round | hashes equal | imports parallel (main / late EL) | refused | builder steps | fast hits (main / late) | delegated | timeouts per validator |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| f5f-fast | 100/100 | 158 / 64 | 0 | 64 | 3,006 / 1,002 | 0 | 4, 4, 4, 0 |
+| f5f-stock (`N42_BATCH_FAST_TRANSFER=0`) | 100/100 | 158 / 64 | 0 | 64 | 0 / 0 | 0 | 4, 4, 4, 0 |
+
+Both rounds carried 1,002 transfers in 74 blocks, EL ERROR 0 on both ELs, fold refusals 0, serial
+rebuilds 0. The main EL ran the handler 3,006 times for the 1,002 transfers (its builds plus the imports
+it runs), the late EL 1,002 times; none was handed over, since the load is transfers to
+existing accounts, so the hand-over path is covered by the unit tests only. Speed is the A/B's
+question; the devnet carries 3-4 transfers a block.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:
@@ -761,6 +832,10 @@ Items the F5 paths leave for F6 or later, each with the condition that brings it
   before a parallel build runs there (coordinator 2026-11-05).
 - **The serial-rebuild copy of the transaction list** (F5c). Measure it in the A/B. Remove it only
   if fold refusals at `finish` prove unreachable in the field.
+- **The fast transfer on an Amsterdam chain** (F5f). `fast_handler::covers` is Prague and Osaka
+  only: on Amsterdam (EIP-8037 state gas, the block access list) the handler hands every
+  transaction to the stock one. Port it, with its own equivalence tests against the stock Amsterdam
+  handler, before fleet7 or chain 94 runs Amsterdam blocks through the parallel step.
 - **The output shards** (`take_cached` / `into_staged`, `N42_OUTPUT_SHARDS`). Stay legacy; port
   only if the A/B shows the merge is the cost.
 

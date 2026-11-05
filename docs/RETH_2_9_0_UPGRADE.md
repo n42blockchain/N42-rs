@@ -927,6 +927,114 @@ Devnet check of the seal path (`ci/f5d-gate.log`, `devnet/f5g1-*`):
   (`no-candidates`), so the evm2 seal path never ran. This is not a g1 effect; it is noted for the
   devnet's deferred start-up.
 
+#### E10, and the order after it
+
+The fx pair E10 (18:06-18:29Z, natives of 2d687b583, `wt-main/target/fleet-runs/loop351fx-E10.launch.out`)
+read 1.06-1.08M TPS at a 0.185 s cycle on the branch, against the control's 4.9M at 0.041 s: a 4.6x
+gap, down from 7.3x. Medians per full block, branch against control (ms): state_wait 71 / 2, par_exec
+67 / 27, par_fold 14 / 2, tx_root 26 / 2, give_back 16 / 0, sealed 26 / 3, sealed_at 182 / 37,
+merge 61 / 0. The coordinator's order: the merge (and with it state_wait), then exec, then the
+transactions root, the seal's body, the give-back.
+
+#### g3, the output shards on the evm2 step (merge elided, state_wait)
+
+**Why `merge_elide()` did nothing on evm2.** Merge elision acts on the output shards: the next
+build reads a block that is still in its shards, under the executor's residual
+(`built_executions::shards_ready` with a `ShardedParent`), the roots read `shards.view(residual)`,
+and the block's one bundle is merged behind them or not at all. The evm2 step never made shards.
+Every batch bundle was merged into one map (`merge_batches`), and that map was folded into the
+executor's bundle in `finish` (`graft_fold::fold_into`, 190,000 accounts). That fold is E10's
+`merge` 61 ms, and the next build's `state_wait` 71 ms waited for it.
+
+**The change.**
+- `execute_batches_into` hands each batch's bundle to a sink on the batch's own thread, which is
+  `OutputShards::add`. It first splits off the accounts the executor still needs: the beneficiary,
+  whose credits from every batch the finish sums, and the withdrawal recipients, which the block's
+  end reads. Those few stay in the run's `merged` and take the old fold, so nothing reads the shards
+  before they are frozen.
+- On a block that seals at the execution's end, the evm2 step now:
+  - freezes the shards behind the seal, on their own thread under X22's `N42_FREEZE_AFTER_SEAL`
+    (joined where the seal branch files the residual, the revm-era join);
+  - writes only the split-off accounts into the executor's cache (`CacheScope::Only`);
+  - hands the frozen shards to the existing `output_shards` path. That path (`shards_ready`, the
+    roots on the view, `N42_MERGE_ELIDE`) is the control's code, which was already compiled on
+    evm2.
+- A block that took the shard path but did not seal merges the shards back into one bundle, with
+  the split-off bundles, and runs the old path.
+- `sharded_total` on the `parallel step` line counts the sealed runs whose output stayed in shards.
+
+**Bench** (`evm2_step_bound`, 200,000 transfers, 400 senders, recipients from 2,000,000 so ~190,700
+accounts, in-memory parent, 32 threads, release, medians of 4). Both legs are on a Prague chain
+(below). The shard leg checks that the shards merged under the finish's residual give the fold
+path's bundle, account by account and revert by revert. That check passes in plain and index mode.
+
+| path | exec | freeze | commit | finish (fold) |
+| --- | --- | --- | --- | --- |
+| before: merge, fold at finish | 97.7 ms | | 41.8 (All) / 11.4 (Only) | 94.1 ms |
+| shards, plain (16) | 15.5 ms | 42.8 ms | 11.6 ms | 0.0 ms |
+| shards, X22 (16, index, live index, own pool) | 29.4 ms | 4.2 ms | 10.8 ms | 0.2 ms |
+
+(`ci/f5g3-bench1.log`, `ci/f5g3-bench2.log`, `ci/f5g2-split2.log`.) The 94 ms fold is gone from the
+finish. What the next build waits for is the freeze, 4.2 ms behind the seal under X22. The fleet's
+`merge` 61 and `state_wait` 71 should fall to the control's few ms. That is to be read in E11.
+
+Gate for bcb193399 (`ci/f5g3-gate.log`, `ci/f5g3-gate2.log`):
+- workspace check rc 0 and clippy (engine-types, n42, with tests) rc 0;
+- engine-types: 278 passed, 8 ignored;
+- `n42-qmdb-reth`: one failure under a box load of 113,
+  `a_rename_while_the_tree_is_leased_is_followed_and_tree_readers_wait_for_it`. It is a 100 ms
+  sleep race on the waiter, in a crate this change does not touch, and it passes alone;
+- qmdb-state, n42-testing and n42-env pass.
+
+Devnet round **f5g3-x22** (`ci/f5d-gate.log`, `devnet/f5g3-x22`) ran on the E11 natives, with the
+deferred genesis (tenure 8), X22 and the fleet's state knobs:
+- hashes equal 40/40 on both execution layers;
+- imports parallel 38 and 18, fold refusals 0, serial rebuilds 0;
+- `sharded_total` 16 on the main EL and 7 on the late one: early-sealed blocks whose output stayed
+  in the shards and that the next build read through the sharded parent;
+- one `failed_after_seal`, the stale-parent refusal g1 also showed (a build ahead on block 40 after
+  41 was canonical). The chain was not affected.
+
+Natives for E11: `/data/n42-build/reth29-native/release`, built from bcb193399 with
+`RUSTFLAGS="-C target-cpu=native"` (`ci/f5g3-natives.log`).
+
+#### g2, the execution: where a transfer goes
+
+**"exec" held the merge.** The step's exec time included `merge_batches`, the 190,000-account
+merge of the batch bundles. On the shard path that merge is gone: exec is 97.7 -> 29.4 ms with
+X22's live index, or 15.5 ms without it. E10's fleet number for the same span is 67 ms (with
+QMDB reads); the bench, from memory, gives 97.7 before and 29.4 after.
+
+**The bench chain was Shanghai.** The fast transfer handler is registered only from Prague
+(`fast_handler::covers`), so the earlier bench numbers were without it. The timing tests now run
+on Prague (`F5G_SPEC=shanghai` for the old chain); the fleet chain is Osaka from genesis.
+
+**One transfer** (`evm2_batch_split`, one batch of 20,000 transfers on one thread, Prague, release,
+ns per transfer, `ci/f5g2-split3.log`):
+
+| part | fast handler | stock handler | fast, inherent API |
+| --- | --- | --- | --- |
+| `convert` (pooled tx clone, envelope) | 55-62 | 54 | 55 |
+| evm2 `transact` (reth trait: detach) | 632-655 | 667-678 | 606-610 (inherent) |
+| `BatchState::commit` | 270-319 | 282-288 | 277-285 |
+| `commit_state` / `commit()` | 108-165 | 108-156 | 145-146 |
+| result push | 28-49 | 28 | 29 |
+| whole loop | 1,155-1,305 | 1,198-1,248 | 1,156-1,160 |
+
+Per batch, on top: `take_bundle` 5.2-6.2 ms and the old `merge` 8.7-9.2 ms per 20,000
+transfers (~0.27 and ~0.44 us a transfer). The merge is the part the shards removed.
+
+- The fast handler saves ~30 ns of the ~650 ns in `transact`. The handler skips the
+  interpreter, but the rest of the transaction is still evm2's: the stock `prepare`, the
+  transaction overlay over the batch's accepted overlay and `CacheDB`, the gas settlement and the
+  scratch clear.
+- The inherent `transact` + `account_changes()` + `commit()` (no owned `PendingState`) is no
+  faster in total. It moves cost from the detach into the commit.
+- So the remaining per-transfer cost (~1.15 us of thread time, about 60% of it `transact`) is
+  inside evm2's transaction and overlay layers. Only bypassing evm2's transaction state for the
+  batch would cut it further, and that is a design decision. With the merge gone, the step is
+  within the ~30 ms target in the bench, so no change was made there for now.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

@@ -15,11 +15,12 @@
 /// feature).
 pub const LEGACY_REVM_PATHS: bool = cfg!(feature = "legacy-revm-paths");
 
-/// Every knob read by a path behind `legacy-revm-paths`.
+/// Every knob read by a path behind `legacy-revm-paths` and not yet ported to
+/// evm2. Ported (F5c, `crate::parallel_build`): `N42_PARALLEL_BUILD`,
+/// `N42_PARALLEL_BUILD_THREADS`, `N42_BUILD_BATCHES`, `N42_BUILD_ONE_WAVE`,
+/// `N42_FREEZE_POOL(_THREADS)`, `N42_PLAN_AHEAD_BODY(_THREADS)`.
 pub const KNOBS: &[&str] = &[
     "N42_FAST_TRANSFER",
-    "N42_PARALLEL_BUILD",
-    "N42_PARALLEL_BUILD_THREADS",
     "N42_FOLLOWER_GRAFT",
     "N42_FOLLOWER_GRAFT_INDEX",
     "N42_FOLLOWER_GRAFT_RANGES",
@@ -32,14 +33,10 @@ pub const KNOBS: &[&str] = &[
     "N42_FOLLOWER_PARTITION_AHEAD",
     "N42_FOLLOWER_PARTITION_HASH",
     "N42_FOLLOWER_SENDER_GROUPS",
-    "N42_BUILD_BATCHES",
     "N42_BUILD_COLLECT_IN_PLACE",
     "N42_BUILD_GRAFT_NO_CACHE",
     "N42_BUILD_MLP",
-    "N42_BUILD_ONE_WAVE",
     "N42_BUILD_PREFETCH",
-    "N42_FREEZE_POOL",
-    "N42_FREEZE_POOL_THREADS",
     "N42_GRAFT_BASE_SWAP",
     "N42_GRAFT_INDEX",
     "N42_GRAFT_PREFAULT",
@@ -47,8 +44,6 @@ pub const KNOBS: &[&str] = &[
     "N42_GRAFT_SHARDED",
     "N42_GRAFT_STREAM",
     "N42_PHASE_TIMERS",
-    "N42_PLAN_AHEAD_BODY",
-    "N42_PLAN_AHEAD_BODY_THREADS",
     "N42_PLAN_AHEAD_WARM",
     "N42_READ_SET",
 ];

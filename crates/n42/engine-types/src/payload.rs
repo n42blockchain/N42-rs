@@ -1018,8 +1018,54 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     })
 }
 
+/// The plan-ahead hook's work on evm2 (`N42_PLAN_AHEAD_BODY=1`, F5c): the
+/// candidates in plan order, their transfer keys and hashes and the
+/// partition at the beneficiary this node builds for, made on the plan
+/// body's own pool -- what the evm2 parallel step reads. The revm-era
+/// body parts (transactions, senders, slots, the root ahead) are not made:
+/// only that step's direct body and seal read them. `None` when not every
+/// candidate is a plain transfer.
+#[cfg(not(feature = "legacy-revm-paths"))]
+fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
+    segments: &[(n42_tx_queue::FrameTxs<P>, usize)],
+    _plan: &n42_tx_queue::FramePlan,
+) -> Option<crate::frame_blocks::PreparedBuild<P>> {
+    use rayon::prelude::*;
+    let at = std::time::Instant::now();
+    let pool = crate::parallel_transfer::plan_body_pool();
+    let parts: Vec<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<P>>>> = pool.install(|| {
+        segments.par_iter().map(|(txs, taken)| txs.get(..*taken).map_or_else(Vec::new, <[_]>::to_vec)).collect()
+    });
+    let mut cands = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in parts {
+        cands.extend(part);
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    let (keys, hashes) = pool.install(|| {
+        let keys = cands.par_iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>();
+        let hashes: Vec<B256> = cands.par_iter().map(|tx| *tx.hash()).collect();
+        (keys, hashes)
+    });
+    let keys = keys?;
+    let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
+        crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
+    });
+    Some(crate::frame_blocks::PreparedBuild {
+        segments: segments.to_vec(),
+        cands,
+        keys,
+        transactions: Vec::new(),
+        senders: Vec::new(),
+        hashes,
+        groups,
+        made_us: at.elapsed().as_micros() as u64,
+        root_ahead: None,
+    })
+}
+
 /// Installs the plan-ahead hook on the queue once (`N42_PLAN_AHEAD_BODY=1`).
-#[cfg(feature = "legacy-revm-paths")]
 fn install_plan_ahead_body<P: PoolTransaction<Consensus = TransactionSigned>>(queue: &n42_tx_queue::TxQueue<P>) {
     if queue.has_plan_ahead_hook() {
         return;
@@ -1691,6 +1737,9 @@ where
         withdrawals: attributes.withdrawals.clone().map(Into::into),
         extra_data: Default::default(),
     };
+    // What a serial rebuild after a refused fold starts again from
+    // (`finish_or_rebuild`).
+    let rebuild_attributes = next_attributes.clone();
     let evm_env = evm_config
         .next_evm_env(&parent_header, &next_attributes)
         .map_err(PayloadBuilderError::other)?;
@@ -1810,7 +1859,6 @@ where
     crate::frame_blocks::want_bulk(parallel_build && builder_puller() != 0);
     // `N42_PLAN_AHEAD_BODY=1`: the queue makes the next block's body with its
     // plan; the partition is made at this build's beneficiary.
-    #[cfg(feature = "legacy-revm-paths")]
     if crate::frame_blocks::plan_ahead_body_wanted()
         && let Some(queue) = n42_tx_queue::global::<Pool::Transaction>()
     {
@@ -2435,6 +2483,163 @@ where
             build_stage.at(5);
             (payload, recovered, block_hash, block_number, root_ms, fields_ms, sealed_ms, sealed_at_ms, parent_sealed)
         }};
+    }
+    // The parallel step on evm2 (docs/RETH_2_9_0_UPGRADE.md, F5c): a block's
+    // worth of candidates taken from the puller, the frames' bulk vector or
+    // the pool's iterator; when every one is a plain transfer and nothing
+    // executed before, they run in sender batches on the build pool, each
+    // transfer through the stock evm2 handler (`parallel_build`). The merge
+    // is written into the executor's overlay (the cache half), the receipts
+    // committed in candidate order, and the merge folded into the bundle at
+    // `finish` (the bundle half; a refusal there rebuilds the block serially,
+    // see `finish_or_rebuild`). Any refusal before the cache half hands the
+    // candidates to the serial loop below in candidate order; a transfer the
+    // EVM refused, with its sender's later ones, is given back at the end,
+    // as the revm-era step did.
+    #[cfg(not(feature = "legacy-revm-paths"))]
+    if parallel_build && !is_amsterdam {
+        let par_at = std::time::Instant::now();
+        par_start_ms = build_started.elapsed().as_millis() as u64;
+        let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
+        par_budget = budget;
+        let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
+            bulk.take().unwrap_or_else(|| Vec::with_capacity(budget.min(262_144)));
+        if let Some(puller) = pulled.as_ref() {
+            while cands.len() < budget {
+                match puller.batches().recv() {
+                    Ok(batch) if !batch.is_empty() => cands.extend(batch),
+                    _ => break,
+                }
+            }
+        } else if let Some(best) = best_txs.as_mut() {
+            while cands.len() < budget {
+                let Some(tx) = best.next() else { break };
+                cands.push(tx);
+            }
+        }
+        par_drained = cands.len() < budget;
+        if cands.len() > budget {
+            for tx in cands.split_off(budget).into_iter().rev() {
+                lookahead.push_front(tx);
+            }
+        }
+        par_pull_ms = par_at.elapsed().as_millis() as u64;
+        open_deferred_state!()?;
+        let beneficiary = group_env.block.beneficiary;
+        // `N42_PLAN_AHEAD_BODY=1`: the keys and the partition made with the
+        // plan, when they are for exactly these candidates.
+        let prepared = prepared_build.take().filter(|made| made.keys.len() == cands.len() && made.cands.len() == cands.len());
+        let (keys, groups) = match prepared {
+            Some(mut made) => {
+                let groups = made.groups.take().filter(|(at, _)| *at == beneficiary).map(|(_, groups)| groups);
+                (Some(std::mem::take(&mut made.keys)), groups)
+            }
+            None => (cands.iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>(), None),
+        };
+        let refused: Option<&'static str> = if cands.is_empty() {
+            Some("no-candidates")
+        } else if !builder.transactions.is_empty() {
+            Some("transactions-before")
+        } else if keys.is_none() {
+            Some("not-all-transfers")
+        } else {
+            None
+        };
+        let mut line = (0usize, 0usize, 0usize, refused);
+        if refused.is_none() {
+            let keys = keys.unwrap_or_default();
+            let exec_at = std::time::Instant::now();
+            let convert = |i: usize| {
+                let (tx, sender) = cands[i].to_consensus().into_parts();
+                reth_primitives_traits::Recovered::new_unchecked(evm2::ethereum::TxEnvelope::from(tx), sender)
+            };
+            let worst_case = |i: usize| crate::frame_scan::tx_cost(pooled_consensus(&cands[i]));
+            let open = || {
+                open_parent_state()
+                    .ok()
+                    .map(|s| StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(s)))
+            };
+            let run = crate::parallel_build::execute_batches(
+                &evm_config,
+                &group_env,
+                &keys,
+                groups,
+                &convert,
+                &open,
+                deferred_now.then_some(&worst_case as &(dyn Fn(usize) -> U256 + Sync)),
+                beneficiary,
+                crate::parallel_transfer::Dispatch::from_env(),
+            );
+            par_exec_ms = exec_at.elapsed().as_millis() as u64;
+            let fold_at = std::time::Instant::now();
+            let committed = run.and_then(|run| {
+                let crate::parallel_build::ParallelRun { executed, skipped, merged, batches } = run;
+                let indices: Vec<usize> = executed.iter().map(|e| e.index).collect();
+                let mut fees = U256::ZERO;
+                for e in &executed {
+                    let tip = pooled_consensus(&cands[e.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
+                    fees += U256::from(tip) * U256::from(e.result.tx_gas_used());
+                }
+                let results = executed.into_iter().map(|e| {
+                    let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&cands[e.index]));
+                    (e.result, tx_type)
+                });
+                let gas = crate::parallel_build::commit_run(&mut builder.executor, results, merged)?;
+                Ok((indices, skipped, batches, gas, fees))
+            });
+            match committed {
+                Ok((indices, skipped, batches, gas, fees)) => {
+                    for &i in &indices {
+                        builder.transactions.push(cands[i].to_consensus());
+                    }
+                    cumulative_gas_used += gas;
+                    total_fees += fees;
+                    tx_count += indices.len() as u64;
+                    par_batches = batches;
+                    par_skipped = skipped.len();
+                    for i in skipped {
+                        deferred.push(Arc::clone(&cands[i]));
+                    }
+                    line = (indices.len(), par_skipped, batches, None);
+                    // Freed behind the build (`N42_FREEZE_POOL=own`: on its
+                    // own pool) rather than on the builder's thread.
+                    let spent = std::mem::take(&mut cands);
+                    crate::parallel_transfer::behind_pool().spawn(move || drop(spent));
+                }
+                Err(crate::parallel_build::Refused::Commit(err)) => {
+                    return Err(PayloadBuilderError::other(std::io::Error::other(format!(
+                        "the parallel step's receipts could not be committed: {err}"
+                    ))));
+                }
+                Err(err) => {
+                    line.3 = Some(err.reason());
+                    warn!(target: "n42::parallel_build", number = header.number, %err, "the parallel step refused; the block is built serially");
+                }
+            }
+            par_fold_ms = fold_at.elapsed().as_millis() as u64;
+        }
+        if line.3.is_some() {
+            for tx in std::mem::take(&mut cands).into_iter().rev() {
+                lookahead.push_front(tx);
+            }
+        }
+        par_ms = par_at.elapsed().as_millis() as u64;
+        let (txs, skipped, batches, why) = line;
+        tracing::info!(
+            target: "n42::parallel_build",
+            number = header.number,
+            parallel = why.is_none(),
+            txs,
+            skipped,
+            batches,
+            refused = why.unwrap_or(""),
+            fold_refused_total = crate::graft_fold::refused_count(),
+            serial_rebuilds_total = crate::parallel_build::serial_rebuilds(),
+            pull_ms = par_pull_ms,
+            exec_ms = par_exec_ms,
+            commit_ms = par_fold_ms,
+            "parallel step"
+        );
     }
     // The parallel step is written against revm 43: built only with
     // `legacy-revm-paths` until it is ported (docs/RETH_2_9_0_UPGRADE.md).
@@ -5238,7 +5443,9 @@ where
                 }
             }
             lookahead.pop_front().expect("checked non-empty")
-        } else if prefetch == 0 {
+        } else if prefetch == 0 && lookahead.is_empty() {
+            // What the parallel step handed back (`lookahead`) is taken
+            // first, by the branch below.
             let Some(pool_tx) = best_txs.as_mut().expect("direct").next() else { break };
             pool_tx
         } else {
@@ -5543,6 +5750,50 @@ where
         });
     }
 
+    // F5c: with the parallel step's merge pending, `finish` folds it into
+    // the block's bundle (`N42BlockExecutor`). Should the fold refuse, the
+    // block is not lost and the payload does not fail: the same transactions,
+    // in the same order, are executed again serially on a fresh executor over
+    // the parent, and that block is the build's. The transactions are copied
+    // for it only on a build with a merge pending.
+    let mut rebuild_txs = builder.executor.has_pending_fold().then(|| builder.transactions.clone());
+    macro_rules! finish_or_rebuild {
+        ($root:expr) => {{
+            match builder.finish(parent_state_ref()?, $root) {
+                Err(err) if matches!(&err, BlockExecutionError::Internal(internal) if internal.is_other::<crate::graft_fold::FoldRefused>()) => {
+                    let txs = rebuild_txs.take().unwrap_or_default();
+                    warn!(
+                        target: "n42::parallel_build",
+                        number = parent_header.number + 1,
+                        %err,
+                        txs = txs.len(),
+                        "the fold refused at finish; the block is rebuilt serially in this build"
+                    );
+                    crate::parallel_build::note_serial_rebuild();
+                    let db = cached_reads.as_db_mut(LazyParentDb { slot: &parent_state_slot, open: &open_parent_state });
+                    let evm = evm_config.evm_with_env(db, group_env.clone());
+                    let ctx = evm_config
+                        .context_for_next_block(&parent_header, rebuild_attributes.clone())
+                        .map_err(PayloadBuilderError::other)?;
+                    let mut again: reth_evm::execute::BasicBlockBuilder<'_, EvmConfig::BlockExecutorFactory, _, _, EthPrimitives> =
+                        reth_evm::execute::BasicBlockBuilder::new(
+                            evm_config.block_executor_factory(),
+                            &assembler,
+                            evm,
+                            group_env.clone(),
+                            &parent_header,
+                            ctx,
+                        );
+                    again.apply_pre_execution_changes().map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+                    for tx in txs {
+                        again.execute_transaction(tx)?;
+                    }
+                    again.finish(parent_state_ref()?, $root)?
+                }
+                other => other?,
+            }
+        }};
+    }
     // On a QMDB chain the state root is not reth's to compute. The builder is
     // handed a zero root so it skips the Merkle-Patricia computation; the real
     // root comes from the forest, over the bundle execution left behind, and
@@ -5563,8 +5814,7 @@ where
     ) = match &qmdb {
         Some(state) => {
             let finish_at = std::time::Instant::now();
-            let outcome =
-                builder.finish(parent_state_ref()?, Some((B256::ZERO, TrieUpdates::default())))?;
+            let outcome = finish_or_rebuild!(Some((B256::ZERO, TrieUpdates::default())));
             let finish_took = finish_at.elapsed();
             let root_at = std::time::Instant::now();
             // Computed during assembly (see `assembler`); the fallback below
@@ -5587,7 +5837,7 @@ where
         }
         None => {
             let finish_at = std::time::Instant::now();
-            let outcome = builder.finish(parent_state_ref()?, None)?;
+            let outcome = finish_or_rebuild!(None);
             (outcome, None, finish_at.elapsed(), std::time::Duration::ZERO)
         }
     };
@@ -6017,7 +6267,17 @@ fn direct_receipts_enabled() -> bool {
     *ON.get_or_init(|| n42_env::flag("N42_DIRECT_RECEIPTS", true))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for `N42_PARALLEL_BUILD` on its own thread.
+    static PARALLEL_BUILD_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 fn parallel_build() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PARALLEL_BUILD_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_PARALLEL_BUILD", false))
 }
@@ -6853,6 +7113,55 @@ mod includability_tests {
     fn a_deferred_build_keeps_each_senders_worst_case_within_its_balance() {
         let (accounts, txs) = balance_case();
         let block = build(true, &accounts, txs);
+        let of = |s: u64| block.senders().iter().filter(|a| **a == address(s)).count();
+        assert_eq!(of(1), 1, "the second transfer could cost more than sender 1 has");
+        assert_eq!(of(2), 2, "the other sender's transfers are still in");
+        follower_verdict(&block, &accounts).expect("the follower accepts the block");
+    }
+
+    /// [`build`] with `N42_PARALLEL_BUILD` as `parallel` on this thread, the
+    /// fold made to refuse once when `refuse_fold`.
+    #[cfg(not(feature = "legacy-revm-paths"))]
+    fn build_with(parallel: bool, refuse_fold: bool, deferred: bool, accounts: &[(Address, u64, U256)], txs: &[Candidate]) -> RecoveredBlock<n42_tx_types::Block> {
+        PARALLEL_BUILD_FOR_TEST.with(|on| on.set(Some(parallel)));
+        crate::graft_fold::REFUSE_NEXT_FOLD.with(|next| next.set(refuse_fold));
+        let block = build(deferred, accounts, txs.to_vec());
+        PARALLEL_BUILD_FOR_TEST.with(|on| on.set(None));
+        crate::graft_fold::REFUSE_NEXT_FOLD.with(|next| next.set(false));
+        block
+    }
+
+    /// Ten senders, two transfers each, every recipient created: the
+    /// parallel step's block (F5c) is the serial build's, header and all;
+    /// and when the fold refuses at `finish` the build rebuilds the block
+    /// serially in the same build, which is again the same block.
+    #[cfg(not(feature = "legacy-revm-paths"))]
+    #[test]
+    fn the_parallel_build_and_its_serial_rebuild_give_the_serial_block() {
+        // Not sender 7: the attributes' fee recipient.
+        let accounts: Vec<_> = (11..=20).map(|s| (address(s), 0, RICH)).collect();
+        let txs: Vec<Candidate> = (11..=20).flat_map(|s| [transfer(s, 0, 21_000), transfer(s, 1, 21_000)]).collect();
+        let serial = build_with(false, false, false, &accounts, &txs);
+        assert_eq!(serial.body().transactions.len(), 20);
+        let rebuilds = crate::parallel_build::serial_rebuilds();
+        let runs = crate::parallel_build::committed_runs();
+        let parallel = build_with(true, false, false, &accounts, &txs);
+        assert!(crate::parallel_build::committed_runs() > runs, "the block went parallel");
+        assert_eq!(crate::parallel_build::serial_rebuilds(), rebuilds, "the fold held");
+        assert_eq!(parallel.header(), serial.header(), "the parallel step's block");
+        let rebuilt = build_with(true, true, false, &accounts, &txs);
+        assert_eq!(crate::parallel_build::serial_rebuilds(), rebuilds + 1, "the refused fold rebuilt the block");
+        assert_eq!(rebuilt.header(), serial.header(), "the serial rebuild's block");
+        assert_eq!(rebuilt.body().transactions.len(), 20);
+    }
+
+    /// Under deferred execution the parallel step keeps each sender's
+    /// summed worst case within its balance, as the serial loop does.
+    #[cfg(not(feature = "legacy-revm-paths"))]
+    #[test]
+    fn a_deferred_parallel_build_keeps_each_senders_worst_case_within_its_balance() {
+        let (accounts, txs) = balance_case();
+        let block = build_with(true, false, true, &accounts, &txs);
         let of = |s: u64| block.senders().iter().filter(|a| **a == address(s)).count();
         assert_eq!(of(1), 1, "the second transfer could cost more than sender 1 has");
         assert_eq!(of(2), 2, "the other sender's transfers are still in");

@@ -64,6 +64,9 @@ pub struct ParallelRun<C: ConfigureEvm> {
     pub merged: MergedBatches,
     /// How many batches ran.
     pub batches: usize,
+    /// The partition the batches ran, handed back so that a caller can free
+    /// it off its own thread (`N42_FOLLOWER_FREE_ASYNC`).
+    pub groups: Vec<Vec<usize>>,
 }
 
 /// Why the parallel step gave the block to the serial loop.
@@ -354,7 +357,9 @@ where
     executed.sort_unstable_by_key(|e| e.index);
     skipped.sort_unstable();
     let merged = merge_batches(bundles).map_err(Refused::Fold)?;
-    Ok(ParallelRun { executed, skipped, merged, batches: batches.len() })
+    let count = batches.len();
+    drop(batches);
+    Ok(ParallelRun { executed, skipped, merged, batches: count, groups })
 }
 
 static IMPORTS_PARALLEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -378,6 +383,8 @@ pub struct ImportStats {
     pub txs: usize,
     /// Transactions executed after them by the block's executor.
     pub tail: usize,
+    /// Whether the plan was made ahead (`N42_FOLLOWER_PARTITION_AHEAD`).
+    pub planned: bool,
     /// Batches they ran in.
     pub batches: usize,
     /// Accounts the batches changed.
@@ -390,6 +397,59 @@ pub struct ImportStats {
     /// The executor's part (pre-execution, receipts, the block's end and
     /// the fold), microseconds.
     pub finish_us: u64,
+}
+
+/// `N42_FOLLOWER_PARTITION_AHEAD=1` on evm2 (F5e): the follower makes a
+/// block's [`ImportPlan`] on the worker pool as soon as the block is known,
+/// beside the wait for its parent, instead of inside the execution gate.
+pub fn follower_partition_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARTITION_AHEAD", false))
+}
+
+/// `N42_FOLLOWER_FREE_ASYNC=1` on evm2 (F5e): the import's own working
+/// memory (the keys, the partition, the plan) is freed on the worker pool
+/// rather than on the import thread.
+pub fn follower_free_async() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_FREE_ASYNC", false))
+}
+
+/// What [`import_block`] decides before it executes anything: the leading
+/// transfers' (sender, recipient) and their partition by sender. Made by
+/// [`plan_import`], either inside the import or ahead of it.
+#[derive(Debug, Default)]
+pub struct ImportPlan {
+    keys: Vec<(Address, Address)>,
+    groups: Option<Vec<Vec<usize>>>,
+    beneficiary: Address,
+}
+
+/// The block's [`ImportPlan`]: its leading plain transfers -- every
+/// transaction up to the first that is not one or that names the
+/// beneficiary -- and their partition by sender.
+pub fn plan_import(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> ImportPlan {
+    use alloy_consensus::BlockHeader as _;
+    let beneficiary = block.header().beneficiary();
+    let keys: Vec<(Address, Address)> = block
+        .body()
+        .transactions
+        .iter()
+        .zip(block.senders())
+        .map_while(|(tx, sender)| import_key(tx, *sender).filter(|(from, to)| *from != beneficiary && *to != beneficiary))
+        .collect();
+    let groups = (!keys.is_empty()).then(|| partition_by_sender(&keys, beneficiary).ok()).flatten();
+    ImportPlan { keys, groups, beneficiary }
+}
+
+/// Frees `what` on the worker pool when `N42_FOLLOWER_FREE_ASYNC=1`, here
+/// otherwise.
+fn free<T: Send + 'static>(what: T) {
+    if follower_free_async() {
+        rayon::spawn(move || drop(what));
+    } else {
+        drop(what);
+    }
 }
 
 /// A transaction's (sender, recipient) when the batches take it: a call
@@ -424,6 +484,7 @@ pub fn import_block<C, M, D>(
     main_db: M,
     open: &(dyn Fn() -> Option<D> + Sync),
     dispatch: Dispatch,
+    plan: Option<ImportPlan>,
 ) -> Result<(reth_evm::BlockExecutionOutput<n42_tx_types::Receipt>, ImportStats), Refused>
 where
     C: ConfigureEvm<Primitives = n42_tx_types::N42Primitives, BlockExecutorFactory = crate::parallel_common::FastExecutorFactory> + Sync,
@@ -440,25 +501,33 @@ where
     let senders = block.senders();
     let env = config.evm_env(block.header()).map_err(|err| refused(commit_err(&err)))?;
     let beneficiary = env.block.beneficiary;
-    let keys: Vec<(Address, Address)> = transactions
-        .iter()
-        .zip(senders)
-        .map_while(|(tx, sender)| import_key(tx, *sender).filter(|(from, to)| *from != beneficiary && *to != beneficiary))
-        .collect();
+    // A plan made ahead is the block's own; one made for another fee
+    // recipient than the EVM's is made again here.
+    let planned = plan.is_some();
+    let ImportPlan { keys, groups, .. } = match plan {
+        Some(plan) if plan.beneficiary == beneficiary => plan,
+        _ => plan_import(block),
+    };
     if keys.is_empty() {
         return Err(refused(Refused::NotParallel(NotParallel::NotATransfer(0))));
     }
+    let Some(groups) = groups else {
+        // `plan_import` names no partition only for a beneficiary touch,
+        // which its keys already stop before; made here for the error.
+        let err = partition_by_sender(&keys, beneficiary).err().unwrap_or(NotParallel::NoState);
+        return Err(refused(Refused::NotParallel(err)));
+    };
     let tail = keys.len()..transactions.len();
     let tail_len = tail.len();
     let convert = |i: usize| Recovered::new_unchecked(evm2::ethereum::TxEnvelope::from(transactions[i].clone()), senders[i]);
     let batches_at = std::time::Instant::now();
-    let run = execute_batches(config, &env, &keys, None, &convert, open, None, beneficiary, dispatch).map_err(refused)?;
+    let run = execute_batches(config, &env, &keys, Some(groups), &convert, open, None, beneficiary, dispatch).map_err(refused)?;
     let batches_us = batches_at.elapsed().as_micros() as u64;
     if let Some(&i) = run.skipped.first() {
         return Err(refused(Refused::NotParallel(NotParallel::Failed(i, "refused by the EVM on the batches' view".to_owned()))));
     }
     let finish_at = std::time::Instant::now();
-    let ParallelRun { executed, merged, batches, .. } = run;
+    let ParallelRun { executed, merged, batches, groups, .. } = run;
     let accounts = merged.len();
     let withdrawals: Vec<Address> = block.body().withdrawals.as_ref().map_or_else(Vec::new, |w| w.iter().map(|w| w.address).collect());
     let (scope, cached) = if tail.is_empty() {
@@ -489,8 +558,9 @@ where
         },
         _ => refused(commit_err(&err)),
     })?;
+    free((keys, groups));
     IMPORTS_PARALLEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok((output, ImportStats { txs, tail: tail_len, batches, accounts, cached, batches_us, finish_us: finish_at.elapsed().as_micros() as u64 }))
+    Ok((output, ImportStats { txs, tail: tail_len, planned, batches, accounts, cached, batches_us, finish_us: finish_at.elapsed().as_micros() as u64 }))
 }
 
 #[cfg(test)]
@@ -797,7 +867,7 @@ mod tests {
     }
 
     fn import(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Result<(Output, ImportStats), Refused> {
-        import_block(&config(), block, parent(), &|| Some(parent()), Dispatch::LargestFirst(4))
+        import_block(&config(), block, parent(), &|| Some(parent()), Dispatch::LargestFirst(4), None)
     }
 
     /// The QMDB root of an output's bundle over an empty tree: the state
@@ -844,6 +914,13 @@ mod tests {
         assert_same_import(&ours, &stock);
         assert!(!ours.state.state[&addr(STORE)].storage.is_empty());
         assert_eq!(ours.state.state[&addr(FRESH)].original_info, None);
+        // The plan made ahead (`N42_FOLLOWER_PARTITION_AHEAD`) is the one
+        // made inside, and the import on it the same.
+        let plan = plan_import(&block);
+        assert_eq!(plan.keys.len(), 8);
+        let (ahead, stats) = import_block(&config(), &block, parent(), &|| Some(parent()), Dispatch::LargestFirst(4), Some(plan)).expect("the import on the plan");
+        assert!(stats.planned);
+        assert_same_import(&ahead, &stock);
     }
 
     /// Leading transfers that spend in-block credits: a recipient with a

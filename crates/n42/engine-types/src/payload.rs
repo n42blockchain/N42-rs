@@ -2573,7 +2573,7 @@ where
             par_exec_ms = exec_at.elapsed().as_millis() as u64;
             let fold_at = std::time::Instant::now();
             let committed = run.and_then(|run| {
-                let crate::parallel_build::ParallelRun { executed, skipped, merged, batches } = run;
+                let crate::parallel_build::ParallelRun { executed, skipped, merged, batches, .. } = run;
                 let indices: Vec<usize> = executed.iter().map(|e| e.index).collect();
                 let mut fees = U256::ZERO;
                 for e in &executed {
@@ -7177,7 +7177,7 @@ mod includability_tests {
             }
             db
         };
-        let (ours, stats) = crate::parallel_build::import_block(&config, &block, parent(), &|| Some(parent()), crate::parallel_transfer::Dispatch::LargestFirst(4))
+        let (ours, stats) = crate::parallel_build::import_block(&config, &block, parent(), &|| Some(parent()), crate::parallel_transfer::Dispatch::LargestFirst(4), None)
             .expect("the parallel import");
         assert_eq!((stats.txs, stats.tail), (20, 0), "{stats:?}");
         assert!(stats.batches >= 2, "{stats:?}");

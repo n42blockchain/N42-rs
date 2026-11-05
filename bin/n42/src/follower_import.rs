@@ -2483,6 +2483,24 @@ where
         plan
     });
 
+    // `N42_FOLLOWER_PARTITION_AHEAD=1` on evm2 (F5e): the block's import
+    // plan (its leading transfers' keys and their partition by sender) made
+    // on the worker pool from here, beside the wait for the parent and the
+    // includability check; the execution takes it just before the gate.
+    #[cfg(not(feature = "legacy-revm-paths"))]
+    let import_plan = (follower_parallel() && tx_count > 0 && n42_engine_types::parallel_build::follower_partition_ahead())
+        .then(|| late.get().map(Arc::clone))
+        .transpose()?
+        .map(|block| {
+            let (planned, plan) = std::sync::mpsc::sync_channel(1);
+            rayon::spawn(move || {
+                let made = n42_engine_types::parallel_build::plan_import(&block);
+                drop(block);
+                let _ = planned.send(made);
+            });
+            plan
+        });
+
     // `N42_FOLLOWER_PARTITION_AHEAD=1` on the build path: the block's
     // (sender, recipient) keys, which its partition reads, made on the build
     // pool from here, beside the wait for the parent and the check, instead
@@ -2753,6 +2771,8 @@ where
             }
             Err(_) => None,
         });
+        #[cfg(not(feature = "legacy-revm-paths"))]
+        let import_plan = import_plan.as_ref().and_then(|plan| plan.recv().ok());
         let ahead_wait_us = ahead_at.elapsed().as_micros() as u64;
         // The build path's keys made ahead; one that failed is made again in
         // the execution, which then declines the block the same way.
@@ -3060,6 +3080,7 @@ where
                 cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))),
                 &open,
                 n42_engine_types::parallel_transfer::Dispatch::from_env(),
+                import_plan,
             ) {
                 Ok((out, stats)) => {
                     tracing::info!(
@@ -3068,6 +3089,8 @@ where
                         parallel = true,
                         txs = stats.txs,
                         tail = stats.tail,
+                        planned = stats.planned,
+                        plan_wait_us = ahead_wait_us,
                         batches = stats.batches,
                         accounts = stats.accounts,
                         cached = stats.cached,

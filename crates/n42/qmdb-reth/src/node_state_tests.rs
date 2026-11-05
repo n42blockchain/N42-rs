@@ -349,6 +349,29 @@ fn a_stale_build_below_the_persisted_blocks_does_not_invalidate_the_view() {
     assert_eq!(view.head(), (5, hash));
 }
 
+/// F5g5: with the committed block known, a parent at or above it builds
+/// although the canonical head is past it (the high-QC block after a
+/// timed-out view whose block the head had moved onto); one below it is
+/// still refused, on both compute paths.
+#[test]
+fn a_build_at_the_committed_block_below_the_head_builds() {
+    for offlock in [false, true] {
+        let (state, _view, hashes) = viewed(if offlock { "committed-floor-offlock" } else { "committed-floor" }, 4);
+        state.set_compute_offlock(offlock);
+        state.set_refuse_stale_builds(true);
+        assert!(state.compute_build(hashes[3], &changes_for(9)).is_err(), "no source: refused as before");
+        state.set_committed_source(Some(std::sync::Arc::new(|| Some(3))));
+        assert_eq!(state.committed_number(), Some(3));
+        assert!(matches!(
+            state.compute_operations(hashes[2], changes_for(9).operations()),
+            Err(NodeStateError::State(StateError::StaleBuildParent { parent_number: 2, .. }))
+        ), "below the committed block");
+        assert!(state.compute_operations(hashes[3], changes_for(9).operations()).is_ok(), "the committed block builds");
+        state.set_committed_source(Some(std::sync::Arc::new(|| None)));
+        assert!(state.compute_build(hashes[2], &changes_for(9)).is_err(), "a source that does not know: as before");
+    }
+}
+
 #[test]
 fn a_build_on_a_parent_below_the_head_is_refused_and_the_view_stays_valid() {
     for offlock in [false, true] {

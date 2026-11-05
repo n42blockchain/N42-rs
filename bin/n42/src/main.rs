@@ -315,6 +315,32 @@ fn main() {
                         // that would revert the state tree below the head.
                         if n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(node.provider.chain_spec().genesis()).is_ok() {
                             qmdb.set_refuse_stale_builds(true);
+                            // The canonical head can run ahead of consensus onto a
+                            // block that is never certified (a build ahead on the
+                            // block this node just voted for makes it canonical); the
+                            // next leader then builds on its high-QC block, an
+                            // ancestor of that head (F5g5). The guard refuses only
+                            // what lies below the committed block, which the
+                            // validator's forkchoice gives as `safe` plus the
+                            // deferred-execution depth (`safe` is the block whose
+                            // execution a committed child carries, under the default
+                            // `split` settlement tags; under `legacy` it is the
+                            // committed block itself, and the floor is then stricter,
+                            // never looser, than the committed block).
+                            let provider = node.provider.clone();
+                            let genesis = node.provider.chain_spec().genesis().clone();
+                            qmdb.set_committed_source(Some(std::sync::Arc::new(move || {
+                                let safe = reth_provider::BlockIdReader::safe_block_num_hash(&provider).ok()??;
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |since| since.as_secs());
+                                let depth = if reth_chainspec::qmdb::deferred_execution_active_at(&genesis, now) {
+                                    reth_chainspec::qmdb::deferred_execution_depth_at(&genesis, now)
+                                } else {
+                                    0
+                                };
+                                Some(safe.number.saturating_add(depth))
+                            })));
                         }
                         // The QMDB state is registered as the state reader on every QMDB
                         // node: its persistence hook makes the delta log durable through a

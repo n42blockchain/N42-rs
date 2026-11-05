@@ -712,6 +712,10 @@ fn poisoned_forest_guard<'a>(
     guard
 }
 
+/// Answers the committed block's number for the build guard
+/// ([`QmdbNodeState::set_committed_source`]); `None` when not known.
+pub type CommittedSource = std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
 struct Inner {
     forest: Mutex<Option<QmdbForest>>,
     /// The entry-file compaction's schedule (`crate::entry_compaction`).
@@ -790,6 +794,9 @@ struct Inner {
     /// Whether a build on an ancestor of the canonical head is refused
     /// ([`QmdbNodeState::set_refuse_stale_builds`]).
     refuse_stale_builds: std::sync::atomic::AtomicBool,
+    /// The committed block's number for that guard
+    /// ([`QmdbNodeState::set_committed_source`]).
+    committed_source: std::sync::RwLock<Option<CommittedSource>>,
     /// `N42_QMDB_PERSIST_BATCH`, or `set_persist_batch`.
     persist_batch: std::sync::atomic::AtomicBool,
     /// `N42_QMDB_CANONICAL_DEFER`, or `set_canonical_defer`.
@@ -1271,6 +1278,7 @@ impl QmdbNodeState {
                 tree_back: std::sync::Condvar::new(),
                 compute_offlock: std::sync::atomic::AtomicBool::new(compute_offlock_env()),
                 refuse_stale_builds: std::sync::atomic::AtomicBool::new(false),
+                committed_source: std::sync::RwLock::new(None),
                 persist_batch: std::sync::atomic::AtomicBool::new(persist_batch_env()),
                 canonical_defer: std::sync::atomic::AtomicBool::new(canonical_defer_env()),
                 deferred_canonicals: Default::default(),
@@ -1632,10 +1640,26 @@ impl QmdbNodeState {
         self.inner.refuse_stale_builds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The build guard: [`QmdbForest::check_build_parent`] when
-    /// [`Self::refuse_stale_builds`] is on.
+    /// Where the build guard learns the committed block's number
+    /// ([`QmdbForest::check_build_parent_above`]): a parent at or above it is
+    /// not refused although the canonical head is past it. Without a source,
+    /// or when it answers `None`, the guard refuses every ancestor of the
+    /// head, as before.
+    pub fn set_committed_source(&self, source: Option<CommittedSource>) {
+        if let Ok(mut slot) = self.inner.committed_source.write() {
+            *slot = source;
+        }
+    }
+
+    /// The committed block's number, when a source knows it.
+    pub fn committed_number(&self) -> Option<u64> {
+        self.inner.committed_source.read().ok()?.as_ref()?()
+    }
+
+    /// The build guard: [`QmdbForest::check_build_parent_above`] with the
+    /// committed block when [`Self::refuse_stale_builds`] is on.
     fn check_build_parent(&self, forest: &QmdbForest, parent: &B256) -> Result<(), StateError> {
-        if self.refuse_stale_builds() { forest.check_build_parent(parent) } else { Ok(()) }
+        if self.refuse_stale_builds() { forest.check_build_parent_above(parent, self.committed_number()) } else { Ok(()) }
     }
 
     /// Overrides `N42_QMDB_COMPUTE_OFFLOCK` for this state.

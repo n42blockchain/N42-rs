@@ -5,6 +5,7 @@
 #   scripts/devnet-fleet.sh <tag> <seconds> [--gov5] [--keep]
 #   LATE_VALIDATOR=<i> LATE_DELAY=<s> [LATE_SNAPSHOT=<dir>] start one member late (from a snapshot)
 #   ABSENT_VALIDATOR=<i> ABSENT_AT=<s> ABSENT_FOR=<s> take one member (own EL) away and bring it back
+#   DEVNET_PAYLOAD_SERVE=1 raw payload channel on each EL (18571, late 18581)
 #   MOBILEVERIFY=1 serve gov5's /mobileverify on every member: Rust validator i on
 #     127.0.0.1:2101<i> (--mobileverify.http), the gov5 member on 127.0.0.1:21020
 #   PACKETD=<binary> with MOBILEVERIFY=1: gov5's cmd/mobileverify-packetd beside Rust validator 0
@@ -31,6 +32,11 @@ BIN=${DEVNET_BIN:-$REPO/target/debug}
 # MOBILEVERIFY=1: the phone surface on every member (validator i: port 2101<i>).
 mv_flag() { [ "${MOBILEVERIFY:-}" = 1 ] && echo "--mobileverify.http 127.0.0.1:2101$1"; }
 GOV5_MV=; [ "${MOBILEVERIFY:-}" = 1 ] && GOV5_MV="--mobileverify --mobileverify.http 127.0.0.1:21020"
+# DEVNET_PAYLOAD_SERVE=1: each execution layer serves the raw payload channel
+# (N42_PAYLOAD_SERVE; main 127.0.0.1:18571, the late/absent member's 18581),
+# so its validators hand it foreign blocks there and N42_FOLLOWER_DIRECT_IMPORT
+# reaches the follower import (bin/n42/src/follower_import.rs).
+serve() { [ "${DEVNET_PAYLOAD_SERVE:-}" = 1 ] && echo "N42_PAYLOAD_SERVE=127.0.0.1:$1"; }
 mkdir -p $F
 [ -f $F/jwt.hex ] || openssl rand -hex 32 > $F/jwt.hex
 if [ ! -d $F/keys ]; then
@@ -40,7 +46,7 @@ fi
 [ -n "${PACKETD:-}" ] && pkill -f "^$PACKETD " 2>/dev/null
 pkill -f "^$BIN/examples/h2_validator" 2>/dev/null; pkill -f "^$BIN/n42 node" 2>/dev/null; pkill -f "^$GOV5/build/bin/n42 " 2>/dev/null; sleep 1
 if [ -z "$KEEP" ]; then rm -rf $F/datadir $F/consensus-{0..3} $F/gov5; fi
-RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir \
+env $(serve 18571) RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir \
   --authrpc.port 18551 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18545 --http.api eth,net,web3,debug --port 30313 \
   --disable-discovery --ipcdisable > $F/el-$TAG.log 2>&1 &
 for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-$TAG.log 2>/dev/null && break; sleep 1; done
@@ -65,7 +71,7 @@ for i in $(seq 0 $LAST); do
   # "-back" suffix after the return. Not index 0: the others peer through it.
   if [ "${ABSENT_VALIDATOR:-}" = "$i" ]; then
     rm -rf $F/consensus-$i $F/datadir-late
-    own_el() { RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
+    own_el() { env $(serve 18581) RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
         --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --http.api eth,net,web3,debug --port 30323 \
         --disable-discovery --ipcdisable > $F/el-late-$TAG$1.log 2>&1 &
       for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG$1.log 2>/dev/null && break; sleep 1; done; }
@@ -99,7 +105,7 @@ for i in $(seq 0 $LAST); do
           --state $LATE_SNAPSHOT/state.jsonl --header $LATE_SNAPSHOT/state.jsonl.header.rlp \
           --qmdb $LATE_SNAPSHOT/state.qmdb > $F/init-late-$TAG.log 2>&1
       fi
-      RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
+      env $(serve 18581) RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
         --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --http.api eth,net,web3,debug --port 30323 \
         --disable-discovery --ipcdisable > $F/el-late-$TAG.log 2>&1 &
       for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG.log 2>/dev/null && break; sleep 1; done

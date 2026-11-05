@@ -1163,6 +1163,7 @@ mod tests {
         };
         let (mut exec, mut root, mut fold_all, mut fold_only, mut finish) = (vec![], vec![], vec![], vec![], vec![]);
         let (mut shard_exec, mut freeze, mut shard_commit, mut shard_finish) = (vec![], vec![], vec![], vec![]);
+        let (mut body_serial, mut body_pool) = (vec![], vec![]);
         for round in 0..rounds {
             let mut reference: Option<BundleState> = None;
             let mut txs = Vec::with_capacity((senders * per_sender) as usize);
@@ -1186,6 +1187,31 @@ mod tests {
             let signed: Vec<N42TxEnvelope> = txs.iter().map(|t| t.inner().clone()).collect();
             let _ = crate::assembler::parallel_transaction_root(&signed);
             root.push(at.elapsed().as_micros());
+            // The seal's body (F5g items 3-4). Before: each executed
+            // transaction cloned into the builder one by one, split into
+            // transactions and senders at the seal, and its hashes collected
+            // there. The fallback: the same three made on the build pool.
+            // The plan path takes a body made ahead (a move).
+            {
+                use alloy_consensus::transaction::TxHashRef as _;
+                use rayon::prelude::*;
+                let at = Instant::now();
+                let mut pushed = Vec::with_capacity(txs.len());
+                for t in &txs {
+                    pushed.push(t.clone());
+                }
+                let (transactions, senders): (Vec<N42TxEnvelope>, Vec<Address>) = pushed.into_iter().map(|t| t.into_parts()).unzip();
+                let hashes: Vec<B256> = transactions.iter().map(|t| *t.tx_hash()).collect();
+                body_serial.push(at.elapsed().as_micros());
+                drop((transactions, senders, hashes));
+                let at = Instant::now();
+                #[allow(clippy::type_complexity)]
+                let (transactions, (senders, hashes)): (Vec<N42TxEnvelope>, (Vec<Address>, Vec<B256>)) = build_pool().install(|| {
+                    txs.par_iter().with_min_len(1024).map(|t| (t.inner().clone(), (t.signer(), *t.inner().tx_hash()))).unzip()
+                });
+                body_pool.push(at.elapsed().as_micros());
+                drop((transactions, senders, hashes));
+            }
             let accounts = run.merged.len();
             let mut first = Some(run);
             for only in [false, true] {
@@ -1285,6 +1311,11 @@ mod tests {
             median(freeze) as f64 / 1000.0,
             median(shard_commit) as f64 / 1000.0,
             median(shard_finish) as f64 / 1000.0,
+        );
+        eprintln!(
+            "evm2_step_bound seal body medians: serial_ms={:.1} build_pool_ms={:.1}",
+            median(body_serial) as f64 / 1000.0,
+            median(body_pool) as f64 / 1000.0,
         );
     }
 

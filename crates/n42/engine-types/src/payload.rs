@@ -1021,10 +1021,9 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
 /// The plan-ahead hook's work on evm2 (`N42_PLAN_AHEAD_BODY=1`, F5c): the
 /// candidates in plan order, their transfer keys and hashes and the
 /// partition at the beneficiary this node builds for, made on the plan
-/// body's own pool -- what the evm2 parallel step reads. The revm-era
-/// body parts (transactions, senders, slots, the root ahead) are not made:
-/// only that step's direct body and seal read them. `None` when not every
-/// candidate is a plain transfer.
+/// body's own pool -- what the evm2 parallel step reads -- and the body the
+/// evm2 seal lays its header over (F5g item 4): the transactions and
+/// their senders. `None` when not every candidate is a plain transfer.
 #[cfg(not(feature = "legacy-revm-paths"))]
 fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     segments: &[(n42_tx_queue::FrameTxs<P>, usize)],
@@ -1043,12 +1042,10 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     if cands.is_empty() {
         return None;
     }
-    let (keys, hashes) = pool.install(|| {
-        let keys = cands.par_iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>();
-        let hashes: Vec<B256> = cands.par_iter().map(|tx| *tx.hash()).collect();
-        (keys, hashes)
-    });
-    let keys = keys?;
+    let keys = pool.install(|| cands.par_iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>())?;
+    #[allow(clippy::type_complexity)]
+    let (transactions, (senders, hashes)): (Vec<TransactionSigned>, (Vec<alloy_primitives::Address>, Vec<B256>)) = pool
+        .install(|| cands.par_iter().with_min_len(1024).map(|tx| (pooled_consensus(tx).clone(), (tx.sender(), *tx.hash()))).unzip());
     let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
@@ -1056,8 +1053,8 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         segments: segments.to_vec(),
         cands,
         keys,
-        transactions: Vec::new(),
-        senders: Vec::new(),
+        transactions,
+        senders,
         hashes,
         groups,
         made_us: at.elapsed().as_micros() as u64,
@@ -2529,9 +2526,22 @@ where
         // `N42_PLAN_AHEAD_BODY=1`: the keys and the partition made with the
         // plan, when they are for exactly these candidates.
         let prepared = prepared_build.take().filter(|made| made.keys.len() == cands.len() && made.cands.len() == cands.len());
+        // The body made with the plan (transactions, senders, hashes, the
+        // root ahead), for the seal when it seals exactly these candidates.
+        #[allow(clippy::type_complexity)]
+        let mut prepared_body: Option<(Vec<TransactionSigned>, Vec<alloy_primitives::Address>, Vec<B256>, Option<crate::frame_blocks::RootAhead>)> =
+            None;
         let (keys, groups) = match prepared {
             Some(mut made) => {
                 let groups = made.groups.take().filter(|(at, _)| *at == beneficiary).map(|(_, groups)| groups);
+                if made.transactions.len() == cands.len() {
+                    prepared_body = Some((
+                        std::mem::take(&mut made.transactions),
+                        std::mem::take(&mut made.senders),
+                        std::mem::take(&mut made.hashes),
+                        made.root_ahead.take(),
+                    ));
+                }
                 (Some(std::mem::take(&mut made.keys)), groups)
             }
             None => (cands.iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>(), None),
@@ -2642,9 +2652,42 @@ where
                         let seal_at = std::time::Instant::now();
                         par_to_seal_us = seal_at.saturating_duration_since(par_at).as_micros() as u64;
                         exec_end_to_seal_us = seal_at.saturating_duration_since(exec_end).as_micros() as u64;
-                        for &i in &indices {
-                            builder.transactions.push(cands[i].to_consensus());
+                        // The body the seal lays its header over (F5g items
+                        // 3-4): the one made with the plan when the block is
+                        // every candidate in pull order and the plan's hashes
+                        // are the pulled set's (its root ahead with it), or
+                        // else made here from the executed candidates on the
+                        // build pool -- never pushed into the builder one by
+                        // one and split again at the seal.
+                        let body_at = std::time::Instant::now();
+                        let made = prepared_body.take().filter(|(transactions, _, hashes, _)| {
+                            skipped.is_empty()
+                                && indices.len() == cands.len()
+                                && transactions.len() == cands.len()
+                                && body_matches_pull(hashes, &cands, |hash| *hash, |tx| *tx.hash())
+                        });
+                        match made {
+                            Some((transactions, senders, hashes, _)) => {
+                                direct_body = Some((transactions, senders));
+                                direct_hashes = Some(hashes);
+                                commit_body_ahead_used = true;
+                            }
+                            None => {
+                                use rayon::prelude::*;
+                                #[allow(clippy::type_complexity)]
+                                let (transactions, (senders, hashes)): (Vec<TransactionSigned>, (Vec<alloy_primitives::Address>, Vec<B256>)) =
+                                    crate::parallel_transfer::build_pool().install(|| {
+                                        indices
+                                            .par_iter()
+                                            .with_min_len(1024)
+                                            .map(|&i| (pooled_consensus(&cands[i]).clone(), (cands[i].sender(), *cands[i].hash())))
+                                            .unzip()
+                                    });
+                                direct_body = Some((transactions, senders));
+                                direct_hashes = Some(hashes);
+                            }
                         }
+                        commit_body_ms = body_at.elapsed().as_millis() as u64;
                         total_fees += fees;
                         // What the puller took ahead and this block did not
                         // build goes back to the queue before the proposal,

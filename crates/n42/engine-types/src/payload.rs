@@ -2706,15 +2706,26 @@ where
                 }
                 Ok(run) => {
                     let crate::parallel_build::ParallelRun { mut executed, skipped, merged, batches, groups, split } = run;
+                    let fees_at = std::time::Instant::now();
                     let indices: Vec<usize> = executed.iter().map(|e| e.index).collect();
-                    let mut fees = U256::ZERO;
-                    let mut gas = 0u64;
-                    for e in &executed {
-                        let used = e.result.tx_gas_used();
-                        let tip = pooled_consensus(&cands[e.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
-                        fees += U256::from(tip) * U256::from(used);
-                        gas += used;
-                    }
+                    // The fees and gas over the executed set on the build
+                    // pool (F5g8): serial, 200,000 candidates' cold tips
+                    // were read between the execution and the seal.
+                    let (fees, gas) = {
+                        use rayon::prelude::*;
+                        crate::parallel_transfer::build_pool().install(|| {
+                            executed
+                                .par_iter()
+                                .with_min_len(4096)
+                                .map(|e| {
+                                    let used = e.result.tx_gas_used();
+                                    let tip = pooled_consensus(&cands[e.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
+                                    (U256::from(tip) * U256::from(used), used)
+                                })
+                                .reduce(|| (U256::ZERO, 0u64), |a, b| (a.0 + b.0, a.1 + b.1))
+                        })
+                    };
+                    evm2_fees_us = fees_at.elapsed().as_micros() as u64;
                     // `N42_SEAL_AT_EXEC=1` on evm2 (F5g1): under deferred
                     // execution the header carries the parent's execution, so
                     // a block the step filled (or the queue had no more for)

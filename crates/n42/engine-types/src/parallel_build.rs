@@ -283,7 +283,9 @@ where
     type BatchOut<C> = Result<(Vec<Executed<C>>, Vec<usize>, reth_trie::bundle_state::BundleState), Refused>;
     let run_batch = |members: &Vec<&Vec<usize>>| -> BatchOut<C> {
         let db = open().ok_or(Refused::NotParallel(NotParallel::NoState))?;
-        let mut evm = config.evm_with_env(db, env.clone());
+        // The batch's EVM carries the fast transfer handler (as the revm-era
+        // batches always did) unless `N42_BATCH_FAST_TRANSFER=0`.
+        let mut evm = crate::fast_handler::as_batch(|| config.evm_with_env(db, env.clone()));
         let txs = members.iter().map(|g| g.len()).sum::<usize>();
         let mut state = BatchState::with_capacity(txs * 2 + 1);
         let (mut executed, mut skipped) = (Vec::with_capacity(txs), Vec::new());

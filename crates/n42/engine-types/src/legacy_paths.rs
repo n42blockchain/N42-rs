@@ -29,9 +29,10 @@ pub const LEGACY_REVM_PATHS: bool = cfg!(feature = "legacy-revm-paths");
 /// `N42_BUILD_COLLECT_IN_PLACE` (the evm2 step has no slots); retired
 /// `N42_FOLLOWER_PARTITION_HASH` (no component partition left) and
 /// `N42_PHASE_TIMERS` (the per-build and per-import lines carry the
-/// timings). The rest below stay legacy until the A/B.
+/// timings). F5f (`crate::fast_handler`): ported `N42_FAST_TRANSFER`, the
+/// fast transfer as an evm2 registry handler. The rest below stay legacy
+/// until the A/B.
 pub const KNOBS: &[&str] = &[
-    "N42_FAST_TRANSFER",
     "N42_FOLLOWER_GRAFT_INDEX",
     "N42_FOLLOWER_GRAFT_RANGES",
     "N42_FOLLOWER_GRAFT_STREAM",

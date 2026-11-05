@@ -2635,6 +2635,8 @@ where
             refused = why.unwrap_or(""),
             fold_refused_total = crate::graft_fold::refused_count(),
             serial_rebuilds_total = crate::parallel_build::serial_rebuilds(),
+            fast_hits_total = crate::fast_handler::hits(),
+            fast_delegated_total = crate::fast_handler::delegated(),
             pull_ms = par_pull_ms,
             exec_ms = par_exec_ms,
             commit_ms = par_fold_ms,

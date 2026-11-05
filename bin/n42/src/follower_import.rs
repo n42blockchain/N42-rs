@@ -3099,6 +3099,8 @@ where
                         imports_parallel = n42_engine_types::parallel_build::imports_parallel(),
                         imports_refused = n42_engine_types::parallel_build::imports_refused(),
                         fold_refused = n42_engine_types::graft_fold::refused_count(),
+                        fast_hits_total = n42_engine_types::fast_handler::hits(),
+                        fast_delegated_total = n42_engine_types::fast_handler::delegated(),
                         "parallel import"
                     );
                     output = Some(out);

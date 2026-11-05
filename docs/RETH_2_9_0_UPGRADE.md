@@ -605,6 +605,19 @@ transactions, 0 rejected).
 - Open: the A/B against v2.8.1 waits for F5f. The equivalence on a fleet7-sized block is still
   unmeasured.
 
+### F6 leftovers
+
+Items the F5 paths leave for F6 or later, each with the condition that brings it back:
+
+- **The parallel step on an Amsterdam chain.** The step (builder F5c, follower F5d) does not run on
+  a chain with reth's Amsterdam or gov5's Glamsterdam execution: the block access list would lack
+  the batch accounts' entries. fleet7 is Osaka. Chain 94 flips on 2027-01-01, so this is needed
+  before a parallel build runs there (coordinator 2026-11-05).
+- **The serial-rebuild copy of the transaction list** (F5c). Measure it in the A/B. Remove it only
+  if fold refusals at `finish` prove unreachable in the field.
+- **The output shards** (`take_cached` / `into_staged`, `N42_OUTPUT_SHARDS`). Stay legacy; port
+  only if the A/B shows the merge is the cost.
+
 ### Notes for the history
 
 - Commit c117217eb (`fix(storage-overlay): ...`) also carries the ef-tests runner port: the two

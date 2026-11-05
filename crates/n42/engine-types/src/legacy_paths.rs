@@ -22,18 +22,20 @@ pub const LEGACY_REVM_PATHS: bool = cfg!(feature = "legacy-revm-paths");
 /// (F5d, `crate::parallel_build::import_block`): `N42_FOLLOWER_PARALLEL`;
 /// subsumed by it, since the evm2 import always runs sender groups on batch
 /// states and folds them at finish: `N42_FOLLOWER_GRAFT`,
-/// `N42_FOLLOWER_BATCH_STATE`, `N42_FOLLOWER_SENDER_GROUPS`.
+/// `N42_FOLLOWER_BATCH_STATE`, `N42_FOLLOWER_SENDER_GROUPS`. F5e (the X22
+/// knobs, `docs/RETH_2_9_0_UPGRADE.md` "F5e"): ported
+/// `N42_FOLLOWER_PARTITION_AHEAD` and `N42_FOLLOWER_FREE_ASYNC`; subsumed
+/// `N42_FOLLOWER_BUILD_PATH` (the import is `import_block`) and
+/// `N42_BUILD_COLLECT_IN_PLACE` (the evm2 step has no slots); retired
+/// `N42_FOLLOWER_PARTITION_HASH` (no component partition left) and
+/// `N42_PHASE_TIMERS` (the per-build and per-import lines carry the
+/// timings). The rest below stay legacy until the A/B.
 pub const KNOBS: &[&str] = &[
     "N42_FAST_TRANSFER",
     "N42_FOLLOWER_GRAFT_INDEX",
     "N42_FOLLOWER_GRAFT_RANGES",
     "N42_FOLLOWER_GRAFT_STREAM",
-    "N42_FOLLOWER_BUILD_PATH",
-    "N42_FOLLOWER_FREE_ASYNC",
     "N42_FOLLOWER_MERGE_BEHIND",
-    "N42_FOLLOWER_PARTITION_AHEAD",
-    "N42_FOLLOWER_PARTITION_HASH",
-    "N42_BUILD_COLLECT_IN_PLACE",
     "N42_BUILD_GRAFT_NO_CACHE",
     "N42_BUILD_MLP",
     "N42_BUILD_PREFETCH",
@@ -43,7 +45,6 @@ pub const KNOBS: &[&str] = &[
     "N42_GRAFT_RANGES",
     "N42_GRAFT_SHARDED",
     "N42_GRAFT_STREAM",
-    "N42_PHASE_TIMERS",
     "N42_PLAN_AHEAD_WARM",
     "N42_READ_SET",
 ];

@@ -708,6 +708,49 @@ execution layer (`LATE_VALIDATOR`), so a second EL imported every block.
 - Open: the A/B against v2.8.1 waits for F5f. No devnet block had a serial tail or more than one
   batch; those shapes are covered only by the unit tests.
 
+### F5e, the X22 knobs on evm2 (2026-11-05)
+
+The rule (coordinator, 2026-11-05): the A/B runs the X22 profile (`crates/n42/env/src/profile.rs`),
+so before F5f only the knobs X22 sets have to work on evm2. Everything else in
+`legacy_paths::KNOBS` stays under `legacy-revm-paths`, and the A/B decides whether to port it.
+
+- **X22 knobs that were still legacy-listed:**
+  - `N42_FOLLOWER_BUILD_PATH`, `N42_FOLLOWER_PARTITION_AHEAD`, `N42_FOLLOWER_PARTITION_HASH`,
+    `N42_FOLLOWER_FREE_ASYNC` and `N42_BUILD_COLLECT_IN_PLACE` are decided below.
+  - `N42_PLAN_AHEAD` and `N42_PLAN_AHEAD_WAIT_MS` are not legacy: they live in the transaction
+    queue's frame selection (`n42_tx_queue::plan_ahead`), which has no EVM in it, so they run on
+    evm2 unchanged.
+- **The partition ahead, ported.** `parallel_build::plan_import` makes the block's `ImportPlan`:
+  the leading transfers' (sender, recipient) and their partition by sender.
+  - With `N42_FOLLOWER_PARTITION_AHEAD=1`, `follower_import` spawns it on the worker pool once the
+    block is known, and the execution takes it just before the gate.
+  - `import_block` takes `Option<ImportPlan>`. A missing plan, or one made for another fee
+    recipient, is made inside.
+  - The per-import line gains `planned` and `plan_wait_us`.
+- **The frees off the import thread, ported.** With `N42_FOLLOWER_FREE_ASYNC=1`, the import's keys
+  and partition (now handed back in `ParallelRun::groups`) are dropped on the worker pool.
+  - The batches' merge is consumed by the fold at `finish`, so it is not part of this.
+  - The revm-era transaction environments do not exist on evm2.
+
+| knob | state on evm2 | why |
+| --- | --- | --- |
+| `N42_FOLLOWER_PARALLEL` | ported (F5d) | `parallel_build::import_block` |
+| `N42_FOLLOWER_GRAFT`, `N42_FOLLOWER_BATCH_STATE`, `N42_FOLLOWER_SENDER_GROUPS` | subsumed (F5d) | the evm2 import always groups by sender, runs batch states and folds |
+| `N42_FOLLOWER_BUILD_PATH` | subsumed | the follower's parallel import is `import_block`, the builder's batches and fold; the getter reads off on evm2 |
+| `N42_BUILD_COLLECT_IN_PLACE` | subsumed | the evm2 builder step collects per batch and has no slots |
+| `N42_FOLLOWER_PARTITION_AHEAD` | ported | `plan_import` on the worker pool before the gate |
+| `N42_FOLLOWER_FREE_ASYNC` | ported | keys and partition freed on the worker pool |
+| `N42_FOLLOWER_PARTITION_HASH` | retired | it sped up the component partition (`partition_shared`); the evm2 import partitions by sender, one map probe per sender run |
+| `N42_PHASE_TIMERS` | retired | per-door read counts for the revm fast transfer; the per-build and per-import lines carry the timings the A/B reads |
+| `N42_FAST_TRANSFER` | F5f | the evm2 registry handler |
+| `N42_READ_SET`, `N42_BUILD_PREFETCH`, `N42_BUILD_MLP`, `N42_PLAN_AHEAD_WARM` (`warm_ahead.rs` as a whole) | legacy until the A/B | read layers over revm `State`; worth porting only if the A/B shows reads as the cost |
+| `N42_GRAFT_{INDEX,RANGES,STREAM,SHARDED,BASE_SWAP,PREFAULT}`, `N42_BUILD_GRAFT_NO_CACHE` | legacy until the A/B | revm-era graft variants; the evm2 step has one merge and fold |
+| `N42_FOLLOWER_GRAFT_{INDEX,RANGES,STREAM}`, `N42_FOLLOWER_MERGE_BEHIND` | legacy until the A/B | the same, on the follower |
+
+Each row has the matching note in `docs/KNOBS.md`. The ported, subsumed and retired knobs leave
+`KNOBS`, so a node started with X22 on evm2 logs no "not available on evm2" line for them.
+The legacy-until-A/B ones X22 does not set.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

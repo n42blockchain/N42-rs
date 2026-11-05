@@ -1267,6 +1267,62 @@ bundle and reverts equal the sequential execution's. `evm2_step_bound` keeps its
 equal the committed ones, gas and requests equal, and the shards under the late residual equal the
 committed residual's.
 
+#### E13, after g6-g7
+
+The fx pairs E13 (21:48-22:14Z, natives f7fa91058 against main, two pairs,
+`wt-main/target/fleet-runs/strip-loop351D2S12P30T64X11T16E13{a,0,b,0b}MEMF/el.log`):
+- **Throughput.** The branch read 2,926,667 / 2,953,333 TPS (cycle 0.068 s) against the control's
+  5,025,283 / 4,838,183 (0.040-0.041 s). sharded 1378/1378, refusals 0, invalid 0.
+- **g7 worked.** state_wait median 0 (1274 of 1378 blocks "none"), seal_to_shards_ready_us 1433,
+  receipts_late=true, par_fold 0.
+- **g6 half worked.** The hook ran on every block (plan_body=1, plan_body_us 12-13.5k), but the step
+  never took the prepared build (prep_from_plan, commit_body_ahead_used, exec_prepared_groups all
+  false).
+- **What is left.** sealed_at median 64 against 35-37. par_to_seal 60.9 = par_exec 29 +
+  exec_end_to_seal 5 + about 25 ms before the execution that no field named.
+
+#### g8, the evm2 step's span around the execution (F5g8)
+
+**Why the prepared build missed.** The selection moves the plan's candidates into the bulk vector
+(`frame_blocks::select`: `std::mem::take(&mut prepared.cands)`), so the step's check
+`made.cands.len() == cands.len()` compared 0 with 200,000 and failed on every block. The step then
+made the keys serially (8.0 ms on the bench, more on the fleet's cold memory), the partition inside
+`execute_batches_into` (0.8 ms), and the body at the seal (4.5 ms on the build pool). The take is now
+the plan's when the keys and transactions have the candidates' length and the candidates are the
+selection's bulk vector, uncut (`made_cands_cut`, unit test
+`the_prepared_build_is_the_plans_only_on_its_uncut_bulk_take`). `prep_from_plan` and
+`exec_prepared_groups` are now set on the evm2 path.
+
+**New phases-line fields** (us):
+- `evm2_pre_exec_us`: from the step's start to `execute_batches_into`.
+- Its parts: `evm2_open_us` (the deferred state's open, including state_wait), `evm2_prepared_us`
+  (the take), `evm2_keys_us` (keys made inline on a miss), `evm2_shards_new_us`, `evm2_setup_us`
+  (the rest of the set-up).
+- `evm2_prepared_miss`: none / no_plan / `keys_len a!=b` / `cands_len a!=b` / `bulk_cut a!=b` /
+  `transactions_len a!=b`.
+- `evm2_fees_us`: after the execution, the run's indices plus the fees and gas.
+- The rest of the post-execution span keeps its existing fields: `commit_body_ms`,
+  `seal_lookahead_us`, `seal_puller_join_us`, `exec_end_to_seal_us`, `sealed_ms`.
+
+**Post-execution.** The fees loop over the executed set (each candidate's tip read cold) now runs on
+the build pool: 2.9 -> 0.3 ms on the bench.
+
+**Bench** (`plan_body_prep_bound`, release, 200,000 transfers, medians of 5):
+
+| | ms |
+| --- | --- |
+| hook, on the plan-body pool, off the build | 11.7 |
+| keys, inline, taken from the plan now | 8.0 |
+| partition, inline, taken from the plan now | 0.8 |
+| body at the seal, taken from the plan now | 4.5 |
+| output shards' set-up | 0.0 |
+| fees, serial -> pool | 2.9 -> 0.3 |
+
+With the plan taken, the pre-execution span is the open, which state_wait 0 makes ~0.1 ms with the
+pre-execution changes, plus the set-up. The post-execution span is the indices, the fees (0.3), the
+body's move and match, and the seal. E14 is to show `evm2_pre_exec_us` at 2-3 ms or less and
+`exec_end_to_seal_us` at about 3 ms.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

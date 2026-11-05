@@ -18,21 +18,21 @@ pub const LEGACY_REVM_PATHS: bool = cfg!(feature = "legacy-revm-paths");
 /// Every knob read by a path behind `legacy-revm-paths` and not yet ported to
 /// evm2. Ported (F5c, `crate::parallel_build`): `N42_PARALLEL_BUILD`,
 /// `N42_PARALLEL_BUILD_THREADS`, `N42_BUILD_BATCHES`, `N42_BUILD_ONE_WAVE`,
-/// `N42_FREEZE_POOL(_THREADS)`, `N42_PLAN_AHEAD_BODY(_THREADS)`.
+/// `N42_FREEZE_POOL(_THREADS)`, `N42_PLAN_AHEAD_BODY(_THREADS)`. Ported
+/// (F5d, `crate::parallel_build::import_block`): `N42_FOLLOWER_PARALLEL`;
+/// subsumed by it, since the evm2 import always runs sender groups on batch
+/// states and folds them at finish: `N42_FOLLOWER_GRAFT`,
+/// `N42_FOLLOWER_BATCH_STATE`, `N42_FOLLOWER_SENDER_GROUPS`.
 pub const KNOBS: &[&str] = &[
     "N42_FAST_TRANSFER",
-    "N42_FOLLOWER_GRAFT",
     "N42_FOLLOWER_GRAFT_INDEX",
     "N42_FOLLOWER_GRAFT_RANGES",
     "N42_FOLLOWER_GRAFT_STREAM",
-    "N42_FOLLOWER_BATCH_STATE",
     "N42_FOLLOWER_BUILD_PATH",
     "N42_FOLLOWER_FREE_ASYNC",
     "N42_FOLLOWER_MERGE_BEHIND",
-    "N42_FOLLOWER_PARALLEL",
     "N42_FOLLOWER_PARTITION_AHEAD",
     "N42_FOLLOWER_PARTITION_HASH",
-    "N42_FOLLOWER_SENDER_GROUPS",
     "N42_BUILD_COLLECT_IN_PLACE",
     "N42_BUILD_GRAFT_NO_CACHE",
     "N42_BUILD_MLP",

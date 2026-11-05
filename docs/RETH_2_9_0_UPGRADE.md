@@ -605,6 +605,78 @@ transactions, 0 rejected).
 - Open: the A/B against v2.8.1 waits for F5f. The equivalence on a fleet7-sized block is still
   unmeasured.
 
+### F5d, the follower's parallel import (2026-11-05)
+
+- **Rewritten, not renamed.** The revm-era follower paths (`execute_transfers_planned`, the build
+  path, graft index/ranges/stream, partition ahead, merge behind, async frees) stay under
+  `legacy-revm-paths` until F6. The evm2 import is `parallel_build::import_block` and one block in
+  `bin/n42/src/follower_import.rs` under `cfg(not(legacy-revm-paths))`. It reuses the F5c pieces
+  unchanged: `execute_batches`, `commit_run`, `N42BlockExecutor`'s fold at `finish`.
+- **What it takes.** The block's leading plain transfers: every transaction up to the first that has
+  input, an access list, blobs or authorizations, or whose sender or recipient is the beneficiary.
+  0x50 (Ed25519) transfers count as plain transfers.
+  - Those run in sender batches over the parent (`Dispatch::from_env`). Each batch has its own
+    view of the parent (`open_parent_state`), as the revm path's groups did.
+  - The block's executor then runs its pre-execution changes, the transfers' receipts (`commit_run`)
+    and the rest of the block transaction by transaction (the serial tail), then `finish`, which
+    folds the merge.
+  - The batches now refuse a transfer that used more than 21,000 gas (`TRANSFER_GAS`). Such a
+    transfer ran code at its recipient, and that code could read what another batch changed. The
+    builder skips it like any refused transfer.
+- **keep_cache=false, ported as `CacheScope::Only`.** On a block of transfers only, the executor's
+  overlay receives just the withdrawal recipients among the batch accounts. Those are the only
+  accounts the block's end reads. On a block with a serial tail every batch account is installed
+  (`CacheScope::All`), because the tail may read any of them. The stale check in `fold_into` keeps
+  a miss correct: it refuses, and the block is imported serially. **Measurement item for the A/B:**
+  whether caching everything (as the builder does) costs or saves on the follower.
+- **The refusal rule.**
+  - Every `Err` (no leading transfer, a skipped transfer, partition, unsupported change, merge,
+    cache conflict, a tail transaction's error, a fold refused at `finish`) leaves nothing behind.
+    The same call then imports the block through the stock executor, so a step's refusal never
+    rejects a payload. A block that is really invalid is refused by that serial import, with the
+    stock error.
+  - Blocks without transactions do not enter the step.
+  - Counters: `parallel_build::imports_parallel()`, `imports_refused()`,
+    `graft_fold::refused_count()`.
+- **One line per import** (target `n42::parallel_import`, info). An import that went parallel logs
+  `parallel=true`, `txs`, `tail`, `batches`, `accounts`, `cached`, `batches_us` and `finish_us`. A
+  refused one logs `parallel=false` and `refused=<reason>`. Both carry the three counters.
+- **Knobs.**
+  - `N42_FOLLOWER_PARALLEL` is ported.
+  - `N42_FOLLOWER_GRAFT`, `N42_FOLLOWER_BATCH_STATE` and `N42_FOLLOWER_SENDER_GROUPS` are subsumed:
+    the evm2 import always groups by sender, runs batch states and folds. All four are dropped from
+    `KNOBS`.
+  - `N42_FOLLOWER_BUILD_PATH` and `N42_FOLLOWER_PARTITION_AHEAD` now read off on evm2 (their
+    getters check `LEGACY_REVM_PATHS`), so `by_ref_road`, `keys_ahead` and the build path never
+    start there. They stay in `KNOBS`, as do `FOLLOWER_GRAFT_{INDEX,RANGES,STREAM}`,
+    `FOLLOWER_PARTITION_HASH`, `FOLLOWER_FREE_ASYNC` and `FOLLOWER_MERGE_BEHIND`. Each is a
+    revm-era refinement with nothing to act on in the evm2 import; port one only if the A/B points
+    at its phase.
+- **Tests (5 new).** `parallel_build` (4):
+  - a mixed block equals the stock import (`executor().execute`) in receipts, gas, bundle state,
+    reverts, contracts, receipts root and the QMDB root of the bundle. The block has batched
+    transfers with shared recipients, a created recipient and a 0x50 sender, then a serial tail
+    that opens with a storage-writing contract call: after it a batch recipient spends, a batch
+    sender sends again, the created account spends, and a transfer pays the beneficiary. Two
+    withdrawals follow, one to a batch recipient;
+  - leading transfers that spend in-block credits. A recipient with a parent balance of its own
+    spends on the batches' view, and the merge adds the credit to the debit, equal to the stock
+    import. An account the block creates has nothing on that view, so its spend is skipped and
+    the block is refused (imported serially);
+  - a block of transfers only caches just the withdrawal recipients and gives the same result;
+  - the fallback: a fold made to refuse at `finish` refuses the import and is counted, and the
+    serial import is the stock one; a block that opens with a contract call, and a transfer to a
+    contract (skipped by the gas check), are refused.
+
+  `payload` (1): a block built by the F5c parallel builder and imported by the F5d parallel
+  follower equals its serial import: receipts, gas (and the header's gas), bundle, reverts,
+  contracts and QMDB root. This is "build path = follower path = serial", the legacy tree's test.
+
+Gate: `ci/f5-d-gate.log`. `cargo check --workspace --keep-going --tests` is clean in the touched
+files; the one warning left is the existing unused `Header` import in `engine_ext_tests.rs`.
+Clippy is clean on `-p n42-engine-types -p n42 --lib --bins`. n42-engine-types (275), n42-qmdb-reth,
+n42-qmdb-state and n42-testing: 476 passed, 0 failed.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

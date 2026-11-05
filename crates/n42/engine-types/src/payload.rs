@@ -2571,49 +2571,148 @@ where
                 crate::parallel_transfer::Dispatch::from_env(),
             );
             par_exec_ms = exec_at.elapsed().as_millis() as u64;
-            let fold_at = std::time::Instant::now();
-            let committed = run.and_then(|run| {
-                let crate::parallel_build::ParallelRun { executed, skipped, merged, batches, .. } = run;
-                let indices: Vec<usize> = executed.iter().map(|e| e.index).collect();
-                let mut fees = U256::ZERO;
-                for e in &executed {
-                    let tip = pooled_consensus(&cands[e.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
-                    fees += U256::from(tip) * U256::from(e.result.tx_gas_used());
-                }
-                let results = executed.into_iter().map(|e| {
-                    let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&cands[e.index]));
-                    (e.result, tx_type)
-                });
-                let gas = crate::parallel_build::commit_run(&mut builder.executor, results, merged, crate::parallel_build::CacheScope::All)?;
-                Ok((indices, skipped, batches, gas, fees))
-            });
-            match committed {
-                Ok((indices, skipped, batches, gas, fees)) => {
-                    for &i in &indices {
-                        builder.transactions.push(cands[i].to_consensus());
-                    }
-                    cumulative_gas_used += gas;
-                    total_fees += fees;
-                    tx_count += indices.len() as u64;
-                    par_batches = batches;
-                    par_skipped = skipped.len();
-                    for i in skipped {
-                        deferred.push(Arc::clone(&cands[i]));
-                    }
-                    line = (indices.len(), par_skipped, batches, None);
-                    // Freed behind the build (`N42_FREEZE_POOL=own`: on its
-                    // own pool) rather than on the builder's thread.
-                    let spent = std::mem::take(&mut cands);
-                    crate::parallel_transfer::behind_pool().spawn(move || drop(spent));
-                }
-                Err(crate::parallel_build::Refused::Commit(err)) => {
-                    return Err(PayloadBuilderError::other(std::io::Error::other(format!(
-                        "the parallel step's receipts could not be committed: {err}"
-                    ))));
-                }
+            let exec_end = std::time::Instant::now();
+            let mut fold_at = exec_end;
+            match run {
                 Err(err) => {
                     line.3 = Some(err.reason());
                     warn!(target: "n42::parallel_build", number = header.number, %err, "the parallel step refused; the block is built serially");
+                }
+                Ok(run) => {
+                    let crate::parallel_build::ParallelRun { executed, skipped, merged, batches, groups } = run;
+                    let indices: Vec<usize> = executed.iter().map(|e| e.index).collect();
+                    let mut fees = U256::ZERO;
+                    let mut gas = 0u64;
+                    for e in &executed {
+                        let used = e.result.tx_gas_used();
+                        let tip = pooled_consensus(&cands[e.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
+                        fees += U256::from(tip) * U256::from(used);
+                        gas += used;
+                    }
+                    // `N42_SEAL_AT_EXEC=1` on evm2 (F5g1): under deferred
+                    // execution the header carries the parent's execution, so
+                    // a block the step filled (or the queue had no more for)
+                    // needs only its transactions and their root to be
+                    // sealed. It is sealed and proposed here, before the
+                    // receipts are committed and the merge handed to the
+                    // fold; those, and the finish, run behind the proposal,
+                    // and any refusal among them is loud
+                    // (`failed_after_seal`), never a different block. The
+                    // test is the early-seal gate's below (`no_seal_why`),
+                    // on the same inputs.
+                    let gas_left_after = block_gas_limit.saturating_sub(cumulative_gas_used + gas);
+                    let full_after = gas_left_after < MIN_TRANSACTION_GAS
+                        || par_drained
+                        || (!indices.is_empty() && gas_left_after <= seal_shortfall(block_gas_limit));
+                    let seal_here = seal_at_exec()
+                        && seal_early_possible
+                        && block_blob_count == 0
+                        && !indices.is_empty()
+                        && full_after
+                        && early_seal.is_some();
+                    if seal_here && let Some(EarlySeal { hook, parent_built: _ }) = early_seal.take() {
+                        let seal_at = std::time::Instant::now();
+                        par_to_seal_us = seal_at.saturating_duration_since(par_at).as_micros() as u64;
+                        exec_end_to_seal_us = seal_at.saturating_duration_since(exec_end).as_micros() as u64;
+                        for &i in &indices {
+                            builder.transactions.push(cands[i].to_consensus());
+                        }
+                        total_fees += fees;
+                        // What the puller took ahead and this block did not
+                        // build goes back to the queue before the proposal,
+                        // as on the revm-era step: the chained build pulls at
+                        // the seal.
+                        for pool_tx in std::mem::take(&mut lookahead).into_iter().rev() {
+                            refuse!(
+                                &pool_tx,
+                                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
+                            );
+                        }
+                        drop(pulled.take());
+                        give_back_ms = seal_at.elapsed().as_millis() as u64;
+                        let sealed = seal_block!(hook, seal_at, None);
+                        sealed_ahead_id = Some((sealed.2, sealed.3));
+                        // `N42_PLAN_AHEAD_BODY=1`: the frames' bulk vector,
+                        // uncut and executed whole, is the build's whole take.
+                        if from_bulk
+                            && crate::frame_blocks::plan_ahead_body_wanted()
+                            && skipped.is_empty()
+                            && indices.len() == cands.len()
+                            && cands.len() == bulk_len
+                        {
+                            let last = cands.len() - 1;
+                            let checks = [0, last / 2, last].into_iter().map(|i| (i, cands[i].sender(), cands[i].nonce())).collect();
+                            crate::frame_blocks::note_whole_take(crate::frame_blocks::WholeTake {
+                                block: sealed.2,
+                                parent: parent_header.hash(),
+                                len: cands.len(),
+                                checks,
+                            });
+                            whole_take_noted = true;
+                        }
+                        sealed_ahead = Some(sealed);
+                    }
+                    let sealed_here = sealed_ahead.is_some();
+                    fold_at = std::time::Instant::now();
+                    // A block sealed here runs nothing after the batches but
+                    // its end (the withdrawals and the post-block system
+                    // calls), which reads the withdrawal recipients and the
+                    // system contracts and never a batch account: the cache
+                    // half writes just the withdrawal recipients, as the
+                    // follower's import of a block without a serial tail does
+                    // (`CacheScope::Only`). Otherwise every merged account,
+                    // for the serial loop.
+                    let withdrawal_recipients: Vec<alloy_primitives::Address> = if sealed_here {
+                        attributes.withdrawals.as_ref().map_or_else(Vec::new, |w| w.iter().map(|w| w.address).collect())
+                    } else {
+                        Vec::new()
+                    };
+                    let scope = if sealed_here {
+                        crate::parallel_build::CacheScope::Only(&withdrawal_recipients)
+                    } else {
+                        crate::parallel_build::CacheScope::All
+                    };
+                    let results = executed.into_iter().map(|e| {
+                        let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&cands[e.index]));
+                        (e.result, tx_type)
+                    });
+                    match crate::parallel_build::commit_run(&mut builder.executor, results, merged, scope) {
+                        Ok(committed_gas) => {
+                            debug_assert_eq!(committed_gas, gas);
+                            if !sealed_here {
+                                for &i in &indices {
+                                    builder.transactions.push(cands[i].to_consensus());
+                                }
+                                total_fees += fees;
+                            }
+                            cumulative_gas_used += committed_gas;
+                            tx_count += indices.len() as u64;
+                            par_txs = indices.len() as u64;
+                            par_groups = groups.len();
+                            par_batches = batches;
+                            par_skipped = skipped.len();
+                            for i in skipped {
+                                deferred.push(Arc::clone(&cands[i]));
+                            }
+                            line = (indices.len(), par_skipped, batches, None);
+                            // Freed behind the build (`N42_FREEZE_POOL=own`: on
+                            // its own pool) rather than on the builder's thread.
+                            let spent = (std::mem::take(&mut cands), groups);
+                            crate::parallel_transfer::behind_pool().spawn(move || drop(spent));
+                        }
+                        Err(err) if sealed_here || matches!(err, crate::parallel_build::Refused::Commit(_)) => {
+                            return Err(failed_after_seal(
+                                sealed_ahead_id,
+                                PayloadBuilderError::other(std::io::Error::other(format!(
+                                    "the parallel step's receipts could not be committed: {err}"
+                                ))),
+                            ));
+                        }
+                        Err(err) => {
+                            line.3 = Some(err.reason());
+                            warn!(target: "n42::parallel_build", number = header.number, %err, "the parallel step refused; the block is built serially");
+                        }
+                    }
                 }
             }
             par_fold_ms = fold_at.elapsed().as_millis() as u64;

@@ -3038,6 +3038,62 @@ where
                 }
             }
         }
+        // `N42_FOLLOWER_PARALLEL=1` on evm2 (F5d): the block's leading plain
+        // transfers run as sender batches over the parent, the rest of the
+        // block after them on the block's executor; the batches' accounts go
+        // into the executor's cache (only the withdrawal recipients when
+        // nothing follows, as the revm path's `keep_cache=false`) and their
+        // writes are folded into its bundle at finish. Any refusal -- no
+        // leading transfer, a skipped one, a cache or fold conflict -- leaves
+        // `output` empty and the same block is imported serially below, in
+        // this call.
+        #[cfg(not(feature = "legacy-revm-paths"))]
+        if follower_parallel() && tx_count > 0 {
+            let open = || {
+                open_parent_state()
+                    .ok()
+                    .map(|s| StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(s)))
+            };
+            match n42_engine_types::parallel_build::import_block(
+                evm_config,
+                late.get()?,
+                cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))),
+                &open,
+                n42_engine_types::parallel_transfer::Dispatch::from_env(),
+            ) {
+                Ok((out, stats)) => {
+                    tracing::info!(
+                        target: "n42::parallel_import",
+                        number,
+                        parallel = true,
+                        txs = stats.txs,
+                        tail = stats.tail,
+                        batches = stats.batches,
+                        accounts = stats.accounts,
+                        cached = stats.cached,
+                        batches_us = stats.batches_us,
+                        finish_us = stats.finish_us,
+                        imports_parallel = n42_engine_types::parallel_build::imports_parallel(),
+                        imports_refused = n42_engine_types::parallel_build::imports_refused(),
+                        fold_refused = n42_engine_types::graft_fold::refused_count(),
+                        "parallel import"
+                    );
+                    output = Some(out);
+                }
+                Err(why) => {
+                    tracing::info!(
+                        target: "n42::parallel_import",
+                        number,
+                        parallel = false,
+                        refused = why.reason(),
+                        imports_parallel = n42_engine_types::parallel_build::imports_parallel(),
+                        imports_refused = n42_engine_types::parallel_build::imports_refused(),
+                        fold_refused = n42_engine_types::graft_fold::refused_count(),
+                        "parallel import refused; importing serially"
+                    );
+                }
+            }
+        }
         // A block executed on the worker pool read its transfers' accounts
         // through providers of its own, not through `cached`: the carry below
         // would copy ~147,000 accounts (26 ms on the import, loop155) that the
@@ -3849,10 +3905,8 @@ fn ms_between(from: std::time::Instant, to: std::time::Instant) -> u64 {
 
 /// `N42_FOLLOWER_PARALLEL`, read once.
 fn follower_parallel() -> bool {
-    // The parallel follower is the revm-era path (`legacy-revm-paths`).
-    if !n42_engine_types::legacy_paths::LEGACY_REVM_PATHS {
-        return false;
-    }
+    // Both builds read it: the revm-era paths under `legacy-revm-paths`, the
+    // evm2 batches (`parallel_build::import_block`) otherwise.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARALLEL", false))
 }

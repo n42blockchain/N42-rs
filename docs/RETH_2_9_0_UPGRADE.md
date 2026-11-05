@@ -329,6 +329,99 @@ MobileAnchor registry roots and the hashes are identical to gov5's across all th
 SIGKILL recovery on QMDB holds, including a kill before the first persistence. The engine
 defaults are unchanged from 2.8.1 (see the notes below).
 
+### F5 design (2026-11-05)
+
+**What v2.9.0 offers in place of revm's `State`.** The bundle types kept revm's API in
+`reth_trie_common::bundle_state`: `BundleState` and its pub `state`, `contracts`, `reverts` and
+`state_size`, plus `BundleAccount`, `AccountRevert`, `TransitionState`, `TransitionAccount`,
+`AccountStatus` with `on_changed` and the rest, and `apply_transitions_and_create_reverts`.
+
+The block executor is two things.
+
+- **The evm2 `Evm`.** Its `State` holds a transaction layer and journal over a `CacheDB` accepted
+  overlay. `overlay_db_mut().cache.accounts` is a pub `AddressMap<Option<AccountInfo>>`, and
+  contracts and storage sit beside it.
+- **reth's `BlockState`.** It has a private `transitions` map, takes changes only through
+  `commit(&TransactionChanges)` / `commit_account_changes(AccountChanges)`, and finalises to a
+  bundle in `into_bundle()` at the end of `finish`, after the post-execution changes.
+
+The consequences:
+
+- No bundle is mutable mid-block.
+- `merge_transitions` / `take_bundle` are gone.
+- A transaction's changes arrive as evm2's change stream (`StateChangeSink`: account, storage,
+  storage wipe, bytecode), not as `EvmState`.
+- Account code is never in a reth `AccountInfo` (`without_code`). Touched code lives in the bundle's
+  `contracts`.
+- Transactions can be executed detached: `execute_transaction_without_commit`, then
+  `commit_detached_transaction`.
+
+**Finding that sets the order.** Every parallel batch, leader and follower alike
+(`parallel_transfer.rs` 2751, 3194, 3312), builds its EVM with
+`N42EvmFactory::with_fast_transfers(true)`. X22 therefore runs the transfer fast path inside the
+batches even though it does not set `N42_FAST_TRANSFER`. F5c and F5d first run their batches on the
+stock evm2 handler, which is correct but slower. Their A/B against v2.8.1 is like for like only once
+F5f gives the batches the handler, or once a measurement shows evm2's own plain-call path is close
+enough. evm2 has no interpreter-free transfer path of its own.
+
+**Per path.**
+
+| path | rename | rewrite |
+| --- | --- | --- |
+| `parallel_common.rs` | all of it: knobs, pools, partitions, phase timers, revert helpers already work on reth's bundle state | none; un-gate |
+| `batch_state.rs` | `take_bundle`, `loaded`/`loaded_status`/`change` (bundle-account rules) | the read side becomes an evm2 `Database` (`get_account` / `get_code_by_hash` / `get_storage` / `get_block_hash`); `commit(EvmState)` becomes a `StateChangeSink` that folds each transaction's stream into the batch's `BundleAccount`s with the same status moves and the same `Unsupported` refusals (storage, create, destroy) |
+| batch execution (`execute_for_build_*`, `follower_batch`, `execute_transfers_*`) | partition, dispatch, slots, `BuildRun`, body/fees | the batch loop drives a bare evm2 `Evm` over the batch's database (no pre- or post-execution) and feeds each committed transaction to `BatchState`. Step one is reth's `EthBlockExecutor` per batch, taking `block_state.into_bundle()`: the correctness baseline, measured, then replaced by the sink |
+| graft family (`graft_bundles*`, `fold_bundles`, indexed/ranges/sharded/staged/streamed folds, base swap, prefault target, `install_staged`, output shards' `take_cached` / `into_staged`) | everything that folds bundles into a bundle | the target: they write into `&mut State<DB>` (`bundle_state` + `cache`), which v2.9.0 does not have mid-block, so they cannot be ported 1:1; see below |
+| `warm_ahead.rs`, `ReadSet`/`ReadSetDb`, `WarmDb`/`FrozenWarm`, `BUILD_MLP` | the layers and their filling | revm `Database` → evm2 `Database` (four methods, `Word` keys); `AccountHint` for evm2's `CacheDB` and reth's `StateProviderDatabase` |
+| `N42_BUILD_PREFETCH` | — | it wrote revm's `CachedReads`; becomes a fill of the batch database's warm layer, or is retired if `READ_SET` covers it (decided in F5e). reth 2.9.0's prewarm (`prewarm_tx_result`, `payload_processor/prewarm.rs`) serves the engine tree's newPayload path, which neither the leader's build nor the N42 follower import goes through, so it retires no knob of ours |
+| `fast_transfer` | the qualification rules, counters, timers | `N42EvmFactory` (a revm EVM wrapper) becomes an evm2 registry entry for types 0, 1 and 2 (0x50 executes as 2) that wraps the stock Ethereum handler: `prepare` proves the shape on evm2's host, otherwise it delegates. It applies three balance changes and a nonce through `State::account` handles so that evm2's change stream and journal see them. The fork set stays Prague/Osaka (fleet7 is Osaka). Amsterdam needs its own tests first: EIP-8037 state gas on a creating recipient, EIP-2780 intrinsic, and the EIP-7708 transfer log, which changes the receipt |
+
+**The graft, nearest shape: two halves.**
+
+1. **Cache half** (builder; follower only for withdrawal recipients and the beneficiary). After the
+   batches, write each grafted account's current info into the executor's accepted overlay
+   (`evm.db_mut().overlay_db_mut().cache.accounts`). The serial tail, the withdrawals and the
+   beneficiary credit then read the post-batch values, as they read `State.cache` today. The
+   beneficiary's fee total is still applied as one credit before `finish`.
+2. **Bundle half.** After `finish`, fold the batch bundles into the finished `BundleState` with one
+   rule:
+   - An account only the batches touched goes in as the batch left it, exactly as
+     `graft_bundles_direct` does today.
+   - An account also in the serial bundle keeps the serial `info`/`status`, which already include
+     the batch's effect because it was read from the cache half. It takes `original_info` and the
+     revert from the batch, which hold the parent's values. The serial revert to the post-batch value
+     is dropped.
+   - Batch accounts carry no storage or code (`Unsupported`), so nothing else merges.
+
+   Every fold variant keeps its body and changes only its target, from `&mut State<DB>` to
+   `&mut BundleState` plus the overlay. `finish` returns the bundle, so the N42 executor needs no
+   fork.
+
+**Equivalence tests.** These are rebuilt against the stock `N42EvmConfig` executor
+(`executor(db).execute(block)` over an evm2 `InMemoryDB`) on the same block, replacing revm's
+`State` as the reference:
+
+- `parallel_matches_serial*`, `build_run_matches_serial` and
+  `the_build_path_matches_the_follower_path_and_the_serial_executor`: the bundle compared by state,
+  contracts and sorted reverts (`assert_same_bundle`), the receipts root, and the QMDB root through
+  `changes_from_execution`.
+- The fold-equality tests: indexed = direct = sharded = staged, unchanged since they compare bundles.
+- New blocks to test:
+  - transfers plus contract calls in the serial tail that touch batch senders;
+  - a withdrawal to a batch-touched account;
+  - a creating recipient at Amsterdam gas;
+  - a 0x50 sender;
+  - the beneficiary as a recipient, which must refuse the parallel path.
+- F5f: the stock handler against the fast handler, transaction by transaction: gas, refund, balances,
+  nonce, the touched set and the change stream, plus the receipt with and without EIP-7708.
+
+**Open questions for the coordinator.**
+
+- Should F5c/F5d's A/B wait for F5f? My recommendation: yes; measure the stock-handler batches only
+  as a data point.
+- Is the follower's `keep_cache = false` still worth keeping, given that the cache half is cheap?
+  To be measured.
+
 ### Notes for the history
 
 - Commit c117217eb (`fix(storage-overlay): ...`) also carries the ef-tests runner port: the two

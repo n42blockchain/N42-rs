@@ -2559,7 +2559,33 @@ where
                     .ok()
                     .map(|s| StateProviderDatabase::new(reth_storage_api::StateProvider::into_evm_state_provider(s)))
             };
-            let run = crate::parallel_build::execute_batches(
+            // `N42_OUTPUT_SHARDS=<S>` on a block that can seal at the
+            // execution's end (F5g3): each batch's bundle goes into the shard
+            // that owns each address, on the batch's thread, and the block's
+            // output stays in the shards -- no merge of the batches into one
+            // map before the seal, no fold of them into the executor's bundle
+            // after it. The next build reads the shards under the executor's
+            // residual (`ShardedParent`), the root and the hashed post-state
+            // read both, and the block's one bundle is merged behind them or
+            // elided (`N42_MERGE_ELIDE`), as on the revm-era step.
+            let shard_count = crate::output_shards::output_shards();
+            let mut sharded = (shard_count > 0
+                && seal_at_exec()
+                && seal_early_possible
+                && block_blob_count == 0
+                && early_seal.is_some())
+            .then(|| crate::output_shards::OutputShards::new(beneficiary, keys.len(), shard_count));
+            let shard_sink = sharded.as_ref().map(|shards| move |bundle: reth_trie::bundle_state::BundleState| shards.add(bundle));
+            let sink = shard_sink.as_ref().map(|sink| sink as &(dyn Fn(reth_trie::bundle_state::BundleState) + Sync));
+            // The accounts the block's end reads stay out of the shards: the
+            // executor's cache takes them at their post-batch values from the
+            // run's merge, before the shards are frozen.
+            let kept: Vec<alloy_primitives::Address> = if sink.is_some() {
+                attributes.withdrawals.as_ref().map_or_else(Vec::new, |w| w.iter().map(|w| w.address).collect())
+            } else {
+                Vec::new()
+            };
+            let run = crate::parallel_build::execute_batches_into(
                 &evm_config,
                 &group_env,
                 &keys,
@@ -2569,6 +2595,8 @@ where
                 deferred_now.then_some(&worst_case as &(dyn Fn(usize) -> U256 + Sync)),
                 beneficiary,
                 crate::parallel_transfer::Dispatch::from_env(),
+                sink,
+                &kept,
             );
             par_exec_ms = exec_at.elapsed().as_millis() as u64;
             let exec_end = std::time::Instant::now();
@@ -2579,7 +2607,7 @@ where
                     warn!(target: "n42::parallel_build", number = header.number, %err, "the parallel step refused; the block is built serially");
                 }
                 Ok(run) => {
-                    let crate::parallel_build::ParallelRun { executed, skipped, merged, batches, groups } = run;
+                    let crate::parallel_build::ParallelRun { executed, skipped, merged, batches, groups, split } = run;
                     let indices: Vec<usize> = executed.iter().map(|e| e.index).collect();
                     let mut fees = U256::ZERO;
                     let mut gas = 0u64;
@@ -2654,6 +2682,46 @@ where
                     }
                     let sealed_here = sealed_ahead.is_some();
                     fold_at = std::time::Instant::now();
+                    // The shards frozen (one task a shard on the pool). A block
+                    // that did not seal here goes back to one merge: the
+                    // shards merged into one bundle and the beneficiary's
+                    // bundles beside it, for the serial loop's cache.
+                    let mut merged = merged;
+                    let mut frozen = None;
+                    let mut refused = None;
+                    if let Some(shards) = sharded.take() {
+                        // `N42_FREEZE_AFTER_SEAL`: on its own thread, joined
+                        // where the seal branch files the residual.
+                        let shards = if sealed_here && freeze_after_seal() {
+                            match spawn_freeze(shards) {
+                                Ok(handle) => {
+                                    pending_freeze = Some(handle);
+                                    freeze_late_used = true;
+                                    None
+                                }
+                                Err(shards) => shards.map(|shards| shards.freeze()),
+                            }
+                        } else {
+                            Some(shards.freeze())
+                        };
+                        match shards {
+                            None if pending_freeze.is_some() => {}
+                            None => {
+                                refused = Some(crate::parallel_build::Refused::NotParallel(
+                                    crate::parallel_common::NotParallel::NoState,
+                                ));
+                            }
+                            Some(shards) if sealed_here => frozen = Some(shards),
+                            Some(shards) => {
+                                let mut whole = vec![shards.merged(&reth_trie::bundle_state::BundleState::default())];
+                                whole.extend(split);
+                                match crate::graft_fold::merge_batches(whole) {
+                                    Ok(again) => merged = again,
+                                    Err(err) => refused = Some(crate::parallel_build::Refused::Fold(err)),
+                                }
+                            }
+                        }
+                    }
                     // A block sealed here runs nothing after the batches but
                     // its end (the withdrawals and the post-block system
                     // calls), which reads the withdrawal recipients and the
@@ -2667,8 +2735,14 @@ where
                     } else {
                         Vec::new()
                     };
+                    // On the shard path `merged` holds only the beneficiary
+                    // and the withdrawal recipients, folded at `finish`.
+                    let mut cached_only = withdrawal_recipients.clone();
+                    if sealed_here && (frozen.is_some() || pending_freeze.is_some()) {
+                        cached_only.push(beneficiary);
+                    }
                     let scope = if sealed_here {
-                        crate::parallel_build::CacheScope::Only(&withdrawal_recipients)
+                        crate::parallel_build::CacheScope::Only(&cached_only)
                     } else {
                         crate::parallel_build::CacheScope::All
                     };
@@ -2676,9 +2750,22 @@ where
                         let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&cands[e.index]));
                         (e.result, tx_type)
                     });
-                    match crate::parallel_build::commit_run(&mut builder.executor, results, merged, scope) {
+                    let committed = match refused {
+                        Some(err) => Err(err),
+                        None => crate::parallel_build::commit_run(&mut builder.executor, results, merged, scope),
+                    };
+                    match committed {
                         Ok(committed_gas) => {
                             debug_assert_eq!(committed_gas, gas);
+                            if frozen.is_some() || pending_freeze.is_some() {
+                                crate::parallel_build::note_sharded_run();
+                            }
+                            if let Some(shards) = frozen.take() {
+                                out_shards = shards.shard_count();
+                                shard_append_ms = shards.append_ms();
+                                shard_fold_ms = shards.fold_ms();
+                                output_shards = Some(Arc::new(shards));
+                            }
                             if !sealed_here {
                                 for &i in &indices {
                                     builder.transactions.push(cands[i].to_consensus());
@@ -2734,6 +2821,7 @@ where
             refused = why.unwrap_or(""),
             fold_refused_total = crate::graft_fold::refused_count(),
             serial_rebuilds_total = crate::parallel_build::serial_rebuilds(),
+            sharded_total = crate::parallel_build::sharded_runs(),
             fast_hits_total = crate::fast_handler::hits(),
             fast_delegated_total = crate::fast_handler::delegated(),
             pull_ms = par_pull_ms,

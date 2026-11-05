@@ -67,6 +67,9 @@ pub struct ParallelRun<C: ConfigureEvm> {
     /// The partition the batches ran, handed back so that a caller can free
     /// it off its own thread (`N42_FOLLOWER_FREE_ASYNC`).
     pub groups: Vec<Vec<usize>>,
+    /// With a sink ([`execute_batches_into`]): each batch's own bundle of the
+    /// beneficiary, which `merged` is made of. Empty otherwise.
+    pub split: Vec<reth_trie::bundle_state::BundleState>,
 }
 
 /// Why the parallel step gave the block to the serial loop.
@@ -121,6 +124,18 @@ static COMMITTED_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// Runs handed to a block executor by [`commit_run`], since start.
 pub fn committed_runs() -> u64 {
     COMMITTED_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static SHARDED_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts a sealed run whose output stayed in the output shards (F5g3).
+pub fn note_sharded_run() {
+    SHARDED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Sealed runs whose output stayed in the output shards, since start.
+pub fn sharded_runs() -> u64 {
+    SHARDED_RUNS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Counts a block rebuilt serially after its fold refused at `finish`.
@@ -268,6 +283,40 @@ where
     D: evm2::evm::Database + Send + 'static,
     evm2::TxResult<TypesOf<C>>: Send,
 {
+    execute_batches_into(config, env, keys, groups, convert, open, worst_case, beneficiary, dispatch, None, &[])
+}
+
+/// [`execute_batches`] with each batch's bundle handed to `sink` on the
+/// batch's thread as the batch ends (the output shards, F5g3), the
+/// beneficiary's and `kept`'s accounts and reverts split off it first. The
+/// run's `merged` is then theirs alone (every batch credits the beneficiary,
+/// the fold sums the credits; `kept` are the accounts the block's end reads,
+/// the withdrawal recipients, which the executor's cache must hold at their
+/// post-batch values); every other account is the sink's. The checks the merge
+/// makes across batches are the batch state's own refusals here (no code,
+/// no storage, nothing created, destroyed or left empty), and the
+/// partition by sender keeps a sender in one batch, so no account is
+/// debited by two.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_batches_into<C, D>(
+    config: &C,
+    env: &EvmEnvFor<C>,
+    keys: &[(Address, Address)],
+    groups: Option<Vec<Vec<usize>>>,
+    convert: &(dyn Fn(usize) -> Recovered<EvmTxOf<C>> + Sync),
+    open: &(dyn Fn() -> Option<D> + Sync),
+    worst_case: Option<&(dyn Fn(usize) -> alloy_primitives::U256 + Sync)>,
+    beneficiary: Address,
+    dispatch: Dispatch,
+    sink: Option<&(dyn Fn(reth_trie::bundle_state::BundleState) + Sync)>,
+    kept: &[Address],
+) -> Result<ParallelRun<C>, Refused>
+where
+    C: ConfigureEvm + Sync,
+    EvmEnvFor<C>: Sync,
+    D: evm2::evm::Database + Send + 'static,
+    evm2::TxResult<TypesOf<C>>: Send,
+{
     let groups = match groups {
         Some(groups) => groups,
         None => partition_by_sender(keys, beneficiary).map_err(Refused::NotParallel)?,
@@ -281,6 +330,7 @@ where
     };
     let order = largest_first(&batches.iter().map(|b| b.iter().map(|g| g.len()).sum()).collect::<Vec<usize>>());
     type BatchOut<C> = Result<(Vec<Executed<C>>, Vec<usize>, reth_trie::bundle_state::BundleState), Refused>;
+    let split_off: Vec<Address> = std::iter::once(beneficiary).chain(kept.iter().copied().filter(|a| *a != beneficiary)).collect();
     let run_batch = |members: &Vec<&Vec<usize>>| -> BatchOut<C> {
         let db = open().ok_or(Refused::NotParallel(NotParallel::NoState))?;
         // The batch's EVM carries the fast transfer handler (as the revm-era
@@ -338,7 +388,16 @@ where
                 }
             }
         }
-        Ok((executed, skipped, state.take_bundle()))
+        let bundle = state.take_bundle();
+        Ok(match sink {
+            Some(sink) => {
+                let mut bundle = bundle;
+                let own = split_accounts(&mut bundle, &split_off);
+                sink(bundle);
+                (executed, skipped, own)
+            }
+            None => (executed, skipped, bundle),
+        })
     };
     let slots: Vec<std::sync::OnceLock<BatchOut<C>>> = (0..batches.len()).map(|_| std::sync::OnceLock::new()).collect();
     pool.scope(|scope| {
@@ -358,10 +417,42 @@ where
     }
     executed.sort_unstable_by_key(|e| e.index);
     skipped.sort_unstable();
+    let split = if sink.is_some() { bundles.clone() } else { Vec::new() };
     let merged = merge_batches(bundles).map_err(Refused::Fold)?;
     let count = batches.len();
     drop(batches);
-    Ok(ParallelRun { executed, skipped, merged, batches: count, groups })
+    Ok(ParallelRun { executed, skipped, merged, batches: count, groups, split })
+}
+
+/// `addresses`' accounts and reverts taken out of `bundle` into a bundle of
+/// their own (empty of those the bundle does not hold), the reverts in their
+/// order.
+fn split_accounts(bundle: &mut reth_trie::bundle_state::BundleState, addresses: &[Address]) -> reth_trie::bundle_state::BundleState {
+    let mut own = reth_trie::bundle_state::BundleState::default();
+    for address in addresses {
+        if let Some(account) = bundle.state.remove(address) {
+            bundle.state_size = bundle.state_size.saturating_sub(account.size_hint());
+            own.state_size += account.size_hint();
+            own.state.insert(*address, account);
+        }
+    }
+    if own.state.is_empty() {
+        return own;
+    }
+    let mut reverts = Vec::new();
+    for block in bundle.reverts.iter_mut() {
+        block.retain(|entry| {
+            let moved = own.state.contains_key(&entry.0);
+            if moved {
+                reverts.push(entry.clone());
+            }
+            !moved
+        });
+    }
+    bundle.reverts_size = bundle.reverts.iter().map(Vec::len).sum();
+    own.reverts_size = reverts.len();
+    own.reverts.push(reverts);
+    own
 }
 
 static IMPORTS_PARALLEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -588,6 +679,32 @@ mod tests {
     fn config() -> Config {
         let spec = reth_chainspec::ChainSpecBuilder::mainnet().shanghai_activated().build();
         N42EvmConfig::new(Arc::new(n42_header::N42ChainSpec::from(spec)))
+    }
+
+    /// The timing tests' chain: Prague, where the fast transfer handler is
+    /// registered (`fast_handler::covers`), as on the fleet's Osaka chain.
+    /// `F5G_SPEC=shanghai` runs them without it.
+    fn timing_config() -> Config {
+        if std::env::var("F5G_SPEC").as_deref() == Ok("shanghai") {
+            return config();
+        }
+        let spec = reth_chainspec::ChainSpecBuilder::mainnet().prague_activated().build();
+        N42EvmConfig::new(Arc::new(n42_header::N42ChainSpec::from(spec)))
+    }
+
+    /// [`ctx`] with the parent beacon root a Cancun-and-later block needs.
+    fn timing_ctx(withdrawals: &[Withdrawal]) -> reth_evm_ethereum::EthBlockExecutionCtx<'_> {
+        reth_evm_ethereum::EthBlockExecutionCtx { parent_beacon_block_root: Some(B256::ZERO), ..ctx(withdrawals) }
+    }
+
+    /// `header` with the fields a Cancun-and-later header carries.
+    fn timing_header(mut header: alloy_consensus::Header) -> alloy_consensus::Header {
+        header.parent_beacon_block_root = Some(B256::ZERO);
+        header.blob_gas_used = Some(0);
+        header.excess_blob_gas = Some(0);
+        header.withdrawals_root = Some(alloy_consensus::EMPTY_ROOT_HASH);
+        header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+        header
     }
 
     /// Clear of the precompiles (0x01-0x11): a value transfer to one of
@@ -1021,7 +1138,7 @@ mod tests {
             base.insert_account_info(&sender(s), AccountInfo { balance: U256::from(FUND), ..Default::default() });
         }
         base.insert_account_info(&addr(BENEFICIARY), AccountInfo { balance: U256::from(1u64), ..Default::default() });
-        let c = config();
+        let c = timing_config();
         let mut header = alloy_consensus::Header {
             number: 5,
             timestamp: 1_000,
@@ -1031,7 +1148,7 @@ mod tests {
             ..Default::default()
         };
         header.gas_limit += 21_000;
-        let env = c.evm_env(&n42_header::N42Header::from(header)).expect("env");
+        let env = c.evm_env(&n42_header::N42Header::from(timing_header(header))).expect("env");
         let w = withdrawals();
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move || {
@@ -1045,7 +1162,9 @@ mod tests {
             v[v.len() / 2]
         };
         let (mut exec, mut root, mut fold_all, mut fold_only, mut finish) = (vec![], vec![], vec![], vec![], vec![]);
+        let (mut shard_exec, mut freeze, mut shard_commit, mut shard_finish) = (vec![], vec![], vec![], vec![]);
         for round in 0..rounds {
+            let mut reference: Option<BundleState> = None;
             let mut txs = Vec::with_capacity((senders * per_sender) as usize);
             for s in 0..senders {
                 for n in 0..per_sender {
@@ -1076,7 +1195,7 @@ mod tests {
                         .expect("again"),
                 };
                 let ParallelRun { executed, merged, .. } = run;
-                let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(base.clone(), env.clone()), ctx(&w));
+                let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(base.clone(), env.clone()), timing_ctx(&w));
                 ex.apply_pre_execution_changes().expect("pre");
                 let recipients: Vec<Address> = w.iter().map(|w| w.address).collect();
                 let scope = if only { CacheScope::Only(&recipients) } else { CacheScope::All };
@@ -1091,16 +1210,64 @@ mod tests {
                     finish.push(at.elapsed().as_micros());
                 }
                 assert_eq!(out.result.receipts.len(), txs.len());
-                drop(out);
+                if only {
+                    reference = Some(out.state);
+                }
             }
+            // The shard path (F5g3): the batches' bundles filed into the
+            // output shards on their threads, frozen behind the seal, the
+            // beneficiary alone merged and folded at the finish.
+            let shard_count = std::env::var("F5G_SHARDS").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize);
+            let shards = crate::output_shards::OutputShards::new(addr(BENEFICIARY), keys.len(), shard_count);
+            let sink = |bundle: BundleState| shards.add(bundle);
+            let at = Instant::now();
+            let recipients: Vec<Address> = w.iter().map(|w| w.address).collect();
+            let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink), &recipients)
+                .expect("the sharded batches run");
+            shard_exec.push(at.elapsed().as_micros());
+            let at = Instant::now();
+            let frozen = shards.freeze();
+            freeze.push(at.elapsed().as_micros());
+            let ParallelRun { executed, merged, .. } = run;
+            let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(base.clone(), env.clone()), timing_ctx(&w));
+            ex.apply_pre_execution_changes().expect("pre");
+            let mut only = recipients;
+            only.push(addr(BENEFICIARY));
+            let at = Instant::now();
+            let results = executed.into_iter().map(|e| (e.result, <N42TxEnvelope as alloy_consensus::TransactionEnvelope>::tx_type(&signed[e.index])));
+            commit_run(&mut ex, results, merged, CacheScope::Only(&only)).expect("the sharded commit");
+            shard_commit.push(at.elapsed().as_micros());
+            let at = Instant::now();
+            let out = ex.finish().expect("the sharded finish");
+            shard_finish.push(at.elapsed().as_micros());
+            assert_eq!(out.result.receipts.len(), txs.len());
+            // The shards under the residual are the bundle the fold leaves.
+            let whole = frozen.merged(&out.state);
+            let reference = reference.take().expect("the fold path's bundle");
+            assert_eq!(whole.state.len(), reference.state.len(), "the accounts");
+            for (address, account) in &reference.state {
+                let got = whole.state.get(address).expect("the account in the shards' bundle");
+                assert_eq!((&got.info, &got.original_info, &got.status), (&account.info, &account.original_info, &account.status), "{address}");
+            }
+            let reverts = |b: &BundleState| {
+                let mut all: Vec<_> = b.reverts.iter().flatten().map(|(a, r)| (*a, format!("{r:?}"))).collect();
+                all.sort();
+                all
+            };
+            assert_eq!(reverts(&whole), reverts(&reference), "the reverts");
+            drop((out, frozen, whole, reference));
             eprintln!(
-                "round {round}: txs={} accounts={accounts} exec_us={} root_us={} commit_all_us={} commit_only_us={} finish_us={}",
+                "round {round}: txs={} accounts={accounts} exec_us={} root_us={} commit_all_us={} commit_only_us={} finish_us={} | shards={shard_count} exec_us={} freeze_us={} commit_us={} finish_us={}",
                 txs.len(),
                 exec[round],
                 root[round],
                 fold_all[round],
                 fold_only[round],
-                finish[round]
+                finish[round],
+                shard_exec[round],
+                freeze[round],
+                shard_commit[round],
+                shard_finish[round],
             );
         }
         eprintln!(
@@ -1112,5 +1279,135 @@ mod tests {
             median(fold_only) as f64 / 1000.0,
             median(finish) as f64 / 1000.0,
         );
+        eprintln!(
+            "evm2_step_bound shard path medians: exec_ms={:.1} freeze_ms={:.1} commit_ms={:.1} finish_ms={:.1}",
+            median(shard_exec) as f64 / 1000.0,
+            median(freeze) as f64 / 1000.0,
+            median(shard_commit) as f64 / 1000.0,
+            median(shard_finish) as f64 / 1000.0,
+        );
+    }
+
+    /// One evm2 batch, timed section by section on one thread (F5g2): what a
+    /// transfer costs inside `execute_batches`' batch loop. 40 senders of
+    /// 500 transfers to recipients drawn from 2,000,000 (nearly all
+    /// created), the parent an in-memory map. Ignored:
+    ///
+    /// ```text
+    /// cargo test --release -p n42-engine-types --lib evm2_batch_split -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing"]
+    fn evm2_batch_split() {
+        use std::time::Instant;
+        let senders = 40u64;
+        let per_sender = 500u64;
+        let sender = |s: u64| addr(0x10_0000 + s);
+        let mut base = CacheDB::new(EmptyDB::default());
+        for s in 0..senders {
+            base.insert_account_info(&sender(s), AccountInfo { balance: U256::from(FUND), ..Default::default() });
+        }
+        base.insert_account_info(&addr(BENEFICIARY), AccountInfo { balance: U256::from(1u64), ..Default::default() });
+        let c = timing_config();
+        let header = alloy_consensus::Header {
+            number: 5,
+            timestamp: 1_000,
+            gas_limit: 30_000_000_000,
+            base_fee_per_gas: Some(7),
+            beneficiary: addr(BENEFICIARY),
+            ..Default::default()
+        };
+        let env = c.evm_env(&n42_header::N42Header::from(timing_header(header))).expect("env");
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..9u64 {
+            let fast = round % 3 != 1;
+            // The third of each three: the inherent `transact` (no detach),
+            // the batch state fed from the borrowed changes, then `commit`.
+            let inherent = round % 3 == 2;
+            let mut txs = Vec::with_capacity((senders * per_sender) as usize);
+            for s in 0..senders {
+                for n in 0..per_sender {
+                    let to = addr(0x100_0000 + next() % 2_000_000);
+                    txs.push(Recovered::new_unchecked(transfer(0, n, to, 1 + round).into_inner(), sender(s)));
+                }
+            }
+            let n = txs.len() as u128;
+            let (mut t_convert, mut t_transact, mut t_batch, mut t_commit, mut t_push) = (0u128, 0u128, 0u128, 0u128, 0u128);
+            let at = Instant::now();
+            let make = || c.evm_with_env(base.clone(), env.clone());
+            let mut evm = if fast { crate::fast_handler::as_batch(make) } else { make() };
+            let mut state = crate::batch_state::BatchState::with_capacity(txs.len() * 2 + 1);
+            let mut executed = Vec::with_capacity(txs.len());
+            let t_open = at.elapsed().as_nanos();
+            let hits = crate::fast_handler::hits();
+            let whole = Instant::now();
+            for (i, t) in txs.iter().enumerate() {
+                let a = Instant::now();
+                let tx = t.clone().map(evm2::ethereum::TxEnvelope::from);
+                let b = Instant::now();
+                if inherent {
+                    let out = evm.transact(&tx).expect("the transfer");
+                    let c2 = Instant::now();
+                    for changes in out.account_changes() {
+                        state.commit_account(changes).expect("modelled");
+                    }
+                    let d = Instant::now();
+                    let result = out.commit();
+                    let e = Instant::now();
+                    executed.push((i, result));
+                    let f = Instant::now();
+                    t_convert += (b - a).as_nanos();
+                    t_transact += (c2 - b).as_nanos();
+                    t_batch += (d - c2).as_nanos();
+                    t_commit += (e - d).as_nanos();
+                    t_push += (f - e).as_nanos();
+                    continue;
+                }
+                let out = reth_evm::Evm::transact(&mut evm, &tx).expect("the transfer");
+                let c2 = Instant::now();
+                state.commit(&out.pending_state).expect("modelled");
+                let d = Instant::now();
+                reth_evm::Evm::commit_state(&mut evm, &out.pending_state);
+                let e = Instant::now();
+                executed.push((i, out.result));
+                let f = Instant::now();
+                t_convert += (b - a).as_nanos();
+                t_transact += (c2 - b).as_nanos();
+                t_batch += (d - c2).as_nanos();
+                t_commit += (e - d).as_nanos();
+                t_push += (f - e).as_nanos();
+            }
+            let t_loop = whole.elapsed().as_nanos();
+            let at = Instant::now();
+            let bundle = state.take_bundle();
+            let t_take = at.elapsed().as_nanos();
+            let at = Instant::now();
+            let accounts = bundle.state.len();
+            let merged = merge_batches(vec![bundle]).expect("merge");
+            let t_merge = at.elapsed().as_nanos();
+            let at = Instant::now();
+            drop((evm, executed, merged));
+            let t_drop = at.elapsed().as_nanos();
+            eprintln!(
+                "split fast={fast} inherent={inherent} txs={n} accounts={accounts} hits={} per tx ns: loop={} convert={} transact={} batch_state={} commit_state={} push={} | per batch us: open={} take_bundle={} merge={} drop={}",
+                crate::fast_handler::hits() - hits,
+                t_loop / n,
+                t_convert / n,
+                t_transact / n,
+                t_batch / n,
+                t_commit / n,
+                t_push / n,
+                t_open / 1000,
+                t_take / 1000,
+                t_merge / 1000,
+                t_drop / 1000,
+            );
+        }
     }
 }

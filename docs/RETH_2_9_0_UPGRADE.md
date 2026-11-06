@@ -1560,27 +1560,119 @@ What each F5g item moved:
 - **g10, the direct transfer path.** Batch CPU -64% on the bench. On the fleet, par_exec 35 -> 29
   and sealed_at 41 -> 37, at parity (E15 -> E16).
 
+### F6a, the revm-era paths removed (2026-11-06)
+
+F5 passed at E16, so the `legacy-revm-paths` feature and everything behind it are gone:
+
+- **Deleted files.** `batch_state_legacy.rs`, `warm_ahead.rs`, the revm-era `parallel_transfer.rs`,
+  `fast_transfer.rs` / `fast_transfer_legacy.rs`, `legacy_paths.rs`, the three engine-types
+  integration tests that drove them (`e1_bound_bench`, `output_shards`, `output_shards_bench`) and
+  the follower's `by_description_bench`. `crate::parallel_transfer` stays as a re-export of the
+  EVM-free `parallel_common`, which keeps its name.
+- **Removed code.** The cfg'd items in `payload.rs`, `output_shards.rs`, `direct_build.rs`,
+  `parallel_common.rs`, `frame_blocks.rs`, `follower_import.rs` and `lib.rs`, with their tests, and
+  the crate-level `cfg_attr(not(feature = "legacy-revm-paths"), allow(dead_code, ...))` lines.
+  rustc's dead-code warnings then removed what only the revm paths used, among them the graft
+  folds, the read set, the prefetchers, the follower's sender groups and build path, the
+  `ExecSplit::of` / `RootSlot` / `prespawn_early_root` machinery, the `FrozenShards` beneficiary
+  and about 200 phase variables in the build loop that were never assigned on evm2.
+- **Cargo.** The feature lines in `engine-types/Cargo.toml` and `bin/n42/Cargo.toml` and the
+  optional `revm` / `alloy-evm` dependencies are gone, as is the `tikv-jemallocator` dev-dependency
+  that only the deleted bench used.
+- **The plan body gate.** It is `body && plan_ahead && by_frames` (`frame_blocks::plan_body_gate`).
+  `payload::seal_on_counters` had no other reader and is removed. `N42_SEAL_ON_COUNTERS` stays in
+  X22 (the measured set) and `docs/KNOBS.md` says that nothing reads it on evm2.
+- **Retired knobs.** `N42_READ_SET`, `N42_BUILD_PREFETCH`, `N42_BUILD_MLP`, `N42_PLAN_AHEAD_WARM`,
+  `N42_BUILD_GRAFT_NO_CACHE`, `N42_GRAFT_{INDEX,RANGES,STREAM,SHARDED,BASE_SWAP,PREFAULT}`,
+  `N42_FOLLOWER_GRAFT_{INDEX,RANGES,STREAM}` and `N42_FOLLOWER_MERGE_BEHIND` select nothing.
+  `docs/KNOBS.md` gives each a `retired` row with its reason. `n42_env::warn_retired_once`
+  (`crates/n42/env/src/retired.rs`, called from `N42EvmConfig::new`) logs one line naming any that
+  is set to a non-empty value, and the knob is otherwise ignored.
+- **Commits.** ac4b1699e (n42-env), b7ed74021 (the removal) and 37dcdc270 (the witness note).
+  ac4b1699e also swept in the file deletions that were already staged, so it does not build on its own;
+  b7ed74021 completes it. Both were pushed before this was noticed, so they were not rewritten.
+- **Gates.** `scripts/clippy-n42.sh` (`-D warnings`) and `cargo check --workspace --tests` are clean.
+  The engine-types, n42, n42-env, qmdb-state and n42-testing tests pass. In qmdb-reth, 126 of 127 pass under the
+  full-suite load. The failure is `a_rename_while_the_tree_is_leased_is_followed_and_tree_readers_wait_for_it`, the
+  sleep-timed lease test already known to be load-flaky in F5. It passes 3 of 3 in isolation. qmdb-reth has no code
+  change in F6a.
+
+**Left behind, runtime-dead but not flagged by rustc.** These are `pub` or reached only through
+values that are now constant, so rustc does not flag them. They are a follow-up clean-up with no
+behaviour change:
+
+- the follower's shard-merge path (`sharded` is always `None`) and `StartedShards`;
+- the `LateBlock` waiting machinery that served the by-reference road;
+- the `ExecSplit` fields on the import line, which are always zero;
+- the copy-aside road's by-reference half (`N42_FOLLOWER_COPY_ASIDE` now only moves the copy).
+
+**The witness recorder** (`docs/patches/0001-feat-witness-record-*.patch`) is parked. Its
+`StateReadObserver` hooks revm's `State`, which does not exist in reth v2.9.0. On evm2 it would hang
+off the state's read path, either the overlay `Database` implementation the executor reads through
+or a `StateChangeSink` beside it. Recorder and replayer must share one EVM version, because the
+witness is positional. `docs/WITNESS_REPLAY_RUST_PLAN.md` "2026-11-06" has the note. No code.
+
 ### F6 leftovers
 
-Items the F5 paths leave for F6 or later, each with the condition that brings it back:
+Items the F5 paths leave for F6 or later, each with a status (2026-11-06) and the condition that
+brings it back:
 
-- **The tenure stall after a timed-out view, on main** (F5g5). Main 0f3cb36e7 stalls at height 19
-  on the deferred devnet (f5g5-main): the stale-build guard refuses the build on the high-QC
-  block once a build ahead has made an uncertified block canonical. The fix (020cb0de5, a committed
+- **The Amsterdam parallel step.** **Open, needed before 2027-01-01.** The builder's (F5c) and the
+  follower's (F5d) parallel step stays serial on an Amsterdam / Glamsterdam chain today, because
+  a batch does not write block access list entries for the accounts it touches. Two things
+  need it, and neither runs Amsterdam today. One is chain 94, which flips to Glamsterdam execution
+  on 2027-01-01; from then on its blocks execute serially on this node. The other is any fleet7
+  genesis given an Amsterdam time. The fast handler's Amsterdam port (below) goes with it. Both
+  need the BAL entries per batch, folded in transaction order at finish, and an equivalence test
+  against the serial Amsterdam execution. The `mobileverify-v3-parity` decision (gov5 runs
+  Amsterdam on any IsGlamsterdam chain) is the user's and decides whether this lands before or
+  after chain 94's flip.
+- **The deferred-genesis devnet start-up race** (f5g1-seal2). **Probably closed by g5; not
+  re-run.** Validator 0 proposed block 1 before the others were up, its block became the EL's
+  canonical head, and every later build on genesis was refused as stale. g5's committed floor
+  (020cb0de5: forkchoice safe + the deferred depth) lets a build on the committed block, genesis
+  here, pass the stale-build guard, which is the refusal that stalled it. To confirm, rerun
+  f5g1-seal2's shape (deferred, tenure 8, seal-at-exec, validators started apart). The F6 field
+  gate does not include that shape.
+- **The empty `N42_TX_INGEST`.** **Fixed in F6a.** `scripts/fleet7.sh` passes `N42_TX_INGEST=` to a
+  node that serves no ingest, and `bin/n42` logged "N42_TX_INGEST is not an address" at ERROR once
+  per node. An empty or blank value now reads as unset.
+- **The reth v2.9.0 engine defaults.** **No change.**
+  - `TreeConfig` (`crates/engine/primitives/src/config.rs`) and `EngineArgs`
+    (`crates/node/core/src/args/engine.rs`) are byte-identical between upstream v2.8.1 and v2.9.0.
+    The other files under `crates/node/core/src/args/` did not change either.
+  - The defaults therefore stand as in v2.8.1:
+    - `persistence_threshold` 50;
+    - `memory_block_buffer_target` 5;
+    - `num_state_masking_blocks` 30;
+    - `backfill_run_threshold` `EPOCH_SLOTS`;
+    - `multiproof_task_chunk_size` 5;
+    - `reserved_cpu_cores` 1;
+    - `sparse_trie_prune_depth` 4;
+    - `state_root_task_timeout` 1 s.
+  - What the node pins: on a QMDB chain `qmdb_tree_config` (`crates/node/builder/src/builder/mod.rs`)
+    forces `num_state_masking_blocks` to 0. It lowers the persistence threshold to 8 and the
+    buffer target to 6 when they are still reth's defaults.
+  - `scripts/fleet7-env.sh` passes `--engine.persistence-threshold 8` and
+    `--engine.memory-block-buffer-target 6` explicitly.
+  - The vendored `EngineArgs` differs from upstream only by `--engine.state-trie-overlay`.
+  - The F6 field gate's `roll --kill` k90 and k20 runs cover the SIGKILL recovery the reth-bump
+    rule asks for.
+- **Runtime-dead code after F6a.** **Open, clean-up only.** See "F6a" above (the follower's
+  shard-merge path, `LateBlock` waiting, `ExecSplit` zeros, the by-reference half of copy-aside).
+- **The tenure stall after a timed-out view, on main** (F5g5). **Open until the F6 merge.** Main
+  0f3cb36e7 stalls at height 19 on the deferred devnet (f5g5-main): the stale-build guard refuses
+  the build on the high-QC block once a build ahead has made an uncertified block canonical. The fix (020cb0de5, a committed
   floor for the guard) is on this branch and reaches main with the F6 merge. A main release
   before that merge needs it cherry-picked.
-- **The parallel step on an Amsterdam chain.** The step (builder F5c, follower F5d) does not run on
-  a chain with reth's Amsterdam or gov5's Glamsterdam execution: the block access list would lack
-  the batch accounts' entries. fleet7 is Osaka. Chain 94 flips on 2027-01-01, so this is needed
-  before a parallel build runs there (coordinator 2026-11-05).
-- **The serial-rebuild copy of the transaction list** (F5c). Measure it in the A/B. Remove it only
+- **The serial-rebuild copy of the transaction list** (F5c). **Open.** Measure it in the A/B. Remove it only
   if fold refusals at `finish` prove unreachable in the field.
-- **The fast transfer on an Amsterdam chain** (F5f). `fast_handler::covers` is Prague and Osaka
+- **The fast transfer on an Amsterdam chain** (F5f). **Open, with the Amsterdam parallel step.** `fast_handler::covers` is Prague and Osaka
   only: on Amsterdam (EIP-8037 state gas, the block access list) the handler hands every
   transaction to the stock one. Port it, with its own equivalence tests against the stock Amsterdam
   handler, before fleet7 or chain 94 runs Amsterdam blocks through the parallel step.
-- **The output shards** (`take_cached` / `into_staged`, `N42_OUTPUT_SHARDS`). Stay legacy; port
-  only if the A/B shows the merge is the cost.
+- **The output shards' revm-era take** (`take_cached` / `into_staged`). **Closed in F6a**: removed
+  with the feature. E16 showed the evm2 step at parity without them (merge elided since g3).
 
 ### Notes for the history
 

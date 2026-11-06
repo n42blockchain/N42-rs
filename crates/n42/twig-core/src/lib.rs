@@ -14,6 +14,7 @@ pub mod entry_store;
 pub mod entry_view;
 pub mod offsets;
 pub mod prefault;
+pub mod punched;
 mod flat;
 mod index;
 pub mod qmdb_compat;

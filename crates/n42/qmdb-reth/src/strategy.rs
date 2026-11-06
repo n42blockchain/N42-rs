@@ -58,8 +58,10 @@ use crate::node_state::QmdbNodeState;
 #[derive(Clone)]
 pub struct QmdbStateRootStrategy {
     state: QmdbNodeState,
-    /// Whether Prague is active at a timestamp: it decides whether the block
-    /// wrote the system caller leaf. See `changes::with_prague_system_caller`.
+    /// Whether a block at a timestamp wrote the system caller leaf: Prague
+    /// active and Glamsterdam not, since under Glamsterdam gov5's system calls
+    /// make no value transfer from the system address
+    /// (`internal/blockhelp.go:94`). See `changes::system_caller_leaf_at`.
     prague_at: PragueAt,
     /// Whether deferred execution is active at a timestamp
     /// (`deferredExecutionTime`): the header then carries the parent's root.
@@ -80,14 +82,14 @@ impl QmdbStateRootStrategy {
     /// A strategy over the node's forest.
     /// A strategy over `state`, on a chain whose Prague activation `chain_spec`
     /// knows.
-    pub fn new<C: EthereumHardforks + Send + Sync + 'static>(
+    pub fn new<C: EthereumHardforks + reth_chainspec::EthChainSpec + Send + Sync + 'static>(
         state: QmdbNodeState,
         chain_spec: Arc<C>,
         deferred_execution_time: Option<u64>,
     ) -> Self {
         Self {
             state,
-            prague_at: Arc::new(move |timestamp| chain_spec.is_prague_active_at_timestamp(timestamp)),
+            prague_at: Arc::new(move |timestamp| crate::changes::system_caller_leaf_at(&*chain_spec, timestamp)),
             deferred_at: Arc::new(move |timestamp| deferred_execution_time.is_some_and(|at| timestamp >= at)),
         }
     }

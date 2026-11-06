@@ -43,7 +43,7 @@ use std::{
 
 use alloy_primitives::{Address, B256, U256};
 use n42_twig_core::{
-    entry_view::EntryFileView,
+    entry_view::{EntryFileView, EntryViewFiles, RELOCATED_LOCATION},
     qmdb_compat::{gov5_account_key, gov5_storage_key, TruncationGuard},
     Hash, SharedOffsetIndex,
 };
@@ -232,6 +232,10 @@ struct Versions {
     /// The head's hash is `B256::ZERO` when the view stepped back past its oldest journal's
     /// block and no longer knows it.
     head: (u64, B256),
+    /// The head the view stood at when a compaction last moved keys it holds
+    /// ([`QmdbReadView::retarget`]): journals of blocks at or below it may
+    /// still name the moved keys' old locations.
+    last_retarget: Option<u64>,
     /// The entry-file bytes the view reads at its head.
     head_floor: u64,
     /// Blocks `head - len + 1 ..= head`, oldest first.
@@ -311,14 +315,14 @@ pub enum Position {
 pub struct Raised {
     floor: u64,
     cuts: u64,
-    /// A record the block names lies past the view's 1 TiB mapping: the
+    /// A record the block names lies past the view's 512 GiB mapping: the
     /// advance invalidates the view instead of reading it.
     past_view: bool,
 }
 
 /// The read view: see the module documentation.
 pub struct QmdbReadView {
-    file: EntryFileView,
+    files: EntryViewFiles,
     index: SharedOffsetIndex,
     versions: RwLock<Versions>,
     /// [`Frozen`] copies of `versions`, one per reader slot (see the module documentation).
@@ -346,9 +350,19 @@ impl std::fmt::Debug for QmdbReadView {
     }
 }
 
-/// Where the record at `offset` ends; `None` past the view's 1 TiB mapping.
+/// Where the record at `offset` of the main file ends; `None` past the
+/// view's 512 GiB mapping, where a main-file offset would also read as a
+/// relocated location.
 fn record_end(file: &EntryFileView, offset: u64) -> Option<u64> {
     file.record_end(offset)
+}
+
+/// What [`QmdbReadView::retarget`] hands back, for
+/// [`QmdbReadView::moved_unreachable`]: the head the view stood at when the
+/// keys moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retargeted {
+    head: u64,
 }
 
 /// gov5's `StateAccount.MarshalV2` leaf as reth's account: the presence bitmap
@@ -385,30 +399,40 @@ fn decode_account(value: &[u8]) -> Option<Account> {
 }
 
 impl QmdbReadView {
-    /// A view at `head` over the entry file at `entry_file`, holding `live`
-    /// (every live key and its record offset at `head`, records flushed).
+    /// A view at `head` over the entry file at `entry_file` (and
+    /// `entries.relocated` beside it), holding `live` (every live key and its
+    /// location at `head`, `QmdbCompatTree::live_entry_offsets`, records
+    /// flushed).
     pub fn build(entry_file: &Path, head: (u64, B256), mut live: Vec<(Hash, u64)>) -> std::io::Result<Arc<Self>> {
-        let file = EntryFileView::open(entry_file)?;
+        let files = EntryViewFiles::open(entry_file)?;
         live.par_sort_unstable_by_key(|(key, _)| *key);
-        let floor = match live.iter().map(|(_, offset)| *offset).max() {
+        let floor = match live.iter().map(|(_, location)| *location).filter(|location| location & RELOCATED_LOCATION == 0).max() {
             None => 0,
-            Some(offset) => record_end(&file, offset)
-                .ok_or_else(|| std::io::Error::other("entry file past 1 TiB: the read view cannot map it"))?,
+            Some(offset) => record_end(files.main(), offset)
+                .ok_or_else(|| std::io::Error::other("entry file past 512 GiB: the read view cannot map it"))?,
         };
         let changes: Vec<(Hash, Option<u64>)> = live.into_iter().map(|(key, offset)| (key, Some(offset))).collect();
         let index = SharedOffsetIndex::default();
-        // SAFETY: every offset here is a live record of the tree at `head`,
-        // flushed before the call (the caller's contract), and the tree tells
-        // this view before it cuts the file; the index only reads the keys of
-        // offsets it was given.
+        // SAFETY: every location here is a live record of the tree at `head`,
+        // flushed before the call (the caller's contract; a relocated group is
+        // synced before any slot points at it, and `open` mapped the file),
+        // and the tree tells this view before it cuts the file; the index only
+        // reads the keys of locations it was given.
         index
-            .apply_sorted(&changes, |offset| unsafe { file.key(offset) })
+            .apply_sorted(&changes, |location| unsafe { files.key(location) })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let versions =
-            Versions { valid: true, head, head_floor: floor, journals: VecDeque::new(), pending: None, held_from: None };
+        let versions = Versions {
+            valid: true,
+            head,
+            last_retarget: None,
+            head_floor: floor,
+            journals: VecDeque::new(),
+            pending: None,
+            held_from: None,
+        };
         let frozen = versions.frozen();
         Ok(Arc::new(Self {
-            file,
+            files,
             index,
             versions: RwLock::new(versions),
             readers: (0..READER_SLOTS).map(|_| Slot(RwLock::new(frozen.clone()))).collect(),
@@ -500,14 +524,14 @@ impl QmdbReadView {
             // SAFETY: the index holds offsets of records written at or below
             // the view's head, and the tree tells the view (`before_truncate`)
             // before it cuts any of them.
-            None => self.index.get(key, |offset| unsafe { self.file.key(offset) }),
+            None => self.index.get(key, |location| unsafe { self.files.key(location) }),
         };
         // SAFETY: an offset from the index or a journal, as above. A record
         // that does not have the shape of one (a broken offset invariant) is
         // declined, not a panic on this RPC or EVM thread (audit 2026-10 D-8).
         match offset {
             None => Some(None),
-            Some(offset) => Some(Some(decode(unsafe { self.file.try_record(offset) }?.1))),
+            Some(location) => Some(Some(decode(unsafe { self.files.try_record(location) }?.1))),
         }
     }
 
@@ -574,7 +598,7 @@ impl QmdbReadView {
     /// (`QmdbForest::block_changes_parts`). The same rule: under the lock,
     /// before anything that could cut the records.
     pub fn raise_floor_to(&self, max_offset: Option<u64>) -> Raised {
-        let end = max_offset.map(|offset| record_end(&self.file, offset));
+        let end = max_offset.map(|offset| record_end(self.files.main(), offset));
         let past_view = matches!(end, Some(None));
         let floor = end.flatten().unwrap_or(0);
         self.floor.fetch_max(floor, Ordering::SeqCst);
@@ -592,7 +616,7 @@ impl QmdbReadView {
                 return;
             }
             let why = if raised.past_view {
-                Some("entry file past 1 TiB")
+                Some("entry file past 512 GiB")
             } else if number != versions.head.0 + 1 {
                 Some("advanced to a block that is not the head's child")
             } else if self.cuts.load(Ordering::SeqCst) != raised.cuts {
@@ -606,9 +630,10 @@ impl QmdbReadView {
                 return;
             }
         }
-        // SAFETY: the index holds offsets of written records the tree has not
-        // cut: a cut tells the view first and waits on `advancing`, held here.
-        let key_at = |offset: u64| unsafe { self.file.key(offset) };
+        // SAFETY: the index holds locations of written records the tree has
+        // not cut: a cut tells the view first and waits on `advancing`, held
+        // here; a punch waits for `moved_unreachable`.
+        let key_at = |location: u64| unsafe { self.files.key(location) };
         let journal: Vec<(Hash, Option<u64>)> =
             changes.par_iter().with_min_len(1024).map(|(key, _)| (*key, self.index.get(key, key_at))).collect();
         let journal = Arc::new(JournalData::new(journal, self.filter_journals.load(Ordering::Relaxed)));
@@ -691,9 +716,18 @@ impl QmdbReadView {
         if depth > versions.journals.len() {
             return false;
         }
-        // SAFETY: the index and the journals hold offsets of records written at
-        // or below the head being stepped back from, not yet cut.
-        let key_at = |offset: u64| unsafe { self.file.key(offset) };
+        // A journal filed before the last retarget may hold a moved key's old
+        // location, which a punch may take once that journal is gone; undoing
+        // it would put that location back into the index.
+        if let Some(moved_at) = versions.last_retarget
+            && number < moved_at
+            && versions.journals.front().is_some_and(|step| step.number <= moved_at)
+        {
+            return false;
+        }
+        // SAFETY: the index and the journals hold locations of records written
+        // at or below the head being stepped back from, not yet cut.
+        let key_at = |location: u64| unsafe { self.files.key(location) };
         let from = versions.head.0;
         for _ in 0..depth {
             let step = versions.journals.pop_back().expect("depth checked against the journals");
@@ -718,6 +752,61 @@ impl QmdbReadView {
         self.floor.store(versions.head_floor, Ordering::SeqCst);
         info!(target: "n42.qmdb", from, to = number, journals = versions.journals.len(), "the QMDB read view stepped back");
         true
+    }
+
+    /// A compaction moved `moves` (`CompactReport::moves`: each live key of
+    /// a compacted twig, its location before and after): the index takes the
+    /// new locations, and every read that loaded an old one from it is waited
+    /// out (the publish to every reader slot). The journals keep the old
+    /// locations; [`Self::moved_unreachable`] says when none is left, and only
+    /// then may the old bytes be punched. A key the index does not hold at
+    /// its old location (the view standing below the compaction's horizon,
+    /// which the caller rules out) invalidates the view.
+    pub fn retarget(&self, moves: &[(Hash, u64, u64)]) -> Retargeted {
+        let _one = self.advancing.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        let head = versions.head.0;
+        if !versions.valid || moves.is_empty() {
+            return Retargeted { head };
+        }
+        let why = if let Err(error) = self.files.map_relocated() {
+            warn!(target: "n42.qmdb", %error, "the QMDB read view could not map entries.relocated");
+            Some("entries.relocated could not be mapped")
+        } else {
+            // SAFETY: an old location is a record the index holds, not punched
+            // before this call returns and the journals let go of it; a new one
+            // is in a group synced before the tree pointed a slot at it, and the
+            // relocated file is mapped above.
+            let key_at = |location: u64| unsafe { self.files.key(location) };
+            let mut why = None;
+            for (key, old, new) in moves {
+                if self.index.get(key, key_at) != Some(*old) {
+                    why = Some("a compaction moved a key the view does not hold where the tree did");
+                    break;
+                }
+                if self.index.insert(*key, *new, key_at).is_err() {
+                    why = Some("the key index refused a compacted key's location");
+                    break;
+                }
+            }
+            why
+        };
+        versions.last_retarget = Some(head);
+        if let Some(why) = why {
+            Self::invalidate_locked(&mut versions, why);
+        }
+        self.publish(&versions);
+        Retargeted { head }
+    }
+
+    /// Whether nothing in the view can name a location the
+    /// [`Self::retarget`] that returned `moved` replaced: every journal kept
+    /// was filed after it (a journal's prior locations come from the index),
+    /// and the retarget's publish waited out the reads that had loaded one.
+    /// An invalidated view names nothing.
+    pub fn moved_unreachable(&self, moved: Retargeted) -> bool {
+        let versions = self.versions.read().unwrap_or_else(PoisonError::into_inner);
+        !versions.valid || versions.journals.front().is_none_or(|step| step.number > moved.head)
     }
 
     /// Stops the view answering, for good.
@@ -782,7 +871,7 @@ mod tests {
         assert_eq!(decode_account(&[2, 5, 1]), None, "a truncated balance");
     }
 
-    /// A block whose records lie past the view's 1 TiB mapping invalidates
+    /// A block whose records lie past the view's 512 GiB mapping invalidates
     /// the view (reads fall back) instead of reading past the mapping.
     #[test]
     fn a_block_past_the_mapping_invalidates_the_view() {
@@ -803,6 +892,122 @@ mod tests {
         let changes = vec![([4u8; 32], Some(VIEW_MAP_BYTES))];
         let raised = view.raise_floor(&changes);
         view.advance(2, B256::repeat_byte(2), &changes, raised);
+        assert!(!view.is_valid());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compaction under a live view (`docs/QMDB_COMPACTION_DESIGN.md`,
+    /// stage 1 fix): the view keeps locations, takes the moved keys' new ones
+    /// from `retarget`, and answers the same values at its head and through
+    /// its journals; the old bytes are reachable until every journal filed
+    /// before the move is gone, and a step back across the move invalidates
+    /// the view instead of putting an old location back.
+    #[test]
+    fn a_compaction_retargets_the_view_and_the_journals_let_go() {
+        use n42_twig_core::qmdb_compat::{QmdbCompatTree, QmdbOperation, GOV5_EMPTY_CODE_HASH};
+        let dir = std::env::temp_dir().join(format!("n42-view-retarget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let address = |i: u64| Address::from_word(B256::from(U256::from(i + 1)));
+        let value = |nonce: u64| encode_gov5_account_value(nonce, &U256::from(nonce + 1).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+        let ops = |range: std::ops::Range<u64>, nonce: u64| {
+            let mut ops: Vec<QmdbOperation> = range
+                .map(|i| QmdbOperation { key: gov5_account_key(&address(i).0 .0), value: Some(value(nonce)) })
+                .collect();
+            ops.sort_unstable_by_key(|op| op.key);
+            ops
+        };
+        // Applies a block and lists its changes as `on_persisted` does.
+        let block = |tree: &mut QmdbCompatTree, ops: Vec<QmdbOperation>| {
+            let first = tree.next_slot();
+            let keys: Vec<Hash> = ops.iter().map(|op| op.key).collect();
+            tree.apply_sorted_ops(ops).expect("apply");
+            tree.flush_entries_for_sync().expect("flush");
+            keys.into_iter().enumerate().map(|(i, key)| (key, Some(tree.entry_offset(first + i as u64).expect("appended")))).collect::<Vec<_>>()
+        };
+        let mut tree = QmdbCompatTree::new();
+        tree.set_entry_file(&path).expect("the entry file");
+        // Twig 0 is accounts 0..2048 at nonce 0; 1,400 of them are rewritten.
+        block(&mut tree, ops(0..2_048, 0));
+        block(&mut tree, ops(0..1_400, 1));
+        let view = QmdbReadView::build(&path, (1, B256::ZERO), tree.live_entry_offsets().expect("file mode")).expect("the view");
+        // Block 2 changes accounts 1,400..1,410, still in twig 0: its journal
+        // names their twig-0 locations.
+        let changes = block(&mut tree, ops(1_400..1_410, 2));
+        let raised = view.raise_floor(&changes);
+        view.advance(2, B256::with_last_byte(2), &changes, raised);
+
+        let report = tree.compact_twigs(u64::MAX, 0.5, 4).expect("compact");
+        assert_eq!(report.twigs, 1);
+        assert_eq!(report.moves.len(), 2_048 - 1_410);
+        let moved = view.retarget(&report.moves);
+        assert!(view.is_valid());
+        assert!(!view.moved_unreachable(moved), "block 2's journal names twig 0");
+        let expect = |i: u64, at: u64| {
+            let nonce = match i {
+                0..1_400 => 1,
+                1_400..1_410 if at >= 2 => 2,
+                _ => 0,
+            };
+            assert_eq!(view.account(&address(i), at).map(|a| a.map(|a| a.nonce)), Some(Some(nonce)), "account {i} at {at}");
+        };
+        for i in (0..2_048).step_by(7).chain(1_400..1_410) {
+            expect(i, 2);
+            expect(i, 1);
+        }
+        // The relocated keys read through entries.relocated.
+        let key = gov5_account_key(&address(2_000).0 .0);
+        // SAFETY: a location the view's own index holds.
+        let location = view.index.get(&key, |l| unsafe { view.files.key(l) }).expect("held");
+        assert_ne!(location & RELOCATED_LOCATION, 0);
+
+        // JOURNAL_DEPTH more blocks push block 2's journal out.
+        for n in 3..=(JOURNAL_DEPTH as u64 + 2) {
+            let changes = block(&mut tree, ops(3_000 + n..3_001 + n, n));
+            let raised = view.raise_floor(&changes);
+            view.advance(n, B256::with_last_byte(n as u8), &changes, raised);
+            assert_eq!(view.moved_unreachable(moved), n == JOURNAL_DEPTH as u64 + 2, "at block {n}");
+        }
+        for i in (0..2_048).step_by(5) {
+            expect(i, JOURNAL_DEPTH as u64 + 2);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A step back through a journal filed before a retarget invalidates the
+    /// view: undoing it would put a moved key's old location back.
+    #[test]
+    fn a_step_back_across_a_retarget_invalidates_the_view() {
+        use n42_twig_core::qmdb_compat::{QmdbCompatTree, QmdbOperation, GOV5_EMPTY_CODE_HASH};
+        let dir = std::env::temp_dir().join(format!("n42-view-retarget-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let op = |i: u64, nonce: u64| QmdbOperation {
+            key: gov5_account_key(&Address::from_word(B256::from(U256::from(i + 1))).0 .0),
+            value: Some(encode_gov5_account_value(nonce, &[0; 32], &GOV5_EMPTY_CODE_HASH)),
+        };
+        let sorted = |mut ops: Vec<QmdbOperation>| {
+            ops.sort_unstable_by_key(|op| op.key);
+            ops
+        };
+        let mut tree = QmdbCompatTree::new();
+        tree.set_entry_file(&path).expect("the entry file");
+        tree.apply_sorted_ops(sorted((0..2_048).map(|i| op(i, 0)).collect())).expect("apply");
+        tree.apply_sorted_ops(sorted((0..1_500).map(|i| op(i, 1)).collect())).expect("apply");
+        tree.flush_entries_for_sync().expect("flush");
+        let view = QmdbReadView::build(&path, (1, B256::ZERO), tree.live_entry_offsets().expect("file mode")).expect("the view");
+        let first = tree.next_slot();
+        tree.apply_sorted_ops(vec![op(1_600, 2)]).expect("apply");
+        tree.flush_entries_for_sync().expect("flush");
+        let changes = vec![(op(1_600, 2).key, Some(tree.entry_offset(first).expect("appended")))];
+        let raised = view.raise_floor(&changes);
+        view.advance(2, B256::with_last_byte(2), &changes, raised);
+        let report = tree.compact_twigs(u64::MAX, 0.5, 4).expect("compact");
+        view.retarget(&report.moves);
+        assert!(view.is_valid());
+        assert!(!view.revert_to(1));
         assert!(!view.is_valid());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1082,8 +1287,19 @@ mod tests {
         use alloy_primitives::keccak256;
         use n42_twig_core::qmdb_compat::GOV5_EMPTY_CODE_HASH;
         use std::io::Write as _;
-        let keys = 2_000_000u64;
-        let reads = 160_000usize;
+        // `N42_BENCH_VIEW_KEYS` / `_READS` / `_THREADS` scale it (the stage 1
+        // cost was measured at 50M keys, an offsets array past the last-level
+        // cache); `N42_BENCH_VIEW_RELOCATED=1` puts every other key's record
+        // in `entries.relocated` (a compacted twig's live record, read by a
+        // relocated location).
+        let env = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let keys = env("N42_BENCH_VIEW_KEYS", 2_000_000);
+        let reads = env("N42_BENCH_VIEW_READS", 160_000) as usize;
+        let relocate = env("N42_BENCH_VIEW_RELOCATED", 0) == 1;
+        let thread_counts: Vec<usize> = std::env::var("N42_BENCH_VIEW_THREADS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![1, 4, 16]);
         let behind = 16u64;
         let per_block = 10_000u64;
         let address_of = |i: u64| Address::from_slice(&keccak256(i.to_be_bytes())[12..]);
@@ -1091,7 +1307,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let path = dir.join("entries.log");
         let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
-        let mut offset = 0u64;
+        let mut moved = std::io::BufWriter::new(std::fs::File::create(dir.join("entries.relocated")).expect("the relocated file"));
+        let (mut offset, mut moved_at) = (0u64, 0u64);
         let mut put = |file: &mut std::io::BufWriter<std::fs::File>, address: &Address, nonce: u64| {
             let key = gov5_account_key(&address.0 .0);
             let value = encode_gov5_account_value(nonce, &U256::from(nonce + 1).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
@@ -1102,8 +1319,24 @@ mod tests {
             offset += 36 + value.len() as u64;
             (key, at)
         };
-        let live: Vec<(Hash, u64)> = (0..keys).map(|i| put(&mut file, &address_of(i), 0)).collect();
+        let mut live: Vec<(Hash, u64)> = (0..keys).map(|i| put(&mut file, &address_of(i), 0)).collect();
         file.flush().expect("flush");
+        if relocate {
+            // A live relocated record: [tag][slot u64][key][len][value]; its
+            // location is its key's offset with bit 39 set.
+            for (i, (key, location)) in live.iter_mut().enumerate().filter(|(i, _)| i % 2 == 0) {
+                let value = encode_gov5_account_value(0, &U256::from(1).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+                moved.write_all(&[1]).expect("write");
+                moved.write_all(&(i as u64).to_le_bytes()).expect("write");
+                moved.write_all(key).expect("write");
+                moved.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
+                moved.write_all(&value).expect("write");
+                *location = (moved_at + 9) | RELOCATED_LOCATION;
+                moved_at += 9 + 36 + value.len() as u64;
+            }
+        }
+        moved.flush().expect("flush");
+        drop(moved);
         // Blocks 2..=17 each rewrite `per_block` keys, so a reader at block 1 walks 16 journals.
         let mut blocks = Vec::new();
         for b in 0..behind {
@@ -1145,9 +1378,9 @@ mod tests {
             assert_eq!(found, addresses.len(), "every key answers");
             start.elapsed().as_secs_f64() * 1e6 * threads as f64 / addresses.len() as f64
         };
-        println!("us a read of pool time (wall x threads / reads), {reads} distinct keys of {keys}");
+        println!("us a read of pool time (wall x threads / reads), {reads} distinct keys of {keys}, relocated half: {relocate}");
         println!("{:>7} {:>6} {:>9} {:>9} {:>9}", "threads", "at", "cold", "warm", "raw warm");
-        for threads in [1usize, 4, 16] {
+        for threads in thread_counts.iter().copied() {
             for at in [1 + behind, 1] {
                 let view = build();
                 let read = |a: &Address| matches!(view.account(a, at), Some(Some(_)));
@@ -1155,8 +1388,8 @@ mod tests {
                     let key = gov5_account_key(&a.0 .0);
                     // SAFETY: offsets of the built view's own flushed records.
                     view.index
-                        .get(&key, |o| unsafe { view.file.key(o) })
-                        .is_some_and(|o| unsafe { view.file.try_record(o) }.is_some_and(|(_, value)| decode_account(value).is_some()))
+                        .get(&key, |o| unsafe { view.files.key(o) })
+                        .is_some_and(|o| unsafe { view.files.try_record(o) }.is_some_and(|(_, value)| decode_account(value).is_some()))
                 };
                 let cold = time(threads, &read, first);
                 let warm = time(threads, &read, second);

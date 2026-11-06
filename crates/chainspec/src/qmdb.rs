@@ -131,6 +131,32 @@ pub fn glamsterdam_active_at(genesis: &Genesis, timestamp: u64) -> bool {
     glamsterdam_time(genesis).is_some_and(|at| timestamp >= at)
 }
 
+/// Genesis `config` key gov5 reads the consensus engine from
+/// (`params.ChainConfig.Consensus`).
+pub const CONSENSUS_KEY: &str = "consensus";
+
+/// Whether the genesis describes an N42-native chain: gov5's `IsN42Native`
+/// (`params/config.go:473`), consensus `hotstuff` or `apos`, or a `hotstuff`
+/// / `apos` section in the config.
+pub fn is_n42_native(genesis: &Genesis) -> bool {
+    let fields = &genesis.config.extra_fields;
+    let consensus: Option<String> = fields.get_deserialized(CONSENSUS_KEY).and_then(Result::ok);
+    matches!(consensus.as_deref(), Some("hotstuff" | "apos")) || fields.contains_key("hotstuff") || fields.contains_key("apos")
+}
+
+/// Whether a block with `timestamp` executes under the Amsterdam rules
+/// (revm's `SpecId::AMSTERDAM`) although reth's own Amsterdam hardfork is not
+/// scheduled: an N42-native chain past gov5's `glamsterdamTime`. gov5 runs
+/// its Amsterdam state transition on any chain where `IsGlamsterdam` holds,
+/// native ones included (`internal/state_transition.go`), while the header
+/// and payload keep the native shape (no EIP-7928 block access list, gov5's
+/// `UsesEIP7928AccessList`), so reth's `EthereumHardfork::Amsterdam`, which
+/// the header and payload validation hang off, stays off
+/// (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
+pub fn glamsterdam_execution_active_at(genesis: &Genesis, timestamp: u64) -> bool {
+    is_n42_native(genesis) && glamsterdam_active_at(genesis, timestamp)
+}
+
 /// gov5's `mobileAnchorTime`, if the genesis declares one.
 pub fn mobile_anchor_time(genesis: &Genesis) -> Option<u64> {
     genesis.config.extra_fields.get_deserialized::<u64>(MOBILE_ANCHOR_TIME_KEY).and_then(Result::ok)
@@ -333,17 +359,103 @@ mod header_field_gate_tests {
     }
 
     #[test]
-    fn chain_94_carries_the_root_from_its_glamsterdam() {
+    fn amsterdam_execution_needs_a_native_chain() {
+        // A native chain: from its glamsterdamTime on.
+        let g = genesis(r#","consensus":"hotstuff","glamsterdamTime":100"#);
+        assert!(is_n42_native(&g));
+        assert!(!glamsterdam_execution_active_at(&g, 99));
+        assert!(glamsterdam_execution_active_at(&g, 100));
+        let g = genesis(r#","consensus":"apos","glamsterdamTime":0"#);
+        assert!(glamsterdam_execution_active_at(&g, 0));
+        let g = genesis(r#","hotstuff":{},"glamsterdamTime":0"#);
+        assert!(glamsterdam_execution_active_at(&g, 0));
+        // A native chain without the fork: never.
+        let g = genesis(r#","consensus":"hotstuff""#);
+        assert!(!glamsterdam_execution_active_at(&g, u64::MAX));
+        // Not native: the slot rule may hold, the execution rule does not.
+        let g = genesis(r#","consensus":"clique","glamsterdamTime":0"#);
+        assert!(!is_n42_native(&g));
+        assert!(glamsterdam_active_at(&g, 0));
+        assert!(!glamsterdam_execution_active_at(&g, 0));
+    }
+
+    #[test]
+    fn bundled_native_genesis_files() {
+        let gated: Genesis =
+            serde_json::from_str(include_str!("../res/genesis/n42_devnet_mobileanchor.json")).expect("parses");
+        assert!(glamsterdam_execution_active_at(&gated, 0));
+        let devnet: Genesis = serde_json::from_str(include_str!("../res/genesis/n42_devnet.json")).expect("parses");
+        assert!(is_n42_native(&devnet));
+        assert!(!glamsterdam_execution_active_at(&devnet, u64::MAX));
+    }
+
+    #[test]
+    fn chain_94_never_carries_the_root_while_glamsterdam_is_unscheduled() {
+        // gov5 7529e2e9 unscheduled Glamsterdam on chain 94; MobileAnchor alone
+        // does not put the root in the header.
         let g: Genesis = serde_json::from_str(include_str!("../res/genesis/gov5/mainnet_qmdb_staggered.json"))
             .expect("chain 94 parses");
-        let glamsterdam = glamsterdam_time(&g).expect("chain 94 schedules glamsterdamTime");
-        assert!(mobile_anchor_time(&g).is_some_and(|t| t < glamsterdam));
-        assert!(!mobile_registry_root_in_header_at(&g, glamsterdam - 1));
-        assert!(mobile_registry_root_in_header_at(&g, glamsterdam));
+        assert_eq!(glamsterdam_time(&g), None);
+        let anchor = mobile_anchor_time(&g).expect("chain 94 schedules mobileAnchorTime");
+        assert!(!glamsterdam_active_at(&g, u64::MAX));
+        assert!(!mobile_registry_root_in_header_at(&g, anchor));
+        assert!(!mobile_registry_root_in_header_at(&g, u64::MAX));
         // The native devnet schedules neither.
         let devnet: Genesis = serde_json::from_str(include_str!("../res/genesis/n42_devnet.json")).expect("parses");
         assert_eq!(glamsterdam_time(&devnet), None);
         assert_eq!(mobile_anchor_time(&devnet), None);
+    }
+}
+
+#[cfg(test)]
+mod glamsterdam_genesis_tests {
+    use alloy_genesis::Genesis;
+    use alloy_primitives::b256;
+    use alloy_rlp::Encodable;
+
+    fn spec(json: &str) -> crate::ChainSpec {
+        crate::ChainSpec::from_genesis(serde_json::from_str::<Genesis>(json).expect("a bundled genesis parses"))
+    }
+
+    /// gov5's genesis for a chain whose `glamsterdamTime` is at genesis carries
+    /// the empty block-access-list hash and no slot number: 22 elements, hash
+    /// measured from gov5's `n42 init` (audit-notes/devnet/mv4h2).
+    #[test]
+    fn a_glamsterdam_genesis_matches_gov5() {
+        let spec = spec(include_str!("../res/genesis/n42_devnet_mobileanchor.json"));
+        let header = spec.genesis_header();
+        assert_eq!(header.block_access_list_hash, Some(alloy_eips::eip7928::EMPTY_BLOCK_ACCESS_LIST_HASH));
+        assert_eq!(header.slot_number, None);
+        let mut rlp = Vec::new();
+        header.encode(&mut rlp);
+        let mut buf = rlp.as_slice();
+        let list = alloy_rlp::Header::decode(&mut buf).expect("a list");
+        assert!(list.list);
+        let mut elements = 0;
+        while !buf.is_empty() {
+            let item = alloy_rlp::Header::decode(&mut buf).expect("an element");
+            buf = &buf[item.payload_length..];
+            elements += 1;
+        }
+        assert_eq!(elements, 22, "gov5's 21 elements plus the empty BAL hash, no slot");
+        assert_eq!(
+            spec.genesis_hash(),
+            b256!("0x9e8628a6dae0ce078dbd21b2e0d91c3f4389272aa597efae3a499b5ac62ffc95")
+        );
+    }
+
+    #[test]
+    fn chains_without_glamsterdam_at_genesis_keep_their_hashes() {
+        assert_eq!(
+            spec(include_str!("../res/genesis/n42_devnet.json")).genesis_hash(),
+            b256!("0x112489f0dd526cd9dcf3bd9352f723a66182b41cc93f33615175828e5e16ae60")
+        );
+        let chain94 = spec(include_str!("../res/genesis/gov5/mainnet_qmdb_staggered.json"));
+        assert_eq!(chain94.genesis_header().block_access_list_hash, None);
+        assert_eq!(
+            chain94.genesis_hash(),
+            b256!("0xa2d2ff5d814552bb9a113b68ad7ed2b824fbb52caed42dbe573068845b57be99")
+        );
     }
 }
 

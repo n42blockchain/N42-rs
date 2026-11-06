@@ -1612,6 +1612,24 @@ mod tests {
         ));
     }
 
+    /// EIP-8037 on a native chain past `glamsterdamTime`: the header's gas used
+    /// is the executor's max(regular, state) and sits below the last receipt's
+    /// cumulative gas (gov5's fixture block: 749,700 against 994,536). The
+    /// check compares the header with the execution result, never with the
+    /// receipts, so such a block is accepted with reth's Amsterdam off.
+    #[test]
+    fn post_execution_takes_the_header_gas_from_the_result_not_the_receipts() {
+        let c = consensus();
+        let receipts = vec![log_receipt(994_536)];
+        let header = Header { gas_used: 749_700, ..header_for(&receipts, 5, TS_SHANGHAI) };
+        let block = recovered(header);
+        assert!(c.validate_block_post_execution(&block, &result_of(receipts.clone(), 749_700), None, None).is_ok());
+        assert!(matches!(
+            c.validate_block_post_execution(&block, &result_of(receipts, 994_536), None, None),
+            Err(ConsensusError::BlockGasUsed { .. })
+        ));
+    }
+
     #[test]
     fn post_execution_holds_requests_to_the_eip_after_prague() {
         let c = consensus();

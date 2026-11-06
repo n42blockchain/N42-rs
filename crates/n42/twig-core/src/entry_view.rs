@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Reads the entry file by byte offset, outside the tree and its lock.
+//! Reads the entry files by location, outside the tree and its lock.
 //!
 //! A QMDB read view (`docs/QMDB_UPGRADE_PLAN.md`, stage 6) answers state reads for the persisted
 //! head while the tree it was taken from moves on under its own lock. Records in the entry file
@@ -10,18 +10,37 @@
 //! [`VIEW_MAP_BYTES`] of address space once: pages of a shared file mapping follow the file as it
 //! grows, so appends made after the mapping are readable without remapping.
 //!
+//! A compacted twig's live records also sit in `entries.relocated`
+//! (`docs/QMDB_COMPACTION_DESIGN.md`), whose live record is `[tag][slot][key 32][len u32][value]`:
+//! from its key on it has the main file's shape. A *location* names either file in the 40 bits
+//! of a key-index value: bit 39 ([`RELOCATED_LOCATION`]) clear, the byte offset of a record in
+//! `entries.log`; set, the byte offset of a live record's key in `entries.relocated`. Each file
+//! is addressed up to [`VIEW_MAP_BYTES`] (512 GiB). [`EntryViewFiles`] resolves a location with
+//! one branch and no further memory read: the read costs the index bucket and the record, as
+//! before compaction (stage 1 cost, `docs/QMDB_COMPACTION_DESIGN.md`).
+//!
 //! The contract: a caller reads only offsets of records that are written (flushed to the file,
 //! not necessarily synced) and not truncated since. Past the file's end a mapped page is a
 //! `SIGBUS`, which is why a tree cutting its file tells a `TruncationGuard` first, and why
 //! [`EntryFileView::key`] and [`EntryFileView::record`] are `unsafe`: the caller vouches for the
 //! offset. [`EntryFileView::checked_record`] checks it against the file's length instead.
 
-use std::{fs::File, io, path::Path};
+use std::{
+    fs::File,
+    io,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use crate::Hash;
 
-/// Address space the view reserves: 1 TiB, the most a 40-bit index value can name.
-pub const VIEW_MAP_BYTES: u64 = 1 << 40;
+/// Address space the view reserves per file: 512 GiB, the most the 39 offset
+/// bits of a location ([`RELOCATED_LOCATION`]) can name.
+pub const VIEW_MAP_BYTES: u64 = 1 << 39;
+
+/// Bit 39 of a location: the record is in `entries.relocated`, and the low
+/// 39 bits are the offset of its key there.
+pub const RELOCATED_LOCATION: u64 = 1 << 39;
 
 /// The longest value a record can hold (the portable snapshot's bound, far
 /// above any account or slot encoding): a longer length field is a torn or
@@ -150,6 +169,91 @@ impl EntryFileView {
     }
 }
 
+/// The entry files a read view reads, by location (module documentation):
+/// `entries.log`, mapped at once, and `entries.relocated`, mapped by
+/// [`Self::map_relocated`] before the first location into it is handed out.
+pub struct EntryViewFiles {
+    main: EntryFileView,
+    relocated: OnceLock<EntryFileView>,
+    relocated_path: PathBuf,
+}
+
+impl std::fmt::Debug for EntryViewFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntryViewFiles").field("relocated", &self.relocated.get().is_some()).finish_non_exhaustive()
+    }
+}
+
+impl EntryViewFiles {
+    /// Maps `entries.log` at `path`, and `entries.relocated` beside it if it
+    /// exists.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let files = Self {
+            main: EntryFileView::open(path)?,
+            relocated: OnceLock::new(),
+            relocated_path: crate::entry_store::relocated_path(path),
+        };
+        if files.relocated_path.exists() {
+            files.map_relocated()?;
+        }
+        Ok(files)
+    }
+
+    /// Maps `entries.relocated` if it is not mapped yet. A writer calls it
+    /// before it puts the first relocated location where a reader can load
+    /// it, so a reader never maps.
+    pub fn map_relocated(&self) -> io::Result<()> {
+        if self.relocated.get().is_none() {
+            let view = EntryFileView::open(&self.relocated_path)?;
+            let _ = self.relocated.set(view);
+        }
+        Ok(())
+    }
+
+    /// The main file's view.
+    pub const fn main(&self) -> &EntryFileView {
+        &self.main
+    }
+
+    /// The file `location` names and the offset within it.
+    #[inline(always)]
+    fn resolve(&self, location: u64) -> (&EntryFileView, u64) {
+        if location & RELOCATED_LOCATION == 0 {
+            (&self.main, location)
+        } else {
+            let Some(relocated) = self.relocated.get() else {
+                unreachable!("a relocated location {location:#x} before entries.relocated was mapped");
+            };
+            (relocated, location & !RELOCATED_LOCATION)
+        }
+    }
+
+    /// The key of the record at `location`.
+    ///
+    /// # Safety
+    ///
+    /// As [`EntryFileView::key`], in the file the location names (mapped by
+    /// [`Self::map_relocated`] if it is the relocated one).
+    #[inline]
+    pub unsafe fn key(&self, location: u64) -> Hash {
+        let (file, offset) = self.resolve(location);
+        // SAFETY: the caller's contract, passed on.
+        unsafe { file.key(offset) }
+    }
+
+    /// [`EntryFileView::try_record`] at `location`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::key`].
+    #[inline]
+    pub unsafe fn try_record(&self, location: u64) -> Option<(Hash, &[u8])> {
+        let (file, offset) = self.resolve(location);
+        // SAFETY: the caller's contract, passed on.
+        unsafe { file.try_record(offset) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +338,44 @@ mod tests {
         assert_eq!(view.record_end(VIEW_MAP_BYTES), None);
         assert_eq!(view.record_end(VIEW_MAP_BYTES - (KEY_LEN + LEN_LEN) as u64 + 1), None);
         assert_eq!(view.record_end(u64::MAX), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// After a compaction, every live slot's location reads its key and
+    /// value through the two-file view, from `entries.relocated` for the
+    /// compacted twigs.
+    #[test]
+    fn locations_read_both_files_after_a_compaction() {
+        let path = scratch("locations");
+        let mut tree = QmdbCompatTree::new();
+        tree.set_entry_file(&path).unwrap();
+        // Two full twigs, most of the first then overwritten.
+        tree.apply_sorted_ops(block(0..2_048, 1)).unwrap();
+        tree.apply_sorted_ops(block(2_048..4_096, 1)).unwrap();
+        tree.apply_sorted_ops(block(0..1_500, 2)).unwrap();
+        let report = tree.compact_twigs(u64::MAX, 0.5, 8).unwrap();
+        assert_eq!(report.twigs, 1);
+        assert!(!report.moves.is_empty());
+        tree.flush_entries_for_sync().unwrap();
+        let files = EntryViewFiles::open(&path).unwrap();
+        let mut relocated = 0;
+        for (key, location) in tree.live_entry_offsets().unwrap() {
+            relocated += usize::from(location & RELOCATED_LOCATION != 0);
+            // SAFETY: a flushed live record of this tree, which never cuts here.
+            let (k, value) = unsafe { files.try_record(location) }.unwrap();
+            assert_eq!(k, key);
+            assert_eq!(Some(value), tree.get(&key));
+        }
+        assert_eq!(relocated, 2_048 - 1_500);
+        for (key, old, new) in &report.moves {
+            assert_eq!(old & RELOCATED_LOCATION, 0);
+            assert_ne!(new & RELOCATED_LOCATION, 0);
+            // SAFETY: both records are written; nothing is punched here.
+            unsafe {
+                assert_eq!(files.key(*old), *key);
+                assert_eq!(files.key(*new), *key);
+            }
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

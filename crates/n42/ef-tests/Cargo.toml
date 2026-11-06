@@ -59,7 +59,7 @@ tracing.workspace = true
 walkdir.workspace = true
 rayon.workspace = true
 hex.workspace = true
-hashbrown = "0.15"
+hashbrown = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]

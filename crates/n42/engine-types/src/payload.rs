@@ -1572,7 +1572,15 @@ where
         }
     }
     let warm_parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
-    let defer_state = state_after_pull() && parallel_build() && builder_puller() != 0;
+    // The parallel transfer step models the Osaka gas rules (a transfer is
+    // its 21,000 and no log; the block's gas is the transactions' sum). A
+    // block under gov5's Amsterdam execution (EIP-8037's two gas dimensions,
+    // EIP-7708's transfer logs) is built serially, transaction by
+    // transaction, by the executor that applies them
+    // (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
+    let parallel_build = parallel_build()
+        && !reth_chainspec::qmdb::glamsterdam_execution_active_at(client.chain_spec().genesis(), attributes.timestamp);
+    let defer_state = state_after_pull() && parallel_build && builder_puller() != 0;
     let parent_state_slot: std::cell::OnceCell<reth_storage_api::StateProviderBox> = std::cell::OnceCell::new();
     if !defer_state {
         let _ = parent_state_slot.set(open_parent_state()?);
@@ -1677,7 +1685,7 @@ where
         assembler = assembler.with_qmdb_root(crate::assembler::QmdbRootJob {
             state: state.clone(),
             parent: parent_header.hash(),
-            prague: chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
+            prague: n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp),
             out: qmdb_root.clone(),
         });
     }
@@ -1768,7 +1776,7 @@ where
     // `N42_PULL_BY_FRAMES`: the selector may hand the block over as one
     // vector out of the plan's frames, which only the parallel step with the
     // puller consumes (`frame_blocks::take_bulk`).
-    crate::frame_blocks::want_bulk(parallel_build() && builder_puller() != 0);
+    crate::frame_blocks::want_bulk(parallel_build && builder_puller() != 0);
     // `N42_PLAN_AHEAD_BODY=1`: the queue makes the next block's body with its
     // plan; the partition is made at this build's beneficiary.
     if crate::frame_blocks::plan_ahead_body_wanted()
@@ -2389,7 +2397,7 @@ where
             (payload, recovered, block_hash, block_number, root_ms, fields_ms, sealed_ms, sealed_at_ms, parent_sealed)
         }};
     }
-    if parallel_build() && (pulled.is_some() || bulk.is_some()) {
+    if parallel_build && (pulled.is_some() || bulk.is_some()) {
         let par_at = std::time::Instant::now();
         par_start_ms = build_started.elapsed().as_millis() as u64;
         start_other_ms =
@@ -3419,7 +3427,7 @@ where
                     // root job adds the residual's to them.
                     if root_ops_ahead() && sealing_early && let Some(shards) = output_shards.as_ref() {
                         let shards = Arc::clone(shards);
-                        let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+                        let prague = n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp);
                         let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
                             n42_core_layout::enter(n42_core_layout::Set::Critical);
                             let empty = revm::database::BundleState::default();
@@ -3859,7 +3867,7 @@ where
                 let frozen = Arc::new(frozen);
                 if root_ops_ahead() {
                     let shards = Arc::clone(&frozen);
-                    let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+                    let prague = n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp);
                     let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
                         n42_core_layout::enter(n42_core_layout::Set::Critical);
                         let empty = revm::database::BundleState::default();
@@ -3939,7 +3947,7 @@ where
             // `N42_FIELDS_AT_SEAL=verify`: what the fields were published
             // from, compared behind `Complete` with the late derivation.
             let mut early_inputs;
-            let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+            let prague = n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp);
             // `N42_OUTPUT_SHARDS`: the executor's bundle holds only what it
             // changed after the batches. The next build is let go on it laid
             // over the shards; the QMDB root and the hashed post-state read
@@ -5512,7 +5520,7 @@ where
                         parent_header.hash(),
                         &changes_from_execution(
                             &db.bundle_state,
-                            chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
+                            n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp),
                         ),
                     )
                     .map_err(PayloadBuilderError::other)?,

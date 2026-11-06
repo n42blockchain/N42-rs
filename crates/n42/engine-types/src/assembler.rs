@@ -45,8 +45,9 @@ pub struct QmdbRootJob {
     pub state: n42_qmdb_reth::QmdbNodeState,
     /// The block's parent, which the tree is computed on top of.
     pub parent: alloy_primitives::B256,
-    /// Whether Prague is active at the block, which changes how the bundle is
-    /// read.
+    /// Whether the block writes the system caller's leaf
+    /// (`n42_qmdb_reth::system_caller_leaf_at`: Prague active, Glamsterdam
+    /// not), which changes how the bundle is read.
     pub prague: bool,
     /// Where the result goes. `None` until the assembler has run.
     pub out: Arc<Mutex<Option<Result<n42_qmdb_reth::PreparedBlock, String>>>>,

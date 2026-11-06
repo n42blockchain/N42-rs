@@ -54,14 +54,6 @@ impl DescribedTx {
     }
 }
 
-/// The follower's build path reads a described block's transactions where
-/// they are held (`N42_FOLLOWER_COPY_ASIDE=1`): the queue's `Arc`s, as the
-/// leader's batches read the pooled ones.
-impl crate::parallel_transfer::BuildPathTx for DescribedTx {
-    fn build_path_tx(&self) -> &TransactionSigned {
-        self.transaction()
-    }
-}
 
 /// One chunk of the block's transactions, encoded end to end: what the
 /// transactions root is computed over, and what the payload's list is copied

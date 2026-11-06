@@ -4,7 +4,7 @@
 //! The `n42Engine` handlers against a scripted payload service.
 
 use super::*;
-use alloy_consensus::{Header, Signed, TxEip1559};
+use alloy_consensus::{Signed, TxEip1559};
 use alloy_primitives::{Address, Signature, TxKind, B256, U256};
 use n42_engine_types::N42EngineTypes;
 use reth_ethereum_primitives::TransactionSigned;

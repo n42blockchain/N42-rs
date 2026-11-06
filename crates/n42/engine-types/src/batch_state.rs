@@ -22,8 +22,8 @@
 //! into the block's bundle relies on exactly these refusals: a batch account
 //! carries no storage, no code and no selfdestruct.
 //!
-//! Unlike the revm-era batch state ([`crate::batch_state_legacy`] under
-//! `legacy-revm-paths`) this is not the batch's database: an evm2 `Evm` owns
+//! Unlike the revm-era batch state (removed in F6a) this is not the batch's
+//! database: an evm2 `Evm` owns
 //! and caches its database, so the read side is the batch's read layers and
 //! this is only the accumulator.
 

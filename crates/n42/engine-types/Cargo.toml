@@ -92,9 +92,6 @@ alloy-eip7928.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 evm2 = { workspace = true, features = ["std"] }
-# The revm-era paths (`legacy-revm-paths`); see `src/legacy_paths.rs`.
-revm = { workspace = true, optional = true }
-alloy-evm = { workspace = true, optional = true }
 
 # metrics
 reth-metrics.workspace = true
@@ -104,20 +101,13 @@ metrics.workspace = true
 
 [features]
 default = []
-# The fast transfer, parallel builder / graft, batch state and warm-ahead
-# paths written against revm 43. They do not build on reth v2.9.0 (evm2) yet
-# and are ported path by path (docs/RETH_2_9_0_UPGRADE.md, stage F5).
-legacy-revm-paths = ["dep:revm", "dep:alloy-evm"]
 
 [dev-dependencies]
-# `output_shards_bench` runs on the allocator the node runs on (`MALLOC_CONF` read).
-tikv-jemallocator = { workspace = true, features = ["unprefixed_malloc_on_supported_platforms"] }
-libc.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 # `claimed_build`'s tests sign the transactions they check the claim of.
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
 secp256k1.workspace = true
-# `bench_build_prefetch` serves its state from a QMDB read view over an entry file it writes.
+# `fields_at_seal`'s tests read QMDB operations.
 n42-twig-core.workspace = true
 # `parallel_build`'s import tests compare QMDB roots.
 n42-qmdb-state.workspace = true

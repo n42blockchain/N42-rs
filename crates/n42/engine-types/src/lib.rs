@@ -43,8 +43,6 @@ pub mod memory_overlay;
 mod consensus;
 pub mod engine_validator;
 pub mod claimed_build;
-pub mod legacy_paths;
-pub mod fast_transfer;
 pub mod fast_handler;
 pub mod direct_transfer;
 pub mod frame_blocks;
@@ -53,20 +51,11 @@ pub mod includability;
 pub mod batch_state;
 pub mod graft_fold;
 pub mod parallel_build;
-/// The revm-era batch state the legacy parallel paths still use (F5c/F5d port them).
-#[cfg(feature = "legacy-revm-paths")]
-pub mod batch_state_legacy;
 pub mod parallel_common;
-#[cfg(feature = "legacy-revm-paths")]
-pub mod parallel_transfer;
-/// Without `legacy-revm-paths`: the EVM-free parts ([`parallel_common`]) under
-/// the module's usual path.
-#[cfg(not(feature = "legacy-revm-paths"))]
+/// [`parallel_common`] under the module's older path, which callers still use.
 pub mod parallel_transfer {
     pub use crate::parallel_common::*;
 }
-#[cfg(feature = "legacy-revm-paths")]
-pub mod warm_ahead;
 pub mod output_shards;
 pub mod hotstuff_consensus;
 mod network;

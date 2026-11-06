@@ -41,12 +41,6 @@
 //! map (`docs/BREAKTHROUGH_DESIGN.md` 10.14: the v4 fold is bound by the 264
 //! bytes an account it moves). Reads, the view and the merge go through the
 //! index; the results are the v4 fold's (`tests/output_shards.rs`).
-// The stock evm2 build leaves the revm-era paths out (`legacy-revm-paths`): what only they
-// use or mutate reads as dead here until F5 ports or removes them (docs/RETH_2_9_0_UPGRADE.md).
-#![cfg_attr(
-    not(feature = "legacy-revm-paths"),
-    allow(dead_code, unused_mut, unused_variables, unused_assignments, unused_imports)
-)]
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -59,8 +53,6 @@ use alloy_primitives::{
 };
 use reth_primitives_traits::{Account, Bytecode};
 use evm2::bytecode::Bytecode as RevmBytecode;
-#[cfg(feature = "legacy-revm-paths")]
-use reth_evm::db::State;
 use reth_storage_api::{
     errors::ProviderResult, AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider,
     StateProofProvider, StateProvider, StateProviderBox, StateRootProvider, StorageRootProvider,
@@ -70,14 +62,6 @@ use reth_trie::{
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 use reth_trie::bundle_state::{AccountRevert, BundleAccount, BundleState};
-// The cache commits (`take_cached`) and the staged fold write revm 43's
-// `State`: built only with `legacy-revm-paths` until the parallel step is
-// ported (docs/RETH_2_9_0_UPGRADE.md, port log).
-#[cfg(feature = "legacy-revm-paths")]
-use revm::{
-    state::{AccountStatus, EvmState},
-    Database,
-};
 
 /// The most shards a block's output is split into.
 const MAX_SHARDS: usize = 256;
@@ -624,14 +608,6 @@ impl IndexedBatch {
         }
     }
 
-    /// The map, owned, less the removed accounts.
-    fn into_live_map(self) -> AddressHashMap<BundleAccount> {
-        let mut map = Arc::try_unwrap(self.accounts).unwrap_or_else(|shared| (*shared).clone());
-        for address in &self.removed {
-            map.remove(address);
-        }
-        map
-    }
 }
 
 /// The block's output in index mode: the batches' maps, a map a shard from
@@ -1027,9 +1003,9 @@ impl OutputShards {
             if let (Some(live), true) = (self.live, entered) {
                 let parts = live.into_iter().map(|part| part.into_inner().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p))).collect();
                 let split = (self.freeze_split, self.freeze_split_all);
-                return freeze_live(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts, split);
+                return freeze_live(pool, at, count, batches, contracts, self.append_ns.into_inner(), parts, split);
             }
-            return freeze_indexed(pool, at, beneficiary, count, batches, contracts, self.append_ns.into_inner());
+            return freeze_indexed(pool, at, count, batches, contracts, self.append_ns.into_inner());
         }
         let transposed = std::time::Instant::now();
         let batches_ref = &batches;
@@ -1065,7 +1041,6 @@ impl OutputShards {
         let fold_ns = at.elapsed().as_nanos() as u64;
         log_folded(fold_ns, &split, None, false);
         FrozenShards {
-            beneficiary,
             shards,
             indexed: None,
             contracts: self.contracts.into_inner().unwrap_or_else(|p| crate::built_executions::recover_poisoned("output_shards", p)),
@@ -1258,28 +1233,6 @@ impl EarlyOutput {
         self.parts.iter().map(|part| part.index.len()).sum()
     }
 
-    #[cfg(feature = "legacy-revm-paths")]
-    /// [`FrozenShards::take_cached`] on the early output: the changes the
-    /// batches made to accounts `state` holds in its cache, committed to it
-    /// as deltas, read from the early output instead of taken out of the
-    /// frozen set. Returns how many were committed and the addresses the
-    /// frozen set must give up ([`FrozenShards::take_out`]).
-    pub fn take_cached<DB: Database>(&self, state: &mut State<DB>) -> (usize, Vec<Address>) {
-        if state.cache.accounts.is_empty() {
-            return (0, Vec::new());
-        }
-        let cached: Vec<Address> = state.cache.accounts.keys().copied().collect();
-        let mut taken = Vec::new();
-        let mut summed: Vec<(Address, BundleAccount)> = Vec::new();
-        for address in cached {
-            if let Some(account) = self.account(&address) {
-                taken.push(address);
-                summed.push((address, account.into_owned()));
-            }
-        }
-        let committed = commit_cached(state, summed);
-        (committed, taken)
-    }
 }
 
 /// The early index's empty parts, sized for `capacity` accounts.
@@ -1288,48 +1241,6 @@ fn early_parts(capacity: usize) -> Vec<Mutex<EarlyPart>> {
     (0..EARLY_PARTS).map(|_| Mutex::new(EarlyPart::with_capacity(each))).collect()
 }
 
-#[cfg(feature = "legacy-revm-paths")]
-/// `take_cached`'s commit: each account's change against its parent value
-/// laid over the value the block's state holds in its cache.
-fn commit_cached<DB: Database>(state: &mut State<DB>, taken: Vec<(Address, BundleAccount)>) -> usize {
-    let mut slow: AddressHashMap<(U256, U256, u64, bool)> = Default::default();
-    for (address, account) in taken {
-        let Some(info) = account.info.as_ref() else { continue };
-        let (new_balance, new_nonce) = (info.balance, info.nonce);
-        let (old_balance, old_nonce) = match &account.original_info {
-            Some(orig) => (orig.balance, orig.nonce),
-            None => (U256::ZERO, 0),
-        };
-        let entry = slow.entry(address).or_insert((U256::ZERO, U256::ZERO, 0, true));
-        if new_balance >= old_balance {
-            entry.0 = entry.0.saturating_add(new_balance - old_balance);
-        } else {
-            entry.1 = entry.1.saturating_add(old_balance - new_balance);
-        }
-        entry.2 += new_nonce - old_nonce;
-        entry.3 &= account.original_info.is_none();
-    }
-    if slow.is_empty() {
-        return 0;
-    }
-    let mut changes: EvmState = Default::default();
-    for (address, (add, sub, nonce, original_absent)) in slow {
-        let Some(cached) = state.cache.accounts.get(&address) else { continue };
-        let existed = cached.account.is_some();
-        let mut merged = cached.account.as_ref().map(|a| a.info.clone()).unwrap_or_default();
-        merged.balance = merged.balance.saturating_add(add).saturating_sub(sub);
-        merged.nonce += nonce;
-        let mut account = revm::state::Account::from(merged);
-        account.status = AccountStatus::Touched;
-        if !existed && original_absent {
-            account.status |= AccountStatus::Created;
-        }
-        changes.insert(address, account);
-    }
-    let committed = changes.len();
-    revm::DatabaseCommit::commit(state, changes);
-    committed
-}
 
 /// Where the fold's wall goes: the set-up, the wait for the pool's first
 /// thread, the spread of the tasks' starts, the slowest task's own work, and
@@ -1418,7 +1329,6 @@ fn log_folded(fold_ns: u64, split: &FoldSplit, index: Option<(u64, usize)>, live
 fn freeze_indexed(
     pool: &rayon::ThreadPool,
     at: std::time::Instant,
-    beneficiary: Address,
     count: usize,
     batches: Vec<BatchOut>,
     contracts: B256HashMap<RevmBytecode>,
@@ -1475,7 +1385,7 @@ fn freeze_indexed(
         pool.install(|| (0..count).into_par_iter().map(build).collect())
     };
     let done = std::time::Instant::now();
-    finish_indexed(pool, at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, None)
+    finish_indexed(pool, at, transposed, done, count, batches, contracts, append_ns, built, None)
 }
 
 /// The live index's freeze ([`output_index_live`]): the indexes and kept
@@ -1486,7 +1396,6 @@ fn freeze_indexed(
 fn freeze_live(
     pool: &rayon::ThreadPool,
     at: std::time::Instant,
-    beneficiary: Address,
     count: usize,
     batches: Vec<BatchOut>,
     contracts: B256HashMap<RevmBytecode>,
@@ -1583,7 +1492,7 @@ fn freeze_live(
         .collect();
     let split_tasks = (heavy_count * split) as u64;
     let pending = (pending_max, pending_us_max, drops_max, heavy_shard as u64, heavy_work as u64, split_tasks);
-    finish_indexed(pool, at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, Some(pending))
+    finish_indexed(pool, at, transposed, done, count, batches, contracts, append_ns, built, Some(pending))
 }
 
 /// The largest `N42_FREEZE_SPLIT`.
@@ -1754,7 +1663,6 @@ fn finish_indexed(
     at: std::time::Instant,
     transposed: std::time::Instant,
     done: std::time::Instant,
-    beneficiary: Address,
     count: usize,
     batches: Vec<BatchOut>,
     contracts: B256HashMap<RevmBytecode>,
@@ -1828,7 +1736,6 @@ fn finish_indexed(
     let fold_ns = at.elapsed().as_nanos() as u64;
     log_folded(fold_ns, &split, Some((index_build_ns, conflict_count)), live);
     FrozenShards {
-        beneficiary,
         shards: Vec::new(),
         indexed: Some(Box::new(Indexed {
             batches: kept_batches,
@@ -1909,7 +1816,6 @@ impl Drop for FrozenShards {
 /// The block's output after the batches: the shard set, read without locks.
 #[derive(Debug, Default)]
 pub struct FrozenShards {
-    beneficiary: Address,
     /// v4: the shard maps the accounts were copied into (empty in index mode).
     shards: Vec<Shard>,
     /// Index mode: the batches' maps and the index over them.
@@ -2145,21 +2051,6 @@ impl FrozenShards {
         self.contracts.get(code_hash)
     }
 
-    #[cfg(feature = "legacy-revm-paths")]
-    /// The accounts the block's own state already holds in its cache (a
-    /// pre-execution system call's): their changes go on top of the block's
-    /// values, not the parent's, so they leave the shards and are committed
-    /// to `state` as deltas -- `install_staged`'s rule, without the install.
-    /// Returns how many were committed.
-    pub fn take_cached<DB: Database>(&mut self, state: &mut State<DB>) -> usize {
-        if state.cache.accounts.is_empty() || (self.shards.is_empty() && self.indexed.is_none()) {
-            return 0;
-        }
-        let cached: Vec<Address> = state.cache.accounts.keys().copied().collect();
-        let taken: Vec<(Address, BundleAccount)> =
-            cached.into_iter().filter_map(|address| Some((address, self.take_one(&address)?))).collect();
-        commit_cached(state, taken)
-    }
 
     /// `addresses` taken out of the output without a commit: the frozen
     /// half of [`EarlyOutput::take_cached`], whose commit already ran.
@@ -2212,54 +2103,6 @@ impl FrozenShards {
         }
     }
 
-    #[cfg(feature = "legacy-revm-paths")]
-    /// The shards folded into one map after all, for a build that needs the
-    /// block's state in its executor (a serial loop, a cache-reading finish):
-    /// installed by `install_staged` exactly as a streamed graft is.
-    pub fn into_staged(mut self) -> crate::parallel_transfer::StagedGraft {
-        if let Some(indexed) = self.indexed.take() {
-            let Indexed { batches, conflicts, kept, state_size, beneficiary_delta, .. } = *indexed;
-            let mut state: AddressHashMap<BundleAccount> = Default::default();
-            state.reserve(batches.iter().map(|b| b.accounts.len()).sum::<usize>() + conflicts.iter().map(|c| c.len()).sum::<usize>());
-            let mut slots: Vec<Vec<Option<(Address, AccountRevert)>>> = Vec::with_capacity(batches.len());
-            for mut batch in batches {
-                let reverts = std::mem::take(&mut batch.reverts);
-                state.extend(batch.into_live_map());
-                slots.push(reverts.into_iter().map(Some).collect());
-            }
-            for shard in conflicts {
-                state.extend(shard);
-            }
-            let mut reverts = Vec::with_capacity(kept.iter().map(Vec::len).sum());
-            for (id, at) in kept.into_iter().flatten() {
-                if let Some(revert) = slots.get_mut(id as usize).and_then(|batch| batch.get_mut(at as usize)).and_then(Option::take) {
-                    reverts.push(revert);
-                }
-            }
-            let contracts = std::mem::take(&mut self.contracts);
-            return crate::parallel_transfer::StagedGraft::from_parts(
-                self.beneficiary,
-                state,
-                state_size,
-                contracts,
-                reverts,
-                beneficiary_delta,
-            );
-        }
-        let total = self.accounts();
-        let mut state: AddressHashMap<BundleAccount> = Default::default();
-        state.reserve(total);
-        let mut reverts = Vec::with_capacity(total);
-        let (mut size, mut delta) = (0usize, U256::ZERO);
-        for shard in std::mem::take(&mut self.shards) {
-            size += shard.state_size;
-            delta = delta.saturating_add(shard.beneficiary_delta);
-            state.extend(shard.state);
-            reverts.extend(shard.reverts);
-        }
-        let contracts = std::mem::take(&mut self.contracts);
-        crate::parallel_transfer::StagedGraft::from_parts(self.beneficiary, state, size, contracts, reverts, delta)
-    }
 
     /// The block's one `BundleState`: the shards' accounts with `residual` --
     /// what the block's executor changed after the batches, merged and taken
@@ -3313,9 +3156,6 @@ mod incremental_tests {
             .collect()
     }
 
-    fn output(blocks: &[BundleState], defer: bool) -> OutputShards {
-        output_with(blocks, defer, true)
-    }
 
     /// `incremental`: the batches fill the early index as they end;
     /// otherwise the view builds it from the batches when it is taken.
@@ -3361,73 +3201,8 @@ mod incremental_tests {
         }
     }
 
-    /// The output a freeze leaves, in a comparable form: the view's accounts
-    /// and the merge's accounts and reverts, sorted.
-    fn summary(frozen: &FrozenShards) -> (Vec<(Address, Option<AccountInfo>)>, Vec<(Address, Option<AccountInfo>)>, String, usize) {
-        let residual = BundleState::default();
-        let mut view: Vec<_> = frozen.view(&residual, &[]).into_iter().map(|(a, acc)| (*a, acc.info.clone())).collect();
-        view.sort_unstable_by_key(|(a, _)| *a);
-        let merged = frozen.merged(&residual);
-        let mut state: Vec<_> = merged.state.iter().map(|(a, acc)| (*a, acc.info.clone())).collect();
-        state.sort_unstable_by_key(|(a, _)| *a);
-        let reverts = format!("{:?}", merged.reverts);
-        (view, state, reverts, frozen.accounts())
-    }
 
-    #[cfg(feature = "legacy-revm-paths")]
-    #[test]
-    fn a_freeze_beside_an_early_reader_equals_the_one_shot_freeze() {
-        for defer in [false, true] {
-            let blocks = batches(12, 40, 120);
-            let alone = output(&blocks, defer).freeze();
-            let shared = output(&blocks, defer);
-            let early = shared.early_view().map(Arc::new);
-            let mut beside = shared.freeze();
-            assert_eq!(summary(&beside), summary(&alone), "defer {defer}");
-            assert_eq!(beside.index_conflicts(), alone.index_conflicts());
-            // Taken out (the cached accounts' half), both ways alike.
-            let mut alone = alone;
-            let gone: Vec<Address> = every_address(&blocks).into_iter().step_by(17).collect();
-            assert_eq!(beside.take_out(&gone), alone.take_out(&gone));
-            assert_eq!(summary(&beside), summary(&alone), "defer {defer}, after the take");
-            let staged = |frozen: FrozenShards| {
-                let staged = frozen.into_staged();
-                every_address(&blocks).into_iter().filter(|a| staged.holds(a)).collect::<Vec<_>>()
-            };
-            assert_eq!(staged(beside), staged(alone), "defer {defer}, staged");
-            drop(early);
-        }
-    }
 
-    #[cfg(feature = "legacy-revm-paths")]
-    #[test]
-    fn the_early_take_commits_what_the_frozen_take_commits() {
-        use revm::Database as _;
-        let blocks = batches(8, 30, 60);
-        let cached: Vec<Address> = vec![addr(3), addr(7), addr(1_000_005), addr(4_000_000)];
-        let state_with_cache = || {
-            let mut state = State::builder().with_database(revm::database::EmptyDB::default()).build();
-            for address in &cached {
-                let _ = state.basic(*address);
-            }
-            state
-        };
-        let shards = output(&blocks, true);
-        let early = shards.early_view().expect("early");
-        let mut frozen = shards.freeze();
-        let mut by_early = state_with_cache();
-        let (committed, taken) = early.take_cached(&mut by_early);
-        let mut by_frozen = state_with_cache();
-        let mut reference = output(&blocks, true).freeze();
-        assert_eq!(reference.take_cached(&mut by_frozen), committed);
-        assert_eq!(frozen.take_out(&taken), taken.len());
-        for address in &cached {
-            let a = by_early.cache.accounts.get(address).and_then(|c| c.account.as_ref()).map(|a| a.info.clone());
-            let b = by_frozen.cache.accounts.get(address).and_then(|c| c.account.as_ref()).map(|a| a.info.clone());
-            assert_eq!(a, b, "{address}");
-        }
-        assert_eq!(summary(&frozen), summary(&reference));
-    }
 
     /// Random batches whose accounts overlap freely -- senders and
     /// recipients alike drawn from one pool, so an address can be written by

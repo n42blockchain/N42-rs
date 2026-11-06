@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The plain value transfer as an evm2 transaction handler (F5f).
 //!
-//! The revm-era fast transfer (`fast_transfer.rs`, `legacy-revm-paths`) replaced
+//! The revm-era fast transfer (removed in F6a) replaced
 //! revm's whole transaction pipeline for a transfer between two accounts without
 //! code. evm2 already completes a call to an account without code without running
 //! the interpreter (`Evm::execute_call_message`), so what is left to save is the

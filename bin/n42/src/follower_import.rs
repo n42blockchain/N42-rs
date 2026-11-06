@@ -14,12 +14,6 @@
 //! the engine needs to carry the block. What it produces is handed to the
 //! engine as an executed block; the engine's own `newPayload` then finds it
 //! in the tree, and executes it itself if anything here was refused.
-// The stock evm2 build leaves the revm-era paths out (`legacy-revm-paths`): what only they
-// use or mutate reads as dead here until F5 ports or removes them (docs/RETH_2_9_0_UPGRADE.md).
-#![cfg_attr(
-    not(feature = "legacy-revm-paths"),
-    allow(dead_code, unused_mut, unused_variables, unused_assignments, unused_imports)
-)]
 
 use std::sync::Arc;
 
@@ -1656,13 +1650,11 @@ struct Executed {
     split: ExecSplit,
 }
 
-/// A build-path execution ([`execute_transfers_build_path_keyed`]) whose
+/// A build-path execution (the revm-era keyed build path, removed in F6a) whose
 /// QMDB root was started the instant the call returned, on the execution's
 /// own thread -- before the execution's line, the join with the vote road
 /// and the output's hand-over (`root_gap_ms`, 5-6 ms between `exec_end_ms`
 /// and the root's start on the fleet, loop288).
-///
-/// [`execute_transfers_build_path_keyed`]: n42_engine_types::parallel_transfer::execute_transfers_build_path_keyed
 struct StartedShards {
     shards: Arc<n42_engine_types::output_shards::FrozenShards>,
     residual: ParentOutput,
@@ -1690,26 +1682,14 @@ struct ExecSplit {
     batch_median_ms: u64,
 }
 
-impl ExecSplit {
-    const fn of(phases: &n42_engine_types::parallel_transfer::Phases) -> Self {
-        Self {
-            part_ms: phases.partition_ms,
-            batches_ms: phases.groups_ms,
-            graft_ms: phases.merge_ms,
-            batches: phases.batches as u64,
-            threads: phases.threads as u64,
-            batch_max_ms: phases.batch_spans.max_ms,
-            batch_median_ms: phases.batch_spans.median_ms,
-        }
-    }
-}
 
 /// `N42_FOLLOWER_COPY_ASIDE=1` (default off): a described block's owned
 /// `RecoveredBlock` -- the 163,000 transactions copied out of the queue, the
 /// seal and reth's well-formedness checks, 6-8 ms on the road (loop291-301)
 /// -- is made beside the import instead of before it, and the build path
 /// executes the frames' transactions by reference the moment they are taken
-/// ([`n42_engine_types::parallel_transfer::execute_transfers_build_path_on`]).
+/// (the revm-era by-reference build path, removed in F6a; on evm2 the
+/// switch only moves the copy beside the import).
 /// What reads the owned block -- the vote road's header and body checks and
 /// its includability check, the post-execution checks, the engine's
 /// hand-off -- waits for it where it reads it ([`LateBlock`]).
@@ -1787,14 +1767,6 @@ impl LateBlock {
         }
     }
 
-    fn waiting(made: std::sync::mpsc::Receiver<MadeAside>) -> Self {
-        Self {
-            ready: std::sync::OnceLock::new(),
-            made: Mutex::new(Some(made)),
-            copy_us: Default::default(),
-            wait_us: Default::default(),
-        }
-    }
 
     /// The owned block, waiting for it when it is still being made.
     fn get(&self) -> Result<&Arc<RecoveredBlock<Block>>, String> {
@@ -2203,32 +2175,13 @@ where
     let vote_at: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     // The vote's wait for the parent's fields, out of whichever road waited.
     let parent_fields_wait_us = std::sync::atomic::AtomicU64::new(0);
-    // `N42_FOLLOWER_COPY_ASIDE=1`: a described block is executed by
-    // reference only where the execution runs beside the vote road on the
-    // build path with this node's own senders; anywhere else its owned block
-    // is waited for here and the import is the one it always was.
-    let by_ref_road = |timestamp: u64| {
-        reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), timestamp)
-            && exec_early()
-            && follower_parallel()
-            && !reth_chainspec::qmdb::glamsterdam_execution_active_at(chain_spec.genesis(), timestamp)
-            && n42_engine_types::parallel_transfer::follower_build_path()
-            && !n42_tx_types::senders_claimed_at_ingest()
-    };
-    // The described block's parts the execution reads by reference, and
-    // where its owned block arrives.
-    let (head, owned, by_ref, made) = match block {
-        ForeignBlock::Sealed(sealed) => (sealed.clone_sealed_header(), Some(sealed), None, None),
-        ForeignBlock::Aside(DescribedAside { header, withdrawals, transactions, senders, made })
-            if by_ref_road(header.timestamp) =>
-        {
-            (header, None, Some((transactions, senders, withdrawals)), Some(made))
-        }
+    let (head, owned) = match block {
+        ForeignBlock::Sealed(sealed) => (sealed.clone_sealed_header(), Some(sealed)),
         ForeignBlock::Aside(aside) => {
             let (block, _) = aside.made.recv().map_err(|_| "the owned block's maker went away".to_string())??;
             let (sealed, senders) = block.split_sealed();
             given_senders = Some(senders);
-            (sealed.clone_sealed_header(), Some(sealed), None, None)
+            (sealed.clone_sealed_header(), Some(sealed))
         }
     };
     let stage = ImportStage(head.number);
@@ -2236,11 +2189,7 @@ where
     let parent_hash = head.parent_hash;
     let number = head.number;
     let block_hash = head.hash();
-    let tx_count = match (&owned, &by_ref) {
-        (Some(sealed), _) => sealed.body().transactions.len(),
-        (None, Some((transactions, _, _))) => transactions.len(),
-        (None, None) => 0,
-    };
+    let tx_count = owned.as_ref().map_or(0, |sealed| sealed.body().transactions.len());
 
     let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), head.timestamp);
     // The parallel transfer paths model the Osaka gas rules (a transfer is
@@ -2314,7 +2263,7 @@ where
     }
     let cache_hits_out = std::sync::atomic::AtomicU64::new(0);
     let late = match owned {
-        None => LateBlock::waiting(made.ok_or("no block to import")?),
+        None => return Err("no block to import".to_string()),
         Some(sealed) => {
             let recovered = match given_senders {
                 Some(senders) if senders.len() != tx_count => {
@@ -2456,38 +2405,11 @@ where
     phases.senders_us = senders_at.elapsed().as_micros() as u64;
     let senders_ms = phases.senders_us / 1000;
 
-    // `N42_FOLLOWER_PARTITION_AHEAD=1`: the block's senders are known from
-    // this point (the compact body's assembly read them out of the queue),
-    // so its transfers' environments and partition are made now, on the
-    // worker pool, beside the wait for the parent and the includability
-    // check, instead of inside the execution gate (19 ms of a 122 ms gated
-    // execution at 163,000 transfers, loop234). The execution takes the plan
-    // just before the gate; one it cannot use is planned again there.
-    // Not on the build path (`N42_FOLLOWER_BUILD_PATH=1`), which partitions by
-    // sender inside its call and converts each transaction on its batch's
-    // thread, as the leader does.
-    #[cfg(feature = "legacy-revm-paths")]
-    let plan_ahead = (follower_parallel()
-        && n42_engine_types::parallel_transfer::follower_partition_ahead()
-        && !(deferred && n42_engine_types::parallel_transfer::follower_build_path()))
-    .then(|| late.get().map(Arc::clone))
-    .transpose()?
-    .map(|block| {
-        let (planned, plan) = std::sync::mpsc::sync_channel(1);
-        let evm_config = evm_config.clone();
-        rayon::spawn(move || {
-            let made = n42_engine_types::parallel_transfer::plan_transfers(&evm_config, &block);
-            drop(block);
-            let _ = planned.send(made);
-        });
-        plan
-    });
 
     // `N42_FOLLOWER_PARTITION_AHEAD=1` on evm2 (F5e): the block's import
     // plan (its leading transfers' keys and their partition by sender) made
     // on the worker pool from here, beside the wait for the parent and the
     // includability check; the execution takes it just before the gate.
-    #[cfg(not(feature = "legacy-revm-paths"))]
     let import_plan = (follower_parallel() && tx_count > 0 && n42_engine_types::parallel_build::follower_partition_ahead())
         .then(|| late.get().map(Arc::clone))
         .transpose()?
@@ -2501,39 +2423,6 @@ where
             plan
         });
 
-    // `N42_FOLLOWER_PARTITION_AHEAD=1` on the build path: the block's
-    // (sender, recipient) keys, which its partition reads, made on the build
-    // pool from here, beside the wait for the parent and the check, instead
-    // of inside the execution (`exec_part_ms`).
-    let keys_ahead = (deferred
-        && follower_parallel()
-        && n42_engine_types::parallel_transfer::follower_partition_ahead()
-        && n42_engine_types::parallel_transfer::follower_build_path())
-    .then(|| -> Result<_, String> {
-        let (made, keys) = std::sync::mpsc::sync_channel(1);
-        // A described block's keys from its transactions by reference
-        // (`N42_FOLLOWER_COPY_ASIDE=1`), the moment its frames are taken.
-        match &by_ref {
-            Some((transactions, senders, _)) => {
-                let (transactions, senders) = (Arc::clone(transactions), Arc::clone(senders));
-                n42_engine_types::parallel_transfer::build_pool().spawn(move || {
-                    let keys = n42_engine_types::parallel_transfer::build_path_keys_of(&transactions, &senders);
-                    drop((transactions, senders));
-                    let _ = made.send(keys);
-                });
-            }
-            None => {
-                let block = Arc::clone(late.get()?);
-                n42_engine_types::parallel_transfer::build_pool().spawn(move || {
-                    let keys = n42_engine_types::parallel_transfer::build_path_keys(&block);
-                    drop(block);
-                    let _ = made.send(keys);
-                });
-            }
-        }
-        Ok(keys)
-    })
-    .transpose()?;
 
     // The parent: in, and under deferred execution executed here, since the
     // header's fields are checked against its result and the transactions
@@ -2560,7 +2449,6 @@ where
         },
     };
     phases.parent_wait_us = parent_at.elapsed().as_micros() as u64;
-    let parent_done = std::time::Instant::now();
     // What the check and the early execution waited for the parent's output
     // (its shards or its merged bundle), and which one they read.
     let parent_read = parent_output.as_ref().map_or(0, ParentLayer::code);
@@ -2733,15 +2621,6 @@ where
     }
     drop(parent_output);
 
-    // `N42_FOLLOWER_BUILD_PATH=1`: the block executes through the leader's
-    // build path (deferred execution only: the root is filed, not checked).
-    // Its parent, when it was executed here the same way and is read through
-    // its published output, is read through its shards.
-    let build_path = deferred && follower_parallel() && n42_engine_types::parallel_transfer::follower_build_path();
-    let parent_shards = executed_parent
-        .as_ref()
-        .and_then(|(_, layers)| layers.first())
-        .is_some_and(|(_, layer)| matches!(layer, ParentLayer::Shards(..)));
 
     // Execution on the parent's state, then gas, receipts root and bloom
     // against the header. One piece, because on the exec-on-parent-output path
@@ -2762,23 +2641,8 @@ where
         // The plan made ahead, collected before the gate so that a plan
         // still running never holds another block's execution.
         let ahead_at = std::time::Instant::now();
-        #[cfg(feature = "legacy-revm-paths")]
-        let plan = plan_ahead.as_ref().and_then(|plan| match plan.recv() {
-            Ok(Ok(plan)) => Some(plan),
-            Ok(Err(err)) => {
-                tracing::debug!(target: "n42.follower_import", number, %err, "the plan made ahead failed; planning in the execution");
-                None
-            }
-            Err(_) => None,
-        });
-        #[cfg(not(feature = "legacy-revm-paths"))]
         let import_plan = import_plan.as_ref().and_then(|plan| plan.recv().ok());
         let ahead_wait_us = ahead_at.elapsed().as_micros() as u64;
-        // The build path's keys made ahead; one that failed is made again in
-        // the execution, which then declines the block the same way.
-        let keys_at = std::time::Instant::now();
-        let keys = keys_ahead.as_ref().and_then(|keys| keys.recv().ok()).and_then(Result::ok);
-        let keys_wait_us = keys_at.elapsed().as_micros() as u64;
         let gate_at = std::time::Instant::now();
         let _gate = exec_gate();
         let gate_ms = gate_at.elapsed().as_millis() as u64;
@@ -2819,245 +2683,8 @@ where
         // worker pool (`parallel_transfer`), partitioned by the accounts it
         // touches; anything it cannot take falls back to the serial executor.
         let mut output = None;
-        let mut sharded = None;
-        let mut split = ExecSplit::default();
-        #[cfg(feature = "legacy-revm-paths")]
-        if build_path {
-            // The root's thread, up before the execution: its spawn and its
-            // wait for the parent's fields happen beside the batches, and
-            // the root starts the instant the execution hands it the shards.
-            let root_slot = prespawn_early_root(parent_hash, block_hash, executed_parent.is_some())?;
-            let open = || {
-                open_parent_state()
-                    .ok()
-                    .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(
-                        reth_provider::StateProvider::into_evm_state_provider(s),
-                    )))
-            };
-            // A described block (`N42_FOLLOWER_COPY_ASIDE=1`) executes on its
-            // transactions by reference while its owned block is made aside.
-            let executed = match &by_ref {
-                Some((transactions, senders, withdrawals)) => {
-                    n42_engine_types::parallel_transfer::execute_transfers_build_path_on(
-                        evm_config,
-                        n42_engine_types::parallel_transfer::BuildPathBlock {
-                            header: head.header(),
-                            sealed: None,
-                            ommers: &[],
-                            withdrawals: withdrawals.as_deref(),
-                            txs: transactions.as_slice(),
-                            senders: senders.as_slice(),
-                        },
-                        cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))),
-                        &open,
-                        keys,
-                    )
-                }
-                None => n42_engine_types::parallel_transfer::execute_transfers_build_path_keyed(
-                    evm_config,
-                    late.get()?,
-                    cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))),
-                    &open,
-                    keys,
-                ),
-            };
-            match executed
-            .map_err(|err| format!("parallel execution: {err}"))?
-            {
-                Ok((out, phases)) => {
-                    // The root first: it reads the shards' view under the
-                    // residual, both final here.
-                    let returned = std::time::Instant::now();
-                    let n42_engine_types::parallel_transfer::ShardedExecution { shards, residual, result, split: bp_split } = out;
-                    let shards = Arc::new(shards);
-                    let residual: ParentOutput = Arc::new(reth_provider::BlockExecutionOutput {
-                        state: residual,
-                        result: reth_execution_types::BlockExecutionResult {
-                            receipts: Vec::new(),
-                            requests: Default::default(),
-                            gas_used: 0,
-                            blob_gas_used: 0,
-                        },
-                    });
-                    let early_root = {
-                        let (shards, residual, qmdb) = (Arc::clone(&shards), Arc::clone(&residual), qmdb.clone());
-                        let prague = n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, head.timestamp);
-                        root_slot.start(move || {
-                            let overlaps = shards.overlaps(&residual.state);
-                            let view = shards.view(&residual.state, &overlaps);
-                            let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, prague);
-                            qmdb.insert_block_operations(parent_hash, block_hash, number, ops).map_err(|err| format!("state root: {err}"))
-                        })?
-                    };
-                    split = ExecSplit::of(&phases);
-                    tracing::info!(
-                        target: "n42.follower_import",
-                        number,
-                        groups = phases.groups,
-                        partition_ms = phases.partition_ms,
-                        groups_ms = phases.groups_ms,
-                        batches = phases.batches,
-                        threads = phases.threads,
-                        batch_max_ms = phases.batch_spans.max_ms,
-                        batch_median_ms = phases.batch_spans.median_ms,
-                        batch_wait_ms = phases.batch_spans.wait_ms,
-                        index_ms = phases.graft_ms,
-                        merge_ms = phases.merge_ms,
-                        finish_ms = phases.finish_ms,
-                        receipts_ms = phases.receipts_us / 1000,
-                        total_ms = phases.total_us / 1000,
-                        parent_shards,
-                        reads_cache = phases.transfer_timers.reads_cache(),
-                        reads_provider = phases.transfer_timers.reads_provider,
-                        reads_view = phases.transfer_timers.reads_view,
-                        // Around the batches ([`BuildPathSplit`]): what
-                        // `exec_ms` holds beside the partition, the batch
-                        // wall and the index.
-                        exec_setup_ms = bp_split.setup_us / 1000,
-                        exec_keys_ms = bp_split.keys_us / 1000,
-                        keys_ahead = bp_split.keys_ahead,
-                        keys_ahead_wait_ms = keys_wait_us / 1000,
-                        exec_pre_ms = bp_split.pre_us / 1000,
-                        exec_post_ms = bp_split.post_us / 1000,
-                        exec_overrun_ms = bp_split.executor_overrun_us / 1000,
-                        exec_sink_ms = bp_split.sink_us / 1000,
-                        exec_cached_ms = bp_split.cached_us / 1000,
-                        exec_residual_ms = bp_split.residual_us / 1000,
-                        exec_receipts_ms = bp_split.receipts_us / 1000,
-                        exec_receipts_wait_ms = bp_split.receipts_wait_us / 1000,
-                        exec_drop_ms = phases.drop_us / 1000,
-                        // The execution's start after the road's, taken
-                        // apart: before the import (the description, the
-                        // owned block, the dispatch), the header and body
-                        // checks (0 when they ride the vote road), the
-                        // senders, the parent's layer, the set-up to the
-                        // execution (ancestry, the check's road), the plan,
-                        // the keys made ahead, the gate and the state.
-                        exec_start_gap_us = executed_at.saturating_duration_since(road_started).as_micros() as u64,
-                        gap_road_us = started.saturating_duration_since(road_started).as_micros() as u64,
-                        gap_header_us = senders_at.saturating_duration_since(started).as_micros() as u64,
-                        gap_senders_us = parent_at.saturating_duration_since(senders_at).as_micros() as u64,
-                        gap_parent_us = parent_done.saturating_duration_since(parent_at).as_micros() as u64,
-                        gap_setup_us = ahead_at.saturating_duration_since(parent_done).as_micros() as u64,
-                        gap_plan_wait_us = ahead_wait_us,
-                        gap_keys_wait_us = keys_wait_us,
-                        gap_gate_us = state_at.saturating_duration_since(gate_at).as_micros() as u64,
-                        gap_state_us = executed_at.saturating_duration_since(state_at).as_micros() as u64,
-                        core_layout = n42_core_layout::label(),
-                        "build-path import phases"
-                    );
-                    sharded = Some(StartedShards { shards, residual, result, early_root, returned });
-                }
-                Err(why) => {
-                    static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    tracing::info!(target: "n42.follower_import", number, %why, declined, "not on the build path; executing serially");
-                }
-            }
-        } else if follower_parallel() {
-            // `N42_PHASE_TIMERS=1`: counts each batch's reads by door (plan
-            // v6 6.5/6.6). `CountedDb` is a passthrough when the flag is
-            // off, so this costs nothing extra on that path.
-            let open = || {
-                open_parent_state()
-                    .ok()
-                    .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(
-                        reth_provider::StateProvider::into_evm_state_provider(s),
-                    )))
-            };
-            match n42_engine_types::parallel_transfer::execute_transfers_planned(
-                evm_config,
-                late.get()?,
-                cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))),
-                &open,
-                plan,
-            )
-            .map_err(|err| format!("parallel execution: {err}"))?
-            {
-                Ok((out, phases)) => {
-                    // The line adds up now: `total_ms` is the executor's whole
-                    // call and `other_ms` is what the named parts leave of it,
-                    // the way `vote road` reports its own gap. At loop202 the
-                    // four phases named 95 of a 133 ms execution and the rest
-                    // had no name at all.
-                    let named = phases.partition_ms * 1_000
-                        + phases.batch_us
-                        + phases.groups_ms * 1_000
-                        + phases.gas_us
-                        + phases.finish_ms * 1_000
-                        + phases.merge_ms * 1_000
-                        + phases.receipts_us
-                        + phases.drop_us;
-                    // `N42_READ_DEPTH_COUNTS=1`: see
-                    // `n42_engine_types::direct_build::read_depth` (plan v6 6.4).
-                    let read_depth = n42_engine_types::direct_build::read_depth::snapshot();
-                    let overlay_depth = n42_engine_types::direct_build::read_depth::overlay_depth();
-                    tracing::info!(
-                        target: "n42.follower_import",
-                        number,
-                        groups = phases.groups,
-                        partition_ms = phases.partition_ms,
-                        env_ms = phases.env_us / 1000,
-                        batch_ms = phases.batch_us / 1000,
-                        groups_ms = phases.groups_ms,
-                        gas_ms = phases.gas_us / 1000,
-                        merge_ms = phases.merge_ms,
-                        finish_ms = phases.finish_ms,
-                        receipts_ms = phases.receipts_us / 1000,
-                        drop_ms = phases.drop_us / 1000,
-                        other_ms = phases.total_us.saturating_sub(named) / 1000,
-                        total_ms = phases.total_us / 1000,
-                        reads_d0 = read_depth[0],
-                        reads_d1 = read_depth[1],
-                        reads_d2 = read_depth[2],
-                        reads_d3 = read_depth[3],
-                        reads_d4_7 = read_depth[4],
-                        reads_d8_15 = read_depth[5],
-                        reads_d16p = read_depth[6],
-                        reads_hist = read_depth[7],
-                        overlay_depth,
-                        // `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): where the
-                        // groups' wall time (`groups_ms` above) goes inside
-                        // `N42Evm::transfer`, and which door each account
-                        // read took. Zero when the flag is off.
-                        exec_read_ms = phases.transfer_timers.read_ns / 1_000_000,
-                        exec_evm_ms = phases.transfer_timers.evm_ns / 1_000_000,
-                        exec_write_ms = phases.transfer_timers.write_ns / 1_000_000,
-                        exec_other_ms = phases.transfer_timers.other_ns / 1_000_000,
-                        reads_cache = phases.transfer_timers.reads_cache(),
-                        reads_provider = phases.transfer_timers.reads_provider,
-                        reads_view = phases.transfer_timers.reads_view,
-                        // Of `merge_ms`: the install of the staged graft, the
-                        // state's merge and take, and the reverts' append.
-                        graft_ms = phases.graft_ms,
-                        take_ms = phases.take_ms,
-                        reverts_ms = phases.reverts_ms,
-                        // `N42_FOLLOWER_PARTITION_AHEAD=1`: whether the plan
-                        // made ahead was used, what it cost off the gate, and
-                        // how long the execution waited for it.
-                        planned_ahead = phases.planned_ahead,
-                        ahead_plan_ms = phases.ahead_plan_us / 1000,
-                        ahead_env_ms = phases.ahead_env_us / 1000,
-                        ahead_wait_ms = ahead_wait_us / 1000,
-                        // `N42_FOLLOWER_MERGE_BEHIND=1`: the reverts' sort on
-                        // its own thread, and the merge's wait for it.
-                        reverts_sort_ms = phases.reverts_sort_us / 1000,
-                        reverts_wait_ms = phases.reverts_wait_us / 1000,
-                        "parallel import phases"
-                    );
-                    split = ExecSplit::of(&phases);
-                    output = Some(out);
-                }
-                Err(why) => {
-                    // Counted like the builder's: a block that fell back to the
-                    // serial path costs several times its import, and a leg that
-                    // reads medians cannot see it otherwise.
-                    static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    tracing::info!(target: "n42.follower_import", number, %why, declined, "not parallel; executing serially");
-                }
-            }
-        }
+        let sharded = None;
+        let split = ExecSplit::default();
         // `N42_FOLLOWER_PARALLEL=1` on evm2 (F5d): the block's leading plain
         // transfers run as sender batches over the parent, the rest of the
         // block after them on the block's executor; the batches' accounts go
@@ -3067,7 +2694,6 @@ where
         // leading transfer, a skipped one, a cache or fold conflict -- leaves
         // `output` empty and the same block is imported serially below, in
         // this call.
-        #[cfg(not(feature = "legacy-revm-paths"))]
         if follower_parallel() && tx_count > 0 {
             let open = || {
                 open_parent_state()
@@ -3678,61 +3304,9 @@ where
         .map_err(|err| format!("a thread for the early QMDB root: {err}"))
 }
 
-/// An early root's thread started ahead of the execution
-/// ([`prespawn_early_root`]), waiting for the root's work.
-struct RootSlot {
-    work: std::sync::mpsc::SyncSender<RootWork>,
-    handle: EarlyRoot,
-}
 
-/// What a [`RootSlot`]'s thread runs: the operations made and filed.
-type RootWork = Box<dyn FnOnce() -> Result<B256, String> + Send + 'static>;
 
-impl RootSlot {
-    /// Hands the thread its work; the handle answers as
-    /// [`spawn_early_root`]'s does, `began` the instant the work arrived.
-    fn start<F>(self, root_of: F) -> Result<EarlyRoot, String>
-    where
-        F: FnOnce() -> Result<B256, String> + Send + 'static,
-    {
-        match self.work.send(Box::new(root_of)) {
-            Ok(()) => Ok(self.handle),
-            // The thread ended before the work came: its own error (the
-            // parent's fields never filed) is the answer.
-            Err(_) => match self.handle.join() {
-                Ok(Err(err)) => Err(err),
-                Ok(Ok(_)) => Err("the early QMDB root thread ended without its work".to_string()),
-                Err(_) => Err("the early QMDB root thread panicked".to_string()),
-            },
-        }
-    }
-}
 
-/// [`spawn_early_root`] in two steps: the thread now, beside the execution,
-/// doing the wait for the parent's fields there; the work when the execution
-/// returns ([`RootSlot::start`]). Before, the root's start after the
-/// execution's end (`root_gap_ms`) held the thread's spawn and that wait. A
-/// slot dropped without work (the block left the build path, or failed)
-/// ends its thread.
-fn prespawn_early_root(parent_hash: B256, block_hash: B256, on_parent_output: bool) -> Result<RootSlot, String> {
-    let (work, arrives) = std::sync::mpsc::sync_channel::<RootWork>(1);
-    let handle = std::thread::Builder::new()
-        .name("qmdb-root-early".into())
-        .spawn(move || -> Result<(u64, std::time::Instant, std::time::Instant), String> {
-            let wait_at = std::time::Instant::now();
-            if on_parent_output {
-                wait_for_parent_fields(parent_hash)?;
-            }
-            let waited = wait_at.elapsed().as_millis() as u64;
-            let root_of = arrives.recv().map_err(|_| "no root work: the execution left the build path".to_string())?;
-            let root_at = std::time::Instant::now();
-            let root = on_root_pool(root_of)?;
-            n42_engine_types::executed_fields::remember_state_root(block_hash, root);
-            Ok((waited, root_at, std::time::Instant::now()))
-        })
-        .map_err(|err| format!("a thread for the early QMDB root: {err}"))?;
-    Ok(RootSlot { work, handle })
-}
 
 /// How many timings [`import_foreign_block`] returns (see its last lines).
 pub const IMPORT_TIMES: usize = 29;
@@ -3932,8 +3506,7 @@ fn ms_between(from: std::time::Instant, to: std::time::Instant) -> u64 {
 
 /// `N42_FOLLOWER_PARALLEL`, read once.
 fn follower_parallel() -> bool {
-    // Both builds read it: the revm-era paths under `legacy-revm-paths`, the
-    // evm2 batches (`parallel_build::import_block`) otherwise.
+    // The evm2 batches (`parallel_build::import_block`) read it.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_PARALLEL", false))
 }
@@ -4420,7 +3993,7 @@ mod parent_output_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{Header, Signed, TxEip1559};
+    use alloy_consensus::{Signed, TxEip1559};
     use alloy_primitives::{map::AddressHashMap, Bytes, Signature, TxKind, U256};
     use reth_primitives_traits::{Account, SealedBlock};
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
@@ -4888,7 +4461,6 @@ mod tests {
         use alloy_eips::Encodable2718;
         use n42_h2_consensus::header_profile::N42HeaderProfile;
         use rayon::prelude::*;
-        use reth_transaction_pool::PoolTransaction as _;
 
         let (block, _) = bench_fixture(6_000, 27, 2_000_000, 64);
         let txs = block.body().transactions.clone();
@@ -5674,8 +5246,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "legacy-revm-paths"))]
-mod by_description_bench;
 
 #[cfg(test)]
 #[path = "follower_import_tests.rs"]

@@ -12,9 +12,8 @@
 //! transactions.
 //!
 //! reth v2.9.0 executes on evm2. A 0x50 transaction reaches evm2 as an
-//! EIP-1559 transaction (`n42_tx_types::evm`); the revm-era fast transfer
-//! path is behind the `legacy-revm-paths` feature
-//! ([`crate::legacy_paths`]).
+//! EIP-1559 transaction (`n42_tx_types::evm`); the fast transfer is an evm2
+//! registry handler ([`crate::fast_handler`]).
 
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::{eip7840::BlobParams, Decodable2718};
@@ -331,7 +330,7 @@ pub struct N42EvmConfig<C = ChainSpec, EvmF = RethEvmFactory> {
 impl<C> N42EvmConfig<C> {
     /// The configuration for `chain_spec` on reth's evm2 factory.
     pub fn new(chain_spec: Arc<C>) -> Self {
-        crate::legacy_paths::warn_unavailable_once();
+        n42_env::warn_retired_once();
         Self::new_with_evm_factory(chain_spec, RethEvmFactory::default())
     }
 }

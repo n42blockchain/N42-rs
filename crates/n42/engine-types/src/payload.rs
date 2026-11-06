@@ -1,10 +1,4 @@
 //! A basic Ethereum payload builder implementation.
-// The stock evm2 build leaves the revm-era paths out (`legacy-revm-paths`): what only they
-// use or mutate reads as dead here until F5 ports or removes them (docs/RETH_2_9_0_UPGRADE.md).
-#![cfg_attr(
-    not(feature = "legacy-revm-paths"),
-    allow(dead_code, unused_mut, unused_variables, unused_assignments, unused_imports)
-)]
 
 /*
 #![doc(
@@ -28,7 +22,7 @@ use n42_tx_types::{N42Primitives as EthPrimitives, N42TxEnvelope as TransactionS
 use alloy_consensus::transaction::TxHashRef as _;
 use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome},
-    ConfigureEvm, Evm, NextBlockEnvAttributes,
+    ConfigureEvm, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::EthBlockAssembler;
 use crate::engine_types::N42BuiltPayload as EthBuiltPayload;
@@ -41,7 +35,6 @@ use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
     ValidPoolTransaction,
 };
-use evm2::evm::Database as _;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -718,24 +711,6 @@ pub fn shards_ready_first() -> bool {
     })
 }
 
-/// `N42_SEAL_ON_COUNTERS=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 1;
-/// `N42_SEAL_ON_COUNTS=1` is the same switch): with `N42_SEAL_AT_EXEC=1` and
-/// the body made in the prep, every batch counts its transfers, their gas and
-/// their fees as it executes, and a block that seals at the execution's end
-/// with every candidate executed in pull order seals on those sums, with the
-/// prep's body, and no pass over the slots on the seal's path (the pass on the
-/// build pool that finished behind the freeze's slowest task, 16.2). The
-/// references are then made behind the seal by the receipts job only. Any
-/// other block makes them as before. Off by default.
-pub fn seal_on_counters() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        ["N42_SEAL_ON_COUNTERS", "N42_SEAL_ON_COUNTS"]
-            .iter()
-            .any(|name| n42_env::flag(name, false))
-    })
-}
-
 /// `N42_FREEZE_AFTER_SEAL=1` (`docs/SHARED_EXECUTION_SCOPE.md` 15): with
 /// `N42_SEAL_AT_EXEC=1` and the output shards, the shards' freeze (the index's
 /// conflict sums, and under `N42_LIVE_INDEX_DEFER=1` the shards the batches
@@ -799,25 +774,6 @@ struct OpsAheadUse {
 /// The output shards frozen on a thread of their own ([`freeze_after_seal`]).
 type LateFreeze = crate::output_shards::FreezeHandle;
 
-/// Starts the freeze of `shards` on a thread of its own
-/// ([`crate::output_shards::OutputShards::freeze_on_thread`]).
-fn spawn_freeze_maybe_early(
-    shards: crate::output_shards::OutputShards,
-    early: &mut Option<crate::output_shards::EarlyReceiver>,
-) -> Result<LateFreeze, Option<Box<crate::output_shards::OutputShards>>> {
-    if !crate::output_shards::output_incremental() {
-        return spawn_freeze(shards);
-    }
-    shards
-        .freeze_on_thread_early()
-        .map(|(receiver, handle)| {
-            *early = Some(receiver);
-            handle
-        })
-        .inspect_err(|_| {
-            tracing::debug!(target: "payload_builder", "no thread for the freeze; frozen before the seal");
-        })
-}
 
 /// Starts the freeze of `shards` on a thread of its own
 /// ([`crate::output_shards::OutputShards::freeze_on_thread`]).
@@ -918,9 +874,6 @@ fn body_matches_pull<A, P>(body: &[A], pulled: &[P], body_hash: impl Fn(&A) -> B
     [0, last / 2, last].into_iter().all(|i| body_hash(&body[i]) == pulled_hash(&pulled[i]))
 }
 
-/// The pooled candidates of a parallel step, in pull order: a slot's
-/// `index` names its transaction here (the slot keeps no copy of it).
-type Pulled<P> = [Arc<reth_transaction_pool::ValidPoolTransaction<P>>];
 
 /// The consensus transaction inside a pooled one, by reference.
 fn pooled_consensus<P: PoolTransaction<Consensus = TransactionSigned>>(
@@ -944,79 +897,6 @@ fn transfer_key<P: PoolTransaction<Consensus = TransactionSigned>>(
     .then(|| (tx.sender(), inner.to().unwrap_or_default()))
 }
 
-/// The plan-ahead hook's work (`N42_PLAN_AHEAD_BODY=1`): from a prepared
-/// plan's segments, on the plan body's own pool, the candidates in plan
-/// order, their transfer keys, the body's transactions and senders and the
-/// hashes, the partition at the beneficiary this node builds for, and the
-/// empty slots -- what the next build's start, prep and gap made. `None`
-/// when not every candidate is a plain transfer (the build preps as before).
-#[cfg(feature = "legacy-revm-paths")]
-fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
-    segments: &[(n42_tx_queue::FrameTxs<P>, usize)],
-    plan: &n42_tx_queue::FramePlan,
-) -> Option<crate::frame_blocks::PreparedBuild<P>> {
-    use rayon::prelude::*;
-    let at = std::time::Instant::now();
-    // `N42_PLAN_AHEAD_WARM=<threads>`: the plan's accounts read on the warm
-    // pool at the running build's state (`warm_ahead`), started before the
-    // body is made and keyed by the take's identity, so a build that takes
-    // this plan finds its read even when the body is late. The keys are made
-    // on the warm pool from the segments (`Arc`s, nothing copied here).
-    if crate::warm_ahead::threads() > 0 {
-        let ident = crate::warm_ahead::segments_ident(segments.iter().map(|(txs, taken)| (txs, 0, *taken)));
-        let owned = segments.to_vec();
-        crate::warm_ahead::start(ident, move || {
-            let mut keys = Vec::with_capacity(owned.iter().map(|(_, taken)| *taken).sum());
-            for (txs, taken) in &owned {
-                for tx in txs.get(..*taken)? {
-                    keys.push(transfer_key(tx)?);
-                }
-            }
-            Some(keys)
-        });
-    }
-    let pool = crate::parallel_transfer::plan_body_pool();
-    let parts: Vec<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<P>>>> = pool.install(|| {
-        segments.par_iter().map(|(txs, taken)| txs.get(..*taken).map_or_else(Vec::new, <[_]>::to_vec)).collect()
-    });
-    let mut cands = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-    for part in parts {
-        cands.extend(part);
-    }
-    if cands.is_empty() {
-        return None;
-    }
-    // The prep's own pass, with no tip: the batches read the tips at the
-    // block's base fee (`N42_SEAL_ON_COUNTERS`), which this cannot know.
-    let (keys, made) = crate::parallel_transfer::BodyAhead::make_keyed_on(pool, &cands, |_, tx| {
-        (transfer_key(tx), pooled_consensus(tx).clone(), tx.sender(), 0, *tx.hash())
-    })?;
-    if keys.is_empty() {
-        return None;
-    }
-    let hashes = made.hashes;
-    let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
-        crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
-    });
-    let slots = crate::parallel_transfer::empty_slots(pool, cands.len());
-    // `N42_PLAN_AHEAD_PARTS=1`: the body's frame layout and transactions
-    // root, found here with the plan rather than at the seal.
-    let root_ahead = (crate::frame_blocks::plan_ahead_parts() && crate::frame_blocks::active())
-        .then(|| pool.install(|| crate::frame_blocks::root_ahead(plan, &hashes)))
-        .flatten();
-    Some(crate::frame_blocks::PreparedBuild {
-        segments: segments.to_vec(),
-        cands,
-        keys,
-        transactions: made.transactions,
-        senders: made.senders,
-        hashes,
-        groups,
-        slots,
-        made_us: at.elapsed().as_micros() as u64,
-        root_ahead,
-    })
-}
 
 /// The plan-ahead hook's work on evm2 (`N42_PLAN_AHEAD_BODY=1`, F5c): the
 /// candidates in plan order, their transfer keys and hashes and the
@@ -1026,7 +906,6 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
 /// their senders, and with `N42_PLAN_AHEAD_PARTS=1` the frame layout and
 /// transactions root of the hashes on this plan. `None` when not every
 /// candidate is a plain transfer.
-#[cfg(not(feature = "legacy-revm-paths"))]
 fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     segments: &[(n42_tx_queue::FrameTxs<P>, usize)],
     plan: &n42_tx_queue::FramePlan,
@@ -1079,66 +958,9 @@ fn install_plan_ahead_body<P: PoolTransaction<Consensus = TransactionSigned>>(qu
     }));
 }
 
-/// The cumulative gas through each transaction of a block the parallel step
-/// left in its slots, in block order, and the block's gas.
-#[cfg(feature = "legacy-revm-paths")]
-fn cumulative_gas(
-    refs: &[&crate::parallel_transfer::BuiltTransfer<()>],
-) -> (Vec<u64>, u64) {
-    let mut cumulative = Vec::with_capacity(refs.len());
-    let mut tx_gas = 0u64;
-    for built in refs {
-        tx_gas += built.result.gas().tx_gas_used();
-        cumulative.push(tx_gas);
-    }
-    (cumulative, tx_gas)
-}
 
-/// Whether a block's receipts are built on the build pool, whose threads
-/// are idle once the execution has ended (`N42_RECEIPTS_ON_BUILD_POOL=1`,
-/// off by default). The pool behind the seal (`N42_FREEZE_POOL=own`) runs
-/// them beside the freeze on the background cores, and they were the whole
-/// of `par_fold_ms` (8.5 ms a 200,000-transaction block, 10.199), on the
-/// leader's serial seal chain.
-#[cfg(feature = "legacy-revm-paths")]
-fn receipts_on_build_pool() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| n42_env::flag("N42_RECEIPTS_ON_BUILD_POOL", false))
-}
 
-/// The pool a block's receipts are built on: the build pool
-/// ([`receipts_on_build_pool`]), the pool behind the seal
-/// (`N42_FREEZE_POOL=own`), or `None` for the global pool.
-#[cfg(feature = "legacy-revm-paths")]
-fn receipts_pool() -> Option<&'static rayon::ThreadPool> {
-    if receipts_on_build_pool() {
-        Some(crate::parallel_transfer::build_pool())
-    } else if crate::parallel_transfer::freeze_pool_own() {
-        Some(crate::parallel_transfer::behind_pool())
-    } else {
-        None
-    }
-}
 
-/// The receipts of a block the parallel step left in its slots, in block
-/// order, with `cumulative[i]` the block's gas through transaction `i`.
-#[cfg(feature = "legacy-revm-paths")]
-fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
-    refs: &[&crate::parallel_transfer::BuiltTransfer<()>],
-    cumulative: &[u64],
-    pulled: &Pulled<P>,
-) -> Vec<n42_tx_types::Receipt> {
-    use rayon::prelude::*;
-    refs.par_iter()
-        .zip(cumulative.par_iter())
-        .map(|(built, cumulative_gas_used)| n42_tx_types::Receipt {
-            tx_type: <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&pulled[built.index])),
-            success: built.result.is_success(),
-            cumulative_gas_used: *cumulative_gas_used,
-            logs: built.result.logs().to_vec(),
-        })
-        .collect()
-}
 
 /// Whether a block's receipts are built straight from the slots in two
 /// passes on the receipts pool (`N42_RECEIPTS_FUSED=1`, off by default):
@@ -1151,81 +973,8 @@ fn receipts_fused() -> bool {
     *ON.get_or_init(|| n42_env::flag("N42_RECEIPTS_FUSED", false))
 }
 
-/// Where a receipts job's time went, us: the slots' references, the
-/// cumulative gas and the receipts themselves (with
-/// [`receipts_fused`], the chunk pass, the prefix and the receipts).
-#[derive(Debug, Default, Clone, Copy)]
-struct ReceiptsTimes {
-    refs_us: u64,
-    cum_us: u64,
-    build_us: u64,
-}
 
-/// The slots in a chunk of the fused receipts' passes.
-const RECEIPTS_CHUNK: usize = 2048;
 
-/// [`receipts_from_slots`] in two parallel passes over the slots
-/// ([`receipts_fused`]): each chunk's filled count and gas, a prefix over
-/// the ~100 chunks, then each chunk writes its receipts, cumulative gas
-/// included, into its own range of the output. Returns the block's gas too.
-#[cfg(feature = "legacy-revm-paths")]
-fn receipts_fused_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
-    slots: &[std::sync::OnceLock<crate::parallel_transfer::BuiltTransfer<()>>],
-    pulled: &Pulled<P>,
-    times: &mut ReceiptsTimes,
-) -> (Vec<n42_tx_types::Receipt>, u64) {
-    use rayon::prelude::*;
-    let at = std::time::Instant::now();
-    let sums: Vec<(usize, u64)> = slots
-        .par_chunks(RECEIPTS_CHUNK)
-        .map(|chunk| {
-            chunk.iter().filter_map(std::sync::OnceLock::get).fold((0usize, 0u64), |(n, gas), built| {
-                (n + 1, gas + built.result.gas().tx_gas_used())
-            })
-        })
-        .collect();
-    times.refs_us = at.elapsed().as_micros() as u64;
-    let at = std::time::Instant::now();
-    let mut bases = Vec::with_capacity(sums.len());
-    let (mut filled, mut tx_gas) = (0usize, 0u64);
-    for (n, gas) in &sums {
-        bases.push(tx_gas);
-        filled += n;
-        tx_gas += gas;
-    }
-    times.cum_us = at.elapsed().as_micros() as u64;
-    let at = std::time::Instant::now();
-    let Some(first) = slots.iter().find_map(std::sync::OnceLock::get) else {
-        times.build_us = at.elapsed().as_micros() as u64;
-        return (Vec::new(), tx_gas);
-    };
-    let receipt_of = |built: &crate::parallel_transfer::BuiltTransfer<()>, cumulative_gas_used: u64| n42_tx_types::Receipt {
-        tx_type: <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&pulled[built.index])),
-        success: built.result.is_success(),
-        cumulative_gas_used,
-        logs: built.result.logs().to_vec(),
-    };
-    // Placeholders written in parallel, then overwritten chunk by chunk.
-    let template = receipt_of(first, 0);
-    let mut receipts: Vec<n42_tx_types::Receipt> = Vec::new();
-    (0..filled).into_par_iter().map(|_| template.clone()).collect_into_vec(&mut receipts);
-    let mut outs = Vec::with_capacity(sums.len());
-    let mut rest: &mut [n42_tx_types::Receipt] = &mut receipts;
-    for (n, _) in &sums {
-        let (out, tail) = rest.split_at_mut(*n);
-        outs.push(out);
-        rest = tail;
-    }
-    slots.par_chunks(RECEIPTS_CHUNK).zip(outs).zip(bases).for_each(|((chunk, out), base)| {
-        let mut cumulative = base;
-        for (built, slot) in chunk.iter().filter_map(std::sync::OnceLock::get).zip(out.iter_mut()) {
-            cumulative += built.result.gas().tx_gas_used();
-            *slot = receipt_of(built, cumulative);
-        }
-    });
-    times.build_us = at.elapsed().as_micros() as u64;
-    (receipts, tx_gas)
-}
 
 /// Where the thread merging a block's revert set (`N42_ANSWER_BEFORE_REVERTS`)
 /// is sent the promise to fill, once the execution it belongs to exists.
@@ -1630,24 +1379,6 @@ where
             None => client.state_by_block_hash(parent_hash_for_state),
         }
     };
-    // `N42_STATE_AFTER_PULL=1`: opened after the parallel step's pull, prep
-    // and partition instead of here (see `state_after_pull`). Only a build
-    // that takes the parallel step defers; every other opens it here.
-    // `N42_PLAN_AHEAD_WARM`: the next plan's warm read is made at the state
-    // this build reads; the builder's hash of this build's parent and its
-    // grandparent decide whether the read made for this build fits.
-    #[cfg(feature = "legacy-revm-paths")]
-    let warm_ahead_on = crate::warm_ahead::threads() > 0;
-    #[cfg(not(feature = "legacy-revm-paths"))]
-    let warm_ahead_on = false;
-    #[cfg(feature = "legacy-revm-paths")]
-    if warm_ahead_on {
-        match parent_state.as_ref() {
-            Some(open) => crate::warm_ahead::note_base(parent_hash_for_state, Arc::clone(open)),
-            None => crate::warm_ahead::clear_base(),
-        }
-    }
-    let warm_parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
     // The parallel transfer step models the Osaka gas rules (a transfer is
     // its 21,000 and no log; the block's gas is the transactions' sum). A
     // block under gov5's Amsterdam execution (EIP-8037's two gas dimensions,
@@ -1799,7 +1530,6 @@ where
     let prefetch = builder_prefetch();
     let mut lookahead: std::collections::VecDeque<_> = std::collections::VecDeque::new();
     let mut prefetch_ns: u128 = 0;
-    let fast_hits_before = crate::fast_transfer::hits();
     // The claimed senders this build verifies and refuses, and what it
     // spends doing so (`N42_INGEST_VERIFY=leader`; all three are 0 with the
     // mode off). Read as a difference over the build, like the fast-transfer
@@ -1879,12 +1609,6 @@ where
     // `N42_PLAN_AHEAD_BODY=1`: what was made with the plan, its candidates
     // already the bulk vector (always taken, so nothing is left behind).
     let mut prepared_build = crate::frame_blocks::take_prepared::<Pool::Transaction>();
-    // `N42_PLAN_AHEAD_WARM`: the take's identity (its plan's warm read).
-    let warm_plan_id = crate::frame_blocks::take_warm_ident();
-    #[cfg(feature = "legacy-revm-paths")]
-    if warm_ahead_on {
-        crate::warm_ahead::note_selected(warm_plan_id, parent_hash_for_state);
-    }
     let from_bulk = bulk.is_some();
     // `N42_PLAN_AHEAD_WARM`: the take's own transactions, before any pull.
     let bulk_len = bulk.as_ref().map_or(0, Vec::len);
@@ -2101,42 +1825,16 @@ where
     // at the step's start (`budget` there), 0 when the step did not run.
     let mut par_budget = 0usize;
     let mut par_pull_ms = 0u64;
-    let mut par_part_ms = 0u64;
     let mut par_exec_ms = 0u64;
     let mut par_fold_ms = 0u64;
-    let mut par_committed = 0usize;
     let mut deferred: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> = Vec::new();
     // The head the parallel step refused per skipped sender, with the nonce
     // the parent's state has for it: what the give-back below tells the
     // queue instead of a refusal that says nothing. See the diagnosis after
     // the parallel step.
-    let mut skipped_heads: alloy_primitives::map::AddressHashMap<(u64, u64)> = Default::default();
+    let skipped_heads: alloy_primitives::map::AddressHashMap<(u64, u64)> = Default::default();
     let mut par_reverts: Vec<(alloy_primitives::Address, reth_trie::bundle_state::AccountRevert)> = Vec::new();
     let mut par_drained = false;
-    let mut par_prep_ms = 0u64;
-    let mut par_collect_ms = 0u64;
-    // Of the fold: the receipts loop, before the graft.
-    let mut par_commit_ms = 0u64;
-    // Of the fold: the graft alone. `par_fold_ms` covers the receipts loop
-    // and then the longer of the graft and the transactions root beside it.
-    let mut par_graft_ms = 0u64;
-    // Time left waiting for overlapped jobs after the graft has completed.
-    let mut par_root_wait_ms = 0u64;
-    let mut par_receipts_wait_ms = 0u64;
-    // `N42_PHASE_TIMERS=1` (plan v6 6.5): the graft's own sub-phases, the
-    // default in-place fold only (`graft_bundles_direct`), and the parallel
-    // step's transfers by phase and read door -- see `Phases::transfer_timers`.
-    let mut par_graft_base_ms = 0u64;
-    let mut par_graft_reserve_ms = 0u64;
-    let mut par_graft_insert_ms = 0u64;
-    let mut par_graft_reverts_ms = 0u64;
-    let mut par_graft_other_ms = 0u64;
-    // `N42_GRAFT_SHARDED=1` (plan v6 attempt G proper): whether the graft's
-    // insert ran sharded on the build pool, and its three phases in us.
-    let mut par_graft_sharded = false;
-    let mut par_graft_split_us = 0u64;
-    let mut par_graft_build_us = 0u64;
-    let mut par_graft_merge_us = 0u64;
     // `N42_OUTPUT_SHARDS` (docs/BREAKTHROUGH_DESIGN.md section 3): the
     // parallel step's output left in address-range shards and never grafted;
     // carried to the finish behind the seal, where the next build is let go
@@ -2149,40 +1847,8 @@ where
     let mut out_shards = 0usize;
     let mut shard_append_ms = 0u64;
     let mut shard_fold_ms = 0u64;
-    let mut par_transfer_timers = crate::fast_transfer::TransferTimers::default();
-    // `N42_READ_SET=1` (docs/BREAKTHROUGH_DESIGN.md section 4, design A): the
-    // read set's pass and what the batches read from it.
-    let mut par_read_set = crate::parallel_transfer::ReadSetPass::default();
-    let mut par_read_set_hits = 0u64;
-    let mut par_read_set_misses = 0u64;
     // The build's batches on the pool: imbalance, gaps, per-batch overhead.
     let mut par_batch_spans = crate::parallel_transfer::BatchSpans::default();
-    let mut par_loop_timers = crate::parallel_transfer::LoopTimers::default();
-    // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
-    // own thread beside the parallel step (not on the chain).
-    let mut par_prefault_ms = 0u64;
-    // `N42_BUILD_PREFETCH=1`: the prefetch's own time on the worker pool,
-    // summed over its jobs, and how long the build waited for it after the
-    // pull and the prep.
-    let mut par_prefetch_ms = 0u64;
-    let mut par_prefetch_wait_ms = 0u64;
-    // `N42_PLAN_AHEAD_WARM`: the layer read ahead with the plan -- its
-    // accounts, its own wall, the batch reads it answered and whether it was
-    // complete when the execution took it.
-    let mut warm_ahead_accounts = 0usize;
-    let mut warm_ahead_ms = 0u64;
-    let mut warm_ahead_hits = 0u64;
-    let mut warm_ahead_ready = false;
-    // `N42_BUILD_MLP=<k>`: the batches' lookahead distance, 0 when off.
-    let mut par_mlp_k = 0usize;
-    let mut par_mlp_hints = 0u64;
-    // The transactions root, computed beside the graft for a block that
-    // will seal early.
-    let mut early_transactions_root: Option<B256> = None;
-    // `N42_DIRECT_RECEIPTS=1`: for a block that will seal early, the receipts and the gas the
-    // executor's finish reports, built beside the parallel step instead of one executor commit
-    // per transaction (see `direct_receipts_enabled`); taken by the finish behind the seal.
-    let mut direct_receipts: Option<(Vec<n42_tx_types::Receipt>, u64)> = None;
     // `N42_SHARDS_BEFORE_RECEIPTS=1`: the same receipts, still being built on
     // a thread of their own when the shards are filed; joined where the
     // receipts are first read (the receipts root behind the seal).
@@ -2215,11 +1881,6 @@ where
     let parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
     // `deferredExecutionDepth`: which ancestor's result the header carries.
     let carried_depth = reth_chainspec::qmdb::deferred_execution_depth_at(chain_spec.genesis(), attributes.timestamp);
-    // `N42_SEAL_AT_EXEC=1`: the transactions root computed over the pulled
-    // candidates beside the parallel step, whether the seal used it, and how
-    // long the step's end waited for it.
-    let mut tx_root_ahead = false;
-    let mut tx_root_wait_ms = 0u64;
     // The lookahead and the puller given back before the ahead seal, ms.
     let mut give_back_ms = 0u64;
     // Of it on the evm2 step (F5g item 5): the lookahead's return to the
@@ -2245,33 +1906,14 @@ where
     let mut evm2_fees_us = 0u64;
     // Inside the evm2 batches by part (F5g9).
     let mut evm2_inside = crate::parallel_build::BatchInside::default();
-    // The leader's seal chain between its named terms (step 7a): the prep's
-    // end to the batches' start (the prefetch's scope, the shards and the
-    // threads set up, the partition, the deferred state's open, the slots),
-    // the batches' end to the commit's start less the index (`index_ms`, the
-    // shards' freeze: the collect, the release, the joins, the deferred
-    // state's re-check), and the commit's end to the seal's own start (the
-    // body's match, the lookahead and the puller given back).
-    let mut gap_before_exec_ms = 0u64;
-    let mut gap_after_exec_ms = 0u64;
-    let mut gap_before_seal_ms = 0u64;
     let mut index_ms = 0u64;
-    // Where the receipts job in the scope spent its time (`ReceiptsTimes`).
-    let mut scope_receipts_times = ReceiptsTimes::default();
     // `N42_FREEZE_AFTER_SEAL=1`: whether the freeze ran beside the seal, when
     // it ended, and how long its join waited for it (us).
     let mut freeze_late_used = false;
     let mut freeze_ended_at: Option<std::time::Instant> = None;
     let mut freeze_join_wait_us = 0u64;
-    // `N42_OUTPUT_INCREMENTAL=1`: the receiver of the early output the late
-    // freeze hands over before it runs, that output once taken, the freeze
-    // left running (joined after the shards were filed on the early output),
-    // the cached accounts the early take committed (the frozen set gives
-    // them up when it lands), and when the frozen set was filed.
-    let mut early_rx: Option<crate::output_shards::EarlyReceiver> = None;
     let mut early_out: Option<Arc<crate::output_shards::EarlyOutput>> = None;
     let mut pending_freeze: Option<LateFreeze> = None;
-    let mut early_taken: Vec<alloy_primitives::Address> = Vec::new();
     let mut shards_final_at: Option<std::time::Instant> = None;
     // Where the leader's time from the build's start to the seal goes, beside
     // the fields that already name it (plan v6, the seal gap). With the
@@ -2282,71 +1924,30 @@ where
     // Build start to the parallel step's start (the setup, the puller's
     // start, the header's preparation).
     let mut par_start_ms = 0u64;
-    // Of `par_start_ms`: what the named start timers do not cover (the
-    // setup before the selection, the macros' set-up, rounding).
-    let mut start_other_ms = 0u64;
-    // The pull and prep's end to the execution's call (the prefetch layer
-    // frozen, the graft sink, the threads beside the batches spawned).
-    let mut pre_exec_ms = 0u64;
-    // The execution's call, whole: partition, the deferred state's open,
-    // the batches, the collect and the release.
-    let mut par_run_ms = 0u64;
-    // Of `par_run_ms`: the partition's per-sender vectors released.
-    let mut par_release_ms = 0u64;
-    // The execution's return to the fold's start: the transactions-root
-    // and prefault threads joined, the scope's end, the deferred state's
-    // re-check.
-    let mut scope_join_ms = 0u64;
     // The parallel step's wall time (`par_ms`) split at the seal under
     // `N42_SEAL_AT_EXEC=1`: its start to the seal's start (on the seal's
     // chain) and the seal's end to its end (the fold and the give-backs,
     // behind the proposal), us. Both 0 when the step did not seal.
     let mut par_to_seal_us = 0u64;
-    let mut par_behind_seal_us = 0u64;
-    // Between the parallel step's end and the shards' filing, us: the drop
-    // of the step's scope (the pulled set `cands`, the warm layer, the
-    // transfer keys), the give-backs of the lookahead and the deferred
-    // candidates to the queue, and the puller's drop (its thread joined, the
-    // walk's own give-back). The rest of that road is `par_to_finish_us`.
-    let mut par_end_at: Option<std::time::Instant> = None;
     let mut pulled_drop_us = 0u64;
     // `N42_SHARDS_READY_FIRST=1`: the step's pulled set, warm layer and
     // transfer keys, kept past the step's scope and freed off the path after
     // the shards are filed.
     let mut pulled_keep: Option<Box<dyn Send>> = None;
-    // Of the batches' start: the hook before the batches whole (the
-    // deferred state's open, `state_wait_us`, and the pre-execution changes
-    // after it, `state_pre_changes_us`), us.
-    let mut par_hook_us = 0u64;
     // The seal's wait for the carried ancestor's execution fields, us, and
     // what it waited on (`carried_fields_for_seal_traced`).
     let mut parent_fields_us = 0u64;
     let mut parent_fields_wait_on: &'static str = "";
-    // Of `par_commit_ms` on the slots path: the references to the filled
-    // slots and the block's gas; the cumulative gas per transaction (behind
-    // the seal on the ahead path, 0 there); the fees; the body and senders.
-    let mut commit_refs_ms = 0u64;
-    let mut commit_cumulative_ms = 0u64;
-    let mut commit_fees_ms = 0u64;
     let mut commit_body_ms = 0u64;
     // Whether the commit took the body made in the prep's pass.
     let mut commit_body_ahead_used = false;
-    // `N42_SEAL_ON_COUNTERS=1`: whether this block sealed on the batches'
-    // counters with no pass over the slots, and the batches' end to the
-    // seal's start, us (the commit, the give-back and the match between).
-    let mut seal_on_counters_used = false;
     let mut exec_end_to_seal_us = 0u64;
     // `N42_PLAN_AHEAD_BODY=1`: the prep took the keys and body made with the
     // plan; the call took its partition and slots; the hand-off of this
     // block was noted as its whole take.
     let mut prep_from_plan = false;
-    let mut exec_partition_us = 0u64;
-    let mut exec_slots_us = 0u64;
     let mut exec_prepared_groups = false;
-    let mut exec_prepared_slots = false;
     let mut whole_take_noted = false;
-    // Of `give_back_ms`: the body checked against the pulled set.
-    let mut match_ms = 0u64;
     // Of `sealed_ms`: the header filled and `cons.seal`; the sealed and
     // recovered block made; `remember_pending`; the payload and the hook.
     let mut seal_header_ms = 0u64;
@@ -2523,7 +2124,6 @@ where
     // candidates to the serial loop below in candidate order; a transfer the
     // EVM refused, with its sender's later ones, is given back at the end,
     // as the revm-era step did.
-    #[cfg(not(feature = "legacy-revm-paths"))]
     if parallel_build && !is_amsterdam {
         let par_at = std::time::Instant::now();
         par_start_ms = build_started.elapsed().as_millis() as u64;
@@ -3036,1248 +2636,7 @@ where
             "parallel step"
         );
     }
-    // The parallel step is written against revm 43: built only with
-    // `legacy-revm-paths` until it is ported (docs/RETH_2_9_0_UPGRADE.md).
-    #[cfg(feature = "legacy-revm-paths")]
-    if parallel_build && (pulled.is_some() || bulk.is_some()) {
-        let par_at = std::time::Instant::now();
-        par_start_ms = build_started.elapsed().as_millis() as u64;
-        start_other_ms =
-            par_start_ms.saturating_sub(start_best_ms + start_check_ms + start_puller_ms + start_prepare_ms);
-        let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
-        par_budget = budget;
-        // `N42_PLAN_AHEAD_WARM`: a block whose every transaction is the
-        // parallel step's (none executed before it).
-        let nothing_before_par = cumulative_gas_used == 0;
-        let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
-            bulk.take().unwrap_or_else(|| Vec::with_capacity(budget.min(262_144)));
-        // `N42_BUILD_PREFETCH=1`: each batch the puller hands over has its
-        // senders' and recipients' accounts read on the worker pool while the
-        // rest of the block is pulled and prepared, into a layer the
-        // execution's batches read before the parent's state provider
-        // (`WarmAccounts`). The addresses are copied out here, on this
-        // thread, from transactions the build already holds: the jobs touch
-        // neither the queue nor its locks.
-        // `N42_PHASE_TIMERS=1`: counts each batch's reads by door (plan v6
-        // 6.5/6.6). `CountedDb` is a passthrough when the flag is off.
-        let open_db = || {
-            open_parent_state()
-                .ok()
-                .map(|s| crate::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(
-                    reth_storage_api::StateProvider::into_evm_state_provider(s),
-                )))
-        };
-        let warm_fill = crate::parallel_transfer::build_prefetch().then(crate::parallel_transfer::WarmAccounts::new);
-        let (warm_ref, open_ref) = (warm_fill.as_ref(), &open_db);
-        // The body's parts made in the prep's pass (`BodyAhead`), for a
-        // block that may seal at the execution's end.
-        let body_at_prep = seal_at_exec() && seal_early_possible && block_blob_count == 0 && direct_receipts_enabled();
-        let (all_transfers, keys, mut body_ahead, prep_done) = crate::parallel_transfer::build_pool().in_place_scope(|scope| {
-            if let Some(puller) = pulled.as_ref() {
-                while cands.len() < budget {
-                    match puller.batches().recv() {
-                        Ok(batch) if !batch.is_empty() => {
-                            if let Some(warm) = warm_ref {
-                                // Senders first, then recipients: a sender's
-                                // run is read once.
-                                let addresses: Vec<alloy_primitives::Address> = batch
-                                    .iter()
-                                    .map(|tx| tx.sender())
-                                    .chain(batch.iter().map(|tx| tx.transaction.to().unwrap_or_default()))
-                                    .collect();
-                                scope.spawn(move |_| {
-                                    if let Some(mut db) = open_ref() {
-                                        warm.fill(&addresses, &mut db);
-                                    }
-                                });
-                            }
-                            cands.extend(batch)
-                        }
-                        _ => break,
-                    }
-                }
-            }
-            // The queue had less than a block: nothing more will come this build.
-            par_drained = cands.len() < budget;
-            par_pull_ms = par_at.elapsed().as_millis() as u64;
-            let prep_at = std::time::Instant::now();
-            if cands.len() > budget {
-                let extra = cands.split_off(budget);
-                for tx in extra.into_iter().rev() {
-                    lookahead.push_front(tx);
-                }
-            }
-            // One pass over the candidates on the build pool: the check
-            // and the (sender, recipient) keys, in order. Serial, the two
-            // passes read 163,000 transactions' cold memory one after the
-            // other (`par_prep_ms` 10, loop274). The sender is the one the
-            // ingest recorded (the attested frame's, for 0x50); nothing is
-            // hashed or recovered here.
-            // `N42_PLAN_AHEAD_BODY=1`: the keys and the body were made with the
-            // plan, from exactly these candidates (the bulk vector is the
-            // prepared one, uncut); nothing to read here.
-            let from_plan = body_at_prep
-                && prepared_build
-                    .as_ref()
-                    .is_some_and(|made| made.keys.len() == cands.len() && made.transactions.len() == cands.len());
-            prep_from_plan = from_plan;
-            let (all_transfers, keys, body_made) = if from_plan {
-                let keys = prepared_build.as_mut().map(|made| std::mem::take(&mut made.keys)).unwrap_or_default();
-                (!keys.is_empty(), keys, None)
-            } else { crate::parallel_transfer::build_pool().install(|| {
-                use rayon::prelude::*;
-                let transfer_key = |tx: &Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>| {
-                    let inner = &tx.transaction;
-                    (inner.gas_limit() == MIN_TRANSACTION_GAS
-                        && inner.input().is_empty()
-                        && !inner.is_create()
-                        && inner.access_list().is_none_or(|list| list.is_empty())
-                        && !inner.is_eip4844()
-                        && !inner.is_eip7702())
-                    .then(|| (tx.sender(), inner.to().unwrap_or_default()))
-                };
-                if body_at_prep {
-                    // The body's parts read in the same pass, each candidate
-                    // once while its lines are in hand; the commit takes them
-                    // when the block seals at the execution's end.
-                    let made = crate::parallel_transfer::BodyAhead::make_keyed(&cands, |_, tx| {
-                        let consensus = pooled_consensus(tx);
-                        (
-                            transfer_key(tx),
-                            consensus.clone(),
-                            tx.sender(),
-                            consensus.effective_tip_per_gas(base_fee).unwrap_or_default(),
-                            *tx.hash(),
-                        )
-                    });
-                    return match made {
-                        Some((keys, made)) if !keys.is_empty() => (true, keys, Some(made)),
-                        _ => (false, Vec::new(), None),
-                    };
-                }
-                // Straight into the vector, a refusal noted beside it: a
-                // collect into `Option<Vec>` is not an indexed collect.
-                let refused = std::sync::atomic::AtomicBool::new(false);
-                let keys: Vec<(alloy_primitives::Address, alloy_primitives::Address)> = cands
-                    .par_iter()
-                    .with_min_len(1024)
-                    .map(|tx| {
-                        transfer_key(tx).unwrap_or_else(|| {
-                            refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                            Default::default()
-                        })
-                    })
-                    .collect();
-                if refused.into_inner() || keys.is_empty() {
-                    (false, Vec::new(), None)
-                } else {
-                    (true, keys, None)
-                }
-            }) };
-            par_prep_ms = prep_at.elapsed().as_millis() as u64;
-            (all_transfers, keys, body_made, std::time::Instant::now())
-        });
-        // The scope waited here for the prefetch's last jobs: 0 when the
-        // pull and the prep hid it.
-        par_prefetch_wait_ms = prep_done.elapsed().as_millis() as u64;
-        let pre_exec_at = std::time::Instant::now();
-        par_prefetch_ms = warm_fill.as_ref().map_or(0, |warm| warm.busy_us() / 1000);
-        // `N42_PLAN_AHEAD_WARM`: without the on-path prefetch, the layer read
-        // ahead with the plan, when it was made for this build's parent.
-        let warm = match warm_fill {
-            Some(fill) => fill.freeze(),
-            None => match all_transfers.then(|| crate::warm_ahead::take_for(parent_header.parent_hash, warm_parent_built)).flatten() {
-                Some(taken) => {
-                    warm_ahead_accounts = taken.accounts;
-                    warm_ahead_ms = taken.ms;
-                    warm_ahead_ready = taken.ready;
-                    taken.warm
-                }
-                None => Default::default(),
-            },
-        };
-        if !all_transfers {
-            open_deferred_state!()?;
-            for tx in std::mem::take(&mut cands).into_iter().rev() {
-                lookahead.push_front(tx);
-            }
-        } else {
-            // The environment is read off the pooled transaction by
-            // reference (the sender the ingest recorded), and the slot keeps
-            // only the candidate's index: the envelope's clone here (its 0x50
-            // pubkey and signature bytes) was part of the fetch's 450 ns a
-            // transfer on the fleet (loop283), and a slot holding it was 470
-            // bytes to write. The body copies each transaction once, from
-            // `cands`, behind the execution.
-            let convert = |i: usize| ((), evm_config.tx_env(cands[i].transaction.consensus_ref()));
-            // Without the prefetch the layer is empty and every read goes
-            // to the provider, as before.
-            let open = || open_db().map(|db| crate::parallel_transfer::WarmDb::new(&warm, db));
-            // `N42_GRAFT_STREAM=1`: each batch's bundle is folded into the
-            // block's graft as that batch finishes, on the worker pool, rather
-            // than all of them on this thread once the execution is over (the
-            // graft was 60 ms of the leader's serial chain, loop173-174). The
-            // block's state is untouched until the install below, so a batch
-            // that fails still leaves the serial path a clean state.
-            // `N42_OUTPUT_SHARDS=<S>`: each batch writes its accounts into the
-            // shard that owns each address instead (the streamed graft is
-            // not used beside it).
-            let shard_count = crate::output_shards::output_shards();
-            let sharded_out = (shard_count > 0).then(|| {
-                crate::output_shards::OutputShards::new(group_env.block.beneficiary, keys.len(), shard_count)
-            });
-            let staged = (sharded_out.is_none() && crate::parallel_transfer::graft_stream()).then(|| {
-                std::sync::Mutex::new(crate::parallel_transfer::StagedGraft::new(group_env.block.beneficiary, keys.len()))
-            });
-            let sink = staged.as_ref().map(|staged| {
-                move |bundle: reth_trie::bundle_state::BundleState| staged.lock().expect("the staged graft's lock").add(bundle)
-            });
-            let shard_sink = sharded_out.as_ref().map(|shards| move |bundle: reth_trie::bundle_state::BundleState| shards.add(bundle));
-            let sink: Option<&(dyn Fn(reth_trie::bundle_state::BundleState) + Sync)> = match shard_sink.as_ref() {
-                Some(sink) => Some(sink as &(dyn Fn(reth_trie::bundle_state::BundleState) + Sync)),
-                None => sink.as_ref().map(|sink| sink as &(dyn Fn(reth_trie::bundle_state::BundleState) + Sync)),
-            };
-            // `N42_BUILD_COLLECT_IN_PLACE=1`: the transfers stay in the slots the
-            // batches wrote them to; the body and the receipts below are made from
-            // there on the worker pool rather than after a serial move of all of
-            // them (`par_collect_ms` 18 on the four-node fleet, loop214-218).
-            let in_place = crate::parallel_transfer::build_collect_in_place();
-            // `N42_GRAFT_PREFAULT=1`: the graft's memory -- the block's bundle
-            // map and its revert list -- mapped on a thread of its own while
-            // the batches execute, so the graft below writes into resident
-            // pages rather than faulting one in for every fifteen accounts
-            // (`GraftTarget`). Room for a quarter more accounts than
-            // transfers: a block of distinct senders and recipients touches
-            // at most twice as many, the bench's shape 1.04x, and a map that
-            // turns out short grows in the graft as it does today.
-            let prefault = crate::parallel_transfer::graft_prefault() && staged.is_none() && sharded_out.is_none();
-            // `N42_SEAL_AT_EXEC=1`: the transactions root over the pulled
-            // candidates, in pull order, on a thread of its own (not the build
-            // pool, whose threads the execution uses) while the batches run.
-            // With nothing skipped the body is exactly that set in that order
-            // (`body_matches_pull`), and the seal takes this root instead of
-            // computing one after the execution.
-            let root_ahead_wanted = seal_at_exec()
-                && seal_early_possible
-                && block_blob_count == 0
-                && direct_receipts_enabled()
-                && frame_plan.is_none();
-            // `N42_STATE_AFTER_PULL=1`: an error from the deferred open, raised
-            // once the step's threads are joined.
-            let mut deferred_state_err: Option<PayloadBuilderError> = None;
-            let mut exec_returned: Option<std::time::Instant> = None;
-            let mut run_started: Option<std::time::Instant> = None;
-            let (executed, mut graft_target, root_ahead) = std::thread::scope(|scope| {
-                let target = prefault.then(|| {
-                    let accounts = keys.len() + keys.len() / 4;
-                    scope.spawn(move || crate::parallel_transfer::GraftTarget::prefaulted(accounts))
-                });
-                let root_job = root_ahead_wanted.then(|| {
-                    let pulled_set = &cands;
-                    scope.spawn(move || {
-                        use alloy_eips::eip2718::Encodable2718 as _;
-                        crate::assembler::parallel_transaction_root_by(pulled_set.len(), |i| {
-                            pooled_consensus(&pulled_set[i]).encoded_2718()
-                        })
-                    })
-                });
-                pre_exec_ms = pre_exec_at.elapsed().as_millis() as u64;
-                let run_at = std::time::Instant::now();
-                run_started = Some(run_at);
-                // `N42_SEAL_ON_COUNTERS=1`: the batches count the block's
-                // transfers, gas and fees as they execute (a candidate's tip
-                // read beside its conversion, as the prep's body reads it), so
-                // the seal needs no pass over the slots.
-                let tip_of = |i: usize| pooled_consensus(&cands[i]).effective_tip_per_gas(base_fee).unwrap_or_default();
-                // `N42_PLAN_AHEAD_BODY=1`: the partition (at this block's
-                // beneficiary only) and the slots made with the plan.
-                let prepared_exec = prepared_build.as_mut().filter(|_| prep_from_plan).map(|made| {
-                    crate::parallel_transfer::PreparedExec {
-                        groups: made
-                            .groups
-                            .take()
-                            .filter(|(beneficiary, _)| *beneficiary == group_env.block.beneficiary)
-                            .map(|(_, groups)| groups),
-                        slots: Some(std::mem::take(&mut made.slots)),
-                    }
-                });
-                let counted_tips: Option<&(dyn Fn(usize) -> u128 + Sync)> =
-                    if seal_on_counters() && body_at_prep { Some(&tip_of) } else { None };
-                let executed = if defer_state {
-                    // After the partition, before the batches: the builder's
-                    // own state opened (the wait for a sealed parent's output
-                    // happens here) and the pre-execution changes applied.
-                    let mut before_batches = || match open_deferred_state!() {
-                        Ok(()) => true,
-                        Err(err) => {
-                            deferred_state_err = Some(err);
-                            false
-                        }
-                    };
-                    crate::parallel_transfer::execute_for_build_counted(
-                        &group_env,
-                        &keys,
-                        &convert,
-                        &open,
-                        sink,
-                        in_place,
-                        Some(&mut before_batches),
-                        counted_tips,
-                        prepared_exec,
-                        deferred_now,
-                    )
-                } else {
-                    crate::parallel_transfer::execute_for_build_counted(
-                        &group_env,
-                        &keys,
-                        &convert,
-                        &open,
-                        sink,
-                        in_place,
-                        None,
-                        counted_tips,
-                        prepared_exec,
-                        deferred_now,
-                    )
-                };
-                let exec_done = std::time::Instant::now();
-                par_run_ms = exec_done.duration_since(run_at).as_millis() as u64;
-                exec_returned = Some(exec_done);
-                let root_ahead = root_job.and_then(|job| job.join().ok());
-                tx_root_wait_ms = exec_done.elapsed().as_millis() as u64;
-                (executed, target.and_then(|job| job.join().ok()), root_ahead)
-            });
-            // Every batch's `WarmDb` has dropped: its hits are counted.
-            warm_ahead_hits = warm.hits();
-            par_prefault_ms = graft_target.as_ref().map_or(0, |target| target.prefault_us / 1000);
-            if let Some(err) = deferred_state_err.take() {
-                return Err(err);
-            }
-            // A partition that failed returned before the hook: the serial
-            // path below needs the state all the same.
-            open_deferred_state!()?;
-            scope_join_ms = exec_returned.map_or(0, |at| at.elapsed().as_millis() as u64);
-            match executed {
-                Ok(mut run) => {
-                    use reth_evm::execute::BlockExecutor as _;
-                    let beneficiary = group_env.block.beneficiary;
-                    // The batches are done: the fold, a task a shard on the
-                    // build pool.
-                    let freeze_at = std::time::Instant::now();
-                    // `N42_FREEZE_AFTER_SEAL=1`: on a block that can seal at
-                    // the execution's end, the freeze starts on its own
-                    // thread and is joined where the shards are first read.
-                    let freeze_late = freeze_after_seal()
-                        && seal_at_exec()
-                        && direct_receipts_enabled()
-                        && seal_early_possible
-                        && block_blob_count == 0
-                        && early_seal.is_some();
-                    let mut freezing: Option<LateFreeze> = None;
-                    let mut sharded_out = match sharded_out {
-                        Some(shards) if freeze_late => match spawn_freeze_maybe_early(shards, &mut early_rx) {
-                            Ok(handle) => {
-                                freezing = Some(handle);
-                                None
-                            }
-                            Err(shards) => shards.map(|shards| shards.freeze()),
-                        },
-                        other => other.map(crate::output_shards::OutputShards::freeze),
-                    };
-                    let index_us = freeze_at.elapsed().as_micros() as u64;
-                    index_ms = index_us / 1_000;
-                    freeze_late_used = freezing.is_some();
-                    if let Some(shards) = sharded_out.as_ref() {
-                        out_shards = shards.shard_count();
-                        shard_append_ms = shards.append_ms();
-                        shard_fold_ms = shards.fold_ms();
-                    }
-                    // The late freeze joined: its counters as the inline
-                    // freeze sets them, `index_ms` its own wall (off the
-                    // seal's path), and when it ended and how long the join
-                    // waited for it.
-                    macro_rules! freeze_joined {
-                        ($joined:expr) => {{
-                            let (frozen, took, ended): (crate::output_shards::FrozenShards, std::time::Duration, std::time::Instant) = $joined;
-                            index_ms = took.as_millis() as u64;
-                            out_shards = frozen.shard_count();
-                            shard_append_ms = frozen.append_ms();
-                            shard_fold_ms = frozen.fold_ms();
-                            freeze_ended_at = Some(ended);
-                            frozen
-                        }};
-                    }
-                    par_collect_ms = run.phases.collect_ms;
-                    par_release_ms = run.phases.release_ms;
-                    par_hook_us = run.phases.hook_us;
-                    let fold_at = std::time::Instant::now();
-                    if let Some(run_at) = run_started {
-                        gap_before_exec_ms = (run_at.saturating_duration_since(prep_done).as_micros() as u64)
-                            .saturating_add(run.phases.batches_start_us)
-                            / 1_000;
-                        let exec_end = run_at + std::time::Duration::from_micros(run.phases.batches_end_us);
-                        gap_after_exec_ms =
-                            (fold_at.saturating_duration_since(exec_end).as_micros() as u64).saturating_sub(index_us) / 1_000;
-                    }
-                    // `N42_SEAL_AT_EXEC=1`: the passes over the slots between the
-                    // execution's end and the seal run on the build pool (each
-                    // serial pass strides 163k slots of ~470 bytes).
-                    let on_pool = seal_at_exec();
-                    // `N42_SEAL_ON_COUNTERS=1`: the count and the gas are the
-                    // batches' own (`RunCounters`, the same sums), and the
-                    // references are made below only for a block that does
-                    // not seal on the counters.
-                    let counters_first = seal_on_counters() && !run.slots.is_empty();
-                    // Block order, by reference: a pointer a transfer, where the
-                    // collect moved ~470 bytes of each.
-                    // On the pool, the references and the block's gas are one
-                    // pass (`slot_refs_and_gas`).
-                    let (mut refs, pool_gas) = if run.slots.is_empty() || counters_first {
-                        (None, None)
-                    } else if on_pool {
-                        let (refs, gas) = crate::parallel_transfer::slot_refs_and_gas(&run.slots);
-                        (Some(refs), Some(gas))
-                    } else {
-                        (Some(run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>()), None)
-                    };
-                    let (executed_count, executed_gas) = match (refs.as_ref(), pool_gas) {
-                        _ if counters_first => (run.counters.executed, run.counters.gas),
-                        (Some(refs), Some(gas)) => (refs.len(), gas),
-                        (Some(refs), None) => (refs.len(), refs.iter().map(|built| built.gas_used).sum::<u64>()),
-                        (None, _) => (run.executed.len(), run.executed.iter().map(|built| built.gas_used).sum::<u64>()),
-                    };
-                    commit_refs_ms = fold_at.elapsed().as_millis() as u64;
-                    // This block seals early -- full or drained after this step,
-                    // with nothing committed before it -- so nothing executes on
-                    // this builder again: the executor's commit per transfer
-                    // (receipt, gas counters, a Cancun check and an empty state
-                    // commit, 53 ms a full block on the leader's serial chain,
-                    // loop165) only feeds the receipts and the gas its finish
-                    // reports. Both are built here on the worker pool instead and
-                    // handed to that finish; the executor commits none.
-                    let seals_early_here = seal_early_possible
-                        && block_blob_count == 0
-                        && executed_count > 0
-                        && cumulative_gas_used == 0
-                        && builder.transactions.is_empty()
-                        && (block_gas_limit.saturating_sub(executed_gas) < MIN_TRANSACTION_GAS || par_drained);
-                    // `N42_SEAL_AT_EXEC=1`: this block is sealed below, before
-                    // the fold. `seals_early_here` implies the gate after the
-                    // parallel step passes (the chain's preconditions, no blobs,
-                    // something executed, full or drained), so a block sealed
-                    // here is never handed to the serial loop.
-                    let ahead = seal_at_exec() && seals_early_here && direct_receipts_enabled();
-                    // With the slots left in place, the receipts are built from
-                    // them behind the seal, beside the graft, and with them the
-                    // cumulative gas per transaction and the block's gas: the
-                    // seal needs neither.
-                    let mut receipts_behind = false;
-                    // `N42_SEAL_ON_COUNTERS=1`: a block that seals here with
-                    // every candidate executed in pull order is the body made
-                    // in the prep (`BodyAhead`) and the batches' fees; nothing
-                    // on the seal's path reads the slots. Any other block
-                    // makes the references now, as without the switch.
-                    let counted_body = if counters_first
-                        && ahead
-                        && run.skipped.is_empty()
-                        && executed_count == cands.len()
-                        && let Some(fees) = run.counters.fees
-                    {
-                        // The body made with the plan (`N42_PLAN_AHEAD_BODY`)
-                        // or in the prep, every candidate in pull order.
-                        if prep_from_plan
-                            && let Some(made) = prepared_build.as_mut().filter(|made| made.transactions.len() == cands.len())
-                        {
-                            direct_root_ahead = made.root_ahead.take();
-                            Some((
-                                (
-                                    std::mem::take(&mut made.transactions),
-                                    std::mem::take(&mut made.senders),
-                                    std::mem::take(&mut made.hashes),
-                                ),
-                                fees,
-                            ))
-                        } else if body_ahead.as_ref().is_some_and(|made| made.transactions.len() == cands.len()) {
-                            body_ahead.take().map(|made| ((made.transactions, made.senders, made.hashes), fees))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    if counters_first && counted_body.is_none() {
-                        let at = std::time::Instant::now();
-                        refs = Some(if on_pool {
-                            crate::parallel_transfer::slot_refs_and_gas(&run.slots).0
-                        } else {
-                            run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>()
-                        });
-                        commit_refs_ms += at.elapsed().as_millis() as u64;
-                    }
-                    seal_on_counters_used = counted_body.is_some();
-                    if let Some(((transactions, senders, hashes), fees)) = counted_body {
-                        total_fees += fees;
-                        commit_body_ahead_used = true;
-                        cumulative_gas_used += executed_gas;
-                        tx_count += executed_count as u64;
-                        direct_body = Some((transactions, senders));
-                        direct_hashes = Some(hashes);
-                        // The references, the cumulative gas and the receipts
-                        // are made behind the seal by the receipts job, which
-                        // reads the slots itself.
-                        receipts_behind = true;
-                    } else if let (true, true, Some(refs)) = (seals_early_here, direct_receipts_enabled(), refs.as_ref()) {
-                        // The same body and receipts as the branch below, made
-                        // from the slots: the transaction is copied out of its
-                        // slot once, on the pool, straight into the body.
-                        use rayon::prelude::*;
-                        let step_at = std::time::Instant::now();
-                        let cumulative = (!ahead).then(|| cumulative_gas(refs));
-                        commit_cumulative_ms = step_at.elapsed().as_millis() as u64;
-                        let step_at = std::time::Instant::now();
-                        // Ahead: the fees, the body and the senders in one pass
-                        // on the build pool, each candidate read once
-                        // (`body_and_fees`; `commit_fees_ms` is then 0).
-                        if !ahead {
-                            total_fees += refs
-                                .par_iter()
-                                .map(|built| {
-                                    let tip = pooled_consensus(&cands[built.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
-                                    U256::from(tip) * U256::from(built.gas_used)
-                                })
-                                .reduce(|| U256::ZERO, |a, b| a + b);
-                        }
-                        commit_fees_ms = step_at.elapsed().as_millis() as u64;
-                        let step_at = std::time::Instant::now();
-                        // The body made ahead, when the transfers are every
-                        // candidate in pull order (the fees from its tips).
-                        let made = body_ahead.take().filter(|_| ahead).and_then(|made| {
-                            crate::parallel_transfer::fees_from_tips(refs, &made.tips).map(|fees| (made, fees))
-                        });
-                        let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = if let Some((made, fees)) = made {
-                            total_fees += fees;
-                            commit_body_ahead_used = true;
-                            direct_hashes = Some(made.hashes);
-                            (made.transactions, made.senders)
-                        } else if ahead {
-                            let (transactions, senders, fees) = crate::parallel_transfer::body_and_fees(refs, |built| {
-                                let candidate = &cands[built.index];
-                                let tx = pooled_consensus(candidate);
-                                (tx.clone(), candidate.sender(), tx.effective_tip_per_gas(base_fee).unwrap_or_default())
-                            });
-                            total_fees += fees;
-                            (transactions, senders)
-                        } else {
-                            (
-                                refs.par_iter().map(|built| pooled_consensus(&cands[built.index]).clone()).collect(),
-                                refs.par_iter().map(|built| cands[built.index].sender()).collect(),
-                            )
-                        };
-                        commit_body_ms = step_at.elapsed().as_millis() as u64;
-                        cumulative_gas_used += executed_gas;
-                        tx_count += executed_count as u64;
-                        direct_body = Some((transactions, senders));
-                        if let Some((cumulative, tx_gas)) = cumulative {
-                            direct_receipts = Some((receipts_from_slots(refs, &cumulative, &cands), tx_gas));
-                            // The slots' 77 MB are freed on the pool, off this thread.
-                            let slots = std::mem::take(&mut run.slots);
-                            crate::parallel_transfer::behind_pool().spawn(move || drop(slots));
-                        } else {
-                            receipts_behind = true;
-                        }
-                    } else if seals_early_here && direct_receipts_enabled() {
-                        use rayon::prelude::*;
-                        let executed = run.take_executed();
-                        let mut cumulative = Vec::with_capacity(executed_count);
-                        let mut tx_gas = 0u64;
-                        for built in &executed {
-                            tx_gas += built.result.gas().tx_gas_used();
-                            cumulative.push(tx_gas);
-                        }
-                        total_fees += executed
-                            .par_iter()
-                            .map(|built| {
-                                let tip = pooled_consensus(&cands[built.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
-                                U256::from(tip) * U256::from(built.gas_used)
-                            })
-                            .reduce(|| U256::ZERO, |a, b| a + b);
-                        let (transactions, rest): (Vec<TransactionSigned>, Vec<(alloy_primitives::Address, n42_tx_types::Receipt)>) = executed
-                            .into_par_iter()
-                            .zip(cumulative.into_par_iter())
-                            .map(|(built, cumulative_gas_used)| {
-                                let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&cands[built.index]));
-                                let receipt = n42_tx_types::Receipt {
-                                    tx_type,
-                                    success: built.result.is_success(),
-                                    cumulative_gas_used,
-                                    logs: built.result.into_logs(),
-                                };
-                                // Split here, on the pool, where the transaction
-                                // is already in hand: the seal takes the two
-                                // vectors as they are.
-                                // The body's copy, the only one.
-                                (pooled_consensus(&cands[built.index]).clone(), (cands[built.index].sender(), receipt))
-                            })
-                            .unzip();
-                        let (senders, receipts): (Vec<alloy_primitives::Address>, Vec<n42_tx_types::Receipt>) =
-                            rest.into_par_iter().unzip();
-                        cumulative_gas_used += executed_gas;
-                        tx_count += executed_count as u64;
-                        direct_body = Some((transactions, senders));
-                        direct_receipts = Some((receipts, tx_gas));
-                    } else {
-                        // The receipts and the gas, one transfer at a time, with
-                        // no state to commit: the state comes in one piece below.
-                        for built in run.take_executed() {
-                            let recovered = cands[built.index].to_consensus();
-                            let tip = recovered.effective_tip_per_gas(base_fee).unwrap_or_default();
-                            total_fees += U256::from(tip) * U256::from(built.gas_used);
-                            cumulative_gas_used += built.gas_used;
-                            tx_count += 1;
-                            let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(recovered.inner());
-                            builder.executor.commit_transaction(alloy_evm::eth::EthTxResult {
-                                result: revm::context::result::ResultAndState {
-                                    result: built.result,
-                                    state: revm::state::EvmState::default(),
-                                },
-                                blob_gas_used: 0,
-                                tx_type,
-                            });
-                            builder.transactions.push(recovered);
-                        }
-                    }
-                    // The batches' changes, grafted onto the block's state;
-                    // the beneficiary, whom every batch credited from the
-                    // same starting balance, once, through a commit.
-                    // The state's cache is written only if something after
-                    // the graft may read a grafted account: the serial loop
-                    // (which runs only if the block has gas left) or a
-                    // withdrawal to one of them. `N42_BUILD_GRAFT_NO_CACHE=1`
-                    // turns the skip on; the cache insert per account was
-                    // ~a third of a 70 ms graft.
-                    let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS;
-                    // Sealed early, nothing after the graft reads the cache
-                    // either: the serial loop never runs.
-                    let sealing_early = seal_early_possible && block_blob_count == 0 && (block_full || par_drained);
-                    // A block that will not seal early reads the shards below
-                    // (the withdrawals' check, the staged graft): the late
-                    // freeze is joined first. One that will is joined behind
-                    // the seal, beside the receipts.
-                    if !sealing_early && let Some(handle) = freezing.take() {
-                        let joined = handle.join().map_err(|_| {
-                            PayloadBuilderError::other(std::io::Error::other("the shards' freeze panicked"))
-                        })?;
-                        sharded_out = Some(freeze_joined!(joined));
-                    }
-                    let withdrawals_clear = attributes.withdrawals.as_ref().is_none_or(|ws| match (staged.as_ref(), sharded_out.as_ref()) {
-                        (Some(staged), _) => {
-                            let staged = staged.lock().expect("the staged graft's lock");
-                            ws.iter().all(|w| !staged.holds(&w.address))
-                        }
-                        (None, Some(shards)) => ws.iter().all(|w| !shards.holds(&w.address)),
-                        (None, None) => ws.iter().all(|w| !run.bundles.iter().any(|b| b.state.contains_key(&w.address))),
-                    });
-                    // The executor's finish credits the block's withdrawals
-                    // through the cache, and a miss there would load the
-                    // parent's account over the graft's (the faucet, on a
-                    // funding block: audit 2026-09-12) -- so with the cache
-                    // skipped, the withdrawal recipients the graft touched
-                    // are put back into it below, and nothing else is.
-                    let keep_cache = !(sealing_early || (build_graft_no_cache() && block_full && withdrawals_clear));
-                    par_commit_ms = fold_at.elapsed().as_millis() as u64;
-                    let commit_end = std::time::Instant::now();
-                    let _ = executed_count;
-                    // `N42_SEAL_AT_EXEC=1`: sealed and proposed here, with the
-                    // body just collected; everything below -- the graft, the
-                    // put-back, the fee credit, the receipts, the diagnosis and
-                    // the give-backs -- is behind the proposal, and a failure
-                    // in it tells the store's waiters (`failed_after_seal`).
-                    // The seal's own time is left out of `par_fold_ms`.
-                    let mut seal_took = std::time::Duration::ZERO;
-                    if ahead && let Some(EarlySeal { hook, parent_built: _ }) = early_seal.take() {
-                        let seal_at = std::time::Instant::now();
-                        par_to_seal_us = seal_at.saturating_duration_since(par_at).as_micros() as u64;
-                        if let Some(run_at) = run_started {
-                            let exec_end = run_at + std::time::Duration::from_micros(run.phases.batches_end_us);
-                            exec_end_to_seal_us = seal_at.saturating_duration_since(exec_end).as_micros() as u64;
-                        }
-                        let matches = root_ahead.is_some()
-                            && run.skipped.is_empty()
-                            && direct_body.as_ref().is_some_and(|(transactions, _)| {
-                                body_matches_pull(transactions, &cands, |tx| *tx.tx_hash(), |tx| *tx.hash())
-                            });
-                        match_ms = seal_at.elapsed().as_millis() as u64;
-                        tx_root_ahead = matches;
-                        // What the puller took ahead and this block did not
-                        // build goes back to the queue before the proposal,
-                        // not behind the graft: the chained build pulls at
-                        // the seal (`N42_STATE_AFTER_PULL`), and on loop232
-                        // it found the lanes holed by this build's lookahead
-                        // still checked out (117 of 180 builds short of the
-                        // gas limit, every one from a hole the pool could
-                        // not fill); on loop233, with the give-back after the
-                        // hook, by the puller's walk still ending. The
-                        // puller's drop joins its thread. The skipped
-                        // senders' heads, rare on a full block, are given
-                        // back below with their diagnosis.
-                        for pool_tx in std::mem::take(&mut lookahead).into_iter().rev() {
-                            refuse!(
-                                &pool_tx,
-                                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
-                            );
-                        }
-                        drop(pulled.take());
-                        give_back_ms = seal_at.elapsed().as_millis() as u64;
-                        gap_before_seal_ms = commit_end.elapsed().as_millis() as u64;
-                        let sealed = seal_block!(hook, seal_at, if matches { root_ahead } else { None });
-                        sealed_ahead_id = Some((sealed.2, sealed.3));
-                        // `N42_PLAN_AHEAD_WARM`: this block's transactions are
-                        // among its take's (the frames' bulk vector, nothing
-                        // pulled beyond it, nothing before the step, nothing
-                        // serial after a seal here), so it
-                        // changes no account outside the plan's senders and
-                        // recipients, its beneficiary and its withdrawal
-                        // recipients: the next build may use the read made
-                        // at this build's parent leaving those out.
-                        if warm_ahead_on && from_bulk && cands.len() <= bulk_len && nothing_before_par && warm_plan_id != 0 {
-                            let mut extra = vec![group_env.block.beneficiary];
-                            if let Some(withdrawals) = attributes.withdrawals.as_ref() {
-                                extra.extend(withdrawals.iter().map(|w| w.address));
-                            }
-                            crate::warm_ahead::note_built(crate::warm_ahead::Built {
-                                plan: warm_plan_id,
-                                base: parent_hash_for_state,
-                                built: sealed.2,
-                                extra,
-                            });
-                        }
-                        // `N42_PLAN_AHEAD_BODY=1`: a block sealed on its
-                        // counters from the frames' bulk vector, uncut, is
-                        // its build's whole take in take order: the queue's
-                        // hand-off forgets it in O(1) (`forget_whole_take`).
-                        if seal_on_counters_used && from_bulk && crate::frame_blocks::plan_ahead_body_wanted() && !cands.is_empty() {
-                            let last = cands.len() - 1;
-                            let checks = [0, last / 2, last]
-                                .into_iter()
-                                .map(|i| (i, cands[i].sender(), cands[i].nonce()))
-                                .collect();
-                            crate::frame_blocks::note_whole_take(crate::frame_blocks::WholeTake {
-                                block: sealed.2,
-                                parent: parent_header.hash(),
-                                len: cands.len(),
-                                checks,
-                            });
-                            whole_take_noted = true;
-                        }
-                        sealed_ahead = Some(sealed);
-                        seal_took = seal_at.elapsed();
-                    }
-                    // The transactions root beside the graft when the block
-                    // will seal early: the seal needs it, and the graft's
-                    // 60-100 ms hide it (loop139: 42 ms on the seal path).
-                    let bundles = run.bundles;
-                    // `N42_OUTPUT_SHARDS`: no graft when the block seals early
-                    // (nothing after this reads the executor's cache) onto a
-                    // state with no bundle of its own; otherwise the shards are
-                    // folded into one staged map here and installed as the
-                    // streamed graft is.
-                    // Decided once, for the shards frozen here and for the
-                    // late freeze joined in the scope below alike.
-                    let shards_stay = !keep_cache
-                        && sealing_early
-                        && tx_count > 0
-                        && builder.executor.evm_mut().db_mut().bundle_state.state.is_empty();
-                    let (staged, mut sharded_out) = match sharded_out {
-                        Some(shards) if shards_stay => (None, Some(shards)),
-                        Some(shards) => (Some(std::sync::Mutex::new(shards.into_staged())), None),
-                        None => (staged, None),
-                    };
-                    let mut staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
-                    // Of the fold: the graft alone, without the transactions
-                    // root that runs beside it -- `par_fold_ms` is the longer
-                    // of the two, so a graft that falls under the root would
-                    // not show in it (plan v5 attempt D).
-                    let mut graft_ms = 0u64;
-                    // `N42_FREEZE_AFTER_SEAL=1`: set when the late freeze's
-                    // thread panicked; the graft is not run and the build
-                    // fails behind its seal.
-                    let mut freeze_failed = false;
-                    // `N42_SHARDS_BEFORE_RECEIPTS=1` on a block whose output
-                    // stays in its shards: the receipts are built on a thread
-                    // that owns their inputs (the slots and the candidates,
-                    // shared), so the shards are filed without waiting for
-                    // them (`docs/SHARED_EXECUTION_SCOPE.md` 18.7 item 4a):
-                    // the child reads the shards, never the receipts.
-                    let mut cands_shared: Option<Arc<Vec<_>>> = None;
-                    if receipts_behind && shards_stay && crate::output_shards::shards_before_receipts() {
-                        let shared = Arc::new(std::mem::take(&mut cands));
-                        let inputs = Arc::new(std::sync::Mutex::new(Some((std::mem::take(&mut run.slots), Arc::clone(&shared)))));
-                        let taken = Arc::clone(&inputs);
-                        let spawned = std::thread::Builder::new().name("n42-receipts-late".into()).spawn(move || {
-                            let Some((slots, pulled)) = taken.lock().ok().and_then(|mut cell| cell.take()) else {
-                                return (Vec::new(), 0);
-                            };
-                            let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
-                            let (cumulative, tx_gas) = cumulative_gas(&refs);
-                            let receipts = match receipts_pool() {
-                                Some(pool) => pool.install(|| receipts_from_slots(&refs, &cumulative, &pulled)),
-                                None => receipts_from_slots(&refs, &cumulative, &pulled),
-                            };
-                            drop(refs);
-                            // The slots' 77 MB are freed on the pool, off this thread.
-                            crate::parallel_transfer::behind_pool().spawn(move || drop((slots, pulled)));
-                            (receipts, tx_gas)
-                        });
-                        match spawned {
-                            Ok(handle) => {
-                                receipts_pending = Some(handle);
-                                cands_shared = Some(shared);
-                            }
-                            Err(err) => {
-                                // No thread: the inputs come back and the
-                                // receipts are built in the scope, as before.
-                                tracing::warn!(target: "payload_builder", %err, "no thread for the late receipts; built beside the graft");
-                                if let Some((slots, pulled)) = inputs.lock().ok().and_then(|mut cell| cell.take()) {
-                                    run.slots = slots;
-                                    drop(pulled);
-                                }
-                                match Arc::try_unwrap(shared) {
-                                    Ok(back) => cands = back,
-                                    Err(still) => cands_shared = Some(still),
-                                }
-                            }
-                        }
-                    }
-                    let receipts_in_scope = receipts_behind && receipts_pending.is_none();
-                    let (graft, early_root, receipts) = std::thread::scope(|scope| {
-                        // Sealed at the execution's end: the receipts from the
-                        // slots, beside the graft, instead of the root.
-                        let receipts_job = receipts_in_scope.then(|| {
-                            let slots: &[_] = &run.slots;
-                            let pulled: &[_] = &cands;
-                            scope.spawn(move || {
-                                let mut times = ReceiptsTimes::default();
-                                if receipts_fused() {
-                                    let (receipts, tx_gas) = match receipts_pool() {
-                                        Some(pool) => pool.install(|| receipts_fused_from_slots(slots, pulled, &mut times)),
-                                        None => receipts_fused_from_slots(slots, pulled, &mut times),
-                                    };
-                                    return (receipts, tx_gas, times);
-                                }
-                                let at = std::time::Instant::now();
-                                let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
-                                times.refs_us = at.elapsed().as_micros() as u64;
-                                let at = std::time::Instant::now();
-                                let (cumulative, tx_gas) = cumulative_gas(&refs);
-                                times.cum_us = at.elapsed().as_micros() as u64;
-                                let at = std::time::Instant::now();
-                                // The pool `receipts_pool` names; the global pool else.
-                                let receipts = match receipts_pool() {
-                                    Some(pool) => pool.install(|| receipts_from_slots(&refs, &cumulative, pulled)),
-                                    None => receipts_from_slots(&refs, &cumulative, pulled),
-                                };
-                                times.build_us = at.elapsed().as_micros() as u64;
-                                (receipts, tx_gas, times)
-                            })
-                        });
-                        let root = (sealing_early && sealed_ahead.is_none() && frame_plan.is_none()).then(|| match direct_body.as_ref() {
-                            Some((transactions, _)) => {
-                                let txs: &[TransactionSigned] = transactions;
-                                scope.spawn(move || crate::assembler::parallel_transaction_root(txs))
-                            }
-                            None => {
-                                let txs: &[reth_primitives_traits::Recovered<TransactionSigned>] = &builder.transactions;
-                                scope.spawn(move || crate::assembler::parallel_transaction_root_recovered(txs))
-                            }
-                        });
-                        // `N42_FREEZE_AFTER_SEAL=1`: the shards are first read
-                        // here; the freeze has run beside the commit and the
-                        // seal, and the receipts job runs beside its end.
-                        // `N42_OUTPUT_INCREMENTAL=1`: on a block whose output
-                        // stays in its shards, the early output instead (~1 ms
-                        // into the freeze); the freeze is joined after the
-                        // shards were filed on it. No early output (no live
-                        // index, a thread that died first): joined here.
-                        if shards_stay
-                            && let Some(receiver) = early_rx.take()
-                            && freezing.is_some()
-                        {
-                            let wait_at = std::time::Instant::now();
-                            early_out = receiver.recv().ok().flatten();
-                            if early_out.is_some() {
-                                pending_freeze = freezing.take();
-                            }
-                            freeze_join_wait_us = wait_at.elapsed().as_micros() as u64;
-                        }
-                        if let Some(handle) = freezing.take() {
-                            let join_at = std::time::Instant::now();
-                            match handle.join() {
-                                Ok(joined) => {
-                                    let frozen = freeze_joined!(joined);
-                                    if shards_stay {
-                                        sharded_out = Some(frozen);
-                                    } else {
-                                        staged = Some(frozen.into_staged());
-                                    }
-                                }
-                                Err(_) => freeze_failed = true,
-                            }
-                            freeze_join_wait_us = join_at.elapsed().as_micros() as u64;
-                        }
-                        let db = builder.executor.evm_mut().db_mut();
-                        let at = std::time::Instant::now();
-                        let graft = if freeze_failed { None } else { Some(match (staged, sharded_out.as_mut()) {
-                            // `N42_OUTPUT_INCREMENTAL=1`: the cached accounts'
-                            // changes read from the early output; the frozen
-                            // set gives them up when it lands.
-                            (None, None) if let Some(early) = early_out.as_ref() => {
-                                let (committed, taken) = early.take_cached(db);
-                                early_taken = taken;
-                                Ok(crate::parallel_transfer::Graft {
-                                    beneficiary_delta: early.beneficiary_delta(),
-                                    committed,
-                                    ..Default::default()
-                                })
-                            }
-                            // The block's output stays in its shards: only the
-                            // accounts a pre-execution call left in the cache
-                            // are committed, as deltas.
-                            (_, Some(shards)) => {
-                                let committed = shards.take_cached(db);
-                                Ok(crate::parallel_transfer::Graft {
-                                    beneficiary_delta: shards.beneficiary_delta(),
-                                    committed,
-                                    ..Default::default()
-                                })
-                            }
-                            (Some(staged), None) => crate::parallel_transfer::install_staged(db, staged, keep_cache),
-                            (None, None) => crate::parallel_transfer::graft_bundles_folded(
-                                db,
-                                bundles,
-                                beneficiary,
-                                keep_cache,
-                                crate::parallel_transfer::build_graft_fold(),
-                                graft_target.take(),
-                            ),
-                        }) };
-                        // Kept at 0 when nothing was grafted.
-                        graft_ms = if sharded_out.is_some() || early_out.is_some() { 0 } else { at.elapsed().as_millis() as u64 };
-                        let root_wait_at = std::time::Instant::now();
-                        let root_done = root.map(|job| job.join());
-                        par_root_wait_ms = root_wait_at.elapsed().as_millis() as u64;
-                        let receipts_wait_at = std::time::Instant::now();
-                        let receipts_done = receipts_job.map(|job| job.join());
-                        par_receipts_wait_ms = receipts_wait_at.elapsed().as_millis() as u64;
-                        (graft, root_done, receipts_done)
-                    });
-                    par_graft_ms = graft_ms;
-                    early_transactions_root = early_root
-                        .transpose()
-                        .map_err(|_| {
-                            failed_after_seal(
-                                sealed_ahead_id,
-                                PayloadBuilderError::other(std::io::Error::other("the transactions root job panicked")),
-                            )
-                        })?;
-                    if let Some(receipts) = receipts {
-                        let (receipts, tx_gas, times) = receipts.map_err(|_| {
-                            failed_after_seal(
-                                sealed_ahead_id,
-                                PayloadBuilderError::other(std::io::Error::other("the receipts job behind the seal panicked")),
-                            )
-                        })?;
-                        direct_receipts = Some((receipts, tx_gas));
-                        scope_receipts_times = times;
-                        // The slots' 77 MB are freed on the pool, off this thread.
-                        let slots = std::mem::take(&mut run.slots);
-                        crate::parallel_transfer::behind_pool().spawn(move || drop(slots));
-                    }
-                    let graft = graft
-                        .ok_or_else(|| {
-                            failed_after_seal(
-                                sealed_ahead_id,
-                                PayloadBuilderError::other(std::io::Error::other("the shards' freeze behind the seal panicked")),
-                            )
-                        })?
-                        .map_err(|err| failed_after_seal(sealed_ahead_id, PayloadBuilderError::other(err)))?;
-                    // Zero on `install_staged`'s streamed graft
-                    // (`N42_GRAFT_STREAM=1`) and on `GraftFold::Indexed`/
-                    // `IndexedRanges`: only the default in-place fold
-                    // (`graft_bundles_direct`) fills these.
-                    par_graft_base_ms = graft.direct_base_ms;
-                    par_graft_reserve_ms = graft.direct_reserve_ms;
-                    par_graft_insert_ms = graft.direct_insert_ms;
-                    par_graft_reverts_ms = graft.direct_reverts_ms;
-                    par_graft_other_ms = graft.direct_other_ms;
-                    par_graft_sharded = graft.sharded;
-                    par_graft_split_us = graft.sharded_split_us;
-                    par_graft_build_us = graft.sharded_build_us;
-                    par_graft_merge_us = graft.sharded_merge_us;
-                    let db = builder.executor.evm_mut().db_mut();
-                    if !keep_cache
-                        && let Some(withdrawals) = attributes.withdrawals.as_ref() {
-                            for withdrawal in withdrawals {
-                                let grafted = db
-                                    .bundle_state
-                                    .state
-                                    .get(&withdrawal.address)
-                                    .and_then(|account| account.info.clone())
-                                    .or_else(|| {
-                                        sharded_out
-                                            .as_ref()
-                                            .and_then(|shards| shards.get(&withdrawal.address))
-                                            .and_then(|account| account.info.clone())
-                                    })
-                                    .or_else(|| {
-                                        // An account the early take committed
-                                        // is out of the output, as `take_cached`
-                                        // leaves it in the frozen set.
-                                        early_out
-                                            .as_ref()
-                                            .filter(|_| !early_taken.contains(&withdrawal.address))
-                                            .and_then(|early| early.account(&withdrawal.address))
-                                            .and_then(|account| account.info.clone())
-                                    });
-                                if let Some(info) = grafted {
-                                    db.insert_account(withdrawal.address, info);
-                                }
-                            }
-                        }
-                    let fees = graft.beneficiary_delta;
-                    par_committed = graft.committed;
-                    par_reverts = graft.reverts;
-                    let mut changes = revm::state::EvmState::default();
-                    if !fees.is_zero() {
-                        let current = db
-                            .basic(beneficiary)
-                            .map_err(|err| failed_after_seal(sealed_ahead_id, PayloadBuilderError::other(err)))?;
-                        let existed = current.is_some();
-                        let mut info = current.unwrap_or_default();
-                        info.balance = info.balance.saturating_add(fees);
-                        let mut account = revm::state::Account::from(info);
-                        account.status = revm::state::AccountStatus::Touched;
-                        if !existed {
-                            account.status |= revm::state::AccountStatus::Created;
-                        }
-                        changes.insert(beneficiary, account);
-                    }
-                    revm::DatabaseCommit::commit(db, changes);
-                    output_shards = sharded_out.map(Arc::new);
-                    // `N42_ROOT_OPS_AHEAD=1`: the shards are final here (the
-                    // cached accounts taken out of them); their QMDB leaves
-                    // are encoded and sorted now, beside the finish, and the
-                    // root job adds the residual's to them.
-                    if root_ops_ahead() && sealing_early && let Some(shards) = output_shards.as_ref() {
-                        let shards = Arc::clone(shards);
-                        let prague = n42_qmdb_reth::system_caller_leaf_at(&*chain_spec, attributes.timestamp);
-                        let spawned = std::thread::Builder::new().name("n42-ops-ahead".into()).spawn(move || {
-                            n42_core_layout::enter(n42_core_layout::Set::Critical);
-                            let empty = reth_trie::bundle_state::BundleState::default();
-                            let accounts = shards.view(&empty, &[]);
-                            (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
-                        });
-                        match spawned {
-                            Ok(handle) => ops_ahead = Some((handle, prague)),
-                            Err(error) => {
-                                tracing::debug!(target: "payload_builder", %error, "no thread for the operations ahead; the root job encodes them");
-                            }
-                        }
-                    }
-                    par_fold_ms = fold_at.elapsed().saturating_sub(seal_took).as_millis() as u64;
-                    par_txs = tx_count;
-                    par_groups = run.phases.groups;
-                    par_batches = run.phases.batches;
-                    par_part_ms = run.phases.partition_ms;
-                    par_exec_ms = run.phases.groups_ms;
-                    exec_prepared_groups = run.phases.prepared_groups;
-                    exec_prepared_slots = run.phases.prepared_slots;
-                    exec_partition_us = run.phases.partition_us;
-                    exec_slots_us = run.phases.slots_us;
-                    par_transfer_timers = run.phases.transfer_timers;
-                    par_read_set = run.phases.read_set;
-                    par_read_set_hits = run.phases.read_set_hits;
-                    par_read_set_misses = run.phases.read_set_misses;
-                    par_batch_spans = run.phases.batch_spans;
-                    par_loop_timers = run.phases.loop_timers;
-                    par_mlp_k = run.phases.mlp_k;
-                    par_mlp_hints = run.phases.mlp_hints;
-                    par_skipped = run.skipped.len();
-                    // Read by the diagnosis below, which must see what this
-                    // step actually built.
-                    debug_assert_eq!(par_txs, tx_count);
-                    // Not offered to the serial loop: what the transfer path
-                    // refused it would refuse too, one full validation per
-                    // transaction -- 5.2 s for a block's worth when the
-                    // base fee had run past every candidate's fee (round 43).
-                    // Given back with the leftovers at the end instead.
-                    // The candidates are shared with the late receipts'
-                    // thread when it runs (`N42_SHARDS_BEFORE_RECEIPTS`).
-                    let pulled_now: &[_] = cands_shared.as_deref().map_or(&cands[..], |shared| &shared[..]);
-                    for i in run.skipped {
-                        deferred.push(Arc::clone(&pulled_now[i]));
-                    }
-                    // Why each skipped sender's head was refused, so the
-                    // give-back below can say it. Handing every skipped
-                    // candidate back with `ExceedsGasLimit` tells the queue
-                    // nothing, and its lowest nonce is what the next build
-                    // is offered first: on loop207 Pb node3 the same 256-512
-                    // candidates were skipped on all 63 builds of the tenure
-                    // (`refused[6]` +1 a build, `par_skipped` flat), and on
-                    // Ob node1 the skipped set grew 2,880 -> 163,000 over
-                    // twenty blocks until every block was empty with
-                    // 334-360k queued. A stale head lets the queue drop it
-                    // and everything below, so the lane is usable at the
-                    // *next* build; a head above the account's nonce parks
-                    // the lane (`n42_tx_queue::Parked`) so the budget goes
-                    // to lanes that can execute.
-                    //
-                    // Read from *this block's* state, not the parent's, and
-                    // that distinction is the whole correctness of the
-                    // thing. The parallel step drops a sender's whole run
-                    // from wherever it first failed, and the common reason
-                    // is not a hole at all: a batch's view of a sender lacks
-                    // what other groups credit it in the same block, so the
-                    // run stops part-way and the rest is left to the serial
-                    // loop. Those heads sit exactly `k` above the *parent's*
-                    // nonce, where `k` is what this block already executed
-                    // for that sender -- against the parent they look
-                    // gapped, against the block they are the next nonce.
-                    // Reading the parent parked them all: loop209 Pa node3
-                    // parked its whole lane set over two such builds
-                    // (`par_skipped=144000`, then `145936`), its depth stuck
-                    // at 569,520 with `usable=0`, the ingest gate shut on
-                    // the parked depth, and the node proposed empty blocks
-                    // for fifteen seconds until its tenure ended. The graft
-                    // is installed by here, so the builder's own database is
-                    // the block's state.
-                    //
-                    // Only for a build whose own view is sound, and that
-                    // is what `par_txs > 0` says. A build standing on a
-                    // parent the chain has moved past sees *every* lane as
-                    // gapped -- the queue was pruned by blocks that parent
-                    // does not have, so every head is above its state -- and
-                    // it is not the queue that is wrong. loop210 had one or
-                    // two such builds a leg, all of the same shape
-                    // (`par_txs=0 par_groups=384 par_skipped=163000 gas=0`,
-                    // a superseded build at a tenure handover whose payload
-                    // was never proposed), and each parked the node's whole
-                    // sender set: Pb node3 parked 384 lanes holding 631,212
-                    // transactions and the next four blocks carried 8,500 to
-                    // 65,828 instead of 163,000. A build that executed
-                    // nothing has learned nothing about any sender.
-                    //
-                    // And even then only a minority: a hole is a few senders
-                    // among the hundreds a block draws on, so a build
-                    // reporting most of them is describing itself.
-                    const DIAGNOSE_MAX: usize = 1024;
-                    const DIAGNOSE_SHARE: usize = 4;
-                    let db = builder.executor.evm_mut().db_mut();
-                    // ... and never for a height the chain has already
-                    // decided: that build's parent is behind the queue's
-                    // pruning by construction, which is the same thing said
-                    // a second way.
-                    let diagnose = par_txs > 0 && !crate::canonical_head::already_decided(header.number);
-                    for pool_tx in diagnose.then_some(&deferred).into_iter().flatten() {
-                        if skipped_heads.len() >= DIAGNOSE_MAX {
-                            break;
-                        }
-                        let sender = pool_tx.sender();
-                        if skipped_heads.contains_key(&sender) {
-                            continue;
-                        }
-                        // The graft writes the block's accounts into the
-                        // bundle, and into the state's cache only when
-                        // something after it may read them (`keep_cache`
-                        // above) -- which for a block that seals early is
-                        // nothing at all. So the bundle first, and the
-                        // database only for a sender this block has not
-                        // touched.
-                        let grafted = db
-                            .bundle_state
-                            .state
-                            .get(&sender)
-                            .or_else(|| output_shards.as_ref().and_then(|shards| shards.get(&sender)))
-                            .and_then(|account| account.info.as_ref())
-                            .map(|info| info.nonce);
-                        let nonce = match grafted {
-                            Some(nonce) => Some(nonce),
-                            None => db.basic(sender).ok().map(|account| account.map_or(0, |a| a.nonce)),
-                        };
-                        if let Some(nonce) = nonce {
-                            skipped_heads.insert(sender, (pool_tx.nonce(), nonce));
-                        }
-                    }
-                    // What the gap actually is, for the first few senders:
-                    // the nonce the account is at, the lowest the lane
-                    // holds, and how far apart they are. `par_skipped` says
-                    // a build could use nothing; this says why, and it is
-                    // the one thing loop207 through loop213 could not read
-                    // off any line.
-                    if !skipped_heads.is_empty() {
-                        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        if say_once_a_second(&LAST) {
-                            let named: Vec<(alloy_primitives::Address, u64, u64, i64)> = skipped_heads
-                                .iter()
-                                .take(4)
-                                .map(|(sender, (head, state))| {
-                                    (*sender, *head, *state, (*head as i64) - (*state as i64))
-                                })
-                                .collect();
-                            tracing::info!(
-                                target: "payload_builder",
-                                number = header.number,
-                                senders = skipped_heads.len(),
-                                par_groups,
-                                par_skipped,
-                                first = ?named,
-                                "the heads a build could not use: (sender, lane head, account nonce, head - nonce)"
-                            );
-                        }
-                    }
-                    if skipped_heads.len().saturating_mul(DIAGNOSE_SHARE) > par_groups {
-                        // Most of the senders this build was offered: the
-                        // build is the odd one out, not the queue. The
-                        // leftovers go back the way they did before parks
-                        // existed.
-                        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        if say_once_a_second(&LAST) {
-                            warn!(
-                                target: "payload_builder",
-                                number = header.number,
-                                heads = skipped_heads.len(),
-                                par_groups,
-                                par_txs,
-                                par_skipped,
-                                "most of the senders a build was offered looked gapped; reporting none of them"
-                            );
-                        }
-                        skipped_heads.clear();
-                    }
-                }
-                Err(why) => {
-                    // Counted, and said out loud: a leg that reads the phase
-                    // medians of the parallel step has no way of knowing that
-                    // some of its blocks never took it.
-                    static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    tracing::info!(target: "payload_builder", %why, candidates = cands.len(), declined, "parallel build declined; building serially");
-                    for tx in std::mem::take(&mut cands).into_iter().rev() {
-                        lookahead.push_front(tx);
-                    }
-                }
-            }
-        }
-        par_ms = par_at.elapsed().as_millis() as u64;
-        if sealed_ahead.is_some() {
-            par_behind_seal_us = sealed_instant.map_or(0, |at| at.elapsed().as_micros() as u64);
-        }
-        par_end_at = Some(std::time::Instant::now());
-        if sealed_ahead.is_some() && shards_ready_first() {
-            pulled_keep = Some(Box::new((std::mem::take(&mut cands), warm, keys)));
-        }
-    }
     // The step's scope has dropped: the pulled set among it.
-    pulled_drop_us += par_end_at.map_or(0, |at| at.elapsed().as_micros() as u64);
     // `N42_STATE_AFTER_PULL=1`: every way out of the parallel step opened the
     // state already; this is a no-op kept so the serial loop and the finish
     // below never run on a state without its pre-execution changes.
@@ -4416,7 +2775,7 @@ where
                         let Some(EarlySeal { hook, parent_built: _ }) = early else {
                             return Err(PayloadBuilderError::other(std::io::Error::other("no early seal to seal with")));
                         };
-                        seal_block!(hook, seal_at, early_transactions_root)
+                        seal_block!(hook, seal_at, None)
                     }
                 };
             let qmdb_state = qmdb.clone().expect("checked above");
@@ -4444,11 +2803,7 @@ where
             // Receipts built beside the parallel step: the executor committed
             // none, so its finish reports none and no gas.
             let receipts_late_used = receipts_pending.is_some();
-            let direct_receipts_used = direct_receipts.is_some() || receipts_late_used;
-            if let Some((receipts, gas_used)) = direct_receipts {
-                execution_result.receipts = receipts;
-                execution_result.gas_used = gas_used;
-            }
+            let direct_receipts_used = receipts_late_used;
             // `N42_SHARDS_BEFORE_RECEIPTS`: the receipts still being built
             // are joined where they are first read -- beside the QMDB root,
             // after the shards are filed -- on the shard path, and here on any
@@ -4504,7 +2859,7 @@ where
                     give_back_now!();
                 }
                 let join_at = std::time::Instant::now();
-                let (mut frozen, took, ended) = handle.join().map_err(|_| {
+                let (frozen, took, ended) = handle.join().map_err(|_| {
                     PayloadBuilderError::other(std::io::Error::other("the shards' freeze behind the early output panicked"))
                 })?;
                 freeze_join_wait_us += join_at.elapsed().as_micros() as u64;
@@ -4513,7 +2868,6 @@ where
                 shard_append_ms = frozen.append_ms();
                 shard_fold_ms = frozen.fold_ms();
                 freeze_ended_at = Some(ended);
-                frozen.take_out(&early_taken);
                 let frozen = Arc::new(frozen);
                 if root_ops_ahead() {
                     let shards = Arc::clone(&frozen);
@@ -5168,7 +3522,7 @@ where
                 // `N42_PHASE_TIMERS=1`: the layered overlay's blocks skipped on
                 // their address filters and bundles probed since the last line
                 // (the process's, so a follower import in between counts too).
-                let (overlay_filter_skips, overlay_probes) = if crate::fast_transfer::phase_timers() {
+                let (overlay_filter_skips, overlay_probes) = if crate::parallel_common::phase_timers() {
                     reth_provider::providers::overlay_filter::take_counters()
                 } else {
                     (0, 0)
@@ -5193,22 +3547,8 @@ where
                     setup_ms = setup_took.as_millis() as u64,
                     par_ms,
                     par_pull_ms,
-                    par_prep_ms,
-                    par_part_ms,
                     par_exec_ms,
-                    par_collect_ms,
-                    par_commit_ms,
                     direct_receipts = direct_receipts_used,
-                    par_graft_ms,
-                    par_prefault_ms,
-                    par_prefetch_ms,
-                    par_prefetch_wait_ms,
-                    warm_ahead_accounts,
-                    warm_ahead_ms,
-                    warm_ahead_hits,
-                    warm_ahead_ready,
-                    par_mlp_k,
-                    par_mlp_hints,
                     par_fold_ms,
                     tx_root_ms = root_ms,
                     parent_fields_ms = fields_ms,
@@ -5222,13 +3562,10 @@ where
                     // behind it (the fold), us; and of the batches' start,
                     // the hook (state open + pre-execution changes).
                     par_to_seal_us,
-                    par_behind_seal_us,
                     // The parallel step's end to the finish's start and to
                     // the shards' filing, and the steps between them: the
                     // step's scope drop (the pulled set), the give-backs, the
                     // puller's drop.
-                    par_to_finish_us = crate::fields_at_seal::us_between(par_end_at, Some(finish_at)),
-                    par_to_shards_us = crate::fields_at_seal::us_between(par_end_at, shards_ready_at),
                     pulled_drop_us,
                     giveback_us,
                     puller_drop_us,
@@ -5253,7 +3590,6 @@ where
                     evm2_exec_merge_us = evm2_inside.merge_us,
                     evm2_direct_hits = evm2_inside.direct_hits,
                     evm2_direct_delegated = evm2_inside.direct_delegated,
-                    par_hook_us,
                     state_pre_changes_us,
                     sealed_ms,
                     sealed_at_ms,
@@ -5320,25 +3656,9 @@ where
                     // inside `N42Evm::transfer`, which door each account read
                     // took, and the graft's own sub-phases (the default
                     // in-place fold only). Zero when the flag is off.
-                    exec_read_ms = par_transfer_timers.read_ns / 1_000_000,
-                    exec_evm_ms = par_transfer_timers.evm_ns / 1_000_000,
-                    exec_write_ms = par_transfer_timers.write_ns / 1_000_000,
-                    exec_other_ms = par_transfer_timers.other_ns / 1_000_000,
-                    reads_cache = par_transfer_timers.reads_cache(),
-                    reads_provider = par_transfer_timers.reads_provider,
-                    reads_view = par_transfer_timers.reads_view,
                     // `N42_READ_SET=1`: the pass (inside `par_exec_ms`), its
                     // accounts, the batches' reads it answered and those that
                     // fell to the parent's state. Zero when the flag is off.
-                    read_set_ms = par_read_set.wall_us / 1000,
-                    read_set_dedup_us = par_read_set.dedup_us,
-                    read_set_resolve_us = par_read_set.resolve_us,
-                    read_set_accounts = par_read_set.accounts,
-                    read_set_unresolved = par_read_set.unresolved,
-                    read_set_hits = par_read_set_hits,
-                    read_set_misses = par_read_set_misses,
-                    read_set_reads_provider = par_read_set.reads_provider,
-                    read_set_reads_view = par_read_set.reads_view,
                     // Each batch's wall on the pool, start to end (always on).
                     batch_max_ms = par_batch_spans.max_ms,
                     batch_min_ms = par_batch_spans.min_ms,
@@ -5394,24 +3714,6 @@ where
                     build_batches = crate::parallel_transfer::build_batches(),
                     // `N42_PHASE_TIMERS=1`: the batch loop by section, ns of
                     // pool time a transaction (`LoopTimers`); zero when off.
-                    loop_fetch_ns = par_loop_timers.per_tx(par_loop_timers.fetch_ns),
-                    loop_check_ns = par_loop_timers.per_tx(par_loop_timers.check_ns),
-                    loop_transfer_ns = par_loop_timers.per_tx(par_loop_timers.transfer_ns),
-                    loop_receipt_ns = par_loop_timers.per_tx(par_loop_timers.receipt_ns),
-                    loop_sink_ns = par_loop_timers.per_tx(par_loop_timers.sink_ns),
-                    loop_gas_ns = par_loop_timers.per_tx(par_loop_timers.gas_ns),
-                    loop_other_ns = par_loop_timers.per_tx(par_loop_timers.other_ns),
-                    batch_setup_ns = par_loop_timers.per_tx(par_loop_timers.batch_setup_ns),
-                    batch_close_ns = par_loop_timers.per_tx(par_loop_timers.batch_close_ns),
-                    graft_base_ms = par_graft_base_ms,
-                    graft_reserve_ms = par_graft_reserve_ms,
-                    graft_insert_ms = par_graft_insert_ms,
-                    graft_reverts_ms = par_graft_reverts_ms,
-                    graft_other_ms = par_graft_other_ms,
-                    graft_sharded = par_graft_sharded,
-                    graft_split_us = par_graft_split_us,
-                    graft_build_us = par_graft_build_us,
-                    graft_merge_us = par_graft_merge_us,
                     // `N42_OUTPUT_SHARDS` (docs/BREAKTHROUGH_DESIGN.md section
                     // 3): the shard count (0 off, or folded after all), the
                     // batches' pool time splitting their accounts by range
@@ -5489,8 +3791,6 @@ where
                     // the execution was the one sealed, and how long the
                     // step's end waited for it.
                     seal_at_exec = seal_at_exec_used,
-                    tx_root_ahead,
-                    tx_root_wait_ms,
                     give_back_ms,
                     // The seal gap (plan v6): see the declarations of these
                     // timers for how they sum to `sealed_at_ms`.
@@ -5578,20 +3878,11 @@ where
                     start_check_ms,
                     start_puller_ms,
                     start_prepare_ms,
-                    start_other_ms,
-                    pre_exec_ms,
-                    par_run_ms,
-                    par_release_ms,
-                    scope_join_ms,
-                    commit_refs_ms,
-                    commit_cumulative_ms,
-                    commit_fees_ms,
                     commit_body_ms,
                     commit_body_ahead_used,
                     // `N42_SEAL_ON_COUNTERS=1`: sealed on the batches'
                     // counters (no pass over the slots before the seal), and
                     // the batches' end to the seal's start, us.
-                    seal_on_counters = seal_on_counters_used,
                     exec_end_to_seal_us,
                     // `N42_PLAN_AHEAD_BODY=1`: the plan's body (0 none, 1
                     // used, 2 not ready, 3 not this build's) and its making
@@ -5602,11 +3893,7 @@ where
                     plan_body_us = select_times.body_ahead_us,
                     prep_from_plan,
                     exec_prepared_groups,
-                    exec_prepared_slots,
-                    exec_partition_us,
-                    exec_slots_us,
                     whole_take_noted,
-                    match_ms,
                     seal_header_ms,
                     seal_block_ms,
                     seal_remember_ms,
@@ -5620,9 +3907,6 @@ where
                     seal_root_ahead,
                     seal_frames_indexed,
                     seal_frames_hashed,
-                    gap_before_exec_ms,
-                    gap_after_exec_ms,
-                    gap_before_seal_ms,
                     index_ms,
                     // `N42_FREEZE_AFTER_SEAL=1`: the freeze ran on its own
                     // thread beside the commit and the seal (`index_ms` is then
@@ -5637,9 +3921,6 @@ where
                     freeze_join_wait_us,
                     // Where the receipts job spent its time (us) and
                     // whether it ran fused (`N42_RECEIPTS_FUSED`).
-                    scope_receipts_refs_us = scope_receipts_times.refs_us,
-                    scope_receipts_cum_us = scope_receipts_times.cum_us,
-                    scope_receipts_build_us = scope_receipts_times.build_us,
                     receipts_fused = receipts_fused(),
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
                     // opened after the pull, prep and partition, and the time
@@ -5751,7 +4032,7 @@ where
     }
     // Receipts built for an early seal belong to its finish; this block's
     // executor committed none of those transactions, so it must not go on.
-    if direct_receipts.is_some() || receipts_pending.is_some() {
+    if receipts_pending.is_some() {
         return Err(PayloadBuilderError::other(std::io::Error::other(
             "receipts were built for an early seal that did not happen",
         )));
@@ -5874,51 +4155,6 @@ where
                     break;
                 }
                 let prefetch_at = std::time::Instant::now();
-                // The accounts these transactions read, fetched on the worker
-                // pool into the build's read cache: the serial execution then
-                // finds them there. At the bench tier almost every recipient is
-                // a cold miss, and those misses were most of the execution time.
-                // The cache sits inside the EVM's type-erased database on
-                // evm2; the prefetch into it waits for the port.
-                #[cfg(feature = "legacy-revm-paths")]
-                {
-                    use rayon::prelude::*;
-                    let cached: &mut reth_evm::cached::CachedReads = builder.evm_mut().db_mut().database.cached;
-                    let mut wanted: Vec<alloy_primitives::Address> = Vec::with_capacity(lookahead.len() * 2);
-                    for pool_tx in &lookahead {
-                        let sender = pool_tx.sender();
-                        if !cached.accounts.contains_key(&sender) {
-                            wanted.push(sender);
-                        }
-                        if let Some(to) = pool_tx.to()
-                            && !cached.accounts.contains_key(&to) {
-                                wanted.push(to);
-                            }
-                    }
-                    wanted.sort_unstable();
-                    wanted.dedup();
-                    // The build's state provider is not shared across threads;
-                    // each chunk opens its own on the same parent.
-                    let fetched: Vec<(alloy_primitives::Address, Option<Option<evm2::evm::AccountInfo>>)> = wanted
-                        .par_chunks(256)
-                        .flat_map_iter(|chunk| {
-                            let provider = open_parent_state().ok();
-                            chunk.iter().map(move |address| {
-                                let info = provider.as_ref().and_then(|provider| {
-                                    reth_storage_api::AccountReader::basic_account(provider, address).ok().map(|a| a.map(Into::into))
-                                });
-                                (*address, info)
-                            })
-                        })
-                        .collect();
-                    for (address, info) in fetched {
-                        // A read that failed is left for the execution to
-                        // repeat, and report.
-                        if let Some(info) = info {
-                            cached.accounts.entry(address).or_insert(reth_evm::cached::CachedAccount { info, storage: Default::default() });
-                        }
-                    }
-                }
                 prefetch_ns += prefetch_at.elapsed().as_nanos();
             }
             lookahead.pop_front().expect("checked non-empty")
@@ -6478,7 +4714,6 @@ where
             setup_ms = setup_took.as_millis() as u64,
             pool_ms = (pool_ns / 1_000_000) as u64,
             prefetch_ms = (prefetch_ns / 1_000_000) as u64,
-            fast = crate::fast_transfer::hits().saturating_sub(fast_hits_before),
             verified_by_builder = crate::claimed_build::verified().saturating_sub(verified_before),
             builder_dropped_bad_claim = crate::claimed_build::dropped().saturating_sub(dropped_before),
             verify_ms = crate::claimed_build::verify_ms().saturating_sub(verify_ms_before),
@@ -6487,29 +4722,14 @@ where
             par_batches,
             par_skipped,
             par_pull_ms,
-            par_part_ms,
             par_exec_ms,
-            par_graft_ms,
             par_fold_ms,
-            par_committed,
             par_ms,
-            par_commit_ms,
-            par_collect_ms,
-            par_prep_ms,
-            par_prefault_ms,
-            par_root_wait_ms,
-            par_receipts_wait_ms,
-            par_graft_base_ms,
-            par_graft_reserve_ms,
-            par_graft_insert_ms,
-            par_graft_reverts_ms,
-            par_graft_other_ms,
             state_after_pull = defer_state,
             state_wait_ms,
             state_wait_us,
             state_wait_on = state_wait_label(state_wait_us, &state_wait_on),
             state_wait_split = %state_wait_on.split(),
-            refused = ?crate::fast_transfer::rejected(),
             queued,
             usable,
             parked,
@@ -6663,25 +4883,7 @@ impl<EvmConfig> N42PayloadBuilder<EvmConfig> {
 }
 */
 
-/// Whether the builder reads each sender's account before executing, to
-/// skip stale transactions early: `N42_BUILDER_STALE_CHECK=1`; off by
-/// default (see the loop).
-/// `N42_PARALLEL_BUILD`, read once: the block's transfers built in parallel groups.
-/// Whether `N42_BUILD_GRAFT_NO_CACHE=1` is set (see the graft in the parallel step).
-fn build_graft_no_cache() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_BUILD_GRAFT_NO_CACHE").is_ok_and(|v| v == "1"))
-}
 
-/// Whether a block that will seal early builds its receipts beside the parallel step instead of
-/// one executor commit per transfer (`N42_DIRECT_RECEIPTS=0` goes back to the commits). On since
-/// loop170-171: 1,514 early-sealed blocks over eight legs took it with no guard error, no invalid
-/// block and no gas-used mismatch, and the receipts left the leader's serial chain (27-61 ms a
-/// full block before, 11-33 after).
-fn direct_receipts_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| n42_env::flag("N42_DIRECT_RECEIPTS", true))
-}
 
 #[cfg(test)]
 thread_local! {
@@ -6984,196 +5186,11 @@ mod seal_at_exec_tests {
     }
 }
 
-#[cfg(all(test, feature = "legacy-revm-paths"))]
-mod plan_body_tests {
-    //! `N42_PLAN_AHEAD_BODY=1` (`docs/SHARED_EXECUTION_SCOPE.md` 16.4 item 2):
-    //! what the plan-ahead hook makes equals what the build's start, prep and
-    //! gap make from the same candidates.
-    use super::*;
-    use crate::parallel_transfer::{execute_for_build_counted_dispatch, partition_by_sender, BodyAhead, PreparedExec};
-    use alloy_primitives::{Address, Bytes};
-    use n42_tx_types::{AltSigTx, N42TxEnvelope, TxAltSig, ALG_ED25519};
-    use reth_primitives_traits::Recovered;
-    use reth_transaction_pool::{
-        identifier::{SenderId, TransactionId},
-        TransactionOrigin, ValidPoolTransaction,
-    };
-    use revm::database::{CacheDB, EmptyDB};
-    use evm2::evm::AccountInfo;
-
-    type Cand = Arc<ValidPoolTransaction<crate::N42PooledTransaction>>;
-
-    fn address(i: u64) -> Address {
-        let mut a = [0u8; 20];
-        a[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
-        a[12..].copy_from_slice(&i.to_be_bytes());
-        Address::from(a)
-    }
-
-    /// `senders` frames of `run` 0x50 transfers each (one sender a frame,
-    /// nonces from `first`), recipients drawn from `space`, the senders funded
-    /// in `db`.
-    fn frames(senders: u64, run: u64, first: u64, space: u64, db: &mut CacheDB<EmptyDB>) -> Vec<(n42_tx_queue::FrameTxs<crate::N42PooledTransaction>, usize)> {
-        let mut seed = 0x2545_f491_4f6c_dd1du64 ^ first;
-        let mut out = Vec::new();
-        for s in 0..senders {
-            let sender = address(100 + s);
-            db.insert_account_info(sender, AccountInfo { balance: U256::from(10u128.pow(21)), nonce: first, ..Default::default() });
-            let mut pubkey = [0u8; 32];
-            pubkey[..8].copy_from_slice(&s.to_be_bytes());
-            let mut frame: Vec<Cand> = Vec::new();
-            for k in first..first + run {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                let tx = TxAltSig {
-                    chain_id: 1,
-                    nonce: k,
-                    max_priority_fee_per_gas: 1_000_000_000 + u128::from(seed % 1_000),
-                    max_fee_per_gas: 10_000_000_000,
-                    gas_limit: 21_000,
-                    to: address(1_000_000 + seed % space),
-                    value: U256::from(1_000 + k),
-                    input: Bytes::new(),
-                    access_list: Default::default(),
-                    alg_type: ALG_ED25519,
-                    pubkey: Bytes::copy_from_slice(&pubkey),
-                };
-                let mut signature = [0u8; 64];
-                signature[..8].copy_from_slice(&seed.to_be_bytes());
-                let envelope = N42TxEnvelope::AltSig(AltSigTx::new(tx, Bytes::copy_from_slice(&signature)));
-                let encoded = alloy_eips::eip2718::Encodable2718::encode_2718_len(&envelope);
-                let pooled = crate::N42PooledTransaction::new(Recovered::new_unchecked(envelope, sender), encoded);
-                frame.push(Arc::new(ValidPoolTransaction {
-                    transaction: pooled,
-                    transaction_id: TransactionId::new(SenderId::from(s), k),
-                    propagate: false,
-                    timestamp: std::time::Instant::now(),
-                    origin: TransactionOrigin::External,
-                    authority_ids: None,
-                }));
-            }
-            let len = frame.len();
-            // A cut last frame, as a plan's last frame may be.
-            let taken = if s + 1 == senders { len.div_ceil(2) } else { len };
-            out.push((Arc::from(frame), taken));
-        }
-        out
-    }
-
-    /// The body made with the plan equals the body the build's prep makes
-    /// from the same candidates (keys, transactions, senders, hashes), its
-    /// partition is the call's, its slots are empty; and three blocks of
-    /// different shapes executed on the prepared partition and slots equal
-    /// the fresh call: transfers, gas, success, skips, counters and the
-    /// batches' bundles.
-    #[test]
-    fn body_made_with_the_plan_equals_body_made_at_start() {
-        let beneficiary = address(1);
-        crate::frame_blocks::note_beneficiary(beneficiary);
-        let base_fee = 1_000_000_000u64;
-        for (senders, run, first, space) in [(60u64, 20u64, 0u64, 500u64), (200, 3, 4, 50_000), (17, 90, 1, 40)] {
-            let mut db = CacheDB::new(EmptyDB::default());
-            db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
-            let segments = frames(senders, run, first, space, &mut db);
-            // The plan the segments are: each frame's id its root, its
-            // hashes shared, the last one cut.
-            let mut plan = n42_tx_queue::FramePlan::default();
-            for (txs, taken) in &segments {
-                let frame_hashes: Vec<B256> = txs.iter().map(|tx| *tx.hash()).collect();
-                plan.frames.push(n42_tx_queue::PlannedFrame {
-                    id: n42_tx_types::frame_root(&frame_hashes),
-                    len: txs.len(),
-                    taken: *taken,
-                });
-                plan.push_hashes(Arc::from(frame_hashes), *taken);
-            }
-            let made = make_prepared_build(&segments, &plan).expect("every candidate a transfer");
-            // `N42_PLAN_AHEAD_PARTS=1`: the root found with the plan over the
-            // body's hashes is the seal's at the build.
-            let ahead = crate::frame_blocks::root_ahead(&plan, &made.hashes).expect("the body is the plan's");
-            let at_build = crate::frame_blocks::seal_root_timed(Some(&plan), &made.hashes, || B256::ZERO);
-            let carried = crate::frame_blocks::seal_root_carried(&ahead, Some(&plan), &made.hashes).expect("carried");
-            assert_eq!((carried.root, carried.indexed, carried.hashed), (at_build.root, at_build.indexed, at_build.hashed));
-            assert_ne!(at_build.root, B256::ZERO, "a frame root, not the fallback");
-            let cands: Vec<Cand> = segments.iter().flat_map(|(txs, taken)| txs[..*taken].to_vec()).collect();
-            assert_eq!(made.cands.len(), cands.len());
-            assert!(made.cands.iter().zip(&cands).all(|(a, b)| Arc::ptr_eq(a, b)), "the candidates, in plan order");
-            let in_place: Vec<(n42_tx_queue::FrameTxs<_>, usize, usize)> =
-                segments.iter().map(|(txs, taken)| (Arc::clone(txs), 0, *taken)).collect();
-            assert!(made.made_from(&in_place));
-            let mut cut = in_place.clone();
-            cut[0].2 -= 1;
-            assert!(!made.made_from(&cut), "another take is not the plan's");
-            // The prep, as the build runs it.
-            let (keys, fresh) = BodyAhead::make_keyed(&cands, |_, tx| {
-                let consensus = pooled_consensus(tx);
-                (transfer_key(tx), consensus.clone(), tx.sender(), consensus.effective_tip_per_gas(base_fee).unwrap_or_default(), *tx.hash())
-            })
-            .expect("transfers");
-            assert_eq!(made.keys, keys, "keys");
-            assert_eq!(made.transactions, fresh.transactions, "transactions");
-            assert_eq!(made.senders, fresh.senders, "senders");
-            let hashes: Vec<B256> = fresh.transactions.iter().map(|tx| *alloy_consensus::transaction::TxHashRef::tx_hash(tx)).collect();
-            assert_eq!(made.hashes, hashes, "hashes");
-            assert_eq!(fresh.hashes, hashes, "the prep's hashes are the seal's collect");
-            let (noted, groups) = made.groups.clone().expect("a beneficiary was noted");
-            assert_eq!(noted, beneficiary);
-            assert_eq!(groups, partition_by_sender(&keys, beneficiary).expect("a partition"), "partition");
-            assert_eq!(made.slots.len(), cands.len());
-            assert!(made.slots.iter().all(|slot| slot.get().is_none()), "empty slots");
-
-            // Executed on the prepared partition and slots, and fresh.
-            let header = n42_header::N42Header::from(alloy_consensus::Header {
-                number: 20_000_000,
-                beneficiary,
-                gas_limit: 5_000_000_000,
-                base_fee_per_gas: Some(base_fee),
-                timestamp: 1_800_000_000,
-                ..Default::default()
-            });
-            let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(
-                reth_chainspec::MAINNET.clone(),
-                crate::fast_transfer::N42EvmFactory::with_fast_transfers(true),
-            );
-            let evm_env = evm_config.evm_env(&header).expect("env");
-            let convert = |i: usize| ((), evm_config.tx_env(reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction)));
-            let tip_of = |i: usize| pooled_consensus(&cands[i]).effective_tip_per_gas(base_fee).unwrap_or_default();
-            let run_with = |prepared: Option<PreparedExec<()>>| {
-                let run = execute_for_build_counted_dispatch(&evm_env, &keys, &convert, &|| Some(db.clone()), true, false, Some(&tip_of), prepared)
-                    .expect("a block of transfers");
-                let executed: Vec<(usize, u64, bool)> =
-                    run.slots.iter().filter_map(std::sync::OnceLock::get).map(|b| (b.index, b.gas_used, b.result.is_success())).collect();
-                let mut accounts: Vec<(Address, Option<AccountInfo>)> =
-                    run.bundles.iter().flat_map(|b| b.state.iter().map(|(a, acc)| (*a, acc.info.clone()))).collect();
-                accounts.sort_by_key(|(a, _)| *a);
-                (executed, run.skipped, run.counters, accounts, run.phases.prepared_groups, run.phases.prepared_slots)
-            };
-            let fresh_run = run_with(None);
-            let mut made = made;
-            let prepared = PreparedExec { groups: made.groups.take().map(|(_, groups)| groups), slots: Some(std::mem::take(&mut made.slots)) };
-            let planned_run = run_with(Some(prepared));
-            assert!(planned_run.4 && planned_run.5, "the prepared partition and slots were taken");
-            assert!(!fresh_run.4 && !fresh_run.5);
-            assert_eq!(fresh_run.0.len(), cands.len(), "every transfer ran");
-            assert_eq!(fresh_run.0, planned_run.0, "executed transfers");
-            assert_eq!(fresh_run.1, planned_run.1, "skipped");
-            assert_eq!(fresh_run.2, planned_run.2, "counters");
-            assert_eq!(fresh_run.3, planned_run.3, "the batches' accounts");
-            // A partition or slots of another size are not taken.
-            let wrong = PreparedExec { groups: Some(vec![vec![0]]), slots: Some(crate::parallel_transfer::empty_slots(crate::parallel_transfer::build_pool(), 3)) };
-            let fallback = run_with(Some(wrong));
-            assert!(!fallback.4 && !fallback.5);
-            assert_eq!(fallback.0, fresh_run.0);
-        }
-    }
-}
 
 #[cfg(test)]
 mod depth_two_tests {
     use super::*;
     use reth_primitives_traits::SealedHeader;
-    use n42_header::N42Header as Header;
 
     /// T9 of docs/DEFERRED_DEPTH_2_DESIGN.md: the limit step never goes below
     /// the carried `gasUsed`, and never further than the parent allows.
@@ -7268,7 +5285,6 @@ mod depth_two_tests {
 #[cfg(test)]
 mod hand_out_early_tests {
     use super::{hand_out_early, EthBuiltPayload};
-    use n42_header::N42Header as Header;
     use alloy_primitives::{Address, U256};
     use reth_primitives_traits::{RecoveredBlock, SealedBlock};
     use std::sync::Arc;
@@ -7315,7 +5331,6 @@ mod hand_out_early_tests {
 mod includability_tests {
     use super::*;
     use alloy_consensus::{Signed, TxEip1559};
-    use n42_header::N42Header as Header;
     use alloy_primitives::{Address, Bytes, Signature, TxKind};
     use reth_basic_payload_builder::PayloadConfig;
     use reth_chainspec::{ChainSpec, ChainSpecBuilder};
@@ -7579,7 +5594,6 @@ mod includability_tests {
 
     /// [`build`] with `N42_PARALLEL_BUILD` as `parallel` on this thread, the
     /// fold made to refuse once when `refuse_fold`.
-    #[cfg(not(feature = "legacy-revm-paths"))]
     fn build_with(parallel: bool, refuse_fold: bool, deferred: bool, accounts: &[(Address, u64, U256)], txs: &[Candidate]) -> RecoveredBlock<n42_tx_types::Block> {
         PARALLEL_BUILD_FOR_TEST.with(|on| on.set(Some(parallel)));
         crate::graft_fold::REFUSE_NEXT_FOLD.with(|next| next.set(refuse_fold));
@@ -7593,7 +5607,6 @@ mod includability_tests {
     /// parallel step's block (F5c) is the serial build's, header and all;
     /// and when the fold refuses at `finish` the build rebuilds the block
     /// serially in the same build, which is again the same block.
-    #[cfg(not(feature = "legacy-revm-paths"))]
     #[test]
     fn the_parallel_build_and_its_serial_rebuild_give_the_serial_block() {
         // Not sender 7: the attributes' fee recipient.
@@ -7617,7 +5630,6 @@ mod includability_tests {
     /// evm2): the block the parallel builder (F5c) seals, imported by the
     /// parallel follower (F5d), gives the stock serial import's receipts,
     /// gas, bundle and QMDB root, and the gas its header carries.
-    #[cfg(not(feature = "legacy-revm-paths"))]
     #[test]
     fn a_parallel_built_block_imports_in_parallel_as_it_imports_serially() {
         use reth_evm::execute::Executor as _;
@@ -7667,7 +5679,6 @@ mod includability_tests {
 
     /// Under deferred execution the parallel step keeps each sender's
     /// summed worst case within its balance, as the serial loop does.
-    #[cfg(not(feature = "legacy-revm-paths"))]
     #[test]
     fn a_deferred_parallel_build_keeps_each_senders_worst_case_within_its_balance() {
         let (accounts, txs) = balance_case();
@@ -7704,7 +5715,7 @@ mod prepared_take_tests {
 
 /// The evm2 plan-ahead body's cost (F5g6): what `make_prepared_build` takes
 /// off the build, and what the build does inline without it.
-#[cfg(all(test, not(feature = "legacy-revm-paths")))]
+#[cfg(test)]
 mod plan_body_evm2_tests {
     use super::*;
     use alloy_primitives::{Address, Bytes};

@@ -119,10 +119,6 @@ default = ["jemalloc", "asm-keccak", "reth-evm/portable"]
 
 dev = ["reth-ethereum-cli/dev"]
 
-# The revm-era fast transfer / parallel builder / follower graft paths, not yet
-# ported to evm2 (n42-engine-types `legacy-revm-paths`; docs/RETH_2_9_0_UPGRADE.md).
-legacy-revm-paths = ["n42-engine-types/legacy-revm-paths"]
-
 asm-keccak = [
     "reth-node-core/asm-keccak",
     # (was reth-primitives/asm-keccak; reth-ethereum-primitives has no such

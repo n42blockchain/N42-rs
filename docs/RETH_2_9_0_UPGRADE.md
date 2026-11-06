@@ -1381,6 +1381,133 @@ each value exactly once.
 
 E15 is to read par_exec against the control's 28, with the batch fields to name any rest.
 
+#### E15, after g9
+
+The fx pairs E15 (natives 45dc7d5c7 against main, two pairs,
+`wt-main/target/fleet-runs/strip-loop351D2S12P30T64X11T16E15{a,0,b,0b}MEMF/el.log`):
+- **Throughput.** The branch read 4,584,300 / 4,633,333 TPS against the control's 4,986,667 /
+  4,646,667: about -6%, systematic.
+- **Where it is.** On E15a against its control: par_exec 35 vs 27, sealed_at 41 vs 37, and
+  batch_cpu_sum 961k vs 738k with wall about equal to CPU. The batches cost 30% more CPU per
+  block.
+- **Inside the batches** (`evm2_batch_*`): reads 441k, transact 665k with the reads in it, so
+  about 224 ms of transact proper (1.1 us a transfer), commit 92k, shard add 42k. The pool had
+  32 threads on CPUs 0-63.
+- **What is left is evm2's per-transaction machinery.** The registry dispatch, the stock prepare,
+  the journal, the pending state and its change stream, and the batch's commit of that stream
+  cost more than the revm-era fast transfer the control runs.
+
+#### g10, the direct transfer path (F5g10)
+
+**What it does** (`crates/n42/engine-types/src/direct_transfer.rs`):
+- A batch applies each plain transfer straight to its own accounts:
+  - the sender is debited the value plus 21,000 x the settled price, and its nonce is bumped;
+  - the recipient is credited the value;
+  - the beneficiary is credited 21,000 x the tip.
+- The three accounts go into the batch state through `BatchState::commit_info`, the same rule
+  `commit_account` applies (now shared). The result is evm2's for a transfer: success, 21,000
+  spent, no refund, the floor, a stop.
+- Reads go through `Layered`: the accounts the batch has read or written, over the parent.
+
+**What qualifies.** The fast handler's predicate plus every check the stock `prepare` makes:
+- a call with no input and no access list;
+- sender, recipient and beneficiary are three different accounts;
+- the recipient is above 0x1ff (every Prague and Osaka precompile is at or below it) and has no
+  code (an EIP-7702 delegation counts as code);
+- the chain id matches (a legacy transaction without one is handed on);
+- the priority fee is no more than the fee cap, and the settled price is at least the base fee;
+- the gas limit is between 21,000 and the block's limit and the transaction cap;
+- the sender exists, has no code, has the transaction's nonce (below u64::MAX), and holds the
+  gas limit x the fee cap plus the value;
+- a zero value goes only to an existing account that is not empty, and a zero tip only to such a
+  beneficiary (anything else is an EIP-161 touch).
+
+**Where it applies.** `DirectTransfers::new` returns `None` (with a debug reason, `refusal`)
+unless:
+- the spec is one `fast_handler::covers`: Prague or Osaka, never Amsterdam;
+- the environment has every stock check on;
+- EIP-2780 and EIP-8037 are off;
+- a transfer's intrinsic gas is 21,000.
+
+**When a transaction does not qualify**, nothing has been written. The batch makes its EVM at that
+point, over the same `Layered` accounts, so the EVM sees every transfer applied before it. That
+transaction and the rest of the batch run on evm2 (with the fast handler, as before). The
+deferred-execution ledger admits a direct transfer with the sender's balance before it, as it does
+on the evm2 path.
+
+**Wiring.**
+- `execute_batches` and `execute_batches_into` take `Option<&DirectTransfers>`. The builder
+  (`payload.rs`) and the follower import pass `DirectTransfers::for_env(env, shape_of)`.
+- `N42_BATCH_DIRECT_TRANSFER=0` turns the path off; the batches then run as in g9.
+- Counters:
+  - `direct_hits_total` and `direct_delegated_total` on the "parallel step" and "parallel import"
+    lines;
+  - the block's `evm2_direct_hits` and `evm2_direct_delegated` on the phases line.
+
+**Equivalence tests** (`parallel_build.rs`; the batches with the path against the batches on evm2
+alone, on Prague and on Osaka):
+- **What is compared:** the same refusal or the same skipped set; the same results (Debug of the
+  whole result); and, after `commit_run` and the block's end, the same receipts, gas, post-state,
+  reverts and contracts.
+- **The fast handler's 7 taken cases**, all applied directly:
+  - 1559 to an existing account, and creating its recipient;
+  - 1559 over the intrinsic gas;
+  - legacy;
+  - 2930 with an empty access list;
+  - 0x50 as 1559;
+  - zero value to an existing account.
+
+  Plus a zero tip to an existing beneficiary.
+- **The handler's 10 handed-on cases**, all handed on with equal outcomes. Plus an unprotected
+  legacy transaction, a fee cap under the base fee, a priority fee over the cap, and a sender with
+  a delegation.
+- **Sender runs:**
+  - a run of six;
+  - a nonce gap (2 applied, the rest skipped on both paths);
+  - the balance running out mid-run (2 applied);
+  - recipients that send later;
+  - a self-transfer mid-run (the EVM made over the written accounts, the rest of the batch on it);
+  - an unprotected legacy transaction mid-run, then zero to an empty account;
+  - to a delegated account;
+  - to a precompile after a transfer;
+  - a created account spending.
+
+**Bench** (`evm2_step_bound`, release, 32 threads, `N42_BUILD_BATCHES=128`, five rounds;
+`f5g10-bench-d1.log` and `f5g10-bench-d0.log`). The shard path, 200,000 transfers, summed over
+the batches:
+
+| | evm2 + handler (g9) | direct path |
+| --- | --- | --- |
+| batch CPU | 384-394k us | 138-144k us (-64%) |
+| transact | 299-312k us | 104-114k us |
+| reads (part of transact) | 30-45k us | 31-38k us |
+| commit | 42-58k us | 0 (inside transact) |
+| transact proper + commit | ~320k us (1.6 us a transfer) | ~75k us (0.37 us a transfer) |
+| shard-path execution | 14.4-14.8 ms | 6.3 ms |
+| step execution (`exec_ms`) | 89.5 ms | 80.9 ms |
+
+All 200,000 executed on both paths, and the shard path's bundle under the residual equals the
+fold path's, as before. On the bench, what the path leaves is mostly the parent reads (about a
+third) and the three account-map writes.
+
+**Devnet** (`f5d-gate.sh` `ONLY=g10`, natives c8b70f45d, 300 s each, the F5c builder knobs and the
+follower import, member 3 on its own execution layer, two `send_tx` senders):
+- **f5g10-direct (path on).**
+  - Blocks 1..100 hash-equal on both execution layers, with 1,002 transactions in 78 blocks.
+  - 170/170 parallel imports on main and 64/64 on the late execution layer; 0 refused, 0 fold
+    refusals, ERROR=0.
+  - Every batch transaction went through the path and nothing was handed on: main
+    `direct_hits_total=3006 direct_delegated_total=0`, late 1002/0, `fast_hits_total=0`.
+- **f5g10-evm2 (`N42_BATCH_DIRECT_TRANSFER=0`).**
+  - Blocks 1..100 hash-equal, with 1,002 transactions in 75 blocks.
+  - 161/161 and 64/64 parallel imports, ERROR=0.
+  - `fast_hits_total=3006` / 1002 and `direct_hits_total=0`.
+- **Warnings.** In both rounds the WARNs are only the engine loop's idle notes (`idle_before_ms`
+  3000-6000).
+
+E16 is to read par_exec and batch_cpu_sum against the control's 27 and 738k, with
+`evm2_batch_transact_us` and `evm2_direct_hits` on the phases line.
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

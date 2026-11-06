@@ -12,7 +12,8 @@
 
 use alloy_primitives::{FixedBytes, B256};
 use blst::min_pk::{AggregateSignature, PublicKey, SecretKey, Signature};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use n42_primitives::{beacon::AttestationData, shuffle_list::shuffle_list, Validator};
 use std::collections::BTreeSet;
 

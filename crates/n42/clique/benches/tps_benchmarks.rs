@@ -46,7 +46,8 @@
 //! | EVM Execution | 20-50 | CPU | Already fast |
 //! | State Commit | 50-500 | IO/CPU | Lazy root, batch |
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use alloy_primitives::{Address, B256, U256};
 use n42_clique::{DIFF_IN_TURN, DIFF_NO_TURN};

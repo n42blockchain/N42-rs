@@ -116,7 +116,17 @@ impl BatchState {
         {
             return Err(Unsupported(address));
         }
-        let original = changes.original.map(without_code);
+        self.commit_info(address, changes.original, current);
+        Ok(())
+    }
+
+    /// Folds one account's change from `original` (its info at the
+    /// transaction's start, `None` for an account that did not exist) to
+    /// `current` into the batch, by the rule [`Self::commit_account`]
+    /// applies: the direct transfer path's commit (F5g10), which makes only
+    /// changes that rule accepts.
+    pub fn commit_info(&mut self, address: Address, original: Option<&AccountInfo>, current: &AccountInfo) {
+        let original = original.map(without_code);
         let current = without_code(current);
         let had_no_nonce_and_code = original.as_ref().is_none_or(|i| i.nonce == 0 && i.is_empty_code_hash());
         match self.transitions.entry(address) {
@@ -137,7 +147,6 @@ impl BatchState {
                 account.info = Some(current);
             }
         }
-        Ok(())
     }
 
     /// The batch's changes against the parent with their reverts: the bundle

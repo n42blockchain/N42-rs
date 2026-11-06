@@ -1,4 +1,4 @@
---- upstream-f93318f/src/tracing/debug.rs
+--- upstream-592bf18/src/tracing/debug.rs
 +++ n42/src/tracing/debug.rs
 @@ -7,9 +7,9 @@
  use alloy_primitives::{Address, Log, U256};

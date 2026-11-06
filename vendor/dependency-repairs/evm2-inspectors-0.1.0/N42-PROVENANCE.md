@@ -1,7 +1,7 @@
 # evm2 inspectors prestate compatibility repair
 
-Base: evm2 git revision f93318f120f6300599b21170d6c7bef81ed63d87
-(https://github.com/alloy-rs/evm2, the revision reth v2.9.0 pins),
+Base: evm2 git revision 592bf18c4e22fff54ac9b4db606c4ee276e345cb
+(https://github.com/alloy-rs/evm2, the revision reth v2.10.0 pins),
 `crates/inspectors`, package evm2-inspectors 0.1.0. Upstream licenses retained.
 `Cargo.toml` is flattened from the workspace manifest (`Cargo.toml.orig` is
 the member manifest as published); tests and dev-dependencies are dropped.

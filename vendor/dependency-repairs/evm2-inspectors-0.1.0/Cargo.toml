@@ -1,4 +1,4 @@
-# Flattened from evm2 f93318f120f6300599b21170d6c7bef81ed63d87 crates/inspectors/Cargo.toml
+# Flattened from evm2 592bf18c4e22fff54ac9b4db606c4ee276e345cb crates/inspectors/Cargo.toml
 # (workspace inheritance resolved from that revision's root Cargo.toml; dev-dependencies,
 # tests and lints dropped). See N42-PROVENANCE.md.
 [package]
@@ -21,7 +21,7 @@ alloy-rpc-types-trace = { version = "2.0.4", default-features = false }
 alloy-sol-types = { version = "1.5.7", default-features = false }
 alloy-primitives = { version = "1.5.7", default-features = false, features = ["map"] }
 # The same evm2 the rest of the graph resolves (not patched).
-evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "f93318f120f6300599b21170d6c7bef81ed63d87", default-features = false }
+evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "592bf18c4e22fff54ac9b4db606c4ee276e345cb", default-features = false }
 
 anstyle = { version = "1.0", default-features = false, optional = true }
 colorchoice = { version = "1.0", default-features = false }

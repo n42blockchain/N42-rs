@@ -5,7 +5,7 @@ use alloy_primitives::{B256, U256};
 use n42_primitives::{AttestationData, CommitteeIndex};
 // reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
 type SealedBlock<B = n42_tx_types::Block> = reth_primitives_traits::SealedBlock<B>;
-use reth_revm::cached::CachedReads;
+use reth_evm::cached::CachedReads;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Deserialize, Serialize, Debug)]
@@ -27,6 +27,7 @@ pub struct UnverifiedBlock {
     /// The sealed block to verify.
     pub blockbody: SealedBlock,
     /// Cached reads of the block's execution, so a verifier can re-execute it cheaply.
+    #[serde(with = "crate::cached_reads_serde")]
     pub db: CachedReads,
     /// Total difficulty of the chain at this block.
     pub td: U256,

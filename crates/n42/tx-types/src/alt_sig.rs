@@ -239,6 +239,11 @@ impl AltSigTx {
         &self.tx
     }
 
+    /// The unsigned fields, by value.
+    pub fn into_tx(self) -> TxAltSig {
+        self.tx
+    }
+
     /// The signature bytes.
     pub const fn signature(&self) -> &Bytes {
         &self.signature

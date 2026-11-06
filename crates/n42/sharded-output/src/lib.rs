@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use alloy_primitives::Address;
-use revm_database::{BundleAccount, BundleState};
+use reth_trie_common::bundle_state::{BundleAccount, BundleState};
 
 /// A block's frozen output shards, as the registry reads them: the accounts
 /// the batches wrote, before the residual is laid over them.
@@ -191,7 +191,7 @@ pub fn refused() -> Option<&'static str> {
 mod tests {
     use super::*;
     use alloy_primitives::map::AddressHashMap;
-    use revm_database::AccountStatus;
+    use reth_trie_common::bundle_state::AccountStatus;
 
     #[derive(Default)]
     struct Map(AddressHashMap<BundleAccount>);
@@ -212,7 +212,7 @@ mod tests {
 
     fn account(nonce: u64) -> BundleAccount {
         BundleAccount {
-            info: Some(revm_database::state::AccountInfo { nonce, ..Default::default() }),
+            info: Some(evm2::evm::AccountInfo { nonce, ..Default::default() }),
             original_info: None,
             storage: Default::default(),
             status: AccountStatus::Changed,

@@ -29,7 +29,6 @@ n42-tx-queue.workspace = true
 n42-tx-types.workspace = true
 n42-header = { workspace = true, features = ["chainspec", "engine"] }
 n42-core-layout.workspace = true
-alloy-evm.workspace = true
 reth-rpc-convert.workspace = true
 reth-storage-errors.workspace = true
 rayon.workspace = true
@@ -55,7 +54,6 @@ reth-rpc-eth-types.workspace = true
 reth-transaction-pool.workspace = true
 reth-consensus.workspace = true
 #reth-auto-seal-consensus.workspace = true
-reth-revm.workspace = true
 reth-tasks.workspace = true
 reth-primitives-traits.workspace = true
 reth-storage-api.workspace = true
@@ -89,9 +87,11 @@ tracing = "0.1.41"
 # ethereum
 alloy-rlp.workspace = true
 alloy-primitives.workspace = true
+# The block access list types in the N42 block executor's trait methods.
+alloy-eip7928.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
-revm.workspace = true
+evm2 = { workspace = true, features = ["std"] }
 
 # metrics
 reth-metrics.workspace = true
@@ -99,14 +99,15 @@ metrics.workspace = true
 
 
 
+[features]
+default = []
+
 [dev-dependencies]
-# `output_shards_bench` runs on the allocator the node runs on (`MALLOC_CONF` read).
-tikv-jemallocator = { workspace = true, features = ["unprefixed_malloc_on_supported_platforms"] }
-libc.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
-alloy-eip7928.workspace = true
 # `claimed_build`'s tests sign the transactions they check the claim of.
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
 secp256k1.workspace = true
-# `bench_build_prefetch` serves its state from a QMDB read view over an entry file it writes.
+# `fields_at_seal`'s tests read QMDB operations.
 n42-twig-core.workspace = true
+# `parallel_build`'s import tests compare QMDB roots.
+n42-qmdb-state.workspace = true

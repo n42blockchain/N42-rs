@@ -36,8 +36,7 @@ bytes.workspace = true
 thiserror.workspace = true
 # The EVM environment and RPC request conversions for the envelope; both are
 # foreign traits, so they can only be implemented here, where the type lives.
-alloy-evm.workspace = true
-revm.workspace = true
+evm2 = { workspace = true, features = ["std"] }
 alloy-rpc-types-eth = { workspace = true, features = ["std", "serde"] }
 alloy-network.workspace = true
 reth-rpc-traits = "0.8.1"

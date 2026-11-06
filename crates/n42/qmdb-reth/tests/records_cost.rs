@@ -20,8 +20,8 @@
 use alloy_primitives::{Address, B256, U256};
 use n42_qmdb_reth::{changes_from_bundle, sorted_operations_from_execution};
 use n42_qmdb_state::QmdbForest;
-use revm_database::{AccountStatus, BundleAccount, BundleState};
-use revm_state::AccountInfo;
+use reth_trie::bundle_state::{AccountStatus, BundleAccount, BundleState};
+use evm2::evm::AccountInfo;
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

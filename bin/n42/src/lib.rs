@@ -145,9 +145,9 @@ pub mod consensus_common {
     pub use reth_consensus_common::*;
 }
 
-/// Re-exported from `reth_revm`.
+/// Re-exported from `reth_evm`.
 pub mod revm {
-    pub use reth_revm::*;
+    pub use reth_evm::*;
 }
 
 /// Re-exported from `reth_tasks`.
@@ -203,9 +203,9 @@ pub mod rpc {
         pub use reth_rpc_server_types::result::*;
     }
 
-    /// Re-exported from `reth_rpc_types_compat`.
+    /// Re-exported from `reth_rpc_convert`.
     pub mod compat {
-        pub use reth_rpc_types_compat::*;
+        pub use reth_rpc_convert::*;
     }
 }
 

@@ -1171,9 +1171,24 @@ impl QmdbForest {
     /// canonical path and held the forest 555 ms). Validation is not checked
     /// here: an imported side block takes the ordinary move.
     pub fn check_build_parent(&self, parent: &B256) -> Result<(), StateError> {
+        self.check_build_parent_above(parent, None)
+    }
+
+    /// [`Self::check_build_parent`] with the committed block's number, when
+    /// the caller knows it: a parent at or above it is not stale, though the
+    /// canonical head is past it. Under HotStuff-2 the head can run ahead of
+    /// consensus onto a block that is never certified (a build ahead on the
+    /// block a node just voted for makes it canonical), and after the view's
+    /// timeout the next leader builds on its high-QC block, an ancestor of
+    /// that head: refusing it cost an 8-view tenure (F5g5, devnet f5g4-x22).
+    /// A request below the committed block is still refused (loop351 X9j).
+    pub fn check_build_parent_above(&self, parent: &B256, committed: Option<u64>) -> Result<(), StateError> {
         let (head_number, head_hash) = self.head;
         let Some(record) = self.records.get(parent) else { return Ok(()) };
         if *parent == head_hash || record.number >= head_number {
+            return Ok(());
+        }
+        if committed.is_some_and(|committed| record.number >= committed) {
             return Ok(());
         }
         if !self.ancestry(head_hash).contains(parent) {
@@ -2648,6 +2663,26 @@ mod tests {
         assert!(forest.check_build_parent(&h(2)).is_ok(), "the head");
         assert!(forest.check_build_parent(&h(3)).is_ok(), "above the head");
         assert!(forest.check_build_parent(&h(7)).is_ok(), "unknown: compute reports it");
+    }
+
+    /// With the committed block known, an ancestor of the canonical head at
+    /// or above it builds (the high-QC block after a timed-out view whose
+    /// block the head already moved onto); one below it is still refused.
+    #[test]
+    fn a_build_at_the_committed_block_below_the_head_is_not_refused() {
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+        forest.apply(GENESIS, h(1), 1, &changes(1)).unwrap();
+        forest.apply(h(1), h(2), 2, &changes(2)).unwrap();
+        forest.apply(h(2), h(3), 3, &changes(3)).unwrap();
+        forest.set_canonical(h(3)).unwrap();
+        assert!(forest.check_build_parent(&h(2)).is_err(), "no committed block known: as before");
+        assert!(forest.check_build_parent_above(&h(2), Some(2)).is_ok(), "the committed block");
+        assert!(forest.check_build_parent_above(&h(2), Some(1)).is_ok(), "above the committed block");
+        assert!(matches!(
+            forest.check_build_parent_above(&h(1), Some(2)),
+            Err(StateError::StaleBuildParent { parent_number: 1, head_number: 3, .. })
+        ), "below the committed block");
+        assert!(forest.check_build_parent_above(&h(1), None).is_err());
     }
 
     /// A reader's keep holds the records from its block up past the retention

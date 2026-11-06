@@ -35,7 +35,6 @@ reth-node-api.workspace = true
 reth-basic-payload-builder.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
-reth-revm.workspace = true
 reth-stages.workspace = true
 reth-transaction-pool.workspace = true
 reth-trie.workspace = true
@@ -86,7 +85,7 @@ reth-cli-commands.workspace = true
 tempfile.workspace = true
 
 [features]
-default = ["jemalloc", "reth-revm/portable"]
+default = ["jemalloc", "reth-evm/portable"]
 
 account-ext = ["reth-node-ethereum/account-ext"]
 otlp = ["reth-tracing/otlp", "reth-node-core/otlp"]

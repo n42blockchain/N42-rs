@@ -13,9 +13,9 @@ use super::parent_output_tests::publishing;
 use super::*;
 use alloy_primitives::U256;
 use reth_provider::test_utils::MockEthProvider;
-use reth_revm::db::BundleState;
-use reth_revm::primitives::hardfork::SpecId;
-use reth_revm::state::AccountInfo;
+use reth_trie::bundle_state::BundleState;
+use evm2::SpecId;
+use evm2::evm::AccountInfo;
 
 fn info(nonce: u64, balance: u64) -> AccountInfo {
     AccountInfo { nonce, balance: U256::from(balance), ..Default::default() }
@@ -372,50 +372,6 @@ fn a_late_block_that_is_ready_is_handed_out_without_a_wait() {
     let late = LateBlock::ready(Arc::new(recovered(1)));
     assert_eq!(late.get().expect("ready").number, 1);
     assert_eq!(late.times(), (0, 0));
-}
-
-#[test]
-fn a_late_block_waits_for_its_maker_and_remembers_the_copy_cost() {
-    let (made_tx, made_rx) = std::sync::mpsc::channel();
-    let late = LateBlock::waiting(made_rx);
-    made_tx.send(Ok((recovered(9), 1_234))).unwrap();
-    assert_eq!(late.get().expect("made").number, 9);
-    assert_eq!(late.times().0, 1_234);
-    // A second reader gets the same block, and the cost is not re-measured.
-    assert_eq!(late.get().expect("cached").number, 9);
-    assert_eq!(late.times().0, 1_234);
-}
-
-#[test]
-fn a_late_block_whose_maker_failed_or_vanished_says_so_every_time() {
-    let (made_tx, made_rx) = std::sync::mpsc::channel();
-    let late = LateBlock::waiting(made_rx);
-    made_tx.send(Err("copy refused".to_owned())).unwrap();
-    assert_eq!(late.get().unwrap_err(), "copy refused");
-    assert_eq!(late.get().unwrap_err(), "copy refused", "the failure is cached");
-
-    let (gone_tx, gone_rx) = std::sync::mpsc::channel::<MadeAside>();
-    let late = LateBlock::waiting(gone_rx);
-    drop(gone_tx);
-    assert_eq!(late.get().unwrap_err(), "the owned block's maker went away");
-}
-
-#[test]
-fn the_exec_split_takes_the_phases_the_executor_reports() {
-    let phases = n42_engine_types::parallel_transfer::Phases {
-        partition_ms: 1,
-        groups_ms: 2,
-        merge_ms: 3,
-        batches: 4,
-        threads: 5,
-        ..Default::default()
-    };
-    let split = ExecSplit::of(&phases);
-    assert_eq!(
-        (split.part_ms, split.batches_ms, split.graft_ms, split.batches, split.threads),
-        (1, 2, 3, 4, 5)
-    );
-    assert_eq!((split.batch_max_ms, split.batch_median_ms), (0, 0));
 }
 
 // --- the intrinsic-gas spec ------------------------------------------------------

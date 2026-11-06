@@ -24,7 +24,7 @@ reth-network = { workspace = true, features = ["serde"] }
 reth-network-p2p.workspace = true
 reth-rpc-eth-types.workspace = true
 reth-rpc-server-types.workspace = true
-reth-rpc-types-compat.workspace = true
+reth-rpc-convert.workspace = true
 reth-transaction-pool.workspace = true
 reth-tasks.workspace = true
 reth-tracing = { workspace = true, features = ["std"] }
@@ -80,9 +80,11 @@ tokio.workspace = true
 serde_json.workspace = true
 
 [features]
-# Features for vergen to generate correct env vars
+# Features for smolgen to generate correct env vars
 jemalloc = ["reth-cli-util/jemalloc"]
-asm-keccak = ["alloy-primitives/asm-keccak"]
+asm-keccak = [
+    "alloy-primitives/asm-keccak",
+]
 keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
 otlp = ["reth-tracing/otlp", "reth-tracing-otlp/otlp"]
 otlp-logs = ["reth-tracing/otlp-logs", "reth-tracing-otlp/otlp-logs"]
@@ -98,5 +100,4 @@ min-trace-logs = ["tracing/release_max_level_trace"]
 trie-debug = ["reth-engine-primitives/trie-debug"]
 
 [build-dependencies]
-vergen = { workspace = true, features = ["build", "cargo", "emit_and_set"] }
-vergen-git2.workspace = true
+smolgen = { workspace = true, features = ["build", "cargo", "emit_and_set", "gitcl"] }

@@ -347,14 +347,14 @@ impl<Provider: DBProvider + StorageSettingsCache> StateProofProvider
 /// large: a keccak per account and per slot, serial in reth, was 72 ms of a
 /// 147,000-account block on both the builder's `finish` and the follower's
 /// import (N42, round 43); chunked it is 28-40 ms. Small bundles stay serial.
-pub fn hashed_post_state_from_bundle(bundle_state: &revm::database::BundleState) -> HashedPostState {
+pub fn hashed_post_state_from_bundle(bundle_state: &reth_trie::bundle_state::BundleState) -> HashedPostState {
     const PARALLEL_FROM: usize = 8192;
     let state = bundle_state.state();
     if state.len() < PARALLEL_FROM {
         return HashedPostState::from_bundle_state::<KeccakKeyHasher>(state);
     }
     use rayon::prelude::*;
-    let entries: Vec<(&Address, &revm::database::BundleAccount)> = state.iter().collect();
+    let entries: Vec<(&Address, &reth_trie::bundle_state::BundleAccount)> = state.iter().collect();
     // Hashed in chunks on the worker pool, then folded once into a map sized
     // for all of it: a rayon `reduce` merged the chunk maps pairwise, moving
     // every entry through log2(chunks) maps (round 43: 147,000 accounts were
@@ -373,7 +373,7 @@ pub fn hashed_post_state_from_bundle(bundle_state: &revm::database::BundleState)
 impl<Provider: DBProvider> HashedPostStateProvider for LatestStateProviderRef<'_, Provider> {
     fn hashed_post_state(
         &self,
-        bundle_state: &revm::database::BundleState,
+        bundle_state: &reth_trie::bundle_state::BundleState,
     ) -> ProviderResult<HashedPostState> {
         let mut hashed_state = hashed_post_state_from_bundle(bundle_state);
         zero_destroyed_account_storage(

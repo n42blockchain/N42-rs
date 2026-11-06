@@ -315,7 +315,8 @@ mod tests {
     use crate::output_shards::{FrozenShards, OutputShards};
     use alloy_primitives::{Address, U256};
     use n42_qmdb_reth::QmdbNodeState;
-    use revm::{database::BundleState, state::AccountInfo};
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::BundleState;
     use std::sync::Arc;
 
     fn addr(i: u8) -> Address {

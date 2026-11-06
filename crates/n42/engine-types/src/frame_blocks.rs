@@ -123,13 +123,6 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
             // those go through the check's wrapper one batch at a time.
             let at = std::time::Instant::now();
             let segments = best.take_frame_segments();
-            // `N42_PLAN_AHEAD_WARM`: the identity of the take (its frames,
-            // each from its start), which names the plan's warm read whether
-            // or not the plan's body was ready.
-            if crate::warm_ahead::threads() > 0 {
-                let ident = crate::warm_ahead::segments_ident(segments.iter().map(|(txs, from, to)| (txs, *from, *to)));
-                WARM_IDENT.with(|slot| slot.set(ident));
-            }
             // `N42_PLAN_AHEAD_BODY=1`: a plan used whole carries the body
             // made with it; its candidates are these segments' transactions,
             // already cloned, when the segments are the ones it was made from.
@@ -270,7 +263,22 @@ pub fn plan_ahead_body() -> bool {
 /// Whether the build asks for the plan's prepared body: the switch and every
 /// switch it stands on.
 pub fn plan_ahead_body_wanted() -> bool {
-    plan_ahead_body() && n42_tx_queue::plan_ahead() && pull_by_frames() && crate::payload::seal_on_counters()
+    // The revm-era step reads the prepared body only on its counted seal
+    // (`N42_SEAL_ON_COUNTERS`); the evm2 step takes it for its keys and
+    // partition and lays its seal over it (F5g items 4 and 7), with no
+    // counters to stand on. This gate used to be revm-only, so the evm2
+    // hook was never installed and no fleet block took the plan body (E12).
+    plan_body_gate(
+        plan_ahead_body(),
+        n42_tx_queue::plan_ahead(),
+        pull_by_frames(),
+    )
+}
+
+/// [`plan_ahead_body_wanted`] over its switches: the plan body and every
+/// switch it stands on.
+const fn plan_body_gate(body: bool, plan_ahead: bool, by_frames: bool) -> bool {
+    body && plan_ahead && by_frames
 }
 
 /// What the plan-ahead hook makes of a prepared plan (`N42_PLAN_AHEAD_BODY=1`):
@@ -294,8 +302,6 @@ pub struct PreparedBuild<T: reth_transaction_pool::PoolTransaction> {
     pub hashes: Vec<B256>,
     /// The partition of `keys` at this beneficiary, when one was known.
     pub groups: Option<(alloy_primitives::Address, Vec<Vec<usize>>)>,
-    /// One empty slot a candidate.
-    pub slots: Vec<std::sync::OnceLock<crate::parallel_transfer::BuiltTransfer<()>>>,
     /// The hook's time.
     pub made_us: u64,
     /// `N42_PLAN_AHEAD_PARTS=1`: the transactions root of `hashes` laid out
@@ -369,18 +375,6 @@ pub fn note_beneficiary(beneficiary: alloy_primitives::Address) {
 /// The beneficiary [`note_beneficiary`] noted last.
 pub fn noted_beneficiary() -> Option<alloy_primitives::Address> {
     *PLAN_BENEFICIARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-std::thread_local! {
-    /// The identity of the frames [`select`] took whole, for
-    /// [`take_warm_ident`] (`N42_PLAN_AHEAD_WARM`).
-    static WARM_IDENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// The identity [`select`] found for this thread's take
-/// ([`crate::warm_ahead::segments_ident`]), 0 for none. Clears it.
-pub fn take_warm_ident() -> u64 {
-    WARM_IDENT.with(|slot| slot.replace(0))
 }
 
 std::thread_local! {
@@ -1257,6 +1251,16 @@ pub fn root_of_hashes(hashes: &[B256], counts: &[usize]) -> Option<B256> {
 
 #[cfg(test)]
 mod claimed_root_tests {
+    /// F5g item 7: the evm2 step takes the plan body under X22's switches
+    /// (plan body, plan ahead, pull by frames) and only with all three.
+    #[test]
+    fn the_plan_body_gate_opens_on_evm2_without_the_counted_seal() {
+        assert!(super::plan_body_gate(true, true, true), "X22's switches");
+        for (body, ahead, frames) in [(false, true, true), (true, false, true), (true, true, false)] {
+            assert!(!super::plan_body_gate(body, ahead, frames), "{body} {ahead} {frames}");
+        }
+    }
+
     use super::*;
 
     /// A block whose description was refused here (its frames not held) is

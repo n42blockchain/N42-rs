@@ -19,9 +19,6 @@ alloy-primitives.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
 tracing.workspace = true
-# Feature unification: the vendored reth-revm needs revm's serde when this
-# crate is built on its own, as bin/n42 enables it anyway.
-revm = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 alloy-consensus.workspace = true

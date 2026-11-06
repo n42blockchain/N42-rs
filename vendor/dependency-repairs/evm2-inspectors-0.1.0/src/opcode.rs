@@ -1,0 +1,209 @@
+use alloc::{string::ToString, vec::Vec};
+use alloy_primitives::map::HashMap;
+use alloy_rpc_types_trace::opcode::OpcodeGas;
+use evm2::{
+    EvmTypesHost, Inspector,
+    interpreter::{
+        InstrStop, Interpreter, Message, MessageKind, MessageResult,
+        opcode::{OpCode, op},
+    },
+};
+
+#[derive(Clone, Copy, Debug)]
+struct PendingOpcodeGas {
+    opcode: OpCode,
+    gas_remaining: u64,
+    child_gas_used: u64,
+}
+
+/// An Inspector that counts opcodes and measures gas usage per opcode.
+#[derive(Clone, Debug, Default)]
+pub struct OpcodeGasInspector {
+    /// Map of opcode counts per transaction.
+    opcode_counts: HashMap<OpCode, u64>,
+    /// Map of total gas used per opcode.
+    opcode_gas: HashMap<OpCode, u64>,
+    /// Tracks opcodes waiting for `step_end`.
+    pending_steps: Vec<PendingOpcodeGas>,
+}
+
+impl OpcodeGasInspector {
+    /// Creates a new instance of the inspector.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the opcode counts collected during transaction execution.
+    pub const fn opcode_counts(&self) -> &HashMap<OpCode, u64> {
+        &self.opcode_counts
+    }
+
+    /// Returns the opcode gas usage collected during transaction execution.
+    pub const fn opcode_gas(&self) -> &HashMap<OpCode, u64> {
+        &self.opcode_gas
+    }
+
+    /// Returns an iterator over all opcodes with their count and combined gas usage.
+    ///
+    /// Note: this returns in no particular order.
+    pub fn opcode_iter(&self) -> impl Iterator<Item = (OpCode, (u64, u64))> + '_ {
+        self.opcode_counts.iter().map(move |(&opcode, &count)| {
+            let gas = self.opcode_gas.get(&opcode).copied().unwrap_or_default();
+            (opcode, (count, gas))
+        })
+    }
+
+    /// Returns an iterator over all opcodes with their count and combined gas usage.
+    ///
+    /// Note: this returns in no particular order.
+    pub fn opcode_gas_iter(&self) -> impl Iterator<Item = OpcodeGas> + '_ {
+        self.opcode_iter().map(|(opcode, (count, gas_used))| OpcodeGas {
+            opcode: opcode.to_string(),
+            count,
+            gas_used,
+        })
+    }
+
+    /// Helper function to exclude child gas from opcode gas tracking.
+    /// This prevents call/create opcodes from including the gas consumed within the call/create.
+    fn exclude_child_gas(&mut self, opcode_value: u8, child_gas_used: u64) {
+        let Some(opcode) = OpCode::new(opcode_value) else {
+            return;
+        };
+        if let Some(pending) = self.pending_steps.last_mut()
+            && pending.opcode == opcode
+        {
+            pending.child_gas_used = pending.child_gas_used.saturating_add(child_gas_used);
+        }
+    }
+}
+
+impl<T: EvmTypesHost> Inspector<T> for OpcodeGasInspector {
+    fn step(&mut self, interp: &mut Interpreter<'_, '_, T>) {
+        let opcode_value = interp.opcode();
+        if let Some(opcode) = OpCode::new(opcode_value) {
+            // keep track of opcode counts
+            *self.opcode_counts.entry(opcode).or_default() += 1;
+
+            // keep track of the last opcode executed
+            self.pending_steps.push(PendingOpcodeGas {
+                opcode,
+                gas_remaining: interp.gas().remaining(),
+                child_gas_used: 0,
+            });
+        }
+    }
+
+    fn step_end(&mut self, interp: &mut Interpreter<'_, '_, T>) {
+        // update gas usage for the last opcode
+        if let Some(pending) = self.pending_steps.pop() {
+            // The sentry rejects SSTORE before charging gas, but out-of-gas hooks already
+            // see the zeroed frame remainder.
+            let gas_cost = if interp.result() == Err(InstrStop::ReentrancySentryOOG) {
+                0
+            } else {
+                pending
+                    .gas_remaining
+                    .saturating_sub(interp.gas().remaining())
+                    .saturating_sub(pending.child_gas_used)
+            };
+            let opcode = pending.opcode;
+            *self.opcode_gas.entry(opcode).or_default() += gas_cost;
+        }
+    }
+
+    fn call_end(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+        result: &mut MessageResult<T>,
+    ) {
+        if message.depth == interp.version().initial_call_depth {
+            // skip the root call
+            return;
+        }
+
+        // for accurate call opcode gas tracking, we need to deduct the child gas from the opcode
+        // gas, because otherwise the call opcodes would include the total gas consumed within the
+        // call itself, but we want to track how much gas the call opcode itself consumes.
+        let opcode = match message.kind {
+            MessageKind::Call => op::CALL,
+            MessageKind::CallCode => op::CALLCODE,
+            MessageKind::DelegateCall => op::DELEGATECALL,
+            MessageKind::StaticCall => op::STATICCALL,
+            MessageKind::Create | MessageKind::Create2 => return,
+            _ => return,
+        };
+        self.exclude_child_gas(opcode, result.gas.spent());
+    }
+
+    fn create_end(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+        result: &mut MessageResult<T>,
+    ) {
+        if message.depth == interp.version().initial_call_depth {
+            // skip the root create
+            return;
+        }
+
+        // for accurate create opcode gas tracking, we need to deduct the child gas from the opcode
+        // gas, because otherwise the create opcodes would include the total gas consumed within the
+        // create itself, but we want to track how much gas the create opcode itself consumes.
+        let opcode = match message.kind {
+            MessageKind::Create => op::CREATE,
+            MessageKind::Create2 => op::CREATE2,
+            _ => return,
+        };
+        self.exclude_child_gas(opcode, result.gas.spent());
+    }
+}
+
+/// Returns the immediate byte size for an opcode.
+pub fn immediate_size(opcode: u8) -> u8 {
+    OpCode::new(opcode).map_or(0, OpCode::immediate_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::Bytes;
+    use evm2::{BaseEvmTypes, bytecode::Bytecode, env::TxEnv};
+
+    #[test]
+    fn test_opcode_counter_inspector() {
+        let mut opcode_counter = OpcodeGasInspector::new();
+
+        let opcodes = [op::ADD, op::ADD, op::ADD, op::BYTE];
+
+        let tx_env = TxEnv::<BaseEvmTypes>::default();
+        let message = Message::<BaseEvmTypes> {
+            code: Bytecode::new_legacy(Bytes::from(opcodes)),
+            ..Message::<BaseEvmTypes>::default()
+        };
+        let mut interp = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+
+        for _ in &opcodes {
+            opcode_counter.step(&mut interp);
+        }
+    }
+
+    #[test]
+    fn test_with_variety_of_opcodes() {
+        let mut opcode_counter = OpcodeGasInspector::new();
+
+        let opcodes = [op::PUSH1, op::PUSH1, op::ADD, op::PUSH1, op::SSTORE, op::STOP];
+
+        let tx_env = TxEnv::<BaseEvmTypes>::default();
+        let message = Message::<BaseEvmTypes> {
+            code: Bytecode::new_legacy(Bytes::from(opcodes)),
+            ..Message::<BaseEvmTypes>::default()
+        };
+        let mut interp = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+
+        for _ in &opcodes {
+            opcode_counter.step(&mut interp);
+        }
+    }
+}

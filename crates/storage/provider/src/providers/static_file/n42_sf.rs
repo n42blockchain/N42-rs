@@ -262,13 +262,13 @@ where
 /// `increment_block`.
 pub(crate) fn append_block_account_changeset<N: NodePrimitives>(
     w: &mut StaticFileProviderRWRefMut<'_, N>,
-    reverts: &revm::database::states::PlainStateReverts,
+    reverts: &reth_trie::bundle_state::PlainStateReverts,
     block_number: u64,
     parallel: bool,
 ) -> ProviderResult<()> {
     use rayon::prelude::*;
     use reth_db_api::models::AccountBeforeTx;
-    type Revert = (alloy_primitives::Address, Option<revm::state::AccountInfo>);
+    type Revert = (alloy_primitives::Address, Option<evm2::evm::AccountInfo>);
     // `Account::from(&AccountInfo)` is the value `info.clone().map(Into::into)` gives, without
     // cloning the whole `AccountInfo` (its bytecode `Arc`) a row.
     let entry = |(address, info): &Revert| AccountBeforeTx {

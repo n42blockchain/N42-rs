@@ -575,7 +575,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     fn write_account_changesets(
         w: &mut StaticFileProviderRWRefMut<'_, N>,
         blocks: &[ExecutedBlock<N>],
-        plain_reverts: &[revm::database::states::PlainStateReverts],
+        plain_reverts: &[reth_trie::bundle_state::PlainStateReverts],
     ) -> ProviderResult<()> {
         // N42: `N42_SF_PARALLEL_ENCODE=1` builds, sorts and encodes the rows in parallel (same
         // bytes); without it the entries are collected and appended as before.
@@ -595,7 +595,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     fn write_storage_changesets(
         w: &mut StaticFileProviderRWRefMut<'_, N>,
         blocks: &[ExecutedBlock<N>],
-        plain_reverts: &[revm::database::states::PlainStateReverts],
+        plain_reverts: &[reth_trie::bundle_state::PlainStateReverts],
     ) -> ProviderResult<()> {
         for (block, reverts) in blocks.iter().zip(plain_reverts) {
             let block_number = block.recovered_block().number();
@@ -650,7 +650,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         &self,
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
-        plain_reverts: &[revm::database::states::PlainStateReverts],
+        plain_reverts: &[reth_trie::bundle_state::PlainStateReverts],
         ctx: StaticFileWriteCtx,
         runtime: &reth_tasks::Runtime,
     ) -> ProviderResult<()> {

@@ -26,8 +26,8 @@ use std::any::Any;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-pub use revm_database::states::reverts::Reverts;
-use revm_database::BundleState;
+pub use reth_trie_common::bundle_state::Reverts;
+use reth_trie_common::bundle_state::BundleState;
 
 /// How long a consumer waits for a fill: a stall guard, not a budget (the
 /// revert merge is ~50 ms).
@@ -285,7 +285,7 @@ mod tests {
                 .map(|i| {
                     (
                         alloy_primitives::Address::with_last_byte(i as u8),
-                        revm_database::AccountRevert::default(),
+                        reth_trie_common::bundle_state::AccountRevert::default(),
                     )
                 })
                 .collect(),

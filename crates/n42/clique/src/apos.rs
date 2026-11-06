@@ -14,7 +14,7 @@ use reth_primitives_traits::{
     Block as BlockTrait, BlockHeader as BlockHeaderTrait, NodePrimitives,
 };
 use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider};
-use reth_revm::cached::CachedReads;
+use reth_evm::cached::CachedReads;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Debug, Formatter};

@@ -332,3 +332,21 @@ rustc 1.98 与系统 llvm-profdata 同为 LLVM 22.1.8）CPU −2.7~−3.7%、单
 （sha3-asm 在 Zen 5 上本就选标量 Keccak，作者基准显示最快）；每块固定开销 0.096 ms
 （<1%）。预编译后端已是 secp256k1 C、blst、c-kzg；GMP modexp 需 `libgmp-dev`/`m4`
 未测。剩余的都是解释器指令数本身与满载下随机访存的延迟，单项 ≤3%。
+
+## 2026-11-06: the recorder is parked on reth v2.9.0 (evm2)
+
+`docs/patches/0001-feat-witness-record-*.patch` (reth branch `witness-record`, crate
+`reth-witness`) is **parked**: it stays in the tree as a record and is not applied or ported in the
+reth v2.9.0 move (`docs/RETH_2_9_0_UPGRADE.md`, F6a). The patch hooks a `StateReadObserver` into
+revm's `State`, and reth v2.9.0 executes on evm2, where that `State` no longer exists.
+
+On evm2 the recorder would hang off the state's read path instead: either the overlay `Database`
+implementation the executor reads through (one observer call per account, storage slot and code
+read, in the order the EVM issues them), or a `StateChangeSink` beside it for the post-state
+side. The per-block shadow state that decides what a fresh replayer will read has to be rebuilt on
+the same path. No code is written for it yet.
+
+The rule from section 4 still holds and matters more now: the witness is positional, so the
+recorder and the replayer must share one EVM version. A witness recorded under evm2 replays only
+on an evm2 replayer of the same version, and the witnesses already recorded under revm (pevm,
+reth 1.10.2) replay only on a revm replayer of their version.

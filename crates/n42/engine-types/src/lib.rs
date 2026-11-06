@@ -43,13 +43,19 @@ pub mod memory_overlay;
 mod consensus;
 pub mod engine_validator;
 pub mod claimed_build;
-pub mod fast_transfer;
+pub mod fast_handler;
+pub mod direct_transfer;
 pub mod frame_blocks;
 pub mod frame_scan;
 pub mod includability;
 pub mod batch_state;
-pub mod parallel_transfer;
-pub mod warm_ahead;
+pub mod graft_fold;
+pub mod parallel_build;
+pub mod parallel_common;
+/// [`parallel_common`] under the module's older path, which callers still use.
+pub mod parallel_transfer {
+    pub use crate::parallel_common::*;
+}
 pub mod output_shards;
 pub mod hotstuff_consensus;
 mod network;

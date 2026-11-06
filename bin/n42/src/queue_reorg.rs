@@ -110,8 +110,8 @@ mod hashed_state_bench {
     //! the follower's hashed post-state for a 147,000-account bundle, as reth
     //! builds it (sequential keccak) and split over rayon.
     use alloy_primitives::{Address, U256};
-    use reth_revm::db::{BundleAccount, BundleState};
-    use reth_revm::state::AccountInfo;
+    use reth_trie::bundle_state::{BundleAccount, BundleState};
+    use evm2::evm::AccountInfo;
 
     fn addr(i: u64) -> Address {
         let mut a = [0u8; 20];
@@ -127,7 +127,7 @@ mod hashed_state_bench {
         let mut b = BundleState::default();
         for i in 0..147_000u64 {
             let info = AccountInfo { balance: U256::from(1_000_000u64 + i), nonce: i % 7, ..Default::default() };
-            b.state.insert(addr(i), BundleAccount::new(Some(AccountInfo::default()), Some(info), Default::default(), reth_revm::db::AccountStatus::Changed));
+            b.state.insert(addr(i), BundleAccount::new(Some(AccountInfo::default()), Some(info), Default::default(), reth_trie::bundle_state::AccountStatus::Changed));
         }
         for round in 0..3 {
             let at = std::time::Instant::now();

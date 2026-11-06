@@ -37,7 +37,7 @@ use reth_trie::{
     updates::TrieUpdates, AccountProof, SortedTrieData, ExecutionWitnessMode, HashedPostState, HashedStorage,
     LazyTrieData, MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
-use revm::database::BundleState;
+use reth_trie::bundle_state::BundleState;
 
 use crate::{built_executions::BuiltExecution, engine_types::N42BuiltPayload};
 
@@ -1126,9 +1126,10 @@ mod tests {
     use n42_tx_types::{Block, BlockBody};
     use reth_execution_types::BlockExecutionOutput;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
-    use reth_storage_api::{AccountReader, BlockHashReader, StateProvider as _};
+    use reth_storage_api::{AccountReader, BlockHashReader};
     use reth_trie::{updates::TrieUpdates, HashedPostState};
-    use revm::{database::BundleState, state::AccountInfo};
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::BundleState;
 
     /// Serialises the tests that file builds in the process-wide stores.
     fn store_lock() -> std::sync::MutexGuard<'static, ()> {

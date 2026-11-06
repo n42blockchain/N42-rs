@@ -8,7 +8,7 @@ use jsonrpsee::core::RpcResult;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::{ConfigureEvm, Evm};
 
-use reth_revm::{database::StateProviderDatabase, db::CacheDB};
+use reth_evm::{database::StateProviderDatabase, db::CacheDB};
 use reth_rpc_eth_api::{
     helpers::{Call, EthTransactions, LoadPendingBlock},
     EthCallBundleApiServer, FromEthApiError, FromEvmError,

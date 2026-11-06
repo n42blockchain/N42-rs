@@ -38,7 +38,7 @@ use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, TrieInput, DecodedMultiProofV2, MultiProofTargetsV2,
 };
-use revm::database::BundleState;
+use reth_trie::bundle_state::BundleState;
 use std::{
     borrow::Cow,
     sync::{Arc, OnceLock},
@@ -46,7 +46,7 @@ use std::{
 
 use super::overlay_filter::{self, FilterCell, FilterKey};
 use n42_sharded_output::Shards;
-use revm::database::BundleAccount;
+use reth_trie::bundle_state::BundleAccount;
 
 /// The filter slots of `in_memory`, one a block in the same order (none when the filters are off).
 fn filters_of<N: NodePrimitives>(in_memory: &[ExecutedBlock<N>]) -> Vec<Option<FilterCell>> {
@@ -526,10 +526,8 @@ mod elided_tests {
     use reth_ethereum_primitives::EthPrimitives;
     use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
     use reth_primitives_traits::SealedBlock;
-    use revm::{
-        database::{states::StorageSlot, AccountStatus},
-        state::AccountInfo,
-    };
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::{AccountStatus, StorageSlot};
     use std::sync::Arc;
 
     struct Map(AddressHashMap<BundleAccount>);

@@ -23,7 +23,8 @@ mod tests {
     use reth_db_api::models::AccountBeforeTx;
     use reth_static_file_types::StaticFileSegment;
     use reth_storage_api::{ChangeSetReader, ReceiptProvider};
-    use revm::{database::states::PlainStateReverts, state::AccountInfo};
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::PlainStateReverts;
     use std::{collections::BTreeMap, path::Path, time::Instant};
 
     type P = StaticFileProvider<N42Primitives>;

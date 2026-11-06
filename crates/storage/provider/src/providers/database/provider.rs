@@ -74,13 +74,11 @@ use reth_storage_api::{
 use reth_storage_errors::provider::{ProviderResult, StaticFileWriterError};
 use reth_storage_overlay::OverlayManager;
 use reth_trie::{
+    bundle_state::{PlainStateReverts, PlainStorageChangeset, PlainStorageRevert, StateChangeset},
     updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
     HashedPostStateSorted, SortedTrieData,
 };
 use reth_trie_db::{DatabaseStorageTrieCursor, TrieTableAdapter};
-use revm::database::states::{
-    PlainStateReverts, PlainStorageChangeset, PlainStorageRevert, StateChangeset,
-};
 use smallvec::SmallVec;
 use std::{
     cmp::Ordering,
@@ -625,7 +623,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         // (~147,000 accounts each at the fleet's tier).
         let n42_timers = crate::providers::n42_persist::metrics();
         let reverts_start = Instant::now();
-        let plain_reverts: Vec<revm::database::states::PlainStateReverts> = if first_number.is_some() {
+        let plain_reverts: Vec<reth_trie::bundle_state::PlainStateReverts> = if first_number.is_some() {
             use rayon::prelude::*;
             use crate::providers::n42_persist::N42PlainReverts as _;
             // An own block handed out before its revert set was merged
@@ -4212,6 +4210,7 @@ mod tests {
         map::{AddressMap, B256Map},
         U256,
     };
+    use evm2::evm::AccountInfo;
     use reth_chain_state::{test_utils::TestBlockBuilder, ExecutedBlock};
     use reth_db_api::models::StorageSettings;
     use reth_ethereum_primitives::Receipt;
@@ -4220,10 +4219,9 @@ mod tests {
     use reth_storage_api::{DatabaseProviderFactory, MetadataWriter};
     use reth_testing_utils::generators::{self, random_block, BlockParams};
     use reth_trie::{
-        HashedPostState, KeccakKeyHasher, Nibbles, SortedTrieData, StoredNibbles,
-        StoredNibblesSubKey,
+        bundle_state::BundleState, HashedPostState, KeccakKeyHasher, Nibbles, SortedTrieData,
+        StoredNibbles, StoredNibblesSubKey,
     };
-    use revm::{database::BundleState, state::AccountInfo};
     use std::{sync::mpsc, time::Duration};
 
     /// Seeds block zero through the writer core because [`SaveBlocksInput`] only describes
@@ -5574,7 +5572,6 @@ mod tests {
     #[test]
     fn test_write_state_hashed() {
         use reth_trie::{HashedPostState, KeccakKeyHasher};
-        use revm::{database::BundleState, state::AccountInfo};
 
         let factory = create_test_provider_factory();
         factory.set_storage_settings_cache(StorageSettings::v2());

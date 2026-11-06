@@ -21,7 +21,7 @@ use crate::pool::{N42PooledTransaction, N42TransactionPool};
 use crate::rpc::N42EthApiBuilder;
 use n42_tx_types::{N42Primitives, N42TxEnvelope};
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
-use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
+use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_network::{NetworkHandle, PeersInfo};
 use reth_node_api::{FullNodeComponents, NodeAddOns, NodePrimitives, PrimitivesTy, TxTy};
 use reth_node_builder::{
@@ -43,7 +43,6 @@ use reth_transaction_pool::{
     blobstore::{DiskFileBlobStore, DiskFileBlobStoreConfig},
     CoinbaseTipOrdering, PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
 };
-use revm::context::TxEnv;
 use std::{default::Default, sync::Arc, time::SystemTime};
 
 /// Type configuration for a regular Ethereum node.
@@ -197,7 +196,6 @@ where
     ValB: reth_node_builder::rpc::EngineValidatorBuilder<N>,
     BasicEngineApiBuilder<PVB>: reth_node_builder::rpc::EngineApiBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
-    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
 {
     type Handle = RpcHandle<N, EthB::EthApi>;
 
@@ -226,7 +224,6 @@ where
     ValB: reth_node_builder::rpc::EngineValidatorBuilder<N>,
     BasicEngineApiBuilder<PVB>: reth_node_builder::rpc::EngineApiBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
-    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
 {
     type EthApi = EthB::EthApi;
 
@@ -324,7 +321,7 @@ where
     Types: NodeTypes<ChainSpec = N42ChainSpec, Primitives = N42Primitives>,
     Node: FullNodeTypes<Types = Types>,
 {
-    type EVM = N42EvmConfig<N42ChainSpec, crate::fast_transfer::N42EvmFactory>;
+    type EVM = N42EvmConfig<N42ChainSpec>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
         // The sender-recovery cache, as upstream's Ethereum node attaches it.
@@ -333,12 +330,9 @@ where
         // cache on the EVM config at import, and this config had none, so
         // every transaction was recovered again on the worker pool -- the
         // same pool the ingest and the prewarmer recover on.
-        // The EVM with the plain-transfer path (`fast_transfer`), off unless
-        // `N42_FAST_TRANSFER=1`.
-        let mut evm_config = N42EvmConfig::new_with_evm_factory(
-            ctx.chain_spec(),
-            crate::fast_transfer::N42EvmFactory::from_env(),
-        );
+        // reth's evm2 factory; the plain transfer (`N42_FAST_TRANSFER`) is an
+        // evm2 registry handler (`crate::fast_handler`).
+        let mut evm_config = N42EvmConfig::new(ctx.chain_spec());
         if let Some(cache) = ctx.sender_recovery_cache() {
             evm_config = evm_config.with_sender_recovery_cache(cache.clone());
         }

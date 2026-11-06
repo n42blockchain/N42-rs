@@ -39,14 +39,14 @@ reth-trie.workspace = true
 futures.workspace = true
 metrics.workspace = true
 reth-evm.workspace = true
-reth-revm.workspace = true
+evm2 = { workspace = true, features = ["std"] }
 reth-transaction-pool.workspace = true
 reth-cli-runner.workspace = true
 reth-cli-util.workspace = true
 reth-consensus-common.workspace = true
 reth-rpc-builder.workspace = true
 reth-rpc.workspace = true
-reth-rpc-types-compat.workspace = true
+reth-rpc-convert.workspace = true
 reth-rpc-api = { workspace = true, features = ["client"] }
 reth-rpc-eth-types.workspace = true
 reth-rpc-server-types.workspace = true
@@ -115,7 +115,7 @@ tempfile.workspace = true
 # loop314 profile put the software Keccak at ~11.5% of all on-CPU samples
 # (transaction hashes and frame roots at admission). Upstream's reth binary
 # enables it by default too.
-default = ["jemalloc", "asm-keccak", "reth-revm/portable"]
+default = ["jemalloc", "asm-keccak", "reth-evm/portable"]
 
 dev = ["reth-ethereum-cli/dev"]
 

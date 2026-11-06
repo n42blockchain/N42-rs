@@ -89,20 +89,20 @@
   },
   {
     "package": "reth-nippy-jar",
-    "version": "2.8.1",
-    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.8.1#d763342fa185e4e90ee79dc65f6a5706168b0bcb",
+    "version": "2.9.0",
+    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.9.0#c9a780f4f23d6752ca299b104c93b7f099673c80",
     "upstream_manifest_sha256": "f83d6dd5db47c4e6b88d26e331e7e049abda5010ddbbcd37768b32adeb451623",
-    "path": "vendor/dependency-repairs/reth-nippy-jar-2.8.1",
+    "path": "vendor/dependency-repairs/reth-nippy-jar-2.9.0",
     "modified_files": [
       "Cargo.toml"
     ]
   },
   {
     "package": "reth-transaction-pool",
-    "version": "2.8.1",
-    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.8.1#d763342fa185e4e90ee79dc65f6a5706168b0bcb",
-    "upstream_manifest_sha256": "f94c267bd73d1e9047b51c08438dbcfdbdd679549fc0d2616413bbc821007d2a",
-    "path": "vendor/dependency-repairs/reth-transaction-pool-2.8.1",
+    "version": "2.9.0",
+    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.9.0#c9a780f4f23d6752ca299b104c93b7f099673c80",
+    "upstream_manifest_sha256": "75cf765e7689cc5691181d4edea5df7ff7f2934925af25a79ef48e7e31003a59",
+    "path": "vendor/dependency-repairs/reth-transaction-pool-2.9.0",
     "modified_files": [
       "Cargo.toml"
     ]
@@ -165,16 +165,6 @@
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "path": "vendor/dependency-repairs/pprof_util-0.8.2",
     "upstream_manifest_sha256": "13a1016d07f70027c313177c030e81a5eae5609fce502a2b215eb7e035609fae",
-    "modified_files": [
-      "Cargo.toml"
-    ]
-  },
-  {
-    "package": "revmc-builtins",
-    "version": "0.1.0",
-    "source": "git+https://github.com/paradigmxyz/revmc?branch=main#5fba0216ed6bb3c73c4ce214b58c8e434a948e98",
-    "path": "vendor/dependency-repairs/revmc-builtins-0.1.0",
-    "upstream_manifest_sha256": "6ea1c9ce68766e24dfffbbc33d29ae6cbf5d7f166b551258232fa80471d67239",
     "modified_files": [
       "Cargo.toml"
     ]

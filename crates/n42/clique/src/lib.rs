@@ -6,6 +6,7 @@
 mod apos;
 pub use apos::*;
 
+mod cached_reads_serde;
 mod unverifiedblock;
 pub use unverifiedblock::*;
 

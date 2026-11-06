@@ -25,14 +25,13 @@ reth-chainspec = { workspace = true, optional = true }
 reth-network-peers = { workspace = true, optional = true }
 alloy-eips = { workspace = true, optional = true }
 alloy-genesis = { workspace = true, optional = true }
-alloy-evm = { workspace = true, optional = true }
 # The registry root on the Engine API (feature `engine`).
 alloy-rpc-types-engine = { workspace = true, optional = true, features = ["serde"] }
 thiserror = { workspace = true, optional = true }
 
 [features]
 default = []
-chainspec = ["dep:reth-chainspec", "dep:reth-network-peers", "dep:alloy-eips", "dep:alloy-genesis", "dep:alloy-evm"]
+chainspec = ["dep:reth-chainspec", "dep:reth-network-peers", "dep:alloy-eips", "dep:alloy-genesis"]
 engine = ["dep:alloy-rpc-types-engine", "dep:alloy-eips", "dep:thiserror"]
 
 [dev-dependencies]

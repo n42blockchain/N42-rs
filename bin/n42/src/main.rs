@@ -315,6 +315,32 @@ fn main() {
                         // that would revert the state tree below the head.
                         if n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(node.provider.chain_spec().genesis()).is_ok() {
                             qmdb.set_refuse_stale_builds(true);
+                            // The canonical head can run ahead of consensus onto a
+                            // block that is never certified (a build ahead on the
+                            // block this node just voted for makes it canonical); the
+                            // next leader then builds on its high-QC block, an
+                            // ancestor of that head (F5g5). The guard refuses only
+                            // what lies below the committed block, which the
+                            // validator's forkchoice gives as `safe` plus the
+                            // deferred-execution depth (`safe` is the block whose
+                            // execution a committed child carries, under the default
+                            // `split` settlement tags; under `legacy` it is the
+                            // committed block itself, and the floor is then stricter,
+                            // never looser, than the committed block).
+                            let provider = node.provider.clone();
+                            let genesis = node.provider.chain_spec().genesis().clone();
+                            qmdb.set_committed_source(Some(std::sync::Arc::new(move || {
+                                let safe = reth_provider::BlockIdReader::safe_block_num_hash(&provider).ok()??;
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |since| since.as_secs());
+                                let depth = if reth_chainspec::qmdb::deferred_execution_active_at(&genesis, now) {
+                                    reth_chainspec::qmdb::deferred_execution_depth_at(&genesis, now)
+                                } else {
+                                    0
+                                };
+                                Some(safe.number.saturating_add(depth))
+                            })));
                         }
                         // The QMDB state is registered as the state reader on every QMDB
                         // node: its persistence hook makes the delta log durable through a
@@ -737,7 +763,7 @@ fn main() {
                                         use reth_evm::ConfigureEvm as _;
                                         use reth_provider::StateProviderFactory as _;
                                         let state = provider.state_by_block_hash(block.parent_hash).map_err(|e| e.to_string())?;
-                                        let db = reth_revm::database::StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state));
+                                        let db = reth_evm::database::StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state));
                                         let started = std::time::Instant::now();
                                         let mut executor = evm_config.executor(db);
                                         let out = executor.execute_one(&block).map_err(|e| e.to_string())?;
@@ -1035,8 +1061,10 @@ fn main() {
             // `N42_TX_INGEST_ALLOW_REMOTE=1`, and never off loopback under
             // the modes that trust a frame (direct, claimed senders, gateway
             // attestations), which admit what `eth_sendRawTransaction` would
-            // not (`n42_tx_ingest::ingest_bind_refusal`).
-            if let Ok(addr) = std::env::var("N42_TX_INGEST") {
+            // not (`n42_tx_ingest::ingest_bind_refusal`). An empty value is
+            // unset (`scripts/fleet7.sh` passes `N42_TX_INGEST=` to a node
+            // that serves none).
+            if let Some(addr) = n42_env::var("N42_TX_INGEST").filter(|addr| !addr.trim().is_empty()) {
                 match addr.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {
                         let pool = node.pool.clone();

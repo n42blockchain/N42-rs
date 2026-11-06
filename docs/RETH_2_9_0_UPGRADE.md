@@ -1597,6 +1597,29 @@ F5 passed at E16, so the `legacy-revm-paths` feature and everything behind it ar
   sleep-timed lease test already known to be load-flaky in F5. It passes 3 of 3 in isolation. qmdb-reth has no code
   change in F6a.
 
+**The F6 field gate** (natives of 567f49093, `audit-notes/scripts/f4-gate.sh` with `GATE_TAG=f6`,
+progress in `audit-notes/ci/f4-gate.log`) **passed**. Every step's rc was 0, and every result equals
+F4's:
+
+- **f6b-rust** (rc 0, 300 s, four Rust validators). 100 commits per validator, 0 timeouts,
+  newPayload 400, 100 QMDB roots, err 0.
+- **f6b-gov5** (rc 0, three Rust validators plus a gov5 member). 133 commits, gov5 errors 0.
+  Block 133's hash is equal on both clients: 0xf6230bce...d040c6.
+- **f6-mv** (rc 0, the MobileAnchor mixed round with gov5, tx load and the packet sidecar).
+  - 160 commits per validator, 0 timeouts, err 0.
+  - Hashes: reth 160 and gov5 160, 161 of 161 the same, no first difference.
+  - Leader-root check on the Rust chain: ok 120, mismatch 0.
+  - packetd: 160 packets, 0 warn/error lines. send_tx: 1,322 sent, 2 error lines.
+  - The gov5-chain root line (mismatch 120, every root `none`) is the same as F4's f4-mv: gov5's
+    JSON header carries no registry root to compare.
+- **f6k90** and **f6k20** (rc 0 each, `roll --kill` on the fleet7 shape, first kill at 90 s and at
+  20 s, before the first persistence). Node 3 restored the QMDB forest at blocks 57 and 33 and caught
+  up to the fleet at heights 65 and 41. The execution layer logged 0 error lines.
+
+The first launch of the mv step deadlocked for 3 h: the gate held `devnet/.round.lock`, and
+`devnet-mobileanchor.sh` (since d07633c91) takes that lock itself. The coordinator fixed it by
+passing `FLOCKER=$LOCK` and relaunched mv, k90 and k20. The rounds step's results stand.
+
 **Left behind, runtime-dead but not flagged by rustc.** These are `pub` or reached only through
 values that are now constant, so rustc does not flag them. They are a follow-up clean-up with no
 behaviour change:

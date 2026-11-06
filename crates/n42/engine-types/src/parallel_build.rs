@@ -584,14 +584,12 @@ where
                         None => crate::direct_transfer::Step::Fallback,
                     };
                     let applied = step != crate::direct_transfer::Step::Fallback;
-                    if applied {
-                        if let Some(at) = transact_at {
-                            inside.transact_us += at.elapsed().as_nanos() as u64;
-                            let (_, count, ns) = READ_TIMING.with(|cell| cell.replace((false, 0, 0)));
-                            inside.reads_us += ns;
-                            inside.reads_sampled += count;
-                            sampled_txs += 1;
-                        }
+                    if applied && let Some(at) = transact_at {
+                        inside.transact_us += at.elapsed().as_nanos() as u64;
+                        let (_, count, ns) = READ_TIMING.with(|cell| cell.replace((false, 0, 0)));
+                        inside.reads_us += ns;
+                        inside.reads_sampled += count;
+                        sampled_txs += 1;
                     }
                     match step {
                         crate::direct_transfer::Step::Applied => {
@@ -1383,7 +1381,7 @@ mod tests {
         for osaka in [false, true] {
             let c = prague(osaka);
             let env = prague_env(&c);
-            let why = crate::direct_transfer::refusal(env.spec.into(), &env.version);
+            let why = crate::direct_transfer::refusal(env.spec, &env.version);
             assert_eq!(why, None, "Prague and Osaka have the path");
             let direct = DirectTransfers::of_env(&env, crate::direct_transfer::shape_of).expect("Prague and Osaka have the path");
             let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);

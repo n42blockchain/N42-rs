@@ -304,12 +304,13 @@ impl<X> DirectTransfers<X> {
     /// The result evm2 gives a plain transfer: success, 21,000 gas spent,
     /// no refund, the floor, a stop, nothing else.
     pub fn result<E: Default>(&self) -> evm2::TxResultExt<E> {
-        let mut result = evm2::TxResultExt::<E>::default();
-        result.status = true;
-        result.total_gas_spent = TRANSFER_GAS;
-        result.floor_gas = self.floor_gas;
-        result.stop = evm2::interpreter::InstrStop::Stop;
-        result
+        evm2::TxResultExt::<E> {
+            status: true,
+            total_gas_spent: TRANSFER_GAS,
+            floor_gas: self.floor_gas,
+            stop: evm2::interpreter::InstrStop::Stop,
+            ..Default::default()
+        }
     }
 
     /// Applies `tx` to `layer` and records it in `state` when it qualifies

@@ -1508,6 +1508,58 @@ follower import, member 3 on its own execution layer, two `send_tx` senders):
 E16 is to read par_exec and batch_cpu_sum against the control's 27 and 738k, with
 `evm2_batch_transact_us` and `evm2_direct_hits` on the phases line.
 
+#### E16, after g10, and the F5 verdict
+
+The fx pairs E16 (2026-11-06 01:36-02:02Z, natives c8b70f45d against main, two pairs):
+- **Throughput.** The branch read 4,664,833 / 4,820,000 TPS against the control's 4,913,333 /
+  4,680,000 (-5% / +3%). Windows 2-3: branch 4.93 / 4.93 and 4.92 / 4.91M, control 4.97 / 4.95
+  and 4.88 / 4.93M.
+- **Per block, the two are now the same machine** (branch against control):
+  - sealed_at 37 / 37, par_exec 29 / 27;
+  - batch_median 5 / 5, batch_start_skew 21 / 21;
+  - batch_cpu_sum 764k / 744k.
+- **The direct path.** `evm2_direct_hits` was 200,000 on every full block, and
+  direct_delegated_total 8,918 over the leg. Refusals 0, invalid 0.
+
+**F5 gate PASSED: parity with v2.8.1 + X22.**
+
+The A/B legs from E9 to E16: win1 of each leg, and the per-block medians, branch against control.
+
+| leg | branch natives | branch win1 TPS | control win1 TPS | sealed_at (ms) | par_exec (ms) |
+| --- | --- | --- | --- | --- | --- |
+| E9 | 5e582b610 | 673,333 / 664k | 4,910,033 / 4,940,000 | ~299 / 34 | 83 / 27 |
+| E10 | 2d687b583 | 1.06-1.08M | 4.9M | 182 / 37 | 67 / 27 |
+| E11 | bcb193399 | 2,100,000 / 2,140,000 | 4,873,333 / 4,993,333 | 92 / 37 | 26 / 27 |
+| E12 | 648c03ba4 | 2,846,133 (one pair) | 4,833,333 | 63-67 / 37 | not recorded |
+| E13 | f7fa91058 | 2,926,667 / 2,953,333 | 5,025,283 / 4,838,183 | 64 / 35-37 | 29 / not recorded |
+| E14 | eb1859ed6 | 4,158,133 / 4,333,333 | 4,900,000 / 4,906,667 | 43 / 35-37 | 39 / 28 |
+| E15 | 45dc7d5c7 | 4,584,300 / 4,633,333 | 4,986,667 / 4,646,667 | 41 / 37 | 35 / 27 |
+| E16 | c8b70f45d | 4,664,833 / 4,820,000 | 4,913,333 / 4,680,000 | 37 / 37 | 29 / 27 |
+
+What each F5g item moved:
+- **g1, the early seal on evm2.** The step had never set `par_txs`, so every block sealed after the
+  whole finish. With the seal at the execution's end, sealed_at went from ~299 to 182 ms (E9 -> E10).
+- **g2, the execution.** No change to the code path. It found that "exec" included the batches'
+  190k-account merge, and that the bench ran on Shanghai, without the handler. It re-based the
+  bench on Prague.
+- **g3, the output shards.** Merge elided, state_wait 71 -> 13, sealed_at 182 -> 92 (E10 -> E11).
+  par_exec was at parity (26 / 27).
+- **g4, the seal's body.** tx_root 30 -> 3, sealed 30 -> 3, give_back 21 -> 2; sealed_at
+  92 -> 63-67 (E11 -> E12).
+- **g5, the tenure stall after a timed-out view.** A correctness fix: the stale-build guard's
+  committed floor is now forkchoice safe + the deferred depth. The fix round reached 57/57 equal
+  blocks with 0 failed proposals.
+- **g6, the plan body on evm2.** The hook ran on every block, but the prepared build was not taken
+  until g8.
+- **g7, the shards at the finish's end, the receipts behind it.** state_wait 11-14 -> 0,
+  seal_to_shards_ready 15-22 ms -> 1.4 ms (E12 -> E13).
+- **g8, the step's span around the execution.** The prepared take was fixed and the fees moved to
+  the pool. pre_exec ~25 -> 0.9 ms; sealed_at 64 -> 43; 2.93 -> 4.16-4.33M TPS (E13 -> E14).
+- **g9, the batches.** Per-batch fields; the gather moved into in-batch slots (5.5 -> 0.08 ms on the
+  bench). sealed_at 43 -> 41, par_exec 39 -> 35, 4.58-4.63M TPS (E14 -> E15).
+- **g10, the direct transfer path.** Batch CPU -64% on the bench. On the fleet, par_exec 35 -> 29
+  and sealed_at 41 -> 37, at parity (E15 -> E16).
+
 ### F6 leftovers
 
 Items the F5 paths leave for F6 or later, each with the condition that brings it back:

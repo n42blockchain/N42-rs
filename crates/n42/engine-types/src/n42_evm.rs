@@ -167,7 +167,7 @@ impl<'a, T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send
     fn execute_transaction_with_commit_condition(
         &mut self,
         transaction: impl reth_evm::execute::ExecutorTx<Self>,
-        f: impl FnOnce(&evm2::TxResult<T>) -> reth_evm::CommitChanges,
+        f: impl FnOnce(&evm2::TxResult<T>, evm2::TxStateChanges<'_>) -> reth_evm::CommitChanges,
     ) -> Result<Option<reth_evm::GasOutput>, reth_evm::BlockExecutionError> {
         // The inner executor's own path (it commits without detaching).
         self.inner.execute_transaction_with_commit_condition(transaction, f)

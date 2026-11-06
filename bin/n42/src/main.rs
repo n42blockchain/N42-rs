@@ -1061,8 +1061,10 @@ fn main() {
             // `N42_TX_INGEST_ALLOW_REMOTE=1`, and never off loopback under
             // the modes that trust a frame (direct, claimed senders, gateway
             // attestations), which admit what `eth_sendRawTransaction` would
-            // not (`n42_tx_ingest::ingest_bind_refusal`).
-            if let Ok(addr) = std::env::var("N42_TX_INGEST") {
+            // not (`n42_tx_ingest::ingest_bind_refusal`). An empty value is
+            // unset (`scripts/fleet7.sh` passes `N42_TX_INGEST=` to a node
+            // that serves none).
+            if let Some(addr) = n42_env::var("N42_TX_INGEST").filter(|addr| !addr.trim().is_empty()) {
                 match addr.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {
                         let pool = node.pool.clone();

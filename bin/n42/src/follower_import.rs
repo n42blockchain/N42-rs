@@ -3101,6 +3101,8 @@ where
                         fold_refused = n42_engine_types::graft_fold::refused_count(),
                         fast_hits_total = n42_engine_types::fast_handler::hits(),
                         fast_delegated_total = n42_engine_types::fast_handler::delegated(),
+                        direct_hits_total = n42_engine_types::direct_transfer::hits(),
+                        direct_delegated_total = n42_engine_types::direct_transfer::delegated(),
                         "parallel import"
                     );
                     output = Some(out);

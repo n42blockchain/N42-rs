@@ -29,6 +29,7 @@ use crate::{
     parallel_common::{batch_groups, batch_groups_one_wave, build_pool, largest_first, partition_by_sender, Dispatch, NotParallel},
 };
 use crate::n42_evm::N42BlockExecutor;
+use crate::direct_transfer::{DirectTransfers, Layered};
 use alloy_primitives::Address;
 use evm2::evm::AccountInfo;
 use reth_evm::{ConfigureEvm, Evm as _, EvmEnvFor};
@@ -101,6 +102,10 @@ pub struct BatchInside {
     pub gather_us: u64,
     /// After the batches: the split-off bundles copied and merged, wall.
     pub merge_us: u64,
+    /// Transfers the direct path applied (F5g10).
+    pub direct_hits: u64,
+    /// Transactions run on evm2 in batches the direct path was offered to.
+    pub direct_delegated: u64,
 }
 
 /// One transaction in this many is timed by part inside a batch.
@@ -461,14 +466,15 @@ pub fn execute_batches<C, D>(
     worst_case: Option<&(dyn Fn(usize) -> alloy_primitives::U256 + Sync)>,
     beneficiary: Address,
     dispatch: Dispatch,
+    direct: Option<&DirectTransfers<EvmTxOf<C>>>,
 ) -> Result<ParallelRun<C>, Refused>
 where
     C: ConfigureEvm + Sync,
     EvmEnvFor<C>: Sync,
     D: evm2::evm::Database + Send + 'static,
-    evm2::TxResult<TypesOf<C>>: Send,
+    evm2::TxResult<TypesOf<C>>: Send + Default,
 {
-    execute_batches_into(config, env, keys, groups, convert, open, worst_case, beneficiary, dispatch, None, &[])
+    execute_batches_into(config, env, keys, groups, convert, open, worst_case, beneficiary, dispatch, None, &[], direct)
 }
 
 /// [`execute_batches`] with each batch's bundle handed to `sink` on the
@@ -482,6 +488,12 @@ where
 /// no storage, nothing created, destroyed or left empty), and the
 /// partition by sender keeps a sender in one batch, so no account is
 /// debited by two.
+///
+/// `direct`, when given (F5g10, `N42_BATCH_DIRECT_TRANSFER`), applies each
+/// batch's plain transfers straight to the batch's accounts
+/// ([`crate::direct_transfer`]); the first transaction of a batch it does
+/// not apply goes to an EVM made then over the same accounts, and the rest
+/// of that batch runs on it.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_batches_into<C, D>(
     config: &C,
@@ -495,12 +507,13 @@ pub fn execute_batches_into<C, D>(
     dispatch: Dispatch,
     sink: Option<&(dyn Fn(reth_trie::bundle_state::BundleState) + Sync)>,
     kept: &[Address],
+    direct: Option<&DirectTransfers<EvmTxOf<C>>>,
 ) -> Result<ParallelRun<C>, Refused>
 where
     C: ConfigureEvm + Sync,
     EvmEnvFor<C>: Sync,
     D: evm2::evm::Database + Send + 'static,
-    evm2::TxResult<TypesOf<C>>: Send,
+    evm2::TxResult<TypesOf<C>>: Send + Default,
 {
     let before_at = std::time::Instant::now();
     let groups = match groups {
@@ -525,15 +538,21 @@ where
         let start_us = batches_at.elapsed().as_micros() as u64;
         let mark = crate::parallel_common::ThreadMark::now();
         let open_at = std::time::Instant::now();
+        let txs = members.iter().map(|g| g.len()).sum::<usize>();
         let db = TimedDb(open().ok_or(Refused::NotParallel(NotParallel::NoState))?);
+        // The direct path's accounts, which the batch's EVM reads through
+        // when one is made.
+        let mut layer = Some(Layered::new(db, if direct.is_some() { txs * 2 + 1 } else { 0 }));
         let open_us = open_at.elapsed().as_micros() as u64;
         let mut inside = BatchInside::default();
         let mut sampled_txs = 0u64;
         let mut seen = 0usize;
-        // The batch's EVM carries the fast transfer handler (as the revm-era
-        // batches always did) unless `N42_BATCH_FAST_TRANSFER=0`.
-        let mut evm = crate::fast_handler::as_batch(|| config.evm_with_env(db, env.clone()));
-        let txs = members.iter().map(|g| g.len()).sum::<usize>();
+        let (mut direct_hits, mut delegated) = (0u64, 0u64);
+        // The batch's EVM, made at the first transaction the direct path
+        // does not apply (at the start without it). It carries the fast
+        // transfer handler (as the revm-era batches always did) unless
+        // `N42_BATCH_FAST_TRANSFER=0`.
+        let mut evm = None;
         let mut state = BatchState::with_capacity(txs * 2 + 1);
         let mut skipped = Vec::new();
         let mut ledger = crate::includability::RunLedger::new();
@@ -554,6 +573,51 @@ where
                     READ_TIMING.with(|cell| cell.set((true, 0, 0)));
                     std::time::Instant::now()
                 });
+                if let (Some(direct), Some(layer)) = (direct, layer.as_mut()) {
+                    let step = match direct.shape(&tx) {
+                        Some(shape) => {
+                            let ledger = &mut ledger;
+                            direct.apply(&shape, layer, &mut state, |before| {
+                                worst_case.is_none_or(|cost| ledger.admit(shape.caller, first, before, cost(i)))
+                            })
+                        }
+                        None => crate::direct_transfer::Step::Fallback,
+                    };
+                    let applied = step != crate::direct_transfer::Step::Fallback;
+                    if applied {
+                        if let Some(at) = transact_at {
+                            inside.transact_us += at.elapsed().as_nanos() as u64;
+                            let (_, count, ns) = READ_TIMING.with(|cell| cell.replace((false, 0, 0)));
+                            inside.reads_us += ns;
+                            inside.reads_sampled += count;
+                            sampled_txs += 1;
+                        }
+                    }
+                    match step {
+                        crate::direct_transfer::Step::Applied => {
+                            direct_hits += 1;
+                            first = false;
+                            executed_slots.put(i, Executed { index: i, result: direct.result() });
+                            continue;
+                        }
+                        crate::direct_transfer::Step::Refused => {
+                            broken = true;
+                            skipped.push(i);
+                            continue;
+                        }
+                        crate::direct_transfer::Step::Fallback => {}
+                    }
+                }
+                if direct.is_some() {
+                    delegated += 1;
+                }
+                let evm = match &mut evm {
+                    Some(evm) => evm,
+                    None => {
+                        let Some(layer) = layer.take() else { return Err(Refused::NotParallel(NotParallel::NoState)) };
+                        evm.insert(crate::fast_handler::as_batch(|| config.evm_with_env(layer, env.clone())))
+                    }
+                };
                 let transacted = evm.transact(&tx);
                 if let Some(at) = transact_at {
                     inside.transact_us += at.elapsed().as_nanos() as u64;
@@ -606,6 +670,9 @@ where
         // The sampled parts scaled to the batch's count, in microseconds
         // (accumulated in nanoseconds).
         let scale = |ns: u64| ns.saturating_mul(seen as u64).checked_div(sampled_txs).unwrap_or(0) / 1000;
+        crate::direct_transfer::count(direct_hits, delegated);
+        inside.direct_hits = direct_hits;
+        inside.direct_delegated = delegated;
         inside.transact_us = scale(inside.transact_us);
         inside.reads_us = scale(inside.reads_us);
         inside.commit_us = scale(inside.commit_us);
@@ -648,6 +715,8 @@ where
         inside.commit_us += part.commit_us;
         inside.shard_add_us += part.shard_add_us;
         inside.reads_sampled += part.reads_sampled;
+        inside.direct_hits += part.direct_hits;
+        inside.direct_delegated += part.direct_delegated;
     }
     let spans = crate::parallel_common::BatchSpans::of(&mut spans, total_us);
     inside.before_us = before_us;
@@ -853,7 +922,8 @@ where
     let tail_len = tail.len();
     let convert = |i: usize| Recovered::new_unchecked(evm2::ethereum::TxEnvelope::from(transactions[i].clone()), senders[i]);
     let batches_at = std::time::Instant::now();
-    let run = execute_batches(config, &env, &keys, Some(groups), &convert, open, None, beneficiary, dispatch).map_err(refused)?;
+    let direct = DirectTransfers::for_env(&env, crate::direct_transfer::shape_of);
+    let run = execute_batches(config, &env, &keys, Some(groups), &convert, open, None, beneficiary, dispatch, direct.as_ref()).map_err(refused)?;
     let batches_us = batches_at.elapsed().as_micros() as u64;
     if let Some(&i) = run.skipped.first() {
         return Err(refused(Refused::NotParallel(NotParallel::Failed(i, "refused by the EVM on the batches' view".to_owned()))));
@@ -1084,7 +1154,7 @@ mod tests {
     fn run_batches(txs: &[Recovered<N42TxEnvelope>], worst_case: Option<&(dyn Fn(usize) -> U256 + Sync)>) -> Result<ParallelRun<Config>, Refused> {
         let c = config();
         let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);
-        execute_batches(&c, &env(), &keys(txs), None, &convert, &|| Some(parent()), worst_case, addr(BENEFICIARY), Dispatch::LargestFirst(4))
+        execute_batches(&c, &env(), &keys(txs), None, &convert, &|| Some(parent()), worst_case, addr(BENEFICIARY), Dispatch::LargestFirst(4), None)
     }
 
     /// The batches' part through [`execute_batches`] and [`commit_run`],
@@ -1221,6 +1291,190 @@ mod tests {
         assert_eq!(run.skipped, vec![1]);
         assert_eq!(run.executed.len(), 2);
         assert!(run_batches(&txs, None).expect("the batches run").skipped.is_empty(), "the EVM alone takes both");
+    }
+
+    // The direct transfer path (F5g10) against the batches on evm2 alone.
+
+    fn prague(osaka: bool) -> Config {
+        let builder = reth_chainspec::ChainSpecBuilder::mainnet().prague_activated();
+        let spec = if osaka { builder.osaka_activated() } else { builder }.build();
+        N42EvmConfig::new(Arc::new(n42_header::N42ChainSpec::from(spec)))
+    }
+
+    fn prague_env(c: &Config) -> reth_evm::EvmEnvFor<Config> {
+        let header = timing_header(alloy_consensus::Header {
+            number: 5,
+            timestamp: 1_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(7),
+            beneficiary: addr(BENEFICIARY),
+            ..Default::default()
+        });
+        c.evm_env(&n42_header::N42Header::from(header)).expect("env")
+    }
+
+    /// Enough for two transfers of 1,000 at a fee cap of 100 and not a
+    /// third (each settles at 10 a gas).
+    const TWO_TRANSFERS: u64 = 2_312_000;
+    const POOR: u64 = 30;
+    const DELEGATED: u64 = 31;
+
+    fn direct_parent() -> CacheDB<EmptyDB> {
+        let mut db = parent();
+        db.insert_account_info(&addr(POOR), AccountInfo { balance: U256::from(TWO_TRANSFERS), ..Default::default() });
+        let mut delegation = vec![0xef, 0x01, 0x00];
+        delegation.extend_from_slice(addr(2).as_slice());
+        let code = Bytecode::new_raw(Bytes::from(delegation));
+        db.insert_account_info(&addr(DELEGATED), AccountInfo { balance: U256::from(FUND), ..AccountInfo::default().with_code(code) });
+        db
+    }
+
+    fn fee_tx(from: u64, nonce: u64, to: Address, value: u64, max_fee: u128, priority: u128) -> Recovered<N42TxEnvelope> {
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: priority,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(tx, Signature::test_signature(), B256::left_padding_from(&(from * 1000 + nonce + 500).to_be_bytes()));
+        Recovered::new_unchecked(N42TxEnvelope::from(reth_ethereum_primitives::TransactionSigned::from(signed)), addr(from))
+    }
+
+    fn legacy_tx(from: u64, nonce: u64, to: Address, value: u64, chain_id: Option<u64>) -> Recovered<N42TxEnvelope> {
+        let tx = alloy_consensus::TxLegacy {
+            chain_id,
+            nonce,
+            gas_price: 50,
+            gas_limit: 21_000,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            input: Bytes::new(),
+        };
+        let signed = Signed::new_unchecked(tx, Signature::test_signature(), B256::left_padding_from(&(from * 1000 + nonce + 700).to_be_bytes()));
+        Recovered::new_unchecked(N42TxEnvelope::from(reth_ethereum_primitives::TransactionSigned::from(signed)), addr(from))
+    }
+
+    fn eip2930_tx(from: u64, to: Address, value: u64, access_list: alloy_eips::eip2930::AccessList) -> Recovered<N42TxEnvelope> {
+        let tx = alloy_consensus::TxEip2930 {
+            chain_id: 1,
+            nonce: 0,
+            gas_price: 50,
+            gas_limit: 40_000,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            access_list,
+            input: Bytes::new(),
+        };
+        let signed = Signed::new_unchecked(tx, Signature::test_signature(), B256::left_padding_from(&(from * 1000 + 900).to_be_bytes()));
+        Recovered::new_unchecked(N42TxEnvelope::from(reth_ethereum_primitives::TransactionSigned::from(signed)), addr(from))
+    }
+
+    /// `txs` through the batches on evm2 alone and with the direct path, on
+    /// Prague and on Osaka: the same refusal, or the same skipped set, the
+    /// same results (status, gas, refund, floor, output, logs) and, after
+    /// the commit and the block's end, the same receipts, gas, post-state,
+    /// reverts and contracts. `hits` is how many the direct path applied.
+    fn direct_equals_evm2(name: &str, txs: &[Recovered<N42TxEnvelope>], hits: u64) {
+        use alloy_consensus::Typed2718 as _;
+        for osaka in [false, true] {
+            let c = prague(osaka);
+            let env = prague_env(&c);
+            let why = crate::direct_transfer::refusal(env.spec.into(), &env.version);
+            assert_eq!(why, None, "Prague and Osaka have the path");
+            let direct = DirectTransfers::of_env(&env, crate::direct_transfer::shape_of).expect("Prague and Osaka have the path");
+            let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);
+            let keys = keys(txs);
+            let run = |direct: Option<&DirectTransfers<evm2::ethereum::TxEnvelope>>| {
+                execute_batches(&c, &env, &keys, None, &convert, &|| Some(direct_parent()), None, addr(BENEFICIARY), Dispatch::LargestFirst(4), direct)
+            };
+            let (stock, ours) = match (run(None), run(Some(&direct))) {
+                (Err(stock), Err(ours)) => {
+                    assert_eq!(ours.to_string(), stock.to_string(), "{name} (osaka {osaka}): the refusal");
+                    assert_eq!(hits, 0, "{name}: refused, so nothing applied");
+                    continue;
+                }
+                (Ok(stock), Ok(ours)) => (stock, ours),
+                (stock, ours) => panic!("{name} (osaka {osaka}): {:?} against {:?}", stock.map(|_| ()), ours.map(|_| ())),
+            };
+            assert_eq!(ours.inside.direct_hits, hits, "{name} (osaka {osaka}): applied directly");
+            assert_eq!(stock.inside.direct_hits, 0);
+            assert_eq!(ours.skipped, stock.skipped, "{name} (osaka {osaka}): skipped");
+            let results = |run: &ParallelRun<Config>| run.executed.iter().map(|e| (e.index, format!("{:?}", e.result))).collect::<Vec<_>>();
+            assert_eq!(results(&ours), results(&stock), "{name} (osaka {osaka}): results");
+            let w = withdrawals();
+            let finish = |run: ParallelRun<Config>| {
+                let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(direct_parent(), env.clone()), timing_ctx(&w));
+                ex.apply_pre_execution_changes().expect("pre");
+                let results = run.executed.into_iter().map(|e| {
+                    let tx_type = n42_tx_types::N42TxType::try_from(txs[e.index].ty()).expect("a type");
+                    (e.result, tx_type)
+                });
+                commit_run(&mut ex, results, run.merged, CacheScope::All).expect("the commit");
+                ex.finish().expect("the finish")
+            };
+            assert_same(&finish(ours), &finish(stock));
+        }
+    }
+
+    #[test]
+    fn the_direct_path_equals_evm2_on_qualifying_transfers() {
+        direct_equals_evm2("1559 to an existing account", &[transfer(1, 0, addr(2), 100)], 1);
+        direct_equals_evm2("1559 creating its recipient", &[transfer(1, 0, addr(FRESH), 100)], 1);
+        direct_equals_evm2("1559 over the intrinsic gas", &[tx(1, 0, addr(2), 100, 30_000, Bytes::new())], 1);
+        direct_equals_evm2("legacy", &[legacy_tx(2, 0, addr(3), 7, Some(1))], 1);
+        direct_equals_evm2("2930 with an empty access list", &[eip2930_tx(3, addr(4), 9, Default::default())], 1);
+        direct_equals_evm2("0x50 as 1559", &[alt_transfer(0)], 1);
+        direct_equals_evm2("zero value to an existing account", &[transfer(4, 0, addr(5), 0)], 1);
+        direct_equals_evm2("a zero tip to an existing beneficiary", &[fee_tx(4, 0, addr(5), 3, 7, 0)], 1);
+    }
+
+    #[test]
+    fn the_direct_path_hands_everything_else_to_evm2() {
+        let access_list = alloy_eips::eip2930::AccessList(vec![alloy_eips::eip2930::AccessListItem { address: addr(6), storage_keys: vec![B256::ZERO] }]);
+        direct_equals_evm2("zero value to an empty account", &[transfer(1, 0, addr(FRESH), 0)], 0);
+        direct_equals_evm2("to a contract", &[tx(1, 0, addr(STORE), 1, 100_000, Bytes::new())], 0);
+        direct_equals_evm2("to a precompile", &[tx(1, 0, Address::with_last_byte(4), 1, 30_000, Bytes::new())], 0);
+        direct_equals_evm2("to itself", &[transfer(2, 0, addr(2), 5)], 0);
+        direct_equals_evm2("to the beneficiary", &[transfer(3, 0, addr(BENEFICIARY), 5)], 0);
+        direct_equals_evm2("with input", &[tx(4, 0, addr(5), 1, 30_000, Bytes::from_static(&[1, 2]))], 0);
+        direct_equals_evm2("2930 with an access list", &[eip2930_tx(5, addr(6), 1, access_list)], 0);
+        direct_equals_evm2("value the sender lacks", &[transfer(POOR, 0, addr(2), TWO_TRANSFERS)], 0);
+        direct_equals_evm2("a nonce ahead", &[transfer(6, 3, addr(2), 1)], 0);
+        direct_equals_evm2("an intrinsic gas too low", &[tx(7, 0, addr(2), 1, 20_000, Bytes::new())], 0);
+        direct_equals_evm2("a legacy transaction without a chain id", &[legacy_tx(8, 0, addr(3), 7, None)], 0);
+        direct_equals_evm2("a fee cap under the base fee", &[fee_tx(9, 0, addr(3), 7, 6, 0)], 0);
+        direct_equals_evm2("a priority fee over the fee cap", &[fee_tx(9, 0, addr(3), 7, 10, 11)], 0);
+        direct_equals_evm2("a sender with a delegation", &[transfer(DELEGATED, 0, addr(3), 7)], 0);
+    }
+
+    #[test]
+    fn the_direct_path_equals_evm2_on_sender_runs() {
+        let run: Vec<_> = (0..6).map(|n| transfer(1, n, addr(10 + n), 100 + n)).collect();
+        direct_equals_evm2("a run of six", &run, 6);
+        let gap = vec![transfer(1, 0, addr(2), 1), transfer(1, 1, addr(3), 1), transfer(1, 3, addr(4), 1), transfer(1, 4, addr(5), 1)];
+        direct_equals_evm2("a nonce gap", &gap, 2);
+        let poor: Vec<_> = (0..4).map(|n| transfer(POOR, n, addr(2 + n), 1_000)).collect();
+        direct_equals_evm2("the balance running out mid-run", &poor, 2);
+        // 2 is paid by 1, then spends; 3 is paid by 2 and spends after.
+        let chained = vec![transfer(1, 0, addr(2), 5_000), transfer(2, 0, addr(3), 4_000), transfer(3, 0, addr(4), 3_000), transfer(1, 1, addr(3), 1)];
+        direct_equals_evm2("a recipient that sends later", &chained, 4);
+        // A self-transfer goes to evm2, made over the accounts the path
+        // wrote; the rest of that batch runs on it (sender 2's batch is
+        // another).
+        let mixed = vec![transfer(1, 0, addr(2), 100), transfer(1, 1, addr(1), 5), transfer(1, 2, addr(3), 7), transfer(2, 0, addr(4), 9)];
+        direct_equals_evm2("a self-transfer mid-run", &mixed, 2);
+        let mixed = vec![transfer(1, 0, addr(2), 100), legacy_tx(1, 1, addr(3), 7, None), transfer(1, 2, addr(FRESH), 0)];
+        direct_equals_evm2("an unprotected legacy mid-run, then zero to an empty account", &mixed, 1);
+        direct_equals_evm2("zero value to an empty account mid-run", &[transfer(1, 0, addr(2), 1), transfer(1, 1, addr(FRESH), 0)], 1);
+        direct_equals_evm2("to a delegated account", &[transfer(1, 0, addr(DELEGATED), 1)], 0);
+        direct_equals_evm2("to a precompile after a transfer", &[transfer(1, 0, addr(2), 1), transfer(1, 1, Address::with_last_byte(4), 1)], 1);
+        // The created account's spend is another sender's batch over the
+        // parent, where it has nothing: skipped on both paths.
+        direct_equals_evm2("a creating transfer then the created spending", &[transfer(1, 0, addr(FRESH), 1_000_000_000_000_000), transfer(FRESH, 0, addr(5), 1)], 1);
     }
 
     fn alt_key() -> ed25519_dalek::SigningKey {
@@ -1442,6 +1696,13 @@ mod tests {
         };
         header.gas_limit += 21_000;
         let env = c.evm_env(&n42_header::N42Header::from(timing_header(header))).expect("env");
+        // The direct transfer path (F5g10) on every run below unless
+        // `F5G_DIRECT=0`; each round also runs the shard path without it.
+        let direct_on = std::env::var("F5G_DIRECT").map_or(true, |v| v != "0");
+        let direct = direct_on.then(|| DirectTransfers::of_env(&env, crate::direct_transfer::shape_of).expect("a direct path"));
+        let direct = direct.as_ref();
+        eprintln!("evm2_step_bound direct path: {direct_on}");
+        let mut shard_exec_off = vec![];
         let w = withdrawals();
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move || {
@@ -1473,7 +1734,7 @@ mod tests {
             let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);
             let open = || Some(base.clone());
             let at = Instant::now();
-            let run = execute_batches(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env())
+            let run = execute_batches(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), direct)
                 .expect("the batches run");
             exec.push(at.elapsed().as_micros());
             assert_eq!(run.executed.len(), txs.len(), "skipped {}", run.skipped.len());
@@ -1511,7 +1772,7 @@ mod tests {
             for only in [false, true] {
                 let run = match first.take() {
                     Some(run) => run,
-                    None => execute_batches(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env())
+                    None => execute_batches(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), direct)
                         .expect("again"),
                 };
                 let ParallelRun { executed, merged, .. } = run;
@@ -1542,9 +1803,23 @@ mod tests {
             let sink = |bundle: BundleState| shards.add(bundle);
             let at = Instant::now();
             let recipients: Vec<Address> = w.iter().map(|w| w.address).collect();
-            let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink), &recipients)
+            let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink), &recipients, direct)
                 .expect("the sharded batches run");
             shard_exec.push(at.elapsed().as_micros());
+            // The same shard run on evm2 alone, for the split beside it.
+            {
+                let shards_off = crate::output_shards::OutputShards::new(addr(BENEFICIARY), keys.len(), shard_count);
+                let sink_off = |bundle: BundleState| shards_off.add(bundle);
+                let at = Instant::now();
+                let off = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink_off), &recipients, None)
+                    .expect("the evm2-only sharded run");
+                shard_exec_off.push(at.elapsed().as_micros());
+                eprintln!(
+                    "round {round} shard batches without the direct path: wall_sum_us={} cpu_sum_us={} | inside us: reads={} transact={} commit={} shard_add={}",
+                    off.spans.wall_sum_us, off.spans.cpu_sum_us, off.inside.reads_us, off.inside.transact_us, off.inside.commit_us, off.inside.shard_add_us,
+                );
+                drop((off, shards_off));
+            }
             eprintln!(
                 "round {round} shard batches: batches={} threads={} median_ms={} max_ms={} min_ms={} skew_ms={} last_start_us={} last_end_us={} open_sum_us={} txs_max={} txs_min={} wall_sum_us={} cpu_sum_us={} minflt={} vcsw={} ivcsw={} executed_size={} | inside us: reads={} transact={} commit={} shard_add={} reads_sampled={}",
                 run.spans.batches, run.spans.threads, run.spans.median_ms, run.spans.max_ms, run.spans.min_ms, run.spans.start_skew_ms,
@@ -1577,7 +1852,7 @@ mod tests {
                 let shards2 = crate::output_shards::OutputShards::new(addr(BENEFICIARY), keys.len(), shard_count);
                 let sink2 = |bundle: BundleState| shards2.add(bundle);
                 let recipients2: Vec<Address> = w.iter().map(|w| w.address).collect();
-                let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink2), &recipients2)
+                let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink2), &recipients2, direct)
                     .expect("the late-receipts run");
                 let frozen2 = shards2.freeze();
                 let ParallelRun { executed, merged, .. } = run;
@@ -1641,8 +1916,9 @@ mod tests {
             median(finish) as f64 / 1000.0,
         );
         eprintln!(
-            "evm2_step_bound shard path medians: exec_ms={:.1} freeze_ms={:.1} commit_ms={:.1} finish_ms={:.1}",
+            "evm2_step_bound shard path medians: exec_ms={:.1} exec_without_direct_ms={:.1} freeze_ms={:.1} commit_ms={:.1} finish_ms={:.1}",
             median(shard_exec) as f64 / 1000.0,
+            median(shard_exec_off) as f64 / 1000.0,
             median(freeze) as f64 / 1000.0,
             median(shard_commit) as f64 / 1000.0,
             median(shard_finish) as f64 / 1000.0,

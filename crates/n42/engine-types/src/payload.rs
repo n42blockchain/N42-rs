@@ -2684,6 +2684,9 @@ where
                 Vec::new()
             };
             evm2_setup_us = exec_at.elapsed().as_micros().saturating_sub(u128::from(evm2_shards_new_us)) as u64;
+            // The batches apply plain transfers straight to their accounts
+            // (F5g10) unless `N42_BATCH_DIRECT_TRANSFER=0`.
+            let direct = crate::direct_transfer::DirectTransfers::for_env(&group_env, crate::direct_transfer::shape_of);
             evm2_pre_exec_us = par_at.elapsed().as_micros() as u64;
             let run = crate::parallel_build::execute_batches_into(
                 &evm_config,
@@ -2697,6 +2700,7 @@ where
                 crate::parallel_transfer::Dispatch::from_env(),
                 sink,
                 &kept,
+                direct.as_ref(),
             );
             par_exec_ms = exec_at.elapsed().as_millis() as u64;
             let exec_end = std::time::Instant::now();
@@ -3024,6 +3028,8 @@ where
             sharded_total = crate::parallel_build::sharded_runs(),
             fast_hits_total = crate::fast_handler::hits(),
             fast_delegated_total = crate::fast_handler::delegated(),
+            direct_hits_total = crate::direct_transfer::hits(),
+            direct_delegated_total = crate::direct_transfer::delegated(),
             pull_ms = par_pull_ms,
             exec_ms = par_exec_ms,
             commit_ms = par_fold_ms,
@@ -5245,6 +5251,8 @@ where
                     evm2_exec_before_us = evm2_inside.before_us,
                     evm2_exec_gather_us = evm2_inside.gather_us,
                     evm2_exec_merge_us = evm2_inside.merge_us,
+                    evm2_direct_hits = evm2_inside.direct_hits,
+                    evm2_direct_delegated = evm2_inside.direct_delegated,
                     par_hook_us,
                     state_pre_changes_us,
                     sealed_ms,

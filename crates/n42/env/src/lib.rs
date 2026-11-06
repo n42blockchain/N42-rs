@@ -16,7 +16,8 @@
 //! - [`var`]: a free-form value (an address, a list, a mode word).
 //!
 //! [`profile`] holds the adopted-configuration presets (`N42_PROFILE=x22`),
-//! applied at process start before any knob is read.
+//! applied at process start before any knob is read; [`retired`] names the
+//! knobs that select nothing any more and warns once if one is set.
 
 use std::collections::HashSet;
 use std::env::VarError;
@@ -24,6 +25,9 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 pub mod profile;
+pub mod retired;
+
+pub use retired::warn_retired_once;
 
 /// Names already warned about, so a knob read on a hot path (or by several
 /// `OnceLock`s) logs its bad value once.

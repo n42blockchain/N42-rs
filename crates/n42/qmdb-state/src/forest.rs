@@ -491,7 +491,7 @@ pub struct QmdbForest {
     /// The root the pending block's application gave: [`Self::insert`]
     /// adopts the pending work only for the block that computed it. Two
     /// builds on one parent can both be computed before either is filed
-    /// (GA1b, 2026-11-06); the parent alone does not tell them apart.
+    /// (leg `GA1b`, 2026-11-06); the parent alone does not tell them apart.
     pending_root: B256,
     records: HashMap<B256, BlockRecord>,
     head: (u64, B256),

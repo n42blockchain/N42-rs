@@ -250,7 +250,7 @@ A single build per parent is unchanged (its root always matches).
 child; move to P' and back. Before the fix the child's root is P' based and
 the move fails with `Replay { block: child, expected: <filed>, got: <true> }`;
 after it, both are the reference roots. Suite and clippy:
-`/data/n42-build/audit-notes/ci/fix8191-test.log`, `fix8191-clippy.log`.
+`/data/n42-build/audit-notes/ci/fix8191-test.log` (rc 0), `fix8191-clippy2.log` (rc 0; `fix8191-clippy.log` rc 101 was a doc-markdown lint on the new comment, fixed).
 
 **Main.** The adoption rule dates from `49ac08391` (2026-08-26, the forest's
 undo records), so v2.8.1, v2.9.0 and v2.10.0 all carry it; it is not a reth

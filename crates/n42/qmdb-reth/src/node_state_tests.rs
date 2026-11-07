@@ -1929,3 +1929,51 @@ fn canonical_errors_split_into_fatal_and_retried() {
     drop(state);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The Rust half of the cross-client check (`k-cross.sh`): with
+/// `K_CROSS_DIR` set, imports gov5's whole-dead-twig export of its own import
+/// of `v2-tombstones.bin` (`gov5-whole.bin`) into an entry-file node the way
+/// `n42-init-snapshot init` does (`initialize_from_portable`), reopens it, and
+/// writes this node's v2 export of the imported kind-3 fixture to
+/// `rust-v2.bin` for gov5 to import. Ignored: the script runs it.
+#[test]
+#[ignore]
+fn cross_client_portable_v2() {
+    let Ok(dir) = std::env::var("K_CROSS_DIR") else { return };
+    let dir = PathBuf::from(dir);
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../twig-core/testdata/portable_v2");
+    let root_hex = std::fs::read_to_string(fixtures.join("root.hex")).expect("root.hex");
+    let root = B256::from_slice(&alloy_primitives::hex::decode(root_hex.trim()).expect("hex"));
+    let (genesis, head) = (B256::repeat_byte(0x11), (42, B256::repeat_byte(0x22)));
+    let chain = qmdb_chain();
+
+    let gov5 = std::fs::read(dir.join("gov5-whole.bin")).expect("gov5-whole.bin");
+    let store = scratch("cross-gov5");
+    let node = QmdbNodeState::new_with_entry_file(chain.clone(), &store, true);
+    node.initialize_from_portable(&gov5, 1143, genesis, head, root).expect("import gov5's v2 export");
+    println!("rust imported gov5-whole.bin ({} bytes): root {}", gov5.len(), node.state_root());
+    drop(node);
+    let reopened = QmdbNodeState::new_with_entry_file(chain.clone(), &store, true);
+    reopened.initialize(head).expect("reopen");
+    assert_eq!(reopened.state_root(), root);
+    println!("rust reopened the import: root {}", reopened.state_root());
+    let again = reopened.portable_export(1143, genesis).expect("re-export");
+    println!("rust re-export of the gov5 import equals gov5-whole.bin: {}", again == gov5);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&store);
+
+    let v2 = std::fs::read(fixtures.join("v2.bin")).expect("v2.bin");
+    let store = scratch("cross-rust");
+    let node = QmdbNodeState::new_with_entry_file(chain, &store, true);
+    node.initialize_from_portable(&v2, 1143, genesis, head, root).expect("import v2.bin");
+    let exported = node.portable_export(1143, genesis).expect("v2 export");
+    std::fs::write(dir.join("rust-v2.bin"), &exported).expect("write rust-v2.bin");
+    println!(
+        "rust exported its import of v2.bin to rust-v2.bin ({} bytes, equal to v2.bin: {}): root {}",
+        exported.len(),
+        exported == v2,
+        node.state_root()
+    );
+    drop(node);
+    let _ = std::fs::remove_dir_all(&store);
+}

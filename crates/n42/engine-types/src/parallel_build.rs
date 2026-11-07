@@ -264,6 +264,10 @@ pub enum Refused {
     /// An Amsterdam rule the batches cannot reproduce on this block
     /// ([`AmsterdamRefusal`], `docs/AMSTERDAM_PARALLEL_STEP.md`).
     Amsterdam(AmsterdamRefusal),
+    /// The transaction at this index does not fit the block's remaining gas
+    /// at its position ([`InclusionGas`], the stock import's
+    /// `validate_transaction_gas_limit`): the stock import refuses the block.
+    InclusionGas(usize),
 }
 
 /// Why the batches' Amsterdam run does not equal the serial execution.
@@ -273,16 +277,12 @@ pub enum AmsterdamRefusal {
     /// EIP-8037 new-account charge (and whether a creating transfer halts)
     /// depends on which comes first in the block.
     CreatedAcrossBatches(Address),
-    /// The executed transfers fail the block's two-dimensional inclusion
-    /// check at this candidate index (EIP-8037, `validate_transaction_gas_limit`).
-    BlockGas(usize),
 }
 
 impl std::fmt::Display for AmsterdamRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CreatedAcrossBatches(address) => write!(f, "{address} is created by one batch and paid in another"),
-            Self::BlockGas(i) => write!(f, "transaction {i} does not fit the block's regular or state gas"),
         }
     }
 }
@@ -296,6 +296,7 @@ impl std::fmt::Display for Refused {
             Self::Cache(address) => write!(f, "the executor already holds {address} at another value"),
             Self::Commit(err) => write!(f, "a receipt's commit failed: {err}"),
             Self::Amsterdam(err) => err.fmt(f),
+            Self::InclusionGas(i) => write!(f, "transaction {i}'s gas limit is over the block's remaining gas"),
         }
     }
 }
@@ -312,7 +313,7 @@ impl Refused {
             Self::Cache(_) => "cache-conflict",
             Self::Commit(_) => "commit-failed",
             Self::Amsterdam(AmsterdamRefusal::CreatedAcrossBatches(_)) => "amsterdam-created-across",
-            Self::Amsterdam(AmsterdamRefusal::BlockGas(_)) => "amsterdam-block-gas",
+            Self::InclusionGas(_) => "inclusion-gas",
         }
     }
 }
@@ -447,13 +448,15 @@ impl AmsterdamRules {
     /// spends at most 21,000 regular gas (its intrinsic) and at most the
     /// new-account charge as state gas, and only when its gas limit can pay
     /// it. The prefix is what the builder hands the batches, so that
-    /// [`Self::check_inclusion`] cannot refuse what they keep.
+    /// [`InclusionGas::check`] cannot refuse what they keep (the builder
+    /// runs no check of its own; tests prove the bound).
     pub fn take(&self, gas_limits: impl IntoIterator<Item = u64>) -> usize {
         let charge = self.new_account_state_gas();
+        let inclusion = InclusionGas::of(&self.version, self.block_gas_limit);
         let (mut regular, mut state, mut cumulative) = (0u64, 0u64, 0u64);
         let mut taken = 0;
         for gas_limit in gas_limits {
-            if !self.fits(gas_limit, regular, state, cumulative) {
+            if !inclusion.fits(gas_limit, regular, state, cumulative) {
                 break;
             }
             // 12,000 is the least intrinsic of a plain call (a self-transfer).
@@ -465,36 +468,68 @@ impl AmsterdamRules {
         }
         taken
     }
+}
 
-    /// The stock executor's inclusion check (`validate_transaction_gas_limit`,
-    /// which `commit_transaction` does not run) over `executed` in block
-    /// order, from an empty block: each item is (candidate index, gas limit,
-    /// the result). `Err` names the first that does not fit.
-    pub fn check_inclusion<E>(
-        &self,
-        executed: impl IntoIterator<Item = (usize, u64, impl std::borrow::Borrow<evm2::TxResultExt<E>>)>,
-    ) -> Result<(), AmsterdamRefusal> {
-        let (mut regular, mut state, mut cumulative) = (0u64, 0u64, 0u64);
-        for (index, gas_limit, result) in executed {
-            if !self.fits(gas_limit, regular, state, cumulative) {
-                return Err(AmsterdamRefusal::BlockGas(index));
-            }
-            let result = result.borrow();
-            regular = regular.saturating_add(result.execution_gas_spent());
-            state = state.saturating_add(result.state_gas_spent());
-            cumulative = cumulative.saturating_add(result.tx_gas_used());
+/// The stock executor's inclusion check (`validate_transaction_gas_limit`,
+/// which `commit_transaction` does not run, so the batches' receipts skip
+/// it) on every fork: a transaction's gas limit (capped by EIP-7825 for the
+/// regular dimension) against the block's remaining gas at its position;
+/// with EIP-8037 both the regular and the state dimension.
+#[derive(Debug, Clone, Copy)]
+pub struct InclusionGas {
+    block_gas_limit: u64,
+    tx_gas_limit_cap: u64,
+    separate: bool,
+}
+
+impl InclusionGas {
+    /// The check for a block on `version` with `block_gas_limit`.
+    pub fn of(version: &evm2::Version, block_gas_limit: u64) -> Self {
+        Self {
+            block_gas_limit,
+            tx_gas_limit_cap: version.tx_gas_limit_cap,
+            separate: version.feature(evm2::EvmFeatures::EIP8037),
         }
-        Ok(())
     }
 
-    /// `validate_transaction_gas_limit` at the given counters.
-    fn fits(&self, gas_limit: u64, regular: u64, state: u64, cumulative: u64) -> bool {
-        let regular_limit = gas_limit.min(self.version.tx_gas_limit_cap);
-        if self.version.feature(evm2::EvmFeatures::EIP8037) {
+    /// `validate_transaction_gas_limit` at the given counters (the block's
+    /// regular and state gas with EIP-8037, its cumulative gas without).
+    pub fn fits(&self, gas_limit: u64, regular: u64, state: u64, cumulative: u64) -> bool {
+        let regular_limit = gas_limit.min(self.tx_gas_limit_cap);
+        if self.separate {
             regular_limit <= self.block_gas_limit.saturating_sub(regular) && gas_limit <= self.block_gas_limit.saturating_sub(state)
         } else {
             regular_limit <= self.block_gas_limit.saturating_sub(cumulative)
         }
+    }
+
+    /// The check over transactions in block order from an empty block, each
+    /// as (index, gas limit, regular gas, state gas, gas used): one
+    /// comparison per transaction on the running counters. `Err` names the
+    /// first that does not fit.
+    pub fn check(&self, spent: impl IntoIterator<Item = (usize, u64, u64, u64, u64)>) -> Result<(), usize> {
+        let (mut regular, mut state, mut cumulative) = (0u64, 0u64, 0u64);
+        for (index, gas_limit, tx_regular, tx_state, used) in spent {
+            if !self.fits(gas_limit, regular, state, cumulative) {
+                return Err(index);
+            }
+            regular = regular.saturating_add(tx_regular);
+            state = state.saturating_add(tx_state);
+            cumulative = cumulative.saturating_add(used);
+        }
+        Ok(())
+    }
+
+    /// [`Self::check`] over executed results: each item is (index, gas
+    /// limit, the result).
+    pub fn check_results<E>(
+        &self,
+        executed: impl IntoIterator<Item = (usize, u64, impl std::borrow::Borrow<evm2::TxResultExt<E>>)>,
+    ) -> Result<(), usize> {
+        self.check(executed.into_iter().map(|(index, gas_limit, result)| {
+            let result = result.borrow();
+            (index, gas_limit, result.execution_gas_spent(), result.state_gas_spent(), result.tx_gas_used())
+        }))
     }
 }
 
@@ -917,13 +952,6 @@ where
         }
     }
     let executed = executed_slots.into_ordered();
-    if let Some(rules) = &amsterdam {
-        rules
-            .check_inclusion::<<TypesOf<C> as evm2::EvmTypesHost>::TxResultExt>(executed.iter().map(|e| {
-                (e.index, alloy_consensus::Transaction::gas_limit(convert(e.index).inner()), &e.result)
-            }))
-            .map_err(Refused::Amsterdam)?;
-    }
     skipped.sort_unstable();
     inside.gather_us = gather_at.elapsed().as_micros() as u64;
     let merge_at = std::time::Instant::now();
@@ -1130,6 +1158,17 @@ where
     let batches_us = batches_at.elapsed().as_micros() as u64;
     if let Some(&i) = run.skipped.first() {
         return Err(refused(Refused::NotParallel(NotParallel::Failed(i, "refused by the EVM on the batches' view".to_owned()))));
+    }
+    // The stock import's inclusion check, which the receipts' commit skips:
+    // a block whose transaction does not fit the remaining gas is the stock
+    // import's to refuse (`docs/AMSTERDAM_PARALLEL_STEP.md` 5.5).
+    {
+        use reth_evm::EvmEnv as _;
+        InclusionGas::of(env.version(), env.block_env().gas_limit.saturating_to::<u64>())
+            .check_results::<<TypesOf<C> as evm2::EvmTypesHost>::TxResultExt>(
+                run.executed.iter().map(|e| (e.index, alloy_consensus::Transaction::gas_limit(&transactions[e.index]), &e.result)),
+            )
+            .map_err(|i| refused(Refused::InclusionGas(i)))?;
     }
     let finish_at = std::time::Instant::now();
     let ParallelRun { executed, merged, batches, groups, .. } = run;
@@ -2487,20 +2526,30 @@ mod tests {
 
     /// The two gas dimensions (EIP-8037): three creating transfers at
     /// 210,000 fit a 450,000 block's regular gas but not its state gas
-    /// after two. The batches refuse the third (the stock executor refuses
-    /// it as over the block's gas), and the builder's take stops before it.
+    /// after two. The inclusion check refuses the third (the stock executor
+    /// refuses it as over the block's gas), the follower's import of such a
+    /// block is refused, and the builder's take stops before it.
     #[test]
     fn the_block_gas_dimensions_bound_the_batches() {
+        use reth_evm::execute::Executor as _;
         let c = amsterdam();
         let env = amsterdam_env(&c, 450_000);
         let txs = vec![creating(1, 0, addr(FRESH), 5), creating(3, 0, addr(FRESH2), 7), creating(5, 0, addr(FRESH3), 9)];
         let rules = AmsterdamRules::of(&env.version, 450_000).expect("Amsterdam");
         assert_eq!(rules.take(txs.iter().map(|_| CREATING_GAS)), 2);
         assert_eq!(rules.take([21_000; 30]), 21);
-        match run_on(&c, &env, &txs, false) {
-            Err(Refused::Amsterdam(AmsterdamRefusal::BlockGas(2))) => {}
-            other => panic!("{:?}", other.map(|run| run.batches)),
-        }
+        let run = run_on(&c, &env, &txs, false).expect("the batches run");
+        let inclusion = InclusionGas::of(&env.version, 450_000);
+        let check = |run: &ParallelRun<Config>| {
+            inclusion.check_results::<<TypesOf<Config> as evm2::EvmTypesHost>::TxResultExt>(
+                run.executed.iter().map(|e| (e.index, CREATING_GAS, &e.result)),
+            )
+        };
+        assert_eq!(check(&run), Err(2));
+        let block = amsterdam_block_of(&txs, 450_000);
+        assert!(c.executor(direct_parent()).execute(&block).is_err(), "the stock import refuses the block");
+        assert!(matches!(amsterdam_import(&block), Err(Refused::InclusionGas(2))));
+        assert_eq!(check(&run_on(&c, &env, &txs[..2], false).expect("the two kept")), Ok(()));
         let w = withdrawals();
         let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(direct_parent(), env.clone()), timing_ctx(&w));
         ex.apply_pre_execution_changes().expect("pre");
@@ -2528,6 +2577,117 @@ mod tests {
         for osaka in [false, true] {
             let c = prague(osaka);
             assert!(AmsterdamRules::of(&prague_env(&c).version, 30_000_000).is_none());
+        }
+    }
+
+    /// `txs` as a Prague (or Osaka) block of `gas_limit` over [`direct_parent`].
+    fn prague_block_of(txs: &[Recovered<N42TxEnvelope>], gas_limit: u64) -> reth_primitives_traits::RecoveredBlock<n42_tx_types::Block> {
+        let header = n42_header::N42Header::from(timing_header(alloy_consensus::Header {
+            number: 5,
+            timestamp: 1_000,
+            gas_limit,
+            base_fee_per_gas: Some(7),
+            beneficiary: addr(BENEFICIARY),
+            ..Default::default()
+        }));
+        let body = n42_tx_types::BlockBody {
+            transactions: txs.iter().map(|t| t.inner().clone()).collect(),
+            ommers: Vec::new(),
+            withdrawals: Some(withdrawals().into()),
+        };
+        reth_primitives_traits::RecoveredBlock::new_unhashed(n42_tx_types::Block::new(header, body), txs.iter().map(|t| t.signer()).collect())
+    }
+
+    /// The stock and the parallel import of `block` on `c`.
+    fn both_imports(c: &Config, block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> (Result<Output, String>, Result<Output, Refused>) {
+        use reth_evm::execute::Executor as _;
+        let stock = c.executor(direct_parent()).execute(block).map_err(|err| err.to_string());
+        let ours = import_block(c, block, direct_parent(), &|| Some(direct_parent()), Dispatch::LargestFirst(4), None).map(|(out, _)| out);
+        (stock, ours)
+    }
+
+    /// The follower's inclusion check on every fork (section 6 of the audit
+    /// note, fixed): a block whose leading transfer's gas limit is above the
+    /// block's remaining gas at its position is refused by the stock import
+    /// and by the parallel import (`inclusion-gas`), which leaves it to the
+    /// stock import; a block that fits is accepted by both with the same
+    /// receipts, receipts root and QMDB root.
+    #[test]
+    fn a_transfer_over_the_remaining_gas_is_refused_by_both_imports() {
+        let c = prague(false);
+        // 30,000,000 - 21,000 = 29,979,000 left for the second transfer.
+        let over = [transfer(1, 0, addr(2), 1), tx(3, 0, addr(4), 1, 29_979_001, Bytes::new())];
+        let (stock, ours) = both_imports(&c, &prague_block_of(&over, 30_000_000));
+        assert!(stock.is_err(), "the stock import refuses it");
+        assert!(matches!(ours, Err(Refused::InclusionGas(1))), "{:?}", ours.map(|_| ()));
+        assert_eq!(Refused::InclusionGas(1).reason(), "inclusion-gas");
+        let fits = [transfer(1, 0, addr(2), 1), tx(3, 0, addr(4), 1, 29_979_000, Bytes::new())];
+        let (stock, ours) = both_imports(&c, &prague_block_of(&fits, 30_000_000));
+        assert_same_import(&ours.expect("the parallel import"), &stock.expect("the stock import"));
+        // A small block, on Prague and on Osaka: the third 21,000 transfer
+        // is over 50,000 - 42,000; two fit 42,000 exactly.
+        for osaka in [false, true] {
+            let c = prague(osaka);
+            let three = [transfer(1, 0, addr(2), 1), transfer(3, 0, addr(4), 1), transfer(5, 0, addr(6), 1)];
+            let (stock, ours) = both_imports(&c, &prague_block_of(&three, 50_000));
+            assert!(stock.is_err(), "osaka {osaka}: the stock import refuses it");
+            assert!(matches!(ours, Err(Refused::InclusionGas(2))), "osaka {osaka}: {:?}", ours.map(|_| ()));
+            let (stock, ours) = both_imports(&c, &prague_block_of(&three[..2], 42_000));
+            assert_same_import(&ours.expect("the parallel import"), &stock.expect("the stock import"));
+        }
+    }
+
+    /// The builder runs no inclusion check of its own: what it hands the
+    /// batches always passes one. Before Amsterdam its candidates are
+    /// transfers of exactly 21,000 gas (`transfer_key`) from an empty block
+    /// (`transactions-before` refuses otherwise), at most the block's gas
+    /// over 21,000 of them (the budget), each using 21,000; one more would
+    /// fail, so the budget is exact. On Amsterdam [`AmsterdamRules::take`]'s
+    /// prefix passes whatever each transfer turns out to spend (its
+    /// intrinsic, a floor of at most 21,000, the new-account charge when its
+    /// gas limit can pay it).
+    #[test]
+    fn the_builders_take_always_passes_the_inclusion_check() {
+        for osaka in [false, true] {
+            let version = prague_env(&prague(osaka)).version;
+            for limit in [21_000u64, 41_999, 42_000, 50_000, 450_000, 30_000_000, 36_000_007] {
+                let budget = (limit / TRANSFER_GAS) as usize;
+                let inclusion = InclusionGas::of(&version, limit);
+                let spent = |n: usize| (0..n).map(|i| (i, TRANSFER_GAS, TRANSFER_GAS, 0, TRANSFER_GAS));
+                assert_eq!(inclusion.check(spent(budget)), Ok(()), "osaka {osaka} limit {limit}");
+                assert_eq!(inclusion.check(spent(budget + 1)), Err(budget), "osaka {osaka} limit {limit}");
+            }
+        }
+        let version = amsterdam_env(&amsterdam(), 30_000_000).version;
+        let charge = AmsterdamRules::of(&version, 30_000_000).expect("Amsterdam").new_account_state_gas();
+        let gas_limits = [21_000u64, 30_000, 12_000 + charge - 1, 12_000 + charge, 204_600, CREATING_GAS, 1_000_000];
+        let mut seed = 0x2780_8037u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            seed >> 33
+        };
+        for limit in [21_000u64, 450_000, 1_000_000, 5_000_000] {
+            let rules = AmsterdamRules::of(&version, limit).expect("Amsterdam");
+            let inclusion = InclusionGas::of(&version, limit);
+            for _ in 0..200 {
+                let cands: Vec<u64> = (0..(next() % 40) as usize).map(|_| gas_limits[(next() % gas_limits.len() as u64) as usize]).collect();
+                let kept = &cands[..rules.take(cands.iter().copied())];
+                // Every transfer at its worst (21,000 regular, the charge when
+                // its gas limit can pay it) and at a random lesser spend.
+                for worst in [true, false] {
+                    let spent: Vec<_> = kept
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &gas_limit)| {
+                            let payable = gas_limit >= 12_000 + charge;
+                            let regular = if worst { TRANSFER_GAS } else { [12_000, 15_000, TRANSFER_GAS][(next() % 3) as usize] };
+                            let state = if payable && (worst || next() % 2 == 0) { charge } else { 0 };
+                            (i, gas_limit, regular, state, regular + state)
+                        })
+                        .collect();
+                    assert_eq!(inclusion.check(spent), Ok(()), "limit {limit} kept {kept:?}");
+                }
+            }
         }
     }
 

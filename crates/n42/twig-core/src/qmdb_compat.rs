@@ -23,6 +23,13 @@ const PORTABLE_SNAPSHOT_HEADER_SIZE: usize = 8 + 8 + 32 + 8 + 32 + 32 + 8 + 8;
 const PORTABLE_SNAPSHOT_ENTRY_SIZE: usize = 8 + 1 + 32 + 4;
 const MAX_PORTABLE_VALUE_SIZE: usize = 16 << 20;
 
+mod portable_v2;
+pub use portable_v2::{
+    PortableFormat, QmdbPortableTree, PORTABLE_KIND_DEAD, PORTABLE_KIND_DEAD_TWIG, PORTABLE_KIND_LIVE,
+    PORTABLE_KIND_TOMBSTONE, PORTABLE_SNAPSHOT_MAGIC_V2,
+};
+use portable_v2::check_dead_twig_run;
+
 /// Keccak-256 of empty bytecode. gov5 treats both this value and zero as an empty code hash when
 /// serializing a QMDB account leaf.
 pub const GOV5_EMPTY_CODE_HASH: Hash = [
@@ -251,12 +258,33 @@ pub enum QmdbPortableError {
     WrongGenesisHash,
     #[error("QMDB portable snapshot root does not match its positional slot log")]
     RootMismatch,
+    /// A v2 record kind outside 0-3.
+    #[error("QMDB portable slot {slot} has invalid record kind {kind}")]
+    InvalidRecordKind { slot: u64, kind: u8 },
+    /// A kind-3 run that does not cover one whole twig from its first slot.
+    #[error("QMDB portable whole-dead-twig run at slot {slot} of {count} slots does not cover exactly one twig from its start")]
+    MisalignedDeadTwig { slot: u64, count: u64 },
+    /// The header's `tombstones` disagrees with the records of kind 2 and 3.
+    #[error("QMDB portable snapshot header claims {header} tombstone records, the stream has {records}")]
+    TombstoneCount { header: u64, records: u64 },
+    /// A v1 snapshot was asked of slots one of which keeps only its leaf hash.
+    #[error("QMDB slot {slot} keeps only its leaf hash: a v1 portable snapshot needs every slot's key and value")]
+    HashOnlySlot { slot: u64 },
+    /// A live slot keeps only its leaf hash; only dead slots may drop their payload.
+    #[error("QMDB slot {slot} is live but keeps only its leaf hash")]
+    ActiveTombstone { slot: u64 },
+    /// A kind-3 run carries one leaf root, not the 2048 leaf hashes an
+    /// importing tree holds per slot; it verifies, it does not import.
+    #[error("QMDB portable whole-dead-twig run at slot {slot} carries no per-slot leaf hashes: it verifies but cannot be imported; export with tombstones only")]
+    DeadTwigNotImportable { slot: u64 },
 }
 
 /// Result of a bounded-memory streaming verification. Only one 2048-leaf twig
 /// and the compact upper-root list are retained, regardless of replay length.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QmdbPortableVerification {
+    /// Which layout the stream was in (its magic).
+    pub format: PortableFormat,
     pub chain_id: u64,
     pub genesis_hash: Hash,
     pub block_number: u64,
@@ -264,20 +292,26 @@ pub struct QmdbPortableVerification {
     pub root: Hash,
     pub next_slot: u64,
     pub live_count: u64,
+    /// Records of kind 2 and 3 (always 0 for v1).
+    pub tombstones: u64,
 }
 
 /// Verify a portable snapshot from a stream without materializing its values or
 /// full append log. This is the full-replay observer path: peak tree memory is
 /// one twig plus one 32-byte root per historical twig.
+///
+/// Both layouts are accepted, told apart by the magic: v1 (`N42QMDB\x01`,
+/// every slot with its payload) and the tombstone layout
+/// ([`PortableFormat::V2`], `docs/QMDB_COMPACTION_DESIGN.md` section 6),
+/// whose dead slots may carry only their leaf hash (kind 2) and whose
+/// wholly dead twigs may carry only their leaf root (kind 3).
 pub fn verify_portable_stream<R: Read>(
     reader: R,
     expected_chain_id: u64,
     expected_genesis_hash: &Hash,
 ) -> Result<QmdbPortableVerification, QmdbPortableError> {
     let mut reader = PortableHashingReader::new(reader);
-    if reader.array::<8>()? != *PORTABLE_SNAPSHOT_MAGIC {
-        return Err(QmdbPortableError::UnsupportedVersion);
-    }
+    let format = PortableFormat::of_magic(&reader.array::<8>()?).ok_or(QmdbPortableError::UnsupportedVersion)?;
     let chain_id = u64::from_le_bytes(reader.array()?);
     if chain_id != expected_chain_id {
         return Err(QmdbPortableError::WrongChainId {
@@ -300,6 +334,10 @@ pub fn verify_portable_stream<R: Read>(
             next_slot,
         });
     }
+    let claimed_tombstones = match format {
+        PortableFormat::V1 => 0,
+        PortableFormat::V2 => u64::from_le_bytes(reader.array()?),
+    };
 
     let nulls = null_level();
     let mut current_twig = (next_slot > 0).then(|| Twig::new(&nulls));
@@ -309,8 +347,10 @@ pub fn verify_portable_stream<R: Read>(
     // multi-GB reservation before a single entry is validated. `push` amortizes.
     let mut twig_roots: Vec<Hash> = Vec::new();
     let mut live_count = 0_u64;
+    let mut tombstones = 0_u64;
     let mut value = Vec::new();
-    for expected in 0..entry_count {
+    let mut expected = 0_u64;
+    while expected < entry_count {
         let slot = u64::from_le_bytes(reader.array()?);
         if slot != expected {
             return Err(QmdbPortableError::NonContiguousSlotLog {
@@ -318,25 +358,45 @@ pub fn verify_portable_stream<R: Read>(
                 got: slot,
             });
         }
-        let flag = reader.array::<1>()?[0];
-        if flag > 1 {
-            return Err(QmdbPortableError::InvalidActiveFlag { slot, flag });
-        }
-        let key = reader.array()?;
-        let value_len = u32::from_le_bytes(reader.array()?) as usize;
-        if value_len > MAX_PORTABLE_VALUE_SIZE {
-            return Err(QmdbPortableError::ValueTooLarge {
-                slot,
-                size: value_len,
-            });
-        }
-        reader.fill_vec(&mut value, value_len)?;
+        let kind = reader.array::<1>()?[0];
         let local = slot as usize % TWIG_SIZE;
+        let (leaf, active) = match (format, kind) {
+            (_, PORTABLE_KIND_DEAD | PORTABLE_KIND_LIVE) => {
+                let key = reader.array()?;
+                let value_len = u32::from_le_bytes(reader.array()?) as usize;
+                if value_len > MAX_PORTABLE_VALUE_SIZE {
+                    return Err(QmdbPortableError::ValueTooLarge {
+                        slot,
+                        size: value_len,
+                    });
+                }
+                reader.fill_vec(&mut value, value_len)?;
+                (hash_leaf(&key, &value), kind == PORTABLE_KIND_LIVE)
+            }
+            (PortableFormat::V2, PORTABLE_KIND_TOMBSTONE) => {
+                tombstones += 1;
+                (reader.array()?, false)
+            }
+            (PortableFormat::V2, PORTABLE_KIND_DEAD_TWIG) => {
+                let count = u16::from_le_bytes(reader.array()?) as u64;
+                let leaf_root: Hash = reader.array()?;
+                check_dead_twig_run(slot, count, entry_count)?;
+                tombstones += 1;
+                // The twig's leaves are committed by `leaf_root` alone and
+                // its bits are all clear. `current_twig` is untouched: still
+                // the fresh twig the next record starts.
+                twig_roots.push(hash_node(&leaf_root, &hash_bits(&[0; BITS_BYTES])));
+                expected += count;
+                continue;
+            }
+            (PortableFormat::V1, flag) => return Err(QmdbPortableError::InvalidActiveFlag { slot, flag }),
+            (PortableFormat::V2, kind) => return Err(QmdbPortableError::InvalidRecordKind { slot, kind }),
+        };
         let twig = current_twig
             .as_mut()
             .expect("a non-empty stream always has a current twig");
-        twig.set_leaf_unchecked(local, hash_leaf(&key, &value));
-        if flag == 1 {
+        twig.set_leaf_unchecked(local, leaf);
+        if active {
             twig.bits[local / 8] |= 1 << (local % 8);
             live_count += 1;
         }
@@ -347,6 +407,7 @@ pub fn verify_portable_stream<R: Read>(
                 current_twig = Some(Twig::new(&nulls));
             }
         }
+        expected += 1;
     }
     if next_slot > 0 && !(next_slot as usize).is_multiple_of(TWIG_SIZE) {
         let twig = current_twig
@@ -356,12 +417,16 @@ pub fn verify_portable_stream<R: Read>(
         twig_roots.push(twig.root);
     }
     reader.finish()?;
+    if tombstones != claimed_tombstones {
+        return Err(QmdbPortableError::TombstoneCount { header: claimed_tombstones, records: tombstones });
+    }
 
     let root = fold_portable_twig_roots(&twig_roots);
     if root != claimed_root {
         return Err(QmdbPortableError::RootMismatch);
     }
     Ok(QmdbPortableVerification {
+        format,
         chain_id,
         genesis_hash,
         block_number,
@@ -369,6 +434,7 @@ pub fn verify_portable_stream<R: Read>(
         root,
         next_slot,
         live_count,
+        tombstones,
     })
 }
 
@@ -639,6 +705,12 @@ impl<'a> PortableReader<'a> {
 
     fn byte(&mut self) -> Result<u8, QmdbPortableError> {
         Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, QmdbPortableError> {
+        let mut bytes = [0_u8; 2];
+        bytes.copy_from_slice(self.take(2)?);
+        Ok(u16::from_le_bytes(bytes))
     }
 
     fn u32(&mut self) -> Result<u32, QmdbPortableError> {

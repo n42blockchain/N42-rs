@@ -1,6 +1,6 @@
 [package]
 name = "reth-transaction-pool"
-version = "2.9.0"
+version = "2.10.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
@@ -12,17 +12,17 @@ description = "Transaction pool implementation"
 
 [dependencies]
 # reth
-reth-chain-state = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
-reth-ethereum-primitives = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
-reth-chainspec = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
-reth-eth-wire-types = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
-reth-evm = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
-reth-evm-ethereum = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0", "features" = ["std"] }
+reth-chain-state = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
+reth-ethereum-primitives = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
+reth-chainspec = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
+reth-eth-wire-types = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
+reth-evm = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
+reth-evm-ethereum = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0", "features" = ["std"] }
 reth-primitives-traits = { "version" = "0.8.2", "default-features" = false }
-reth-execution-types = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
-reth-fs-util = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
-reth-storage-api = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
-reth-tasks = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
+reth-execution-types = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
+reth-fs-util = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
+reth-storage-api = { "default-features" = false, "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
+reth-tasks = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
 
 # ethereum
 alloy-eips = { "version" = "2.5.0", "default-features" = false, "features" = ["kzg"] }
@@ -37,7 +37,7 @@ tokio = { "version" = "1.52.3", "default-features" = false, "features" = ["sync"
 tokio-stream = { "version" = "0.1.11" }
 
 # metrics
-reth-metrics = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0" }
+reth-metrics = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0" }
 metrics = { "version" = "0.24.0" }
 
 # misc
@@ -59,8 +59,8 @@ paste = { package = "pastey", version = "0.2.3", optional = true }
 proptest = { "version" = "1.7", "optional" = true }
 proptest-arbitrary-interop = { "version" = "0.1.0", "optional" = true }
 [dev-dependencies]
-evm2 = { "git" = "https://github.com/alloy-rs/evm2", "rev" = "f93318f120f6300599b21170d6c7bef81ed63d87", "default-features" = false }
-reth-provider = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0", "features" = ["test-utils"] }
+evm2 = { "git" = "https://github.com/alloy-rs/evm2", "rev" = "592bf18c4e22fff54ac9b4db606c4ee276e345cb", "default-features" = false }
+reth-provider = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0", "features" = ["test-utils"] }
 reth-tracing = { "version" = "0.1.0", "default-features" = false, "features" = ["attributes"] }
 alloy-primitives = { "version" = "1.6.1", "default-features" = false, "features" = ["map-foldhash", "rand"] }
 paste = { package = "pastey", version = "0.2.3" }
@@ -72,7 +72,7 @@ tempfile = { "version" = "3.20" }
 tokio = { "version" = "1.52.3", "default-features" = false, "features" = ["rt-multi-thread"] }
 futures = { "version" = "0.3" }
 criterion = { "package" = "codspeed-criterion-compat", "version" = "4.3" }
-reth-transaction-pool = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.9.0", "features" = ["test-utils"] }
+reth-transaction-pool = { "git" = "https://github.com/paradigmxyz/reth.git", "tag" = "v2.10.0", "features" = ["test-utils"] }
 [features]
 serde = [
     "reth-execution-types/serde",

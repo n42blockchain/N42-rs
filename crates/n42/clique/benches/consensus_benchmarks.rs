@@ -3,7 +3,8 @@
 
 //! Performance benchmarks for consensus operations
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use alloy_primitives::{Address, B256, U256};
 use n42_primitives::{APosConfig, Snapshot};

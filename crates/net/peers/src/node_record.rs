@@ -20,6 +20,7 @@ use serde_with::{DeserializeFromStr, SerializeDisplay};
 
 #[cfg(feature = "secp256k1")]
 use enr::Enr;
+use url::{Host, Url};
 
 /// Represents an ENR in discovery.
 ///
@@ -185,8 +186,6 @@ impl FromStr for NodeRecord {
     type Err = NodeRecordParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        use url::{Host, Url};
-
         let url = Url::parse(s).map_err(|e| NodeRecordParseError::InvalidUrl(e.to_string()))?;
 
         let address = match url.host() {

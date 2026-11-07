@@ -60,8 +60,8 @@ or `audit-notes/ci/`; research notes in English under `docs/`.
 | G3 | v2.10.0: cascade + code gates | fix until check / clippy / tests pass; fast handler and direct transfer unchanged | G | check --workspace --tests, clippy-n42, n42-testing / engine-types / qmdb-state / qmdb-reth / env / n42, ported fixtures | done (40f99113b: one callback signature, #28207); all rc=0 (`ci/g-*.log`) |
 | G4 | v2.10.0: engine defaults | diff TreeConfig / EngineArgs / persistence defaults | G | table in the port log | done: unchanged 2.9.0 -> 2.10.0; QMDB overrides stand |
 | G5 | v2.10.0: native binaries | `-C target-cpu=native` n42, h2_validator, tx_flood, h2_keygen, send_tx | G | build rc | done: `/data/n42-build/reth210-native/release` (`ci/g-natives.log`) |
-| G6 | v2.10.0: field gate | `audit-notes/scripts/g-gate.sh`: rounds rust + gov5, mv, k90, k20 | G | as the F6 gate | pending (`ci/g-gate.log`) |
-| G7 | v2.10.0: A/B fleet7 pair against the v2.9.0 branch | X22 pair | Fable | pair level | pending |
+| G6 | v2.10.0: field gate | `audit-notes/scripts/g-gate.sh`: rounds rust + gov5, mv, k90, k20 | G | as the F6 gate | done 2026-11-06 10:38:55Z, all rc=0 (`ci/g-gate.log`): gb-rust 100/100 commits, 0 timeouts, EL err=0; gb-gov5 133 views, gov5 sealed 33 / committed 166 / errors 0, block 133 hash equal; g-mv 160 blocks, 161/161 hashes, roots 120/120 + 40 gov5-led, device 20/20, 160 packets, gov5 errors 0; gk90 / gk20 every roll recommits, 0 EL error lines, seven nodes agree (119 / 118) |
+| G7 | v2.10.0: A/B fleet7 pair against the v2.9.0 branch | X22 pair | Fable | pair level | open: GA1 (10:41-11:03Z) win1 GA1a 4.82M / GA10 control 4.84M / GA1b 4.77M (parity); GA1b stopped by the D2 gate, EL exited at block 8191 (QMDB head cannot follow, root mismatch after two empty builds of 8191 on one parent); root cause with another agent (`docs/RETH_2_10_0_UPGRADE.md` "G7") |
 
 ## 2. Order and box use
 

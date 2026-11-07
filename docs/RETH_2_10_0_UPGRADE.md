@@ -139,3 +139,64 @@ All through `audit-notes/scripts/quiet-run.sh`, target dir `/data/n42-build/reth
 | ported crates (bmt-core, twig-core, h2-primitives, h2-wire, h2-consensus, mobile-verify, h2-net, h2-execution) | `ci/g-t-ported.log` | 0 | 766 passed, 3 ignored (byte-exact fixtures included) |
 | `cargo test -p n42-clique -p n42-primitives` | `ci/g-t-clique.log` | 0 | 291 passed |
 | native release binaries (`n42`, `h2_validator`, `tx_flood`, `h2_keygen`, `send_tx`), `-C target-cpu=native` | `ci/g-natives.log` | 0 | `/data/n42-build/reth210-native/release` |
+
+## Gate results (G6, 2026-11-06)
+
+`audit-notes/scripts/g-gate.sh` (a copy of `f4-gate.sh` with `TREE` / `BIN` parametrised and
+`FLOCKER=$LOCK` on the mv step), log `audit-notes/ci/g-gate.log`, 09:53:06Z to 10:38:55Z. It
+ran on the native binaries from 4589db923 in `/data/n42-build/reth210-native/release`. The tree
+head the rounds logged is 23741e099, which adds only docs to 4589db923. All four steps exited 0.
+
+- **All-Rust devnet** (`gb-rust`, four members, 300 s, `devnet/gb-rust.out`), rc=0.
+  - Every validator: commits=100, views=100, timeouts=0.
+  - The execution layer: newPayload=400, qmdb_roots=100, err=0, height 100.
+- **Devnet with a gov5 member** (`gb-gov5`, three Rust members plus gov5, 300 s,
+  `devnet/gb-gov5.out`), rc=0.
+  - 133 views, and the Rust members show commits=133.
+  - v0's timeouts=2 is the view-1 start-up TC, logged twice, as in F4 and F6.
+  - gov5: sealed=33, committed=166, errors=0, height 133.
+  - The block 133 hash is the same on both clients: `0x5970ba61…faa1480`. EL err=0.
+- **Mixed gated MobileAnchor round** (`g-mv`, `devnet-mobileanchor.sh g-mv --gov5 --txload`,
+  360 s, `devnet/g-mv.out`, `devnet/g-mv/`), rc=0.
+  - 160 blocks, both heights 160. All 161 hashes are the same, with no first difference
+    (block 160 `0x589ce79b…ffd76cf6`). The genesis hash is the same on both clients.
+  - gov5: sealed=40, committed=200, errors=0, warns=0.
+  - Leader-root check: the Rust leaders' roots are ok=120, mismatch=0. Of the 40 gov5-led
+    blocks, 4 carry the zero root and 36 the committed root.
+  - Device: 2 devices, 20/20 certified, 0 failures.
+  - packetd: 160 packets. Its one error line is "block 0 has no parent state", about the genesis.
+  - send_tx: 1322 sent, with 2 error lines, the same count as `f4-mv` and `f6-mv`.
+  - This is the same shape as F4's and F6's mv rounds.
+- **`roll --kill` on the seven-node fleet7 shape** (`rollkill-check.sh`, outputs
+  `ci/gk{90,20}-rollkill-*.out`). The first kill came at 90 s, and in the second run at 20 s,
+  before the first persistence. Both runs exited 0.
+  - In both runs, every one of rolls 1, 2 and 3 with `--kill` committed again, with 0 error lines
+    in el.log. Each restarted node logged "restored the QMDB forest".
+  - k20's roll 1 shows "commits since restart 1" at height 7, so the 20 s run's first kill
+    restarted onto a chain at height 7.
+  - The 360 s watch read 118 blocks (0.328 per s) in k90 and 117 (0.325 per s) in k20, against
+    the 0.333 target.
+  - At the end all seven nodes agree: on height 119 in k90 (`0xf11ab7f0…`) and on 118 in k20
+    (`0xef67711b…`).
+
+The v2.10.0 port changes nothing visible in the field: blocks, QMDB roots, the MobileAnchor
+registry roots and the hashes are identical to gov5's across all three shapes, and SIGKILL
+recovery on QMDB holds, including a kill before the first persistence.
+
+## G7 A/B pair GA1 (2026-11-06 10:41–11:03Z)
+
+**Status: open.** The coordinator ran an X22 pair on the fleet7 bench. The legs were GA1a
+(v2.10.0), GA10 (control: main's code, `reth29-native`) and GA1b (v2.10.0). Win1 read 4.82M TPS
+on GA1a, 4.84M on GA10 and 4.77M on GA1b, so v2.10.0 is at parity with the control.
+
+The D2 gate stopped the round on GA1b:
+
+- After two empty builds of height 8191 on the same parent within 35 ms, the shared execution
+  layer exited at block 8191.
+- It logged "QMDB head cannot follow the canonical chain … re-applying block 0xbc75fd36… gave
+  root 0x39850779…, expected 0x3c3a1440…".
+- Evidence: `/data/blockchain/rust-fleet7-bench/node0/el.log` lines 107418–107439 and
+  `bench-loop351D2S12P30T64X11T16GA1bMEMF/verify.json`.
+
+Another agent is working on the root cause; it is not part of this record. The pair is
+incomplete until GA1b reruns clean.

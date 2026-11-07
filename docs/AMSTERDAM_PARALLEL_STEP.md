@@ -146,7 +146,84 @@ result made from the tracker after the charge, settled with the charge as `charg
 
 ## 5. Implementation and evidence
 
-(Filled in by the commits of stream H; see the plan row H1.)
+Branch `feat/amsterdam-parallel-step`: 76f9f0337 (this note), 66ad82c09 (the step, the direct
+path and the fast handler), fd9f53151 (clippy), fd8f444b5 + 7f070baea (the creating-recipient
+sender for the field rounds).
+
+### 5.1 What landed
+
+- **Gates.** The builder (`payload.rs`) and the follower (`bin/n42/src/follower_import.rs`) now run
+  the parallel step under gov5's Amsterdam execution (`glamsterdamTime`). reth-chainspec Amsterdam
+  (the block access list) still goes serial. `N42_AMSTERDAM_PARALLEL=0` restores the old gate
+  (`docs/KNOBS.md`). Prague and Osaka take none of the new branches: `AmsterdamRules::of` is `None`
+  there and every check below is skipped.
+- **Batch rules** (`parallel_build.rs`, `AmsterdamRules`):
+  - a transfer counts as "ran no code" when its execution gas equals its EIP-2780 intrinsic
+    (21,000 with value, 15,000 without, 12,000 to itself) rather than `== 21,000`;
+  - an account one batch creates and another pays is refused (`amsterdam-created-across`), since
+    the 183,600 state-gas charge depends on which runs first;
+  - both block gas dimensions are checked in block order before `commit_run`, with the rule of
+    `validate_transaction_gas_limit` (`amsterdam-block-gas`);
+  - the builder cuts its candidates with `take(gas limits)`, so that check cannot fail on its own
+    blocks;
+  - late receipts total `max(Σ regular, Σ state)` when EIP-8037 is on.
+- **Direct path** (`direct_transfer.rs`) and **fast handler** (`fast_handler.rs`): Amsterdam is
+  covered when EIP-2780, 8037 and 7708 are on together, and handed to the stock code otherwise.
+  Both charge the intrinsic per value, the new-account state gas (reservoir first, then regular
+  gas; a gas limit that cannot pay it is handed to the stock code), and the EIP-7708 transfer log.
+
+### 5.2 Equivalence tests (n42-engine-types, all against serial evm2 Amsterdam)
+
+| test | shape |
+| --- | --- |
+| `the_amsterdam_parallel_build_equals_the_serial_execution` | 11-tx batch part (plain, zero-value, self, creating at 210,000) + 5-tx serial part; state root, receipts root, gas, logs |
+| `the_amsterdam_late_receipts_equal_the_committed_ones` | late receipts vs committed, separate block gas |
+| `an_account_created_across_batches_is_refused` | creating in batch A, paid in batch B |
+| `the_block_gas_dimensions_bound_the_batches` | 450,000 limit: `take` = 2, `BlockGas(2)`; `take([21,000; 30])` = 21 |
+| `code_run_at_a_transfers_gas_is_skipped_on_amsterdam` | a call that runs code at a transfer's gas is not "plain" |
+| `the_amsterdam_parallel_import_equals_the_stock_import` | follower `import_block` vs stock import |
+| `the_amsterdam_direct_path_equals_evm2_on_qualifying_transfers`, `..._hands_everything_else_to_evm2`, `..._equals_evm2_on_sender_runs` | direct path vs evm2, incl. creating at 210,000 and at exactly 204,600 |
+| `qualifying_transfers_equal_the_stock_amsterdam_handler`, `everything_else_is_handed_to_the_stock_amsterdam_handler_unchanged` | fast handler vs stock handler; the stock result shows `state_gas_spent 183600`, `total_gas_spent 204600` and the `ddf252ad` log |
+
+### 5.3 Code gates (logs in `/data/n42-build/audit-notes/ci/`)
+
+| gate | result | log |
+| --- | --- | --- |
+| `cargo check --workspace --tests` | rc 0 | `h-check.log` |
+| `scripts/clippy-n42.sh` | rc 0 (after fd9f53151) | `h-clippy.log` |
+| n42-engine-types, n42-h2-node, n42-h2-execution, n42-testing, n42 | 826 passed, 0 failed, 18 ignored | `h-test-main.log` |
+| ported fixture crates (bmt-core ... h2-execution) | 766 passed, 0 failed, 3 ignored | `h-test-ported.log` |
+
+### 5.4 Field gate (2026-11-07, `audit-notes/scripts/h-gate.sh`, `ci/h-gate.log`)
+
+Native release build of fd9f53151 (`/data/n42-build/amst-native/release`, `ci/h-native.log`; the
+later commits only touch the round script). `n42_devnet_mobileanchor.json` (glamsterdamTime 0, so
+every block runs gov5's Amsterdam execution), 360 s MobileAnchor rounds, round lock and box gate.
+Every Rust EL ran `N42_PARALLEL_BUILD=1 N42_PARALLEL_BUILD_THREADS=8 N42_FREEZE_POOL=own
+N42_PLAN_AHEAD_BODY=1 N42_FOLLOWER_PARALLEL=1 N42_FOLLOWER_DIRECT_IMPORT=1` with
+`DEVNET_PAYLOAD_SERVE=1`. Load: two `send_tx` senders at 2 tx/s (existing recipients) and, from
+h2 on, `TX_CREATE=1`: a third sender at 1 tx/s whose every transfer creates its recipient
+(`--fresh-to --gas 210000`). h1 ran without the creating sender (its key was unfunded, fixed in
+7f070baea).
+
+| round | shape | blocks / hash check | txs (creating) | builder parallel steps | follower parallel imports (refused) | EL ERROR | device |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| h1-mv | 3 Rust + gov5 (serial) | 160 / 161 of 161 equal, first difference none | 1,322 (0) | 110 | 220 (0) | 0 | 20/20 certified |
+| h1-rs | 4 Rust, `LATE_VALIDATOR=3` (own EL) | 118, main = late at 118 | 1,322 (0) | 83 + 10 | 196 + 83 (0) | 0, 0 | 20/20 |
+| h2-mv | 3 Rust + gov5 (serial) | 160 / 161 of 161 equal, first difference none | 1,653 (331) | 110 | 220 (0) | 0 | 20/20 |
+| h2-rs | 4 Rust, `LATE_VALIDATOR=3` | 118, main = late at 118 | 1,653 (331) | 83 + 7 | 190 + 83 (0) | 0, 0 | 20/20 |
+
+- Every transaction took the direct path: h2-mv `direct_hits_total` 4,959 = 1,653 x 3 (three
+  validators hand the shared EL each block), 0 delegated; no `amsterdam-*` refusal and no fold
+  refusal anywhere.
+- gov5 executed every block serially with its own Amsterdam code and agreed on every hash, so the
+  331 creating transfers' state gas, the EIP-7708 logs and both gas dimensions match.
+- Leader-root check ok on every Rust-led block (120 / 118).
+- h2-mv's gov5 logged three "committed block not executed locally" errors (views 60 and 98): the
+  three Rust members share one EL that already held the block, voted at once and committed in
+  6 ms, before gov5's body import. gov5 imported the same hash in the same millisecond
+  ("fetch-on-miss: aligned and imported"). It is a devnet timing race, not an execution difference.
+  h1-mv shows none.
 
 ## 6. Findings outside the scope
 

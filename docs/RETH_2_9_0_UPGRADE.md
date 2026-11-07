@@ -1640,7 +1640,7 @@ witness is positional. `docs/WITNESS_REPLAY_RUST_PLAN.md` "2026-11-06" has the n
 Items the F5 paths leave for F6 or later, each with a status (2026-11-06) and the condition that
 brings it back:
 
-- **The Amsterdam parallel step.** **Open, needed before 2027-01-01.** The builder's (F5c) and the
+- **The Amsterdam parallel step.** **Done 2026-11-07 (stream H, 66ad82c09; `docs/AMSTERDAM_PARALLEL_STEP.md`, plan row H1).** The step now runs on gov5's Amsterdam execution (no BAL is needed there: reth's Amsterdam is never active on the native chains, and that one stays serial); the original text follows. The builder's (F5c) and the
   follower's (F5d) parallel step stays serial on an Amsterdam / Glamsterdam chain today, because
   a batch does not write block access list entries for the accounts it touches. Two things
   need it, and neither runs Amsterdam today. One is chain 94, which flips to Glamsterdam execution
@@ -1690,7 +1690,7 @@ brings it back:
   before that merge needs it cherry-picked.
 - **The serial-rebuild copy of the transaction list** (F5c). **Open.** Measure it in the A/B. Remove it only
   if fold refusals at `finish` prove unreachable in the field.
-- **The fast transfer on an Amsterdam chain** (F5f). **Open, with the Amsterdam parallel step.** `fast_handler::covers` is Prague and Osaka
+- **The fast transfer on an Amsterdam chain** (F5f). **Done 2026-11-07 (stream H, 66ad82c09): the fast handler and the direct path cover Amsterdam when EIP-2780, 8037 and 7708 are on together, with equivalence tests against the stock Amsterdam handler; original text follows.** `fast_handler::covers` is Prague and Osaka
   only: on Amsterdam (EIP-8037 state gas, the block access list) the handler hands every
   transaction to the stock one. Port it, with its own equivalence tests against the stock Amsterdam
   handler, before fleet7 or chain 94 runs Amsterdam blocks through the parallel step.

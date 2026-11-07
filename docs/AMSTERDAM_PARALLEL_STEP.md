@@ -100,7 +100,7 @@ half), and the fold at `finish`.
    real `execution_gas_spent` / `state_gas_spent`; a failure refuses the step (builder: serial loop;
    follower: serial import, which refuses the block with the stock error if it is really invalid).
    The follower's Prague import has the same gap (it accepts a transfer whose gas limit exceeds the
-   block's remaining gas, which the stock import refuses); left as it is here, see section 6.
+   block's remaining gas, which the stock import refuses); fixed on every fork in eb7af7c04, see 5.5.
 4. **The builder's take.** It takes only 21,000-gas transfers (`transfer_key`); a creating transfer
    on Amsterdam needs at least 204,600 (`--gas 210000` in `tx_flood`, see the memory note on
    EIP-8037 gas). Needed on Amsterdam: plain transfers of any gas limit, cut before execution to the
@@ -162,10 +162,11 @@ sender for the field rounds).
     (21,000 with value, 15,000 without, 12,000 to itself) rather than `== 21,000`;
   - an account one batch creates and another pays is refused (`amsterdam-created-across`), since
     the 183,600 state-gas charge depends on which runs first;
-  - both block gas dimensions are checked in block order before `commit_run`, with the rule of
-    `validate_transaction_gas_limit` (`amsterdam-block-gas`);
-  - the builder cuts its candidates with `take(gas limits)`, so that check cannot fail on its own
-    blocks;
+  - the follower checks both block gas dimensions in block order before `commit_run`, with the
+    rule of `validate_transaction_gas_limit` (since eb7af7c04 on every fork, `inclusion-gas`, 5.5;
+    66ad82c09 ran an Amsterdam-only `amsterdam-block-gas` check in the builder too);
+  - the builder cuts its candidates with `take(gas limits)`, so its blocks always pass that check
+    (proved by a test, 5.5) and it runs none of its own;
   - late receipts total `max(Σ regular, Σ state)` when EIP-8037 is on.
 - **Direct path** (`direct_transfer.rs`) and **fast handler** (`fast_handler.rs`): Amsterdam is
   covered when EIP-2780, 8037 and 7708 are on together, and handed to the stock code otherwise.
@@ -179,7 +180,7 @@ sender for the field rounds).
 | `the_amsterdam_parallel_build_equals_the_serial_execution` | 11-tx batch part (plain, zero-value, self, creating at 210,000) + 5-tx serial part; state root, receipts root, gas, logs |
 | `the_amsterdam_late_receipts_equal_the_committed_ones` | late receipts vs committed, separate block gas |
 | `an_account_created_across_batches_is_refused` | creating in batch A, paid in batch B |
-| `the_block_gas_dimensions_bound_the_batches` | 450,000 limit: `take` = 2, `BlockGas(2)`; `take([21,000; 30])` = 21 |
+| `the_block_gas_dimensions_bound_the_batches` | 450,000 limit: `take` = 2; the third creating transfer fails the inclusion check, the stock import and the parallel import (`InclusionGas(2)`) both refuse the block; `take([21,000; 30])` = 21 |
 | `code_run_at_a_transfers_gas_is_skipped_on_amsterdam` | a call that runs code at a transfer's gas is not "plain" |
 | `the_amsterdam_parallel_import_equals_the_stock_import` | follower `import_block` vs stock import |
 | `the_amsterdam_direct_path_equals_evm2_on_qualifying_transfers`, `..._hands_everything_else_to_evm2`, `..._equals_evm2_on_sender_runs` | direct path vs evm2, incl. creating at 210,000 and at exactly 204,600 |
@@ -219,17 +220,66 @@ h2 on, `TX_CREATE=1`: a third sender at 1 tx/s whose every transfer creates its 
 - gov5 executed every block serially with its own Amsterdam code and agreed on every hash, so the
   331 creating transfers' state gas, the EIP-7708 logs and both gas dimensions match.
 - Leader-root check ok on every Rust-led block (120 / 118).
-- h2-mv's gov5 logged three "committed block not executed locally" errors (views 60 and 98): the
-  three Rust members share one EL that already held the block, voted at once and committed in
-  6 ms, before gov5's body import. gov5 imported the same hash in the same millisecond
-  ("fetch-on-miss: aligned and imported"). It is a devnet timing race, not an execution difference.
-  h1-mv shows none.
+- **h2-mv's three gov5 errors are a devnet timing race, not an execution difference.** gov5
+  logged "hotstuff: committed block not executed locally" three times (`devnet/h2-mv/gov5-errors.out`):
+  view 60 (block 0xe8bfe28c...e6bae6, `failures` 1) at 09:39:08 and view 98 (block
+  0xca483996...77d99f, `failures` 1 and 2) at 09:40:36 UTC. In each case:
+  - The Rust leader proposed on its normal tick (v0 for view 60: proposal sent 09:39:08.737, its own
+    EL imported it at once, Valid).
+  - The three Rust members share one EL, which already held the block, so v1 and v2 voted at once
+    ("block already execution-validated") and the leader committed it 6 ms after the proposal with
+    a quorum of the three Rust votes (`votes=3+3`).
+  - gov5 received the proposal and its body in the same millisecond, deferred its vote until the
+    import ("import-gated vote: deferring until block imported"), and received the Decide before
+    its own import had finished: the error.
+  - In the same millisecond gov5 logged "fetch-on-miss: aligned and imported" for the same hash at
+    number 60, then (view 98) "deferred commit-to-canonical completed" and built its next block on
+    it.
+  - Both heads stayed equal through block 160 (161 of 161 hashes). h1-mv, the same shape without
+    the creating sender, shows none of these lines: the race needs the body to arrive at gov5 just
+    behind the Decide.
 
-## 6. Findings outside the scope
+### 5.5 The follower's inclusion check on every fork (eb7af7c04; was section 6)
 
-- **The follower's parallel import skips the inclusion check on every fork.** `commit_run` commits
-  through `commit_transaction`, which, unlike `execute_transaction`, does not call
-  `validate_transaction_gas_limit`. A leader's block whose leading transfer has a gas limit above
-  the block's remaining gas is refused by the stock import and accepted by the parallel import. On
-  Amsterdam this note adds the check (3.2 item 3); on Prague/Osaka the behaviour is left unchanged,
-  as the brief requires, and the fix (the same check, cheap) is for the coordinator to schedule.
+Found while writing section 3: `commit_run` commits through `commit_transaction`, which, unlike
+`execute_transaction`, does not call `validate_transaction_gas_limit`. A leader's block whose
+leading transfer has a gas limit above the block's remaining gas was refused by the stock import
+and accepted by the parallel import, on every fork.
+
+- **Fix.** `InclusionGas` (`parallel_build.rs`) applies the stock rule in block order over the
+  batches' results before `commit_run`. With EIP-8037 that is the regular dimension (gas limit
+  capped by EIP-7825) and the state dimension; without it, cumulative gas. It costs one comparison
+  per transaction on counters already known.
+- **Refusal.** `import_block` refuses a block that fails with `inclusion-gas`, and the block falls
+  back to the stock import like any other refusal; the stock import refuses it with its own error.
+  The Amsterdam-only `amsterdam-block-gas` refusal of 66ad82c09 is folded into it.
+- **The builder runs no check.** It cannot produce such a block:
+  - before Amsterdam its candidates are transfers of exactly 21,000 gas (`transfer_key`), taken
+    only into an empty block (`transactions-before` refuses otherwise), at most the block's gas
+    over 21,000 of them;
+  - on Amsterdam they are `AmsterdamRules::take`'s prefix.
+- **Tests.**
+  - `a_transfer_over_the_remaining_gas_is_refused_by_both_imports`: on Prague, a second transfer at
+    29,979,001 gas in a 30,000,000 block is refused by the stock import and by the parallel import
+    (`InclusionGas(1)`), and at 29,979,000 both accept it with the same receipts, receipts root and
+    QMDB root. On Prague and on Osaka, three 21,000 transfers in a 50,000 block are refused by both
+    (`InclusionGas(2)`), and two in a 42,000 block are accepted by both, equal.
+  - `the_builders_take_always_passes_the_inclusion_check`: the pre-Amsterdam budget passes and
+    is exact (one more fails) for limits from 21,000 to 36,000,007 on Prague and Osaka. On
+    Amsterdam, 800 random candidate sets over gas limits around the 12,000 + 183,600 charge
+    threshold pass at their worst spend and at random lesser ones.
+  - `the_block_gas_dimensions_bound_the_batches`: Amsterdam, as in 5.2.
+  - Every equivalence test of 5.2 still passes.
+- **Gates.** See 5.6.
+
+### 5.6 Gates of eb7af7c04 (logs in `/data/n42-build/audit-notes/ci/`)
+
+| gate | result | log |
+| --- | --- | --- |
+| targeted engine-types tests (amsterdam, direct, fast_handler, parallel_build, inclusion) | 80 passed, 0 failed | `h-test-incl.log` |
+| `scripts/clippy-n42.sh` | rc 0 | `h-clippy2.log` |
+| n42-engine-types, n42-h2-node, n42-h2-execution, n42-testing | 657 passed, 0 failed, 14 ignored | `h-test-main2.log` |
+| native release build of eb7af7c04 (`/data/n42-build/amst-native/release`: n42, h2_validator, tx_flood, h2_keygen, send_tx) | rc 0 | `h-native2.log` |
+
+No devnet rerun: the change refuses only blocks that the stock import refuses, and the h1/h2 rounds
+had no such block.

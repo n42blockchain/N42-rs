@@ -2990,4 +2990,52 @@ mod tests {
         drop(restored);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Two builds on one parent, computed before either is filed (the
+    /// payload builder computes a root and files it in two separate holds
+    /// of the node's lock, so a second build's compute can land between
+    /// the first's compute and its insert; GA1b, 2026-11-06). The insert of
+    /// the first must not adopt the second's pending application as its
+    /// own: the tree would then stand at the second block under the first's
+    /// name, every root computed on the first would be computed on the
+    /// second's state, and a later move through the parent's parent replays
+    /// those blocks onto other roots than they were filed with.
+    #[test]
+    fn a_sibling_computed_between_a_build_and_its_insert_is_not_adopted() {
+        fn sibling(tag: u8) -> BlockChanges {
+            let mut c = BlockChanges::new();
+            // The two builds differ in a key both write (the withdrawal
+            // recipient's balance) and in one each writes alone (the
+            // beacon-root slot keyed by its timestamp).
+            c.set_account(Address::with_last_byte(0xBB), AccountState { nonce: 1, balance: U256::from(tag as u64 * 7), code_hash: B256::ZERO });
+            c.set_account(Address::from_word(B256::from(U256::from(900_000u64 + tag as u64))), AccountState { nonce: 1, balance: U256::from(1u64), code_hash: B256::ZERO });
+            c
+        }
+        let start = || {
+            let mut f = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+            f.apply(GENESIS, h(1), 1, &accounts(1, 50)).unwrap();
+            f.set_canonical(h(1)).unwrap();
+            f
+        };
+        let mut reference = start();
+        reference.apply(h(1), h(2), 2, &sibling(1)).unwrap();
+        let child_root = reference.apply(h(2), h(3), 3, &accounts(5, 4)).unwrap();
+
+        let mut forest = start();
+        // Build P and build P' on block 1; P is filed after P' was computed.
+        let built = forest.compute_operations(h(1), sibling(1).ops()).unwrap();
+        let other = forest.compute_operations(h(1), sibling(2).ops()).unwrap();
+        forest.insert(h(2), 2, built).unwrap();
+        forest.insert(h(0x22), 2, other).unwrap();
+        // The child of P: its root must be the one computed on P's state.
+        let child = forest.compute_operations(h(2), accounts(5, 4).ops()).unwrap();
+        let computed = child.root;
+        forest.insert(h(3), 3, child).unwrap();
+        // A move to the sibling and back replays P and its child from block 1.
+        forest.compute_operations(h(0x22), accounts(6, 2).ops()).unwrap();
+        let moved = forest.set_canonical(h(3));
+        assert_eq!(computed, child_root, "the child of P was computed on P' state (replay: {moved:?})");
+        moved.expect("P and its child replay onto the roots they were filed with");
+        assert_eq!(forest.root(), child_root);
+    }
 }

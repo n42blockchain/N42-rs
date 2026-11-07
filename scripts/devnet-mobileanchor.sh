@@ -39,7 +39,7 @@
 #   DEVICE [$N42_GOV5/build/mobileverify-device]  DEVICE_ARGS [-genesis $DEVNET_GENESIS]
 #   EVIDENCE_ROOT [/data/n42-build/audit-notes/devnet]
 #   TX_KEYS / TX_TO: senders' keys and recipients [anvil accounts 4,5 -> 6,7]
-#   TX_CREATE=1 (with --txload): a third sender (anvil account 8) at 1 tx/s whose every
+#   TX_CREATE=1 (with --txload): a third sender (TX_CREATE_KEY, anvil account 3) at 1 tx/s whose every
 #     transfer creates its recipient (send_tx --fresh-to --gas 210000: EIP-8037 state gas)
 #   TX_DELAY [0]: seconds before the senders start (a chain whose senders are funded
 #     only by the block reward)
@@ -152,7 +152,7 @@ if [ -n "$TXLOAD" ]; then
   if [ "${TX_CREATE:-}" = 1 ]; then
     say "tx load: a creating sender at 1 tx/s"
     "$BIN/examples/send_tx" --rpc http://127.0.0.1:18545 \
-      --key 0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97 \
+      --key "${TX_CREATE_KEY:-0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6}" \
       --to 0x00000000000000000000000000000000000c4ea7 --fresh-to --gas 210000 \
       --chain-id "$CHAIN_ID" --rate 1 --seconds $((SECS - 30 - ${TX_DELAY:-0})) >> "$EV/send_tx-create.out" 2>&1 &
   fi

@@ -183,9 +183,11 @@ The v2.10.0 port changes nothing visible in the field: blocks, QMDB roots, the M
 registry roots and the hashes are identical to gov5's across all three shapes, and SIGKILL
 recovery on QMDB holds, including a kill before the first persistence.
 
-## G7 A/B pair GA1 (2026-11-06 10:41–11:03Z)
+## G7 A/B pairs GA1–GA3 (2026-11-06/07)
 
-**Status: open.** The coordinator ran an X22 pair on the fleet7 bench. The legs were GA1a
+**Status: done, parity** (GA2/GA3 below). GA1 first.
+
+**GA1 (2026-11-06 10:41–11:03Z).** The coordinator ran an X22 pair on the fleet7 bench. The legs were GA1a
 (v2.10.0), GA10 (control: main's code, `reth29-native`) and GA1b (v2.10.0). Win1 read 4.82M TPS
 on GA1a, 4.84M on GA10 and 4.77M on GA1b, so v2.10.0 is at parity with the control.
 
@@ -198,8 +200,24 @@ The D2 gate stopped the round on GA1b:
 - Evidence: `/data/blockchain/rust-fleet7-bench/node0/el.log` lines 107418–107439 and
   `bench-loop351D2S12P30T64X11T16GA1bMEMF/verify.json`.
 
-Another agent is working on the root cause; it is not part of this record. The pair is
-incomplete until GA1b reruns clean.
+The root cause is the forest defect recorded in the next section; it is not a reth or evm2
+change and main had it too.
+
+**GA2 and GA3 (2026-11-07 02:40–03:33Z).** Both sides rebuilt with the fix (v2.10.0 from
+`25b986f9f` into `reth210-native`; the control from main `3bfb5b002`, which carries the same
+two forest commits, into `wt-docs/target/native`). Each round ran four legs, v2.10.0 and control
+alternating, win1 tx/s:
+
+| round | v2.10.0 a | control | v2.10.0 b | control b |
+| --- | --- | --- | --- | --- |
+| GA2 | 4,920,000 | 4,893,333 | 4,946,667 | 4,876,733 |
+| GA3 | 4,906,667 | 4,953,333 | 4,870,417 | 4,779,933 |
+
+Eight legs, every block full, no execution-layer exit, and every gate line clean
+(`invalid_blocks=0`, `incomplete=0`, `gas_mismatch=0`, `direct_imports_failed=0`,
+`proposals_given_up=0`; `ci/pairs-queue.log`, `wt-main/target/fleet-runs/loop351fx-GA{2,3}.launch.out`).
+Every difference is inside the 10% that single rounds cannot resolve, and the v2.10.0 legs
+average slightly above the controls, so v2.10.0 is at parity with main. Merge gate passed.
 
 ## The same-parent rebuild root mismatch (GA1b, 2026-11-06)
 

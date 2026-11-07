@@ -202,6 +202,19 @@ fn refused(message: String) -> io::Error {
 /// The record layout in the file: the key, the value's length, the value.
 const KEY_LEN: usize = 32;
 const LEN_LEN: usize = 4;
+/// The length field of a hash-only record in `entries.log`: the key field
+/// holds the slot's leaf hash and no value follows. Written for a dead slot
+/// imported from a portable tombstone (kind 2) outside a full twig, which a
+/// relocated group cannot hold yet (a gov5 node reclaims dead rows in its
+/// active twig too). No value reaches 4 GiB, so the length is free.
+const HASH_ONLY_LEN: u32 = u32::MAX;
+
+/// The bytes a `[key 32][len u32][value]` record at the start of `bytes`
+/// takes, a hash-only one included.
+fn main_record_len(bytes: &[u8]) -> usize {
+    let len = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+    KEY_LEN + LEN_LEN + if len == HASH_ONLY_LEN { 0 } else { len as usize }
+}
 /// The file is mapped in chunks of about this many bytes, each sealed and
 /// mapped once, with its page tables populated at that moment, so a read
 /// never takes a page fault afterwards: 133,000 random reads a block on a
@@ -799,7 +812,10 @@ impl FileEntries {
                 break;
             }
             reader.read_exact(&mut header)?;
-            let value_len = u32::from_le_bytes([header[32], header[33], header[34], header[35]]) as u64;
+            let value_len = match u32::from_le_bytes([header[32], header[33], header[34], header[35]]) {
+                HASH_ONLY_LEN => 0,
+                value_len => u64::from(value_len),
+            };
             let end = at + (KEY_LEN + LEN_LEN) as u64 + value_len;
             if end > len {
                 break; // torn tail
@@ -1009,7 +1025,7 @@ impl FileEntries {
     pub(crate) fn location(&self, slot: usize) -> Option<u64> {
         let raw = (slot < self.offsets.len()).then(|| self.raw(slot))?;
         if raw & RELOCATED_BIT == 0 {
-            return Some(raw);
+            return matches!(payload_at(self.main.bytes_from(raw)), SlotRef::Payload(..)).then_some(raw);
         }
         let file = self.relocated.as_ref()?;
         let at = raw & !RELOCATED_BIT;
@@ -1026,7 +1042,10 @@ impl FileEntries {
     pub(crate) fn key(&self, slot: usize) -> Option<&Hash> {
         let raw = self.raw(slot);
         if raw & RELOCATED_BIT == 0 {
-            return Some(as_hash(&self.main.bytes_from(raw)[..KEY_LEN]));
+            return match payload_at(self.main.bytes_from(raw)) {
+                SlotRef::Payload(key, _) => Some(key),
+                SlotRef::HashOnly(_) => None,
+            };
         }
         match self.read(slot) {
             SlotRef::Payload(key, _) => Some(key),
@@ -1086,6 +1105,33 @@ impl FileEntries {
         } else {
             self.active[slot / 64] &= !(1 << (slot % 64));
         }
+    }
+
+    /// Appends a dead hash-only slot as the next slot: a record carrying
+    /// only its leaf hash ([`HASH_ONLY_LEN`]).
+    pub(crate) fn push_hash_only(&mut self, leaf: &Hash) -> io::Result<()> {
+        self.main.writable()?;
+        let slot = self.offsets.len();
+        self.offsets.reserve(slot + 1)?;
+        let record_len = KEY_LEN + LEN_LEN;
+        let main = &mut self.main;
+        if !main.tail.is_empty() && main.tail.len() + record_len > CHUNK_BYTES {
+            main.seal_tail()?;
+        }
+        if main.tail.capacity() < CHUNK_BYTES {
+            main.tail.reserve_exact(CHUNK_BYTES.max(record_len) - main.tail.len());
+        }
+        main.populate_ahead();
+        crate::prefault::note_append(main.populate_epoch, main.tail.len() + record_len);
+        main.tail.extend_from_slice(leaf);
+        main.tail.extend_from_slice(&HASH_ONLY_LEN.to_le_bytes());
+        self.offsets.push(main.len_bytes)?;
+        main.len_bytes += record_len as u64;
+        if self.active.len() * 64 <= slot {
+            self.active.push(0);
+        }
+        self.set_active(slot, false);
+        Ok(())
     }
 
     /// Appends a live entry as the next slot: into the tail, which reaches
@@ -1512,8 +1558,7 @@ impl FileEntries {
                 let first = self.offsets.at(base);
                 let last = self.offsets.at(base + TWIG_SIZE - 1);
                 debug_assert_eq!((first | last) & RELOCATED_BIT, 0);
-                let SlotRef::Payload(_, value) = payload_at(self.main.bytes_from(last)) else { unreachable!() };
-                FileRange { relocated: false, start: first, end: last + (KEY_LEN + LEN_LEN + value.len()) as u64 }
+                FileRange { relocated: false, start: first, end: last + main_record_len(self.main.bytes_from(last)) as u64 }
             }
         };
         if self.relocated.is_none() {
@@ -1569,7 +1614,11 @@ impl FileEntries {
 
 /// A `[key 32][len u32][value]` record at the start of `bytes`.
 fn payload_at(bytes: &[u8]) -> SlotRef<'_> {
-    let len = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]) as usize;
+    let len = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+    if len == HASH_ONLY_LEN {
+        return SlotRef::HashOnly(as_hash(&bytes[..KEY_LEN]));
+    }
+    let len = len as usize;
     SlotRef::Payload(as_hash(&bytes[..KEY_LEN]), &bytes[KEY_LEN + LEN_LEN..KEY_LEN + LEN_LEN + len])
 }
 

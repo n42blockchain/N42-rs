@@ -1923,9 +1923,14 @@ impl QmdbCompatTree {
         for slot in 0..self.entries.len() {
             match self.entries.read(slot) {
                 SlotRef::Payload(key, value) => file.push(key, value)?,
-                SlotRef::HashOnly(_) => {
-                    file.push(&NULL_HASH, &[])?;
-                    hash_only_twigs.insert(slot / TWIG_SIZE);
+                SlotRef::HashOnly(hash) => {
+                    file.push_hash_only(hash)?;
+                    // A full twig's hash-only slots move into a relocated
+                    // group (the compacted twig's own layout); the partial
+                    // twig's stay in the log as hash-only records.
+                    if (slot / TWIG_SIZE + 1) * TWIG_SIZE <= self.entries.len() {
+                        hash_only_twigs.insert(slot / TWIG_SIZE);
+                    }
                 }
             }
             if !self.entries.is_active(slot) {

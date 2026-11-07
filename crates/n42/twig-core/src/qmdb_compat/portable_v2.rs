@@ -649,6 +649,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `bytes` as a node that reclaimed its dead rows writes it (a gov5 node
+    /// with a leaf store): every kind-0 record becomes a kind-2 tombstone
+    /// with the leaf hash of its payload.
+    fn reclaimed_rows(bytes: &[u8]) -> (Vec<u8>, Vec<u64>) {
+        let body = &bytes[..bytes.len() - PORTABLE_SNAPSHOT_DIGEST_SIZE];
+        let mut out = body[..HEADER_SIZE_V2].to_vec();
+        let mut reclaimed = Vec::new();
+        let mut at = HEADER_SIZE_V2;
+        while at < body.len() {
+            let (slot, kind) = (&body[at..at + 8], body[at + 8]);
+            let len = match kind {
+                PORTABLE_KIND_DEAD | PORTABLE_KIND_LIVE => {
+                    45 + u32::from_le_bytes(body[at + 41..at + 45].try_into().unwrap()) as usize
+                }
+                PORTABLE_KIND_TOMBSTONE => 41,
+                _ => 43,
+            };
+            if kind == PORTABLE_KIND_DEAD {
+                let leaf = crate::hash_leaf(body[at + 9..at + 41].try_into().unwrap(), &body[at + 45..at + len]);
+                out.extend_from_slice(slot);
+                out.push(PORTABLE_KIND_TOMBSTONE);
+                out.extend_from_slice(&leaf);
+                reclaimed.push(u64::from_le_bytes(slot.try_into().unwrap()));
+            } else {
+                out.extend_from_slice(&body[at..at + len]);
+            }
+            at += len;
+        }
+        let count = HEADER_SIZE_V2 - 8..HEADER_SIZE_V2;
+        let tombstones = u64::from_le_bytes(out[count.clone()].try_into().unwrap()) + reclaimed.len() as u64;
+        out[count].copy_from_slice(&tombstones.to_le_bytes());
+        out.extend_from_slice(&[0; PORTABLE_SNAPSHOT_DIGEST_SIZE]);
+        (reseal(out), reclaimed)
+    }
+
+    /// Tombstones in the partial (last) twig -- what a gov5 node that
+    /// reclaimed its dead rows exports -- import into the entry file as
+    /// hash-only log records, reopen, refuse revival and v1, and re-export
+    /// byte for byte.
+    #[test]
+    fn tombstones_in_the_partial_twig_import_into_the_entry_file() {
+        let (plain, compacted) = trees();
+        for whole in [false, true] {
+            let (bytes, reclaimed) = reclaimed_rows(&compacted.encode(PortableFormat::V2, whole).unwrap());
+            assert_eq!(reclaimed.len(), 50);
+            assert!(reclaimed.iter().all(|slot| slot / TWIG_SIZE as u64 == 2), "{reclaimed:?}");
+            let (_, imported) = QmdbPortableTree::decode(&bytes).unwrap();
+            let mut tree = imported.verify_and_build(CHAIN_ID, &tag(0x11)).unwrap();
+            assert_eq!(tree.root(), plain.root);
+            let dir = std::env::temp_dir().join(format!("n42-portable-v2-partial-{whole}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("entries.log");
+            tree.set_entry_file(&path).unwrap();
+            tree.sync_entries().unwrap();
+            let (next, active) = (tree.next_slot(), tree.active_bits());
+            drop(tree);
+            let (mut tree, kept) = QmdbCompatTree::from_entry_file(&path, next, &active).unwrap();
+            assert_eq!((kept, tree.root()), (next, plain.root));
+            let live = super::fixture::key(4300);
+            assert_eq!(tree.get(&live), Some([1u8, (4300 % 251) as u8].as_slice()));
+            assert!(tree.prove(&live).unwrap().verify_for_key(&plain.root, &live));
+            let again = super::fixture::portable(tree.snapshot(), tree.root());
+            assert_eq!(again.encode(PortableFormat::V2, whole).unwrap(), bytes);
+            assert!(matches!(again.encode(PortableFormat::V1, false), Err(QmdbPortableError::HashOnlySlot { .. })));
+            let slot = reclaimed[0];
+            let revive = BlockUndo { prev_next_slot: next, slots_only: true, slots: vec![slot], ..Default::default() };
+            assert_eq!(tree.apply_undo(&revive), Err(QmdbUndoError::HashOnlySlot { slot }));
+            // The partial twig fills and compacts over its hash-only records.
+            for n in 0..800u64 {
+                tree.set(super::fixture::key(10_000 + n), vec![7]).unwrap();
+            }
+            let extended = tree.root();
+            assert!(tree.next_slot() > 3 * TWIG_SIZE as u64);
+            tree.compact_twigs(u64::MAX, 0.0, usize::MAX).unwrap();
+            assert_eq!(tree.root(), extended);
+            tree.sync_entries().unwrap();
+            let (next, active) = (tree.next_slot(), tree.active_bits());
+            drop(tree);
+            let (tree, _) = QmdbCompatTree::from_entry_file(&path, next, &active).unwrap();
+            assert_eq!(tree.root(), extended);
+            drop(tree);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// The leaf root of the kind-3 record at slot 0 of `bytes`.
     fn twig_root_of(bytes: &[u8]) -> &Hash {
         let at = find_record(bytes, 0, PORTABLE_KIND_DEAD_TWIG) + 9 + 2;

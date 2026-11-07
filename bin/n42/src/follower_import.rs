@@ -2192,13 +2192,18 @@ where
     let tx_count = owned.as_ref().map_or(0, |sealed| sealed.body().transactions.len());
 
     let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), head.timestamp);
-    // The parallel transfer paths model the Osaka gas rules (a transfer is
-    // its 21,000 and no log; the block's gas is the sum). A block under gov5's
-    // Amsterdam execution (EIP-8037, EIP-7708) is executed serially, as gov5
-    // does (`ProcessParallel` falls back at Glamsterdam;
-    // `docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
+    // A block under gov5's Amsterdam execution (EIP-2780, EIP-8037, EIP-7708)
+    // takes the parallel import with the batches' Amsterdam checks
+    // (`docs/AMSTERDAM_PARALLEL_STEP.md`) unless `N42_AMSTERDAM_PARALLEL=0`,
+    // which imports it serially as gov5 does (`ProcessParallel` falls back at
+    // Glamsterdam). reth's own Amsterdam (a block access list) stays serial.
     let amsterdam_execution = reth_chainspec::qmdb::glamsterdam_execution_active_at(chain_spec.genesis(), head.timestamp);
-    let follower_parallel = || follower_parallel() && !amsterdam_execution;
+    let reth_amsterdam = chain_spec.is_amsterdam_active_at_timestamp(head.timestamp);
+    let follower_parallel = || {
+        follower_parallel()
+            && !reth_amsterdam
+            && (!amsterdam_execution || n42_engine_types::parallel_build::amsterdam_parallel())
+    };
     // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md): which
     // ancestor's result the header carries, so which one the vote road waits
     // for. The includability check and the execution read the *parent's*

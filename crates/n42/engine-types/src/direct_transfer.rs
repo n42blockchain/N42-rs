@@ -23,8 +23,14 @@
 //! through the same [`Layered`] view, so the transfers applied before it was
 //! made are what it sees.
 //!
-//! What it does not model, so falls back on: Amsterdam (EIP-2780, EIP-8037,
-//! EIP-7708), any environment whose checks are not the stock ones, a zero
+//! On Amsterdam (gov5's Amsterdam execution on a native chain) it applies
+//! EIP-2780's intrinsic (21,000 with a value, 15,000 without), EIP-8037's
+//! new-account state gas for a value to an empty recipient (183,600, paid
+//! only when the gas limit covers it; otherwise evm2 makes the halt) and
+//! EIP-7708's transfer log (`docs/AMSTERDAM_PARALLEL_STEP.md` 3.3).
+//!
+//! What it does not model, so falls back on: a version with only some of
+//! EIP-2780, EIP-8037 and EIP-7708, any environment whose checks are not the stock ones, a zero
 //! value to an empty or missing recipient or a zero tip to an empty or
 //! missing beneficiary (EIP-161 touches), a recipient with code (including an EIP-7702 delegation), a sender with
 //! code, the precompile range, and a sender, recipient and beneficiary that
@@ -199,8 +205,13 @@ impl<D: Database> Database for Layered<D> {
 /// What [`DirectTransfers::apply`] did with a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// Applied: the accounts and the batch state hold the transfer.
-    Applied,
+    /// Applied: the accounts and the batch state hold the transfer, which
+    /// paid `state_gas` (EIP-8037; 0 off Amsterdam). Its result is
+    /// [`DirectTransfers::result_for`].
+    Applied {
+        /// The EIP-8037 state gas the transfer paid.
+        state_gas: u64,
+    },
     /// Qualified, but the admission check (the deferred-execution ledger)
     /// refused it; nothing written.
     Refused,
@@ -218,6 +229,13 @@ pub struct DirectTransfers<X> {
     chain_id: u64,
     tx_gas_cap: u64,
     floor_gas: u64,
+    /// The intrinsic and floor of a transfer without a value (EIP-2780:
+    /// 15,000 on Amsterdam; the same as with one before).
+    zero_value_gas: (u64, u64),
+    /// EIP-8037's new-account charge; 0 without EIP-8037.
+    new_account_state_gas: u64,
+    /// Whether a transfer's result carries its EIP-7708 log.
+    transfer_logs: bool,
 }
 
 impl<X> std::fmt::Debug for DirectTransfers<X> {
@@ -257,8 +275,8 @@ impl<X> DirectTransfers<X> {
     /// The path for a block on `spec` with `version` (the environment's
     /// runtime configuration), crediting `beneficiary`, or `None` when the
     /// block is not one it models: a spec [`crate::fast_handler::covers`]
-    /// does not, a check switched off, EIP-2780 or EIP-8037 gas, or a
-    /// transfer whose intrinsic gas is not 21,000.
+    /// does not, a check switched off, only some of Amsterdam's transfer
+    /// rules, or a transfer with a value whose intrinsic gas is not 21,000.
     pub fn new(
         spec: SpecId,
         version: &Version,
@@ -273,7 +291,22 @@ impl<X> DirectTransfers<X> {
         }
         let (_, floor_gas) = transfer_gas(version);
         let (tx_gas_cap, _) = version.tx_gas_caps();
-        Some(Self { shape, beneficiary, basefee, block_gas_limit, chain_id: version.chain_id, tx_gas_cap, floor_gas })
+        let zero_value_gas = transfer_gas_of(version, U256::ZERO);
+        let new_account_state_gas =
+            if version.feature(EvmFeatures::EIP8037) { version.gas_params.new_account_state_gas() } else { 0 };
+        let transfer_logs = version.feature(EvmFeatures::EIP7708) && version.feature(EvmFeatures::LOG_COLLECTION);
+        Some(Self {
+            shape,
+            beneficiary,
+            basefee,
+            block_gas_limit,
+            chain_id: version.chain_id,
+            tx_gas_cap,
+            floor_gas,
+            zero_value_gas,
+            new_account_state_gas,
+            transfer_logs,
+        })
     }
 
     /// [`Self::new`] over a reth environment, and only with
@@ -301,14 +334,43 @@ impl<X> DirectTransfers<X> {
         (self.shape)(tx)
     }
 
-    /// The result evm2 gives a plain transfer: success, 21,000 gas spent,
-    /// no refund, the floor, a stop, nothing else.
+    /// The result evm2 gives a plain transfer with a value: success, 21,000
+    /// gas spent, no refund, the floor, a stop, nothing else (off Amsterdam;
+    /// [`Self::result_for`] in general).
     pub fn result<E: Default>(&self) -> evm2::TxResultExt<E> {
         evm2::TxResultExt::<E> {
             status: true,
             total_gas_spent: TRANSFER_GAS,
             floor_gas: self.floor_gas,
             stop: evm2::interpreter::InstrStop::Stop,
+            ..Default::default()
+        }
+    }
+
+    /// The intrinsic and floor gas of a transfer of `value`.
+    fn gas_of(&self, value: U256) -> (u64, u64) {
+        if value.is_zero() {
+            self.zero_value_gas
+        } else {
+            (TRANSFER_GAS, self.floor_gas)
+        }
+    }
+
+    /// The result evm2 gives `tx` applied with `state_gas` (its
+    /// [`Step::Applied`]): success, the intrinsic of its value plus the
+    /// state gas spent, no refund, the floor, a stop, and on Amsterdam its
+    /// EIP-7708 log. Off Amsterdam a transfer with a value gets
+    /// [`Self::result`].
+    pub fn result_for<E: Default>(&self, tx: &TxShape, state_gas: u64) -> evm2::TxResultExt<E> {
+        let (intrinsic, floor_gas) = self.gas_of(tx.value);
+        let logs = if self.transfer_logs { eip7708_transfer_log(tx.caller, tx.to, tx.value).into_iter().collect() } else { Vec::new() };
+        evm2::TxResultExt::<E> {
+            status: true,
+            total_gas_spent: intrinsic + state_gas,
+            state_gas_spent: state_gas,
+            floor_gas,
+            stop: evm2::interpreter::InstrStop::Stop,
+            logs,
             ..Default::default()
         }
     }
@@ -354,12 +416,11 @@ impl<X> DirectTransfers<X> {
             return Some(Step::Fallback);
         }
         let tip = price - self.basefee;
-        if tx.gas_limit < TRANSFER_GAS || tx.gas_limit > self.tx_gas_cap || U256::from(tx.gas_limit) > self.block_gas_limit {
+        let (intrinsic, floor_gas) = self.gas_of(tx.value);
+        if tx.gas_limit < intrinsic || tx.gas_limit > self.tx_gas_cap || U256::from(tx.gas_limit) > self.block_gas_limit {
             return Some(Step::Fallback);
         }
         let max_upfront = U256::from(tx.gas_limit).checked_mul(tx.max_fee)?.checked_add(tx.value)?;
-        let fee = U256::from(TRANSFER_GAS).checked_mul(price)?;
-        let reward = U256::from(TRANSFER_GAS).checked_mul(tip)?;
         let sender = layer.account(&caller).ok()??;
         if !sender.is_empty_code_hash() || sender.nonce != tx.nonce || tx.nonce == u64::MAX || sender.balance < max_upfront {
             return Some(Step::Fallback);
@@ -375,6 +436,20 @@ impl<X> DirectTransfers<X> {
         if tx.value.is_zero() && !alive(&recipient) {
             return Some(Step::Fallback);
         }
+        // EIP-8037: a value to an empty recipient pays the new-account state
+        // gas, from what the gas limit leaves over the intrinsic (reservoir
+        // and regular gas together); short of it evm2 makes the halt.
+        let state_gas = if self.new_account_state_gas > 0 && !tx.value.is_zero() && !alive(&recipient) {
+            if tx.gas_limit - intrinsic < self.new_account_state_gas {
+                return Some(Step::Fallback);
+            }
+            self.new_account_state_gas
+        } else {
+            0
+        };
+        let used = (intrinsic + state_gas).max(floor_gas);
+        let fee = U256::from(used).checked_mul(price)?;
+        let reward = U256::from(used).checked_mul(tip)?;
         let paid = layer.account(&beneficiary).ok()?;
         if reward.is_zero() && !alive(&paid) {
             return Some(Step::Fallback);
@@ -399,13 +474,36 @@ impl<X> DirectTransfers<X> {
             state.commit_info(beneficiary, paid.as_ref(), &paid_after);
             layer.accounts.insert(beneficiary, Some(paid_after));
         }
-        Some(Step::Applied)
+        Some(Step::Applied { state_gas })
     }
 }
 
-/// The intrinsic and floor gas of a plain transfer on `version`.
+/// EIP-7708's log for `value` moved from `from` to `to` (evm2's
+/// `eip7708_transfer_log`): none for a zero value or a self-transfer.
+pub fn eip7708_transfer_log(from: Address, to: Address, value: U256) -> Option<alloy_primitives::Log> {
+    if value.is_zero() || from == to {
+        return None;
+    }
+    let topics = vec![
+        evm2::constants::EIP7708_TRANSFER_TOPIC,
+        alloy_primitives::B256::left_padding_from(from.as_slice()),
+        alloy_primitives::B256::left_padding_from(to.as_slice()),
+    ];
+    Some(alloy_primitives::Log {
+        address: evm2::evm::SYSTEM_ADDRESS,
+        data: alloy_primitives::LogData::new_unchecked(topics, Bytes::copy_from_slice(&value.to_be_bytes::<32>())),
+    })
+}
+
+/// The intrinsic and floor gas of a plain transfer with a value on `version`.
 fn transfer_gas(version: &Version) -> (u64, u64) {
-    ethereum::intrinsic_and_floor_gas(version, Address::ZERO, TxKind::Call(Address::with_last_byte(1)), &Bytes::new(), 0, 0, U256::from(1u64))
+    transfer_gas_of(version, U256::from(1u64))
+}
+
+/// The intrinsic and floor gas of a plain transfer of `value` to another
+/// account on `version`.
+fn transfer_gas_of(version: &Version, value: U256) -> (u64, u64) {
+    ethereum::intrinsic_and_floor_gas(version, Address::ZERO, TxKind::Call(Address::with_last_byte(1)), &Bytes::new(), 0, 0, value)
 }
 
 /// Why the direct path does not model a block on `spec` with `version`, or
@@ -417,15 +515,17 @@ pub fn refusal(spec: SpecId, version: &Version) -> Option<&'static str> {
     if let Some(i) = STOCK_CHECKS.iter().position(|f| !version.feature(*f)) {
         return Some(STOCK_CHECK_NAMES[i]);
     }
-    if version.feature(EvmFeatures::EIP2780) {
-        return Some("EIP2780");
-    }
-    if version.feature(EvmFeatures::EIP8037) {
-        return Some("EIP8037");
+    // Amsterdam's transfer rules are modelled together or not at all.
+    if !crate::fast_handler::amsterdam_features_consistent(version) {
+        return Some("amsterdam features");
     }
     // BALANCE_TOP_UP acts only without BALANCE_CHECK, which is required.
     let (intrinsic, floor_gas) = transfer_gas(version);
     if intrinsic != TRANSFER_GAS || floor_gas > TRANSFER_GAS {
+        return Some("transfer gas");
+    }
+    let (intrinsic, floor_gas) = transfer_gas_of(version, U256::ZERO);
+    if intrinsic > TRANSFER_GAS || floor_gas > intrinsic {
         return Some("transfer gas");
     }
     None

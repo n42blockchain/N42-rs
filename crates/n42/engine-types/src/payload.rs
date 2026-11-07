@@ -887,9 +887,20 @@ fn pooled_consensus<P: PoolTransaction<Consensus = TransactionSigned>>(
 fn transfer_key<P: PoolTransaction<Consensus = TransactionSigned>>(
     tx: &reth_transaction_pool::ValidPoolTransaction<P>,
 ) -> Option<(alloy_primitives::Address, alloy_primitives::Address)> {
+    if tx.transaction.gas_limit() != MIN_TRANSACTION_GAS {
+        return None;
+    }
+    plain_transfer_key(tx)
+}
+
+/// [`transfer_key`] whatever the gas limit: the take of a block under gov5's
+/// Amsterdam execution, where a transfer creating its recipient needs its
+/// EIP-8037 state gas on top of the 21,000 (`docs/AMSTERDAM_PARALLEL_STEP.md`).
+fn plain_transfer_key<P: PoolTransaction<Consensus = TransactionSigned>>(
+    tx: &reth_transaction_pool::ValidPoolTransaction<P>,
+) -> Option<(alloy_primitives::Address, alloy_primitives::Address)> {
     let inner = &tx.transaction;
-    (inner.gas_limit() == MIN_TRANSACTION_GAS
-        && inner.input().is_empty()
+    (inner.input().is_empty()
         && !inner.is_create()
         && inner.access_list().is_none_or(|list| list.is_empty())
         && !inner.is_eip4844()
@@ -1379,14 +1390,15 @@ where
             None => client.state_by_block_hash(parent_hash_for_state),
         }
     };
-    // The parallel transfer step models the Osaka gas rules (a transfer is
-    // its 21,000 and no log; the block's gas is the transactions' sum). A
-    // block under gov5's Amsterdam execution (EIP-8037's two gas dimensions,
-    // EIP-7708's transfer logs) is built serially, transaction by
-    // transaction, by the executor that applies them
-    // (`docs/GLAMSTERDAM_EXECUTION_PARITY.md`).
-    let parallel_build = parallel_build()
-        && !reth_chainspec::qmdb::glamsterdam_execution_active_at(client.chain_spec().genesis(), attributes.timestamp);
+    // A block under gov5's Amsterdam execution (EIP-2780 intrinsic, EIP-8037
+    // state gas and its two block gas dimensions, EIP-7708 transfer logs)
+    // takes the parallel step with the batches' Amsterdam checks
+    // (`docs/AMSTERDAM_PARALLEL_STEP.md`) unless `N42_AMSTERDAM_PARALLEL=0`,
+    // which builds it serially as before. reth's own Amsterdam (a block
+    // access list) stays serial below (`is_amsterdam`).
+    let glamsterdam_execution =
+        reth_chainspec::qmdb::glamsterdam_execution_active_at(client.chain_spec().genesis(), attributes.timestamp);
+    let parallel_build = parallel_build() && (!glamsterdam_execution || crate::parallel_build::amsterdam_parallel());
     let defer_state = state_after_pull() && parallel_build && builder_puller() != 0;
     let parent_state_slot: std::cell::OnceCell<reth_storage_api::StateProviderBox> = std::cell::OnceCell::new();
     if !defer_state {
@@ -2150,6 +2162,21 @@ where
                 lookahead.push_front(tx);
             }
         }
+        // Amsterdam: the prefix whose gas limits pass the block's two gas
+        // dimensions whatever each transfer turns out to be
+        // (`AmsterdamRules::take`); the rest waits for the next block like a
+        // block's worth over the budget.
+        let amsterdam_rules = crate::parallel_build::AmsterdamRules::of(&group_env.version, block_gas_limit);
+        // EIP-8037's two block gas counters, for the late receipts' gas.
+        let separate_block_gas = group_env.version.feature(evm2::EvmFeatures::EIP8037);
+        if let Some(rules) = amsterdam_rules.as_ref() {
+            let take = rules.take(cands.iter().map(|tx| tx.gas_limit()));
+            if take < cands.len() {
+                for tx in cands.split_off(take).into_iter().rev() {
+                    lookahead.push_front(tx);
+                }
+            }
+        }
         par_pull_ms = par_at.elapsed().as_millis() as u64;
         // `N42_PULLER_STOP_AT_PULL` (default on, F5g item 5): a full pull
         // on a block that can seal at the execution's end gives the
@@ -2225,7 +2252,14 @@ where
             }
             None => {
                 let keys_at = std::time::Instant::now();
-                let keys = cands.iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>();
+                // Amsterdam: a creating transfer needs more than 21,000
+                // (EIP-8037), so the batches take plain transfers of any gas
+                // limit there and check what each used.
+                let keys = if amsterdam_rules.is_some() {
+                    cands.iter().map(|tx| plain_transfer_key(tx)).collect::<Option<Vec<_>>>()
+                } else {
+                    cands.iter().map(|tx| transfer_key(tx)).collect::<Option<Vec<_>>>()
+                };
                 evm2_keys_us = keys_at.elapsed().as_micros() as u64;
                 (keys, None)
             }
@@ -2531,12 +2565,15 @@ where
                             let executed = std::mem::take(&mut executed);
                             let late_cands = std::mem::take(&mut cands);
                             let spawned = std::thread::Builder::new().name("n42-receipts-late".into()).spawn(move || {
-                                let receipts = crate::parallel_build::late_receipts(executed.into_iter().map(|e| {
-                                    let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(
-                                        pooled_consensus(&late_cands[e.index]),
-                                    );
-                                    (e.result, tx_type)
-                                }));
+                                let receipts = crate::parallel_build::late_receipts(
+                                    executed.into_iter().map(|e| {
+                                        let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(
+                                            pooled_consensus(&late_cands[e.index]),
+                                        );
+                                        (e.result, tx_type)
+                                    }),
+                                    separate_block_gas,
+                                );
                                 crate::parallel_transfer::behind_pool().spawn(move || drop(late_cands));
                                 receipts
                             });

@@ -15,9 +15,9 @@
 //! default hooks' `settle_transaction`) refunds the sender and pays the
 //! beneficiary. Anything that does not qualify goes to the stock `execute`.
 //!
-//! What qualifies: a call with no input and no access list, on Prague or Osaka
-//! (Amsterdam's EIP-2780 runtime gas, EIP-8037 state gas and EIP-7708 transfer
-//! log are not modelled: the registry keeps the stock handlers there), with no
+//! What qualifies: a call with no input and no access list, on Prague, Osaka
+//! or Amsterdam (EIP-2780's intrinsic, EIP-8037's new-account state gas and
+//! EIP-7708's transfer log are applied as the stock path applies them), with no
 //! inspector, to an account without code that is not a precompile, where the
 //! sender, the recipient and the beneficiary are three accounts, the recipient
 //! is not left empty by a zero-value call (EIP-161), and the sender can pay the
@@ -83,9 +83,21 @@ pub fn wanted() -> bool {
     everywhere() || (IN_BATCH.with(std::cell::Cell::get) && in_batches())
 }
 
-/// Whether the handler is registered on `spec`: Prague and Osaka.
+/// Whether the handler is registered on `spec`: Prague, Osaka and
+/// Amsterdam (gov5's Amsterdam execution on a native chain; the EIP-2780
+/// intrinsic, the EIP-8037 new-account state gas and the EIP-7708 transfer
+/// log are modelled, `docs/AMSTERDAM_PARALLEL_STEP.md`).
 pub fn covers(spec: SpecId) -> bool {
-    spec.enables(SpecId::PRAGUE) && !spec.enables(SpecId::AMSTERDAM)
+    spec.enables(SpecId::PRAGUE) && SpecId::AMSTERDAM.enables(spec)
+}
+
+/// Whether `version`'s Amsterdam transfer rules are all on or all off: the
+/// fast paths model EIP-2780, EIP-8037 and EIP-7708 together and nothing in
+/// between.
+pub fn amsterdam_features_consistent(version: &evm2::Version) -> bool {
+    use evm2::EvmFeatures;
+    let eip2780 = version.feature(EvmFeatures::EIP2780);
+    eip2780 == version.feature(EvmFeatures::EIP8037) && eip2780 == version.feature(EvmFeatures::EIP7708)
 }
 
 /// `base` (the stock registry for `spec`) with types 0, 1 and 2 handled by
@@ -189,6 +201,7 @@ fn transfer<T: EvmTypes>(host: &mut Evm<'_, T>, envelope: &T::Tx, shape: &Shape)
     let caller = shape.caller;
     let beneficiary = host.block().beneficiary;
     if !covers(host.spec_id())
+        || !amsterdam_features_consistent(host.version())
         || host.inspector().is_some()
         || to == caller
         || to == beneficiary
@@ -197,7 +210,7 @@ fn transfer<T: EvmTypes>(host: &mut Evm<'_, T>, envelope: &T::Tx, shape: &Shape)
     {
         return delegate();
     }
-    {
+    let recipient_empty = {
         let state = host.state_mut();
         let (recipient_empty, recipient_codeless) = {
             let recipient = state.account(&to)?;
@@ -209,24 +222,45 @@ fn transfer<T: EvmTypes>(host: &mut Evm<'_, T>, envelope: &T::Tx, shape: &Shape)
         if state.account(&caller)?.balance() < shape.value {
             return delegate();
         }
-    }
+        recipient_empty
+    };
     // The intrinsic gas of a call with no input and no access list, as the
-    // stock `prepare` computed it (no hooks: no adjustment, no state gas).
+    // stock `prepare` computed it (no hooks: no adjustment, no state gas;
+    // EIP-2780's decomposed base on Amsterdam).
     let (intrinsic, floor_gas) =
         ethereum::intrinsic_and_floor_gas(host.version(), caller, TxKind::Call(to), &Bytes::new(), 0, 0, shape.value);
     let (execution_gas_limit, reservoir) = ethereum::initial_gas_and_reservoir(host.version(), shape.gas_limit, intrinsic, 0);
+    let mut tx_gas = GasTracker::new_with_execution_gas_and_reservoir(execution_gas_limit, reservoir);
+    // EIP-2780's runtime phase (`prepare_initial_frame`): a value to an empty
+    // recipient pays EIP-8037's new-account state gas, reservoir first. When
+    // it does not fit the stock path makes the out-of-gas halt; nothing has
+    // been written yet.
+    let mut charged_state_gas = 0;
+    if host.version().feature(evm2::EvmFeatures::EIP2780) && !shape.value.is_zero() && recipient_empty {
+        let charge = host.version().gas_params.new_account_state_gas();
+        if tx_gas.spend_state(charge).is_err() {
+            return delegate();
+        }
+        charged_state_gas = charge;
+    }
     if !host.state_mut().transfer(&caller, &to, &shape.value)? {
         // Unreachable: the balance was checked above.
         return delegate();
     }
-    // What `execute_call_message` returns for an account without code.
+    // EIP-7708: the transfer's log, as `execute_call_message` emits it.
+    if host.version().feature(evm2::EvmFeatures::EIP7708) && host.logs_observed() {
+        if let Some(log) = crate::direct_transfer::eip7708_transfer_log(caller, to, shape.value) {
+            host.log(log);
+        }
+    }
+    // What `execute_call_message` returns for an account without code: the
+    // frame starts with what the runtime phase left.
     let mut result = MessageResultExt {
         stop: InstrStop::Stop,
-        gas: GasTracker::new_with_execution_gas_and_reservoir(execution_gas_limit, reservoir),
+        gas: GasTracker::new_with_execution_gas_and_reservoir(tx_gas.remaining(), tx_gas.reservoir()),
         ..MessageResultExt::default()
     };
-    let mut tx_gas = GasTracker::new_with_execution_gas_and_reservoir(execution_gas_limit, reservoir);
-    ethereum::settle_initial_frame_gas(&mut tx_gas, &mut result, 0);
+    ethereum::settle_initial_frame_gas(&mut tx_gas, &mut result, charged_state_gas);
     let settled = <DefaultTxHandlerHooks as TxHandlerHooks<T>>::settle_transaction(
         host,
         envelope,
@@ -454,10 +488,80 @@ mod tests {
     }
 
     #[test]
-    fn the_handler_covers_prague_and_osaka_only() {
+    fn the_handler_covers_prague_osaka_and_amsterdam() {
         assert!(covers(SpecId::PRAGUE));
         assert!(covers(SpecId::OSAKA));
+        assert!(covers(SpecId::AMSTERDAM), "gov5's Amsterdam execution on a native chain (stream H)");
         assert!(!covers(SpecId::CANCUN));
-        assert!(!covers(SpecId::AMSTERDAM), "Amsterdam keeps the stock handlers (EIP-2780, EIP-8037, EIP-7708)");
+        let mut partial = evm2::Version::new(SpecId::AMSTERDAM);
+        assert!(amsterdam_features_consistent(&partial));
+        partial.features.remove(evm2::EvmFeatures::EIP7708);
+        assert!(!amsterdam_features_consistent(&partial), "only some of the Amsterdam transfer rules");
+        assert!(amsterdam_features_consistent(&evm2::Version::new(SpecId::OSAKA)));
+    }
+
+    /// A native chain (HotStuff, chain id 1) past `glamsterdamTime`: evm2's
+    /// Amsterdam, as gov5 runs it (`docs/AMSTERDAM_PARALLEL_STEP.md`).
+    fn amsterdam() -> Config {
+        let json = r#"{"config":{"chainId":1,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"terminalTotalDifficultyPassed":true,"shanghaiTime":0,"cancunTime":0,"pragueTime":0,"osakaTime":0,"consensus":"hotstuff","glamsterdamTime":0},"alloc":{}}"#;
+        let genesis: alloy_genesis::Genesis = serde_json::from_str(json).expect("genesis");
+        N42EvmConfig::new(Arc::new(n42_header::N42ChainSpec::from(reth_chainspec::ChainSpec::from_genesis(genesis))))
+    }
+
+    /// [`check`] on Amsterdam: the stock Amsterdam handler (EIP-2780,
+    /// EIP-8037, EIP-7708) against the fast one, result (gas, state gas,
+    /// logs) and change stream.
+    fn check_amsterdam(cases: &[(&str, Recovered<N42TxEnvelope>, bool)]) {
+        let config = amsterdam();
+        assert_eq!(env(&config).spec, SpecId::AMSTERDAM);
+        for (name, tx, fast) in cases {
+            let stock = outcome(&config, false, tx);
+            let before = hits();
+            let ours = outcome(&config, true, tx);
+            assert_eq!(ours, stock, "{name} (amsterdam)");
+            if *fast {
+                assert!(hits() > before, "{name} (amsterdam) did not take the fast path");
+            }
+        }
+    }
+
+    #[test]
+    fn qualifying_transfers_equal_the_stock_amsterdam_handler() {
+        let creating = eip1559(1, 0, addr(FRESH), 100, 210_000, Bytes::new());
+        check_amsterdam(&[
+            ("1559 to an existing account", transfer(1, addr(2), 100), true),
+            ("1559 creating its recipient (EIP-8037)", creating.clone(), true),
+            ("1559 creating its recipient, the charge to the gas limit", eip1559(1, 0, addr(FRESH), 100, 204_600, Bytes::new()), true),
+            ("1559 over the intrinsic gas", eip1559(1, 0, addr(2), 100, 30_000, Bytes::new()), true),
+            ("legacy", legacy(2, addr(3), 7), true),
+            ("2930 with an empty access list", eip2930(3, addr(4), 9, AccessList::default()), true),
+            ("0x50 as 1559", alt_transfer(), true),
+            ("zero value to an existing account (15,000)", transfer(4, addr(5), 0), true),
+            ("zero value at its 15,000 intrinsic", eip1559(4, 0, addr(5), 0, 15_000, Bytes::new()), true),
+        ]);
+        // The stock outcome carries what Prague's does not.
+        let (result, _) = outcome(&amsterdam(), false, &creating);
+        assert!(result.contains("state_gas_spent: 183600") && result.contains("total_gas_spent: 204600"), "{result}");
+        assert!(result.contains("ddf252ad"), "the EIP-7708 log: {result}");
+    }
+
+    #[test]
+    fn everything_else_is_handed_to_the_stock_amsterdam_handler_unchanged() {
+        let access_list = AccessList(vec![AccessListItem { address: addr(6), storage_keys: vec![B256::ZERO] }]);
+        check_amsterdam(&[
+            ("creating its recipient at 21,000 (a runtime out-of-gas halt)", transfer(1, addr(FRESH), 100), false),
+            ("creating its recipient one gas short", eip1559(1, 0, addr(FRESH), 100, 204_599, Bytes::new()), false),
+            ("zero value to an empty account", transfer(1, addr(FRESH), 0), false),
+            ("to a contract", eip1559(1, 0, addr(CONTRACT), 1, 200_000, Bytes::new()), false),
+            ("to a precompile", eip1559(1, 0, Address::with_last_byte(4), 1, 30_000, Bytes::new()), false),
+            ("to itself", transfer(2, addr(2), 5), false),
+            ("to the beneficiary", transfer(3, addr(BENEFICIARY), 5), false),
+            ("with input", eip1559(4, 0, addr(5), 1, 30_000, Bytes::from_static(&[1, 2])), false),
+            ("2930 with an access list", eip2930(5, addr(6), 1, access_list), false),
+            ("value the sender lacks after the fee", transfer(9, addr(2), 1), false),
+            ("a nonce ahead", eip1559(6, 3, addr(2), 1, 21_000, Bytes::new()), false),
+            ("an intrinsic gas too low", eip1559(7, 0, addr(2), 1, 20_000, Bytes::new()), false),
+            ("zero value under its intrinsic", eip1559(7, 0, addr(2), 0, 14_999, Bytes::new()), false),
+        ]);
     }
 }

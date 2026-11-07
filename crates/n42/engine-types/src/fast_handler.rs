@@ -248,10 +248,11 @@ fn transfer<T: EvmTypes>(host: &mut Evm<'_, T>, envelope: &T::Tx, shape: &Shape)
         return delegate();
     }
     // EIP-7708: the transfer's log, as `execute_call_message` emits it.
-    if host.version().feature(evm2::EvmFeatures::EIP7708) && host.logs_observed() {
-        if let Some(log) = crate::direct_transfer::eip7708_transfer_log(caller, to, shape.value) {
-            host.log(log);
-        }
+    if host.version().feature(evm2::EvmFeatures::EIP7708)
+        && host.logs_observed()
+        && let Some(log) = crate::direct_transfer::eip7708_transfer_log(caller, to, shape.value)
+    {
+        host.log(log);
     }
     // What `execute_call_message` returns for an account without code: the
     // frame starts with what the runtime phase left.

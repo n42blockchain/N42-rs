@@ -412,7 +412,7 @@ impl AmsterdamRules {
     /// when the version has neither EIP-2780 nor EIP-8037.
     pub fn of(version: &evm2::Version, block_gas_limit: u64) -> Option<Self> {
         (version.feature(evm2::EvmFeatures::EIP2780) || version.feature(evm2::EvmFeatures::EIP8037))
-            .then(|| Self { version: version.clone(), block_gas_limit })
+            .then_some(Self { version: *version, block_gas_limit })
     }
 
     /// The intrinsic gas of a call from `caller` to `to` with `value`, no

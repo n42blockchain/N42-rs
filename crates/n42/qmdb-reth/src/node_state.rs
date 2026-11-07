@@ -482,7 +482,8 @@ pub enum NodeStateError {
     /// 3.2, the 2026-10-28 consequence): a compacting node is a pruned node.
     #[error(
         "QMDB slot {slot} keeps only its leaf hash (a compacted twig): a v1 portable snapshot needs every slot's key \
-         and value, so export from a node that runs with compaction off (an archive node)"
+         and value, so export v2 (`--format v2`, the tombstone layout) or v1 from a node that runs with compaction \
+         off (an archive node)"
     )]
     PortableCompacted {
         /// The first hash-only slot.
@@ -2935,9 +2936,11 @@ impl QmdbNodeState {
         expected_head: (u64, B256),
         expected_root: B256,
     ) -> Result<(), NodeStateError> {
-        use n42_twig_core::qmdb_compat::QmdbPortableSnapshot;
-        let snapshot = QmdbPortableSnapshot::decode(portable)
-            .map_err(|e| NodeStateError::Portable(e.to_string()))?;
+        use n42_twig_core::qmdb_compat::QmdbPortableTree;
+        // Either layout (`docs/QMDB_COMPACTION_DESIGN.md` section 6): a v2
+        // tombstone becomes a hash-only slot of the rebuilt tree.
+        let (_, snapshot) =
+            QmdbPortableTree::decode(portable).map_err(|e| NodeStateError::Portable(e.to_string()))?;
         let at = (snapshot.block_number, B256::from(snapshot.block_hash));
         if at != expected_head {
             return Err(NodeStateError::Portable(format!(
@@ -2953,6 +2956,15 @@ impl QmdbNodeState {
             return Err(NodeStateError::Portable(format!(
                 "snapshot root {root:?} is not the header's state root {expected_root:?}"
             )));
+        }
+        if !self.inner.entry_file && tree.has_hash_only_slots() {
+            // The heap checkpoint's layout has no hash-only slot (it would
+            // lose the hash): only the entry file holds one.
+            return Err(NodeStateError::Portable(
+                "the snapshot has tombstoned slots (a v2 export of a compacted tree), which only a node with the \
+                 QMDB entry file can hold"
+                    .to_owned(),
+            ));
         }
         let mut forest = QmdbForest::from_tree(expected_head.0, expected_head.1, tree);
         let mut cursor = self.cursor();
@@ -2983,10 +2995,26 @@ impl QmdbNodeState {
     }
 
     /// The persisted forest as a cross-client portable snapshot, for another
-    /// node to start from. Reads the snapshot file; the node need not be
-    /// running.
+    /// node to start from: v1 when every slot keeps its payload, the v2
+    /// tombstone layout when compacted twigs dropped some
+    /// ([`Self::portable_export_as`] with no format). Reads the snapshot
+    /// file; the node need not be running.
     pub fn portable_export(&self, chain_id: u64, genesis_hash: B256) -> Result<Vec<u8>, NodeStateError> {
-        use n42_twig_core::qmdb_compat::{QmdbPortableSnapshot, QmdbSlotEntry, QmdbSlotSnapshot};
+        self.portable_export_as(chain_id, genesis_hash, None)
+    }
+
+    /// [`Self::portable_export`] in `format`, or (`None`) v1 unless a slot
+    /// keeps only its leaf hash, then v2. v1 of a compacted tree is refused
+    /// ([`NodeStateError::PortableCompacted`]). v2 writes every hash-only slot
+    /// as a tombstone (kind 2) and never a whole-twig record (kind 3), which
+    /// an importer cannot rebuild (`docs/QMDB_COMPACTION_DESIGN.md` section 6).
+    pub fn portable_export_as(
+        &self,
+        chain_id: u64,
+        genesis_hash: B256,
+        format: Option<n42_twig_core::qmdb_compat::PortableFormat>,
+    ) -> Result<Vec<u8>, NodeStateError> {
+        use n42_twig_core::qmdb_compat::{PortableFormat, QmdbPortableTree};
         let ckpt_path = self.ckpt_path();
         let snapshot = if let Some(ckpt) = read_ckpt(&ckpt_path)? {
             // File mode: the checkpoint plus the logs say where the head is
@@ -3005,31 +3033,21 @@ impl QmdbNodeState {
             let (snapshot, _) = replay_delta_log(&self.delta_log_path(), checkpoint, None)?;
             snapshot
         };
-        if let Some(slot) = snapshot.tree.first_hash_only_slot() {
+        let hash_only = snapshot.tree.first_hash_only_slot();
+        let format = format.unwrap_or_else(|| if hash_only.is_some() { PortableFormat::V2 } else { PortableFormat::V1 });
+        if let (PortableFormat::V1, Some(slot)) = (format, hash_only) {
             return Err(NodeStateError::PortableCompacted { slot });
         }
-        let tree = QmdbForest::from_snapshot(&snapshot)?;
-        let entries = snapshot
-            .tree
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(slot, entry)| QmdbSlotEntry {
-                slot: slot as u64,
-                key: entry.key,
-                value: entry.value.clone(),
-                active: entry.active,
-            })
-            .collect();
-        let portable = QmdbPortableSnapshot {
+        let root = QmdbForest::from_snapshot(&snapshot)?.root();
+        let portable = QmdbPortableTree {
             chain_id,
             genesis_hash: genesis_hash.0,
             block_number: snapshot.head_number,
             block_hash: snapshot.head_hash.0,
-            root: tree.root().0,
-            slots: QmdbSlotSnapshot { next_slot: snapshot.tree.next_slot, entries },
+            root: root.0,
+            slots: snapshot.tree,
         };
-        portable.encode().map_err(|e| NodeStateError::Portable(e.to_string()))
+        portable.encode(format, false).map_err(|e| NodeStateError::Portable(e.to_string()))
     }
 
     /// Whether [`Self::initialize`] has run.
@@ -5342,10 +5360,44 @@ mod tests {
         assert_eq!(restarted.state_root(), root);
         assert_eq!(restarted.entry_stats().unwrap().relocated_bytes, report.bytes_written);
         drop(restarted);
-        let refused = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true).portable_export(1143, chain.genesis_hash());
+        let refused = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true).portable_export_as(
+            1143,
+            chain.genesis_hash(),
+            Some(n42_twig_core::qmdb_compat::PortableFormat::V1),
+        );
         let error = refused.unwrap_err();
         assert!(matches!(error, NodeStateError::PortableCompacted { .. }), "{error}");
         assert!(error.to_string().contains("compaction off"), "{error}");
+
+        // The tombstone layout (design 6) is what it writes by default, and a
+        // node with the entry file starts from it at the same root and
+        // follows the source's next block; a heap node refuses it by name.
+        let source = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        let v2 = source.portable_export(1143, chain.genesis_hash()).unwrap();
+        assert_eq!(&v2[..8], n42_twig_core::qmdb_compat::PORTABLE_SNAPSHOT_MAGIC_V2);
+        let verified = n42_twig_core::qmdb_compat::verify_portable_stream(v2.as_slice(), 1143, &chain.genesis_hash().0).unwrap();
+        assert!(verified.tombstones > 0 && verified.root == root.0, "{verified:?}");
+        let target_dir = scratch("compacted-v2-target");
+        let target = QmdbNodeState::new_with_entry_file(chain.clone(), &target_dir, true);
+        target.initialize_from_portable(&v2, 1143, chain.genesis_hash(), (80, parent), root).unwrap();
+        assert_eq!(target.state_root(), root);
+        source.initialize((80, parent)).unwrap();
+        let (_, source_root) = advance(&source, 81, parent);
+        let (_, target_root) = advance(&target, 81, parent);
+        assert_eq!(source_root, target_root);
+        // The imported node is compacted too: v1 refused, v2 again.
+        drop(target);
+        let reopened = QmdbNodeState::new_with_entry_file(chain.clone(), &target_dir, true);
+        assert!(matches!(
+            reopened.portable_export_as(1143, chain.genesis_hash(), Some(n42_twig_core::qmdb_compat::PortableFormat::V1)),
+            Err(NodeStateError::PortableCompacted { .. })
+        ));
+        assert_eq!(&reopened.portable_export(1143, chain.genesis_hash()).unwrap()[..8], b"N42QMDB\x03");
+        let heap = QmdbNodeState::new_with_entry_file(chain.clone(), scratch("compacted-v2-heap"), false);
+        let error = heap.initialize_from_portable(&v2, 1143, chain.genesis_hash(), (80, parent), root).unwrap_err();
+        assert!(error.to_string().contains("entry file"), "{error}");
+        assert!(!heap.is_initialized());
+        let _ = std::fs::remove_dir_all(&target_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5463,11 +5515,14 @@ mod tests {
         assert_eq!(restarted.state_root(), root);
         assert_eq!(restarted.entry_stats().unwrap().punched_bytes, punched.punched_bytes);
         check(&restarted.read_view().expect("rebuilt on the punched files"), 99);
-        // A compacted node is a pruned node to the v1 format (design 6).
+        // A compacted node is a pruned node to the v1 format; it writes v2
+        // (design 6).
         assert!(matches!(
-            restarted.portable_export(1143, chain.genesis_hash()),
+            restarted.portable_export_as(1143, chain.genesis_hash(), Some(n42_twig_core::qmdb_compat::PortableFormat::V1)),
             Err(NodeStateError::PortableCompacted { .. })
         ));
+        let v2 = restarted.portable_export(1143, chain.genesis_hash()).unwrap();
+        assert_eq!(&v2[..8], n42_twig_core::qmdb_compat::PORTABLE_SNAPSHOT_MAGIC_V2);
         drop(restarted);
         let _ = std::fs::remove_dir_all(&dir);
     }

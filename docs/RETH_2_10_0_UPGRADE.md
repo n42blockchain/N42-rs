@@ -200,3 +200,59 @@ The D2 gate stopped the round on GA1b:
 
 Another agent is working on the root cause; it is not part of this record. The pair is
 incomplete until GA1b reruns clean.
+
+## The same-parent rebuild root mismatch (GA1b, 2026-11-06)
+
+**Evidence.** Leg GA1b (seven validators on one execution layer, X22, the
+flood just ended) exited at 11:02:58.325Z with `QMDB head cannot follow the
+canonical chain ... re-applying block 0xbc75fd36... (8191) gave root
+0x39850779..., expected 0x3c3a1440...` (`rust-fleet7-bench/node0/el.log`
+lines 107410-107439). 8191 is a tenure handover: node0 had chained block A
+of 8191 on 0xe11459... (8190) for view 8192 (`chained=true`, .271715), node1
+led view 8192 and had block B built on the same parent (`chained=false`,
+.305737, after its FCU payload job on that parent was given up). Every 1024th
+block in that log is the same shape (1023, 2047, ..., 7167 built twice on one
+parent, the last four empty) and passed; the forest logs nothing per root, so
+the exact interleaving at 8190/8191 is not in the log.
+
+**Mechanism.** The payload builder computes a block's QMDB root
+(`QmdbNodeState::compute_operations`, which leaves the block applied on the
+tree as the forest's *pending* work) and files it (`insert`) in two separate
+holds of the forest's lock. `QmdbForest::insert` adopted the pending
+application as the filed block's own whenever the pending block's parent was
+the filed block's parent. A second build of the same height computed between
+the first's compute and its insert is pending on that same parent, so the
+first block's record took the *second* block's undo and the forest's tip was
+set to the first block while the tree held the second's state. Nothing
+fails at that moment: reverts by that undo still restore the parent. But a
+root computed on the mislabelled block -- its child -- is computed on the
+sibling's state and filed; when a later move goes through the parent's parent
+(a branch switch, a build on a sibling), the child is replayed onto the true
+state and lands on another root: exactly `re-applying block X gave root
+<true>, expected <filed>`. In GA1b, X is 8191, so the mislabelled block was
+its parent 8190 (each block is requested twice on its parent, by the chain
+and by the FCU job), and the move was the handover's sibling builds of 8191.
+Not refuted: that the mislabel was at 8191 itself with a sibling of 8190;
+both are this same defect. The hypotheses of a builder reading A's state,
+the F5g8 prepared-build take, and evm2/reth #28207 are not needed: the
+forest test below reproduces the error with no builder at all.
+
+**Fix** (`44cdc0873`, `crates/n42/qmdb-state/src/forest.rs`). The forest
+keeps the root the pending application gave (`pending_root`, set wherever
+`pending` is) and `insert` adopts the pending work only when that root is the
+filed block's root (equal roots are equal states, so adopting is then exact).
+Otherwise the pending block is reverted and the block filed unapplied, as was
+already done for a pending block on another parent; the next move replays it.
+A single build per parent is unchanged (its root always matches).
+
+**Test.** `forest::tests::a_sibling_computed_between_a_build_and_its_insert_is_not_adopted`
+(`6d770907c`): compute P and P' on block 1, insert P, then P'; compute P's
+child; move to P' and back. Before the fix the child's root is P' based and
+the move fails with `Replay { block: child, expected: <filed>, got: <true> }`;
+after it, both are the reference roots. Suite and clippy:
+`/data/n42-build/audit-notes/ci/fix8191-test.log`, `fix8191-clippy.log`.
+
+**Main.** The adoption rule dates from `49ac08391` (2026-08-26, the forest's
+undo records), so v2.8.1, v2.9.0 and v2.10.0 all carry it; it is not a reth
+or evm2 regression. The test applied to main 1f173b278 (which contains the
+v2.9.0 merge 6703c576f) fails the same way. The fix should go to main as is.

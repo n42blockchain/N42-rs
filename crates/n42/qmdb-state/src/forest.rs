@@ -488,6 +488,11 @@ pub struct QmdbForest {
     /// A block computed but not yet filed, still applied on the tree. Any
     /// move of the tree reverts it first.
     pending: Option<(B256, BlockUndo)>,
+    /// The root the pending block's application gave: [`Self::insert`]
+    /// adopts the pending work only for the block that computed it. Two
+    /// builds on one parent can both be computed before either is filed
+    /// (GA1b, 2026-11-06); the parent alone does not tell them apart.
+    pending_root: B256,
     records: HashMap<B256, BlockRecord>,
     head: (u64, B256),
     retain_depth: u64,
@@ -941,6 +946,7 @@ impl QmdbForest {
         let renamed = self.tip != lease.parent;
         let parent = self.tip;
         self.pending = Some((parent, computed.undo));
+        self.pending_root = computed.root;
         // A head move recorded while the tree was out trims now, with the
         // block just computed counted among the undos it must not cut into
         // -- the bound the trim would have had had the move come after this
@@ -1009,6 +1015,7 @@ impl QmdbForest {
             tree,
             tip: hash,
             pending: None,
+            pending_root: B256::ZERO,
             records,
             head: (number, hash),
             retain_depth: DEFAULT_RETAIN_DEPTH,
@@ -1332,6 +1339,7 @@ impl QmdbForest {
         self.note_move(&undo);
         let delta = self.delta_of_applied(&undo);
         self.pending = Some((parent, undo));
+        self.pending_root = B256::from(root);
         Ok(PreparedBlock {
             root: B256::from(root),
             parent,
@@ -1372,6 +1380,7 @@ impl QmdbForest {
         let delta = self.delta_of_applied(&undo);
         self.last_tail = (note_us, delta_at.elapsed().as_micros() as u64, apply_us);
         self.pending = Some((parent, undo));
+        self.pending_root = B256::from(root);
         Ok(PreparedBlock {
             root: B256::from(root),
             parent,
@@ -1444,9 +1453,12 @@ impl QmdbForest {
             return Ok(());
         }
         // The pending work is this very block, on the same parent: adopt it as
-        // applied rather than reverting and replaying it.
+        // applied rather than reverting and replaying it. Another block
+        // computed on the same parent since (a second build of the same
+        // height, computed between this one's compute and its insert) is
+        // not this block: it is reverted and this one filed unapplied.
         let undo = match self.pending.take() {
-            Some((parent, undo)) if parent == prepared.parent => Some(undo),
+            Some((parent, undo)) if parent == prepared.parent && self.pending_root == prepared.root => Some(undo),
             Some((parent, undo)) => {
                 if let Err(err) = self.tree.apply_undo(&undo) {
                     let err = self.undo_failed(&format!("reverting the pending block on {parent}"), err);

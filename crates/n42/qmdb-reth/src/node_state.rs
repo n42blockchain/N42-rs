@@ -5547,7 +5547,7 @@ mod tests {
         let entry = |key, value| QmdbEntrySnapshot::new([key; 32], vec![value], true);
         let checkpoint = ForestSnapshot {
             version: ForestSnapshot::VERSION, head_number: 1, head_hash: B256::repeat_byte(1),
-            tree: QmdbSnapshot { next_slot: 2, entries: vec![entry(1, 1), entry(2, 1)] },
+            tree: QmdbSnapshot { next_slot: 2, entries: vec![entry(1, 1), entry(2, 1)], dead_twigs: Vec::new() },
         };
         let delta = |number, hash, base, appended: Vec<QmdbEntrySnapshot>, changed| ForestDelta {
             version: ForestDelta::VERSION, head_number: number, head_hash: B256::repeat_byte(hash),

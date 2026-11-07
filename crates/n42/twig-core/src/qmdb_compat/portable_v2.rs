@@ -136,7 +136,7 @@ impl From<QmdbPortableSnapshot> for QmdbPortableTree {
             block_number: portable.block_number,
             block_hash: portable.block_hash,
             root: portable.root,
-            slots: QmdbSnapshot { next_slot: portable.slots.next_slot, entries },
+            slots: QmdbSnapshot { next_slot: portable.slots.next_slot, entries, dead_twigs: Vec::new() },
         }
     }
 }
@@ -170,27 +170,37 @@ impl QmdbPortableTree {
         })
     }
 
-    /// For each full twig, whether it is written as one kind-3 record: every
-    /// slot dead and hash-only, and `whole_dead_twigs` asked for.
-    fn dead_twigs(&self, whole_dead_twigs: bool) -> Vec<bool> {
+    /// For each full twig, the leaf root of its kind-3 record if it is
+    /// written as one: always for a root-only twig
+    /// ([`QmdbSnapshot::dead_twigs`], whose leaves are not known), and for
+    /// a twig whose every slot is dead and hash-only when `whole_dead_twigs`
+    /// is asked for.
+    fn dead_twigs(&self, whole_dead_twigs: bool) -> Vec<Option<Hash>> {
         let entries = &self.slots.entries;
-        (0..entries.len() / TWIG_SIZE)
+        let mut roots: Vec<Option<Hash>> = (0..entries.len() / TWIG_SIZE)
             .map(|twig| {
-                whole_dead_twigs
-                    && entries[twig * TWIG_SIZE..(twig + 1) * TWIG_SIZE]
-                        .iter()
-                        .all(|entry| entry.leaf_hash.is_some() && !entry.active)
+                let slots = &entries[twig * TWIG_SIZE..(twig + 1) * TWIG_SIZE];
+                (whole_dead_twigs && slots.iter().all(|entry| entry.leaf_hash.is_some() && !entry.active)).then(|| {
+                    let leaves: Vec<Hash> = slots.iter().map(|entry| entry.leaf_hash.unwrap_or(NULL_HASH)).collect();
+                    twig_leaf_root(&leaves)
+                })
             })
-            .collect()
+            .collect();
+        for (twig, leaf_root) in &self.slots.dead_twigs {
+            if let Some(root) = roots.get_mut(*twig as usize) {
+                *root = Some(*leaf_root);
+            }
+        }
+        roots
     }
 
     /// Encodes the snapshot in `format`. v1 is refused when a slot keeps only
     /// its leaf hash. v2 writes such slots as tombstones (kind 2) and, when
     /// `whole_dead_twigs` is set, a full twig made only of them as one kind-3
-    /// record; an importer reads only kinds 0-2 (a kind-3 twig has no
-    /// per-slot leaf hashes to rebuild), so an export meant for a bootstrap
-    /// leaves it off. A v2 encoding of a tree with no hash-only slot differs
-    /// from v1 only in the header and the kind bytes.
+    /// record; a root-only twig ([`QmdbSnapshot::dead_twigs`], a kind-3
+    /// import) is always kind 3, having no per-slot leaf hashes. A v2
+    /// encoding of a tree with no hash-only slot differs from v1 only in the
+    /// header and the kind bytes.
     pub fn encode(&self, format: PortableFormat, whole_dead_twigs: bool) -> Result<Vec<u8>, QmdbPortableError> {
         if format == PortableFormat::V1 {
             return self.to_v1()?.encode();
@@ -199,11 +209,14 @@ impl QmdbPortableTree {
         if self.slots.next_slot != entries.len() as u64 {
             return Err(QmdbPortableError::NonPositional { entries: entries.len() as u64, next_slot: self.slots.next_slot });
         }
+        if let Some((twig, _)) = self.slots.dead_twigs.iter().find(|(twig, _)| (twig + 1) * TWIG_SIZE as u64 > self.slots.next_slot) {
+            return Err(QmdbPortableError::MisalignedDeadTwig { slot: twig * TWIG_SIZE as u64, count: TWIG_SIZE as u64 });
+        }
         let dead_twigs = self.dead_twigs(whole_dead_twigs);
-        let mut tombstones = dead_twigs.iter().filter(|dead| **dead).count() as u64;
+        let mut tombstones = dead_twigs.iter().filter(|dead| dead.is_some()).count() as u64;
         let mut capacity = HEADER_SIZE_V2 + PORTABLE_SNAPSHOT_DIGEST_SIZE;
         for (slot, entry) in entries.iter().enumerate() {
-            if dead_twigs.get(slot / TWIG_SIZE).copied().unwrap_or(false) {
+            if dead_twigs.get(slot / TWIG_SIZE).is_some_and(Option::is_some) {
                 continue;
             }
             match entry.leaf_hash {
@@ -232,13 +245,11 @@ impl QmdbPortableTree {
         out.extend_from_slice(&tombstones.to_le_bytes());
         let mut slot = 0;
         while slot < entries.len() {
-            if slot % TWIG_SIZE == 0 && dead_twigs.get(slot / TWIG_SIZE).copied().unwrap_or(false) {
-                let leaves: Vec<Hash> =
-                    entries[slot..slot + TWIG_SIZE].iter().map(|entry| entry.leaf_hash.unwrap_or(NULL_HASH)).collect();
+            if let Some(Some(leaf_root)) = (slot % TWIG_SIZE == 0).then(|| dead_twigs.get(slot / TWIG_SIZE).copied().flatten()) {
                 out.extend_from_slice(&(slot as u64).to_le_bytes());
                 out.push(PORTABLE_KIND_DEAD_TWIG);
                 out.extend_from_slice(&(TWIG_SIZE as u16).to_le_bytes());
-                out.extend_from_slice(&twig_leaf_root(&leaves));
+                out.extend_from_slice(&leaf_root);
                 slot += TWIG_SIZE;
                 continue;
             }
@@ -264,10 +275,10 @@ impl QmdbPortableTree {
     }
 
     /// Decodes and authenticates either layout into the slots an importer
-    /// rebuilds: a tombstone becomes a hash-only entry. A kind-3 record is
-    /// checked for its shape and then refused
-    /// ([`QmdbPortableError::DeadTwigNotImportable`]). Root and chain identity
-    /// are checked by [`Self::verify_and_build`].
+    /// rebuilds: a tombstone becomes a hash-only entry, a kind-3 run (its
+    /// shape checked) a root-only twig ([`QmdbSnapshot::dead_twigs`]) whose
+    /// slots are hash-only placeholders. Root and chain identity are checked
+    /// by [`Self::verify_and_build`].
     pub fn decode(encoded: &[u8]) -> Result<(PortableFormat, Self), QmdbPortableError> {
         let format = PortableFormat::detect(encoded).ok_or(if encoded.len() < 8 {
             QmdbPortableError::Truncated
@@ -303,11 +314,13 @@ impl QmdbPortableTree {
         if entry_count > most {
             return Err(QmdbPortableError::Truncated);
         }
-        // Reserved for the records an importer reads (kind 3 is refused).
+        // Reserved for one record a slot; kind-3 runs grow it.
         let reserve = entry_count.min((reader.remaining() / TOMBSTONE_RECORD_SIZE) as u64);
         let mut entries = Vec::with_capacity(usize::try_from(reserve).map_err(|_| QmdbPortableError::Truncated)?);
         let mut tombstones = 0_u64;
-        for expected in 0..entry_count {
+        let mut dead_twigs = Vec::new();
+        let mut expected = 0_u64;
+        while expected < entry_count {
             let slot = reader.u64()?;
             if slot != expected {
                 return Err(QmdbPortableError::NonContiguousSlotLog { expected, got: slot });
@@ -334,12 +347,23 @@ impl QmdbPortableTree {
                 }
                 PORTABLE_KIND_DEAD_TWIG => {
                     let count = u64::from(reader.u16()?);
-                    reader.hash()?;
+                    let leaf_root = reader.hash()?;
                     check_dead_twig_run(slot, count, entry_count)?;
-                    return Err(QmdbPortableError::DeadTwigNotImportable { slot });
+                    tombstones += 1;
+                    // A root-only twig: its slots are placeholders.
+                    dead_twigs.push((slot / TWIG_SIZE as u64, leaf_root));
+                    entries.extend((0..TWIG_SIZE).map(|_| QmdbEntrySnapshot {
+                        key: NULL_HASH,
+                        value: Vec::new(),
+                        active: false,
+                        leaf_hash: Some(NULL_HASH),
+                    }));
+                    expected += count;
+                    continue;
                 }
                 kind => return Err(QmdbPortableError::InvalidRecordKind { slot, kind }),
             }
+            expected += 1;
         }
         if reader.remaining() != 0 {
             return Err(QmdbPortableError::TrailingBytes(reader.remaining()));
@@ -355,7 +379,7 @@ impl QmdbPortableTree {
                 block_number,
                 block_hash,
                 root,
-                slots: QmdbSnapshot { next_slot, entries },
+                slots: QmdbSnapshot { next_slot, entries, dead_twigs },
             },
         ))
     }
@@ -384,6 +408,9 @@ impl QmdbPortableTree {
             }
             QmdbSnapshotError::DuplicateActiveKey(_) => QmdbPortableError::RootMismatch,
             QmdbSnapshotError::ActiveHashOnly { slot } => QmdbPortableError::ActiveTombstone { slot },
+            QmdbSnapshotError::InvalidDeadTwig { twig } => {
+                QmdbPortableError::MisalignedDeadTwig { slot: twig * TWIG_SIZE as u64, count: TWIG_SIZE as u64 }
+            }
             // A heap rebuild touches no entry file.
             QmdbSnapshotError::EntryFile(_) => QmdbPortableError::RootMismatch,
             QmdbSnapshotError::Index(reason) => QmdbPortableError::Io(format!("key index: {reason}")),
@@ -573,9 +600,59 @@ mod tests {
         assert_eq!(tree.root(), plain.root);
         drop(tree);
         let _ = std::fs::remove_dir_all(&dir);
-        // A kind-3 twig verifies but does not import.
+        // A kind-3 twig imports too, as a root-only twig, and survives the
+        // entry file and a reopen.
         let v2_dead_twig = compacted.encode(PortableFormat::V2, true).unwrap();
-        assert_eq!(QmdbPortableTree::decode(&v2_dead_twig), Err(QmdbPortableError::DeadTwigNotImportable { slot: 0 }));
+        import_kind_3(&v2_dead_twig, plain.root);
+    }
+
+    /// `bytes` (with a kind-3 twig 0) imported into a file tree: the root,
+    /// a live key's proof, a reopen of the files, the refusals on twig 0's
+    /// slots and a byte-equal v2 re-export.
+    fn import_kind_3(bytes: &[u8], root: Hash) {
+        let (format, imported) = QmdbPortableTree::decode(bytes).unwrap();
+        assert_eq!(format, PortableFormat::V2);
+        assert_eq!(imported.slots.dead_twigs, vec![(0, *twig_root_of(bytes))]);
+        assert_eq!(imported.slots.first_hash_only_slot(), Some(0));
+        let mut tree = imported.verify_and_build(CHAIN_ID, &tag(0x11)).unwrap();
+        assert_eq!(tree.root(), root);
+        // A heap round trip keeps the root-only twig.
+        assert_eq!(super::fixture::portable(tree.snapshot(), root).encode(PortableFormat::V2, false).unwrap(), bytes);
+        let dir = std::env::temp_dir().join(format!("n42-portable-v2-kind3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entries.log");
+        tree.set_entry_file(&path).unwrap();
+        tree.sync_entries().unwrap();
+        assert_eq!(tree.root(), root);
+        let (next, active) = (tree.next_slot(), tree.active_bits());
+        drop(tree);
+        let (mut tree, kept) = QmdbCompatTree::from_entry_file(&path, next, &active).unwrap();
+        assert_eq!(kept, next);
+        assert_eq!(tree.root(), root);
+        let live = super::fixture::key(2049);
+        assert_eq!(tree.get(&live), Some([1u8, (2049 % 251) as u8].as_slice()));
+        assert!(tree.prove(&live).unwrap().verify_for_key(&root, &live));
+        assert_eq!(tree.get(&super::fixture::key(5)), None, "a key of the dead twig");
+        let again = super::fixture::portable(tree.snapshot(), tree.root());
+        assert_eq!(again.encode(PortableFormat::V1, false), Err(QmdbPortableError::HashOnlySlot { slot: 0 }));
+        assert_eq!(again.encode(PortableFormat::V2, false).unwrap(), bytes);
+        for slot in [0, 5, 2047] {
+            let revive = BlockUndo { prev_next_slot: next, slots_only: true, slots: vec![slot], ..Default::default() };
+            assert_eq!(tree.apply_undo(&revive), Err(QmdbUndoError::HashOnlySlot { slot }));
+        }
+        // Compaction leaves it alone; the tree extends.
+        assert_eq!(tree.compact_twigs(u64::MAX, 0.0, usize::MAX).unwrap().twigs, 0);
+        tree.set(super::fixture::key(9_999), vec![9]).unwrap();
+        assert_ne!(tree.root(), root);
+        drop(tree);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The leaf root of the kind-3 record at slot 0 of `bytes`.
+    fn twig_root_of(bytes: &[u8]) -> &Hash {
+        let at = find_record(bytes, 0, PORTABLE_KIND_DEAD_TWIG) + 9 + 2;
+        bytes[at..at + 32].try_into().unwrap()
     }
 
     #[test]

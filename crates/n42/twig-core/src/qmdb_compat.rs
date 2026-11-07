@@ -168,10 +168,18 @@ impl serde::Serialize for QmdbEntrySnapshot {
 
 /// Portable, positional QMDB state. Every slot below `next_slot` must be
 /// present, including dead slots: their frozen leaves are consensus-relevant.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct QmdbSnapshot {
     pub next_slot: u64,
     pub entries: Vec<QmdbEntrySnapshot>,
+    /// Full twigs, wholly dead, that keep only their leaf root (twig id,
+    /// leaf root), ascending: a kind-3 import of the tombstone portable
+    /// snapshot (`docs/QMDB_COMPACTION_DESIGN.md` section 6). Their slots'
+    /// entries are hash-only placeholders (a null leaf hash) that nothing
+    /// hashes. Like a hash-only entry it has no serialized form: the heap
+    /// checkpoint layout is unchanged, and a heap node never holds one.
+    #[serde(skip)]
+    pub dead_twigs: Vec<(u64, Hash)>,
 }
 
 impl QmdbSnapshot {
@@ -213,6 +221,10 @@ pub enum QmdbSnapshotError {
     /// slot of a compacted twig drops its payload.
     #[error("QMDB slot {slot} is live but keeps only its leaf hash")]
     ActiveHashOnly { slot: u64 },
+    /// A root-only twig that is not full, or one of whose slots is live
+    /// or keeps a payload.
+    #[error("QMDB twig {twig} is root-only but not a full twig of dead hash-only slots")]
+    InvalidDeadTwig { twig: u64 },
     /// The entry file could not be opened or read.
     #[error("QMDB entry file: {0}")]
     EntryFile(String),
@@ -273,10 +285,6 @@ pub enum QmdbPortableError {
     /// A live slot keeps only its leaf hash; only dead slots may drop their payload.
     #[error("QMDB slot {slot} is live but keeps only its leaf hash")]
     ActiveTombstone { slot: u64 },
-    /// A kind-3 run carries one leaf root, not the 2048 leaf hashes an
-    /// importing tree holds per slot; it verifies, it does not import.
-    #[error("QMDB portable whole-dead-twig run at slot {slot} carries no per-slot leaf hashes: it verifies but cannot be imported; export with tombstones only")]
-    DeadTwigNotImportable { slot: u64 },
 }
 
 /// Result of a bounded-memory streaming verification. Only one 2048-leaf twig
@@ -643,6 +651,7 @@ impl QmdbPortableSnapshot {
                 QmdbSnapshotError::DuplicateActiveKey(_) => QmdbPortableError::RootMismatch,
                 // A slot snapshot carries every payload; unreachable in practice.
                 QmdbSnapshotError::ActiveHashOnly { .. } => QmdbPortableError::RootMismatch,
+                QmdbSnapshotError::InvalidDeadTwig { .. } => QmdbPortableError::RootMismatch,
                 // A slot snapshot is built in the heap; the entry file is not
                 // involved, so this arm is unreachable in practice.
                 QmdbSnapshotError::EntryFile(_) => QmdbPortableError::RootMismatch,
@@ -937,6 +946,10 @@ pub(crate) fn init_twig_nodes(nodes: &mut [Hash; 2 * TWIG_SIZE]) {
 
 #[derive(Clone)]
 struct Twig {
+    /// The twig's leaves were never known here: it holds only its leaf root
+    /// (a kind-3 import, [`QmdbSnapshot::dead_twigs`]); `nodes` is `None`
+    /// for good, and a hydration refuses it (its entries do not hash to it).
+    leaves_dropped: bool,
     /// The leaf merkle tree: `None` once the twig is evicted (full and below
     /// the retention window, `evict_twig_nodes`; or every slot dead,
     /// `trim_dead_twigs`), when only `leaf_root` is kept -- 32 B instead of
@@ -986,6 +999,7 @@ impl Twig {
             bits_root,
             root,
             last_retired_at: 0,
+            leaves_dropped: false,
         }
     }
 
@@ -1043,6 +1057,21 @@ impl Twig {
 
     fn refresh_root(&mut self) {
         self.root = hash_node(&self.leaf_root, &self.bits_root);
+    }
+
+    /// A full, wholly dead twig known only by its leaf root.
+    fn root_only(leaf_root: Hash) -> Self {
+        let bits = [0u8; BITS_BYTES];
+        let bits_root = hash_bits(&bits);
+        Self {
+            nodes: None,
+            leaf_root,
+            bits,
+            bits_root,
+            root: hash_node(&leaf_root, &bits_root),
+            last_retired_at: 0,
+            leaves_dropped: true,
+        }
     }
 
     /// Whether no slot of this twig is live.
@@ -1471,11 +1500,11 @@ fn recompute_all(twigs: &mut [Twig]) {
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        twigs.par_iter_mut().for_each(Twig::recompute);
+        twigs.par_iter_mut().filter(|twig| twig.nodes.is_some()).for_each(Twig::recompute);
     }
     #[cfg(not(feature = "rayon"))]
     {
-        twigs.iter_mut().for_each(Twig::recompute);
+        twigs.iter_mut().filter(|twig| twig.nodes.is_some()).for_each(Twig::recompute);
     }
 }
 
@@ -1905,6 +1934,10 @@ impl QmdbCompatTree {
         }
         file.sync()?;
         for twig in hash_only_twigs {
+            if self.twigs[twig].leaves_dropped {
+                file.append_group(file.dead_twig_group(twig, self.twigs[twig].leaf_root)?)?;
+                continue;
+            }
             let group = file.build_group(twig, |slot| match self.entries.read(slot) {
                 SlotRef::HashOnly(hash) => Some(*hash),
                 SlotRef::Payload(..) => None,
@@ -2010,6 +2043,9 @@ impl QmdbCompatTree {
         // truncation rehashes one, `hydrate`); the partial last twig keeps its
         // nodes for the appends.
         let build = |twig_id: usize| -> Twig {
+            if let Some(leaf_root) = entries.dead_twig_root(twig_id) {
+                return Twig::root_only(leaf_root);
+            }
             let base = twig_id * TWIG_SIZE;
             let filled = (n - base).min(TWIG_SIZE);
             let nodes = twig_leaf_nodes(&entries, twig_id, filled);
@@ -2028,6 +2064,7 @@ impl QmdbCompatTree {
                 bits_root,
                 root: hash_node(&leaf_root, &bits_root),
                 last_retired_at: 0,
+                leaves_dropped: false,
             }
         };
         #[cfg(feature = "rayon")]
@@ -3116,7 +3153,17 @@ impl QmdbCompatTree {
     }
 
     pub fn snapshot(&self) -> QmdbSnapshot {
-        QmdbSnapshot { next_slot: self.next_slot, entries: (0..self.entries.len()).map(|slot| self.entry_snapshot(slot)).collect() }
+        QmdbSnapshot {
+            next_slot: self.next_slot,
+            entries: (0..self.entries.len()).map(|slot| self.entry_snapshot(slot)).collect(),
+            dead_twigs: self
+                .twigs
+                .iter()
+                .enumerate()
+                .filter(|(_, twig)| twig.leaves_dropped)
+                .map(|(id, twig)| (id as u64, twig.leaf_root))
+                .collect(),
+        }
     }
 
     pub fn from_snapshot(snapshot: &QmdbSnapshot) -> Result<Self, QmdbSnapshotError> {
@@ -3126,12 +3173,25 @@ impl QmdbCompatTree {
                 next_slot: snapshot.next_slot,
             });
         }
+        // Root-only twigs: full, every slot a dead hash-only placeholder.
+        let dead_twigs: std::collections::BTreeMap<usize, Hash> =
+            snapshot.dead_twigs.iter().map(|(twig, root)| (*twig as usize, *root)).collect();
+        for twig in dead_twigs.keys() {
+            let slots = snapshot.entries.get(twig * TWIG_SIZE..(twig + 1) * TWIG_SIZE);
+            if !slots.is_some_and(|slots| slots.iter().all(|entry| entry.leaf_hash.is_some() && !entry.active)) {
+                return Err(QmdbSnapshotError::InvalidDeadTwig { twig: *twig as u64 });
+            }
+        }
         let mut tree = Self::new();
         tree.next_slot = snapshot.next_slot;
         for (slot, entry) in snapshot.entries.iter().enumerate() {
             let twig_id = slot / TWIG_SIZE;
             let local = slot % TWIG_SIZE;
             tree.ensure_twig(twig_id);
+            if dead_twigs.contains_key(&twig_id) {
+                tree.entries.push_hash_only(NULL_HASH).expect("a heap push cannot fail");
+                continue;
+            }
             // A compacted twig's dead slot: the stored leaf hash, no payload.
             if let Some(leaf_hash) = entry.leaf_hash {
                 if entry.active {
@@ -3160,6 +3220,9 @@ impl QmdbCompatTree {
                 tree.entries.set_active(slot, false);
             }
         }
+        for (twig, leaf_root) in dead_twigs {
+            tree.twigs[twig] = Twig::root_only(leaf_root);
+        }
         recompute_all(&mut tree.twigs);
         Ok(tree)
     }
@@ -3180,10 +3243,7 @@ impl QmdbCompatTree {
             }
             entries.push(QmdbEntrySnapshot::new(entry.key, entry.value.clone(), entry.active));
         }
-        Self::from_snapshot(&QmdbSnapshot {
-            next_slot: snapshot.next_slot,
-            entries,
-        })
+        Self::from_snapshot(&QmdbSnapshot { next_slot: snapshot.next_slot, entries, dead_twigs: Vec::new() })
     }
 
     fn ensure_twig(&mut self, twig_id: usize) {

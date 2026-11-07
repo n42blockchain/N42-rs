@@ -115,6 +115,60 @@ fn a_portable_snapshot_started_node_continues_to_the_same_roots_in_both_storage_
     }
 }
 
+/// The cross-client kind-3 fixture (`n42-twig-core` `testdata/portable_v2/v2.bin`,
+/// its twig 0 a whole dead twig carried as its leaf root): a node with the
+/// entry file starts from it, reads its live keys, re-exports it byte for
+/// byte and refuses v1, before and after a close and reopen of the store, and
+/// extends it.
+#[test]
+fn a_node_starts_from_the_kind_3_fixture_and_reopens_on_it() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../twig-core/testdata/portable_v2");
+    let v2 = std::fs::read(fixtures.join("v2.bin")).expect("v2.bin");
+    let root_hex = std::fs::read_to_string(fixtures.join("root.hex")).expect("root.hex");
+    let root = B256::from_slice(&alloy_primitives::hex::decode(root_hex.trim()).expect("hex"));
+    let (genesis, head) = (B256::repeat_byte(0x11), (42, B256::repeat_byte(0x22)));
+    let key = |n: u64| {
+        let mut key = [0xab; 32];
+        key[..8].copy_from_slice(&n.to_be_bytes());
+        key
+    };
+    let check = |node: &QmdbNodeState, label: &'static str| {
+        assert_eq!(node.state_root(), root, "{label}");
+        {
+            let mut guard = node.lock_as(label);
+            let forest = guard.as_mut().expect("initialised");
+            assert_eq!(forest.value_at_head(&key(2049)), Some(vec![1, (2049 % 251) as u8]), "{label}");
+            assert_eq!(forest.value_at_head(&key(4300)), Some(vec![1, (4300 % 251) as u8]), "{label}");
+            assert_eq!(forest.value_at_head(&key(5)), None, "{label}: a key of the dead twig");
+        }
+        assert!(
+            matches!(
+                node.portable_export_as(1143, genesis, Some(n42_twig_core::qmdb_compat::PortableFormat::V1)),
+                Err(NodeStateError::PortableCompacted { slot: 0 })
+            ),
+            "{label}"
+        );
+        assert!(node.portable_export(1143, genesis).expect("v2 export") == v2, "{label}: v2 re-export differs from v2.bin");
+    };
+    let chain = qmdb_chain();
+    let dir = scratch("kind3-fixture");
+    let node = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    node.initialize_from_portable(&v2, 1143, genesis, head, root).expect("import");
+    check(&node, "imported");
+    drop(node);
+
+    let reopened = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+    reopened.initialize(head).expect("reopen");
+    check(&reopened, "reopened");
+    let (_, next_root) = advance(&reopened, 43, head.1);
+    assert_ne!(next_root, root);
+    drop(reopened);
+    let again = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+    again.initialize((43, hash_of(43))).expect("reopen after a block");
+    assert_eq!(again.state_root(), next_root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_node_state_exposes_the_entry_store_stats_without_waiting_for_the_lock() {
     use n42_twig_core::entry_store::EntryStoreMode;

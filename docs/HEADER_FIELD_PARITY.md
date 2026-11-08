@@ -418,7 +418,22 @@ until a fleet runs the patched gov5 of `docs/patches/gov5-header-field-parity/`.
   `docs/GLAMSTERDAM_EXECUTION_PARITY.md`.
 - **`n42-init-snapshot`** decodes the snapshot head as `N42Header` since
   2026-11-03 (9b6b65d13; test `init_starts_at_a_head_that_carries_a_registry_root`),
-  so it can start a node at a head that carries a root. Not covered yet: the APoS miner and reth's own `init` / `db` commands stay on
+  so it can start a node at a head that carries a root.
+  **Verified on devnet 2026-11-08** (round `d3-init`, `audit-notes/devnet/d3-init/`, driver
+  `audit-notes/scripts/j-d3.sh`; Rust binaries `reth210-native/release` = main 0ed56c1da, gov5
+  member `integ/mvdev-slot` d4a00b01): `n42_devnet_mobileanchor.json`, three Rust validators and
+  the gov5 member with `MOBILEVERIFY=1`, run to block 53 and stopped there (both chains at 53, same
+  hash). At that head gov5's `n42-reth-state-dump` (13 accounts, 158 slots) and the Rust node's
+  `n42-init-snapshot export` wrote byte-identical 905-byte headers of 24 elements (slot 53 and the
+  registry root, zero here: no device registered); `init` accepted the head both as raw RLP and as
+  hex. The fleet was then resumed with `LATE_VALIDATOR=2 LATE_SNAPSHOT=<that dir>`: validator 2's
+  fresh execution layer was initialised at block 53 and pulled from there. After 240 s main, late
+  and gov5 were all at block 149 with blocks 53..149 hashing the same on all three (97/97, no first
+  difference); the late EL logged 0 errors (5 start-up warnings), validator 2 committed 93 views
+  with 2 timeouts; gov5 0 errors besides its peer-redial lines at the two shutdowns. gov5's own
+  portable export (`n42-qmdb-export`) refuses a live node's chaindata ("entry log is not contiguous
+  at slot 2; replay must retain full --qmdb-history"), so the gov5-produced snapshot form needs a
+  replay-v2 datadir; the Rust export served both runs. Not covered yet: the APoS miner and reth's own `init` / `db` commands stay on
   Ethereum's header (an APoS header never carries a root).
 - **Verified (2026-10-30).** The check
   `cargo check -p n42 -p n42-h2-node -p n42-testing --tests --examples` passes.

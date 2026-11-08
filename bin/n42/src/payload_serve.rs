@@ -3464,8 +3464,7 @@ where
                 // `N42_FOLLOWER_COPY_ASIDE=1`: the owned block is made on the
                 // worker pool beside the import, which executes the frames'
                 // transactions by reference meanwhile; nothing of it is on
-                // the road (`copy_ms` 0, `copy_aside_ms` in the vote road's
-                // line).
+                // the road (`copy_ms` 0).
                 let (made, senders) = if crate::follower_import::copy_aside() {
                     let senders = std::sync::Arc::new(senders);
                     let (made_tx, made_rx) = std::sync::mpsc::sync_channel(1);

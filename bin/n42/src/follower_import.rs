@@ -1510,9 +1510,7 @@ struct ExecSplit {
 /// executes the frames' transactions by reference the moment they are taken
 /// (the revm-era by-reference build path, removed in F6a; on evm2 the
 /// switch only moves the copy beside the import).
-/// What reads the owned block -- the vote road's header and body checks and
-/// its includability check, the post-execution checks, the engine's
-/// hand-off -- waits for it where it reads it ([`LateBlock`]).
+/// The import takes the owned block from the maker before it starts.
 pub fn copy_aside() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_COPY_ASIDE", false))
@@ -1562,57 +1560,6 @@ impl ForeignBlock {
 impl From<SealedBlock<Block>> for ForeignBlock {
     fn from(sealed: SealedBlock<Block>) -> Self {
         Self::Sealed(sealed)
-    }
-}
-
-/// The import's owned block: ready, or made aside and waited for by
-/// whichever reader needs it first ([`copy_aside`]). The wait and the copy's
-/// cost are kept for the vote road's line.
-struct LateBlock {
-    ready: std::sync::OnceLock<Result<Arc<RecoveredBlock<Block>>, String>>,
-    made: Mutex<Option<std::sync::mpsc::Receiver<MadeAside>>>,
-    /// The copy's own cost, beside the import.
-    copy_us: std::sync::atomic::AtomicU64,
-    /// How long the first reader waited for it.
-    wait_us: std::sync::atomic::AtomicU64,
-}
-
-impl LateBlock {
-    fn ready(block: Arc<RecoveredBlock<Block>>) -> Self {
-        Self {
-            ready: std::sync::OnceLock::from(Ok(block)),
-            made: Mutex::new(None),
-            copy_us: Default::default(),
-            wait_us: Default::default(),
-        }
-    }
-
-
-    /// The owned block, waiting for it when it is still being made.
-    fn get(&self) -> Result<&Arc<RecoveredBlock<Block>>, String> {
-        self.ready
-            .get_or_init(|| {
-                let at = std::time::Instant::now();
-                let made = self.made.lock().unwrap_or_else(|p| p.into_inner()).take();
-                let made = match made {
-                    Some(made) => made.recv().map_err(|_| "the owned block's maker went away".to_string()),
-                    None => Err("no owned block and no maker".to_string()),
-                };
-                self.wait_us.store(at.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-                let (block, copy_us) = made??;
-                self.copy_us.store(copy_us, std::sync::atomic::Ordering::Relaxed);
-                Ok(Arc::new(block))
-            })
-            .as_ref()
-            .map_err(Clone::clone)
-    }
-
-    /// The copy's cost and the first reader's wait, microseconds.
-    fn times(&self) -> (u64, u64) {
-        (
-            self.copy_us.load(std::sync::atomic::Ordering::Relaxed),
-            self.wait_us.load(std::sync::atomic::Ordering::Relaxed),
-        )
     }
 }
 
@@ -1760,11 +1707,6 @@ struct RoadPhases {
     /// What the check read the parent through: 0 the engine, 1 the merged
     /// output ([`parent_read_name`]).
     parent_read: u64,
-    /// `N42_FOLLOWER_COPY_ASIDE=1`: the owned block's copy, made beside the
-    /// import (not on the road; not in the line's sum), and how long the
-    /// vote road waited for it.
-    copy_aside_us: u64,
-    copy_wait_us: u64,
 }
 
 impl RoadPhases {
@@ -1860,8 +1802,6 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         road_body_ms = road.road_body_us / 1000,
         road_encode_ms = road.road_encode_us / 1000,
         copy_ms = road.copy_us / 1000,
-        copy_aside_ms = phases.copy_aside_us / 1000,
-        copy_wait_ms = phases.copy_wait_us / 1000,
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,
         senders_indexed = phases.senders_indexed,
@@ -2082,7 +2022,7 @@ where
         return Err(format!("given {} senders for {tx_count} transactions", claims.len()));
     }
     let cache_hits_out = std::sync::atomic::AtomicU64::new(0);
-    let late = match owned {
+    let owned_block: Arc<RecoveredBlock<Block>> = match owned {
         None => return Err("no block to import".to_string()),
         Some(sealed) => {
             let recovered = match given_senders {
@@ -2218,7 +2158,7 @@ where
             };
             // Shared from here on: the executed block hands the engine this same
             // `Arc`, and a plan made ahead of the execution holds it meanwhile.
-            LateBlock::ready(Arc::new(recovered))
+            Arc::new(recovered)
         }
     };
     let cache_hits = cache_hits_out.load(std::sync::atomic::Ordering::Relaxed);
@@ -2231,8 +2171,7 @@ where
     // on the worker pool from here, beside the wait for the parent and the
     // includability check; the execution takes it just before the gate.
     let import_plan = (follower_parallel() && tx_count > 0 && n42_engine_types::parallel_build::follower_partition_ahead())
-        .then(|| late.get().map(Arc::clone))
-        .transpose()?
+        .then(|| Arc::clone(&owned_block))
         .map(|block| {
             let (planned, plan) = std::sync::mpsc::sync_channel(1);
             rayon::spawn(move || {
@@ -2347,8 +2286,7 @@ where
                 "executing before the check; the check and the rest of the vote road run beside the execution"
             );
         } else {
-            let recovered = late.get()?;
-            (phases.copy_aside_us, phases.copy_wait_us) = late.times();
+            let recovered = &owned_block;
             if header_on_vote_road {
                 let header_at = std::time::Instant::now();
                 pre_execution_checks(consensus, recovered.sealed_block())?;
@@ -2515,7 +2453,7 @@ where
             };
             match n42_engine_types::parallel_build::import_block(
                 evm_config,
-                late.get()?,
+                &owned_block,
                 cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))),
                 &open,
                 n42_engine_types::parallel_transfer::Dispatch::from_env(),
@@ -2569,7 +2507,7 @@ where
             Some(out) => out,
             None => evm_config
                 .executor(cached.as_db_mut(StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state))))
-                .execute(late.get()?)
+                .execute(&owned_block)
                 .map_err(|err| format!("execution: {err}"))?,
         };
         let exec_ended = std::time::Instant::now();
@@ -2608,7 +2546,7 @@ where
             let vote_checked = checked.take();
             let vote_at = &vote_at;
             let parent_fields_wait_us = &parent_fields_wait_us;
-            let late = &late;
+            let owned_block = &owned_block;
             let chain_id = chain_spec.chain().id();
             let spec = spec_for_intrinsic_gas(chain_spec, head.timestamp);
             two_roads(
@@ -2616,11 +2554,7 @@ where
                 roads_at,
                 move || {
                     let mut phases = phases;
-                    // The owned block, made aside (`N42_FOLLOWER_COPY_ASIDE=1`)
-                    // while the execution runs on the frames' transactions:
-                    // what the checks below read.
-                    let block: &RecoveredBlock<Block> = late.get()?;
-                    (phases.copy_aside_us, phases.copy_wait_us) = late.times();
+                    let block: &RecoveredBlock<Block> = owned_block;
                     if early_check && header_on_vote_road {
                         let header_at = std::time::Instant::now();
                         pre_execution_checks(consensus, block.sealed_block())?;
@@ -2666,9 +2600,8 @@ where
         }
     };
     // The owned block from here on: the post-execution checks and the
-    // engine's hand-off read it (made aside by now, under the execution).
-    let recovered = Arc::clone(late.get()?);
-    drop(late);
+    // engine's hand-off read it.
+    let recovered = owned_block;
     let prague = n42_qmdb_reth::system_caller_leaf_at(chain_spec, recovered.timestamp);
     let on_parent_output = executed_parent.is_some();
     let execution_output = Arc::new(output);

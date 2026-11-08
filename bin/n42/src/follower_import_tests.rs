@@ -3,7 +3,7 @@
 
 //! Branch tests for the follower import's helpers: the layers a child reads
 //! its parent through, the waits for a parent, the store of kept outputs,
-//! the late-made owned block, and the fork-to-spec mapping.
+//! the foreign block's forms, and the fork-to-spec mapping.
 //!
 //! The kept-output store is a process-wide queue that evicts;
 //! every test that writes to them takes [`publishing`] (the lock the parent
@@ -289,10 +289,6 @@ fn empty_sealed_block(number: u64) -> SealedBlock<Block> {
     })
 }
 
-fn recovered(number: u64) -> RecoveredBlock<Block> {
-    RecoveredBlock::new_sealed(empty_sealed_block(number), Vec::new())
-}
-
 #[test]
 fn a_sealed_foreign_block_counts_its_transactions() {
     let block: ForeignBlock = empty_sealed_block(3).into();
@@ -311,13 +307,6 @@ fn a_described_foreign_block_counts_the_transactions_it_describes() {
         made,
     };
     assert_eq!(ForeignBlock::Aside(aside).tx_count(), 0);
-}
-
-#[test]
-fn a_late_block_that_is_ready_is_handed_out_without_a_wait() {
-    let late = LateBlock::ready(Arc::new(recovered(1)));
-    assert_eq!(late.get().expect("ready").number, 1);
-    assert_eq!(late.times(), (0, 0));
 }
 
 // --- the intrinsic-gas spec ------------------------------------------------------

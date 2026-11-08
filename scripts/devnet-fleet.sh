@@ -11,6 +11,8 @@
 #   PACKETD=<binary> with MOBILEVERIFY=1: gov5's cmd/mobileverify-packetd beside Rust validator 0
 #     (follows the EL on 18545 -- debug_getRawBlock, hence --http.api ...,debug -- and PUTs each
 #     block's StreamPacket to 127.0.0.1:21010, which publishes it to the fleet)
+#   PACKETD_WS=1 with PACKETD: the main EL also serves WebSocket on 18546 (eth) and packetd
+#     subscribes to its newHeads there (-ws), the 250 ms head poll kept as fallback
 #
 # Data lives under $N42_FLEET_DIR (default: /tmp/n42-fleet). Every process is
 # left running afterwards so it can be inspected; the next run kills them.
@@ -37,6 +39,9 @@ GOV5_MV=; [ "${MOBILEVERIFY:-}" = 1 ] && GOV5_MV="--mobileverify --mobileverify.
 # so its validators hand it foreign blocks there and N42_FOLLOWER_DIRECT_IMPORT
 # reaches the follower import (bin/n42/src/follower_import.rs).
 serve() { [ "${DEVNET_PAYLOAD_SERVE:-}" = 1 ] && echo "N42_PAYLOAD_SERVE=127.0.0.1:$1"; }
+# PACKETD_WS=1: WebSocket on the main EL, and packetd wakes on its newHeads.
+el_ws() { [ "${PACKETD_WS:-}" = 1 ] && echo "--ws --ws.port 18546 --ws.api eth"; }
+packetd_ws() { [ "${PACKETD_WS:-}" = 1 ] && echo "-ws ws://127.0.0.1:18546"; }
 mkdir -p $F
 [ -f $F/jwt.hex ] || openssl rand -hex 32 > $F/jwt.hex
 if [ ! -d $F/keys ]; then
@@ -47,7 +52,7 @@ fi
 pkill -f "^$BIN/examples/h2_validator" 2>/dev/null; pkill -f "^$BIN/n42 node" 2>/dev/null; pkill -f "^$GOV5/build/bin/n42 " 2>/dev/null; sleep 1
 if [ -z "$KEEP" ]; then rm -rf $F/datadir $F/consensus-{0..3} $F/gov5; fi
 env $(serve 18571) RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir \
-  --authrpc.port 18551 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18545 --http.api eth,net,web3,debug --port 30313 \
+  --authrpc.port 18551 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18545 --http.api eth,net,web3,debug --port 30313 $(el_ws) \
   --disable-discovery --ipcdisable > $F/el-$TAG.log 2>&1 &
 for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-$TAG.log 2>/dev/null && break; sleep 1; done
 LAST=3; [ -n "$WITH_GOV5" ] && LAST=2
@@ -141,7 +146,7 @@ done
 if [ "${MOBILEVERIFY:-}" = 1 ] && [ -n "${PACKETD:-}" ]; then
   for _ in $(seq 1 30); do curl -sf http://127.0.0.1:21010/mobileverify/health >/dev/null && break; sleep 1; done
   mkdir -p $F/packets
-  $PACKETD -rpc http://127.0.0.1:18545 -mv http://127.0.0.1:21010 -genesis $GENESIS -out $F/packets \
+  $PACKETD -rpc http://127.0.0.1:18545 -mv http://127.0.0.1:21010 -genesis $GENESIS -out $F/packets $(packetd_ws) \
     -verbosity ${PACKETD_VERBOSITY:-info} > $F/packetd-$TAG.log 2>&1 &
 fi
 sleep $SECS

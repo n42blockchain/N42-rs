@@ -299,13 +299,7 @@ fn a_sealed_foreign_block_counts_its_transactions() {
 #[test]
 fn a_described_foreign_block_counts_the_transactions_it_describes() {
     let (_made_tx, made) = std::sync::mpsc::channel();
-    let aside = DescribedAside {
-        header: header(4, B256::ZERO, "aside"),
-        withdrawals: None,
-        transactions: Arc::new(Vec::new()),
-        senders: Arc::new(Vec::new()),
-        made,
-    };
+    let aside = DescribedAside { tx_count: 0, made };
     assert_eq!(ForeignBlock::Aside(aside).tx_count(), 0);
 }
 

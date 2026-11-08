@@ -1485,11 +1485,10 @@ struct Executed {
 /// `N42_FOLLOWER_COPY_ASIDE=1` (default off): a described block's owned
 /// `RecoveredBlock` -- the 163,000 transactions copied out of the queue, the
 /// seal and reth's well-formedness checks, 6-8 ms on the road (loop291-301)
-/// -- is made beside the import instead of before it, and the build path
-/// executes the frames' transactions by reference the moment they are taken
-/// (the revm-era by-reference build path, removed in F6a; on evm2 the
-/// switch only moves the copy beside the import).
-/// The import takes the owned block from the maker before it starts.
+/// -- is made on the worker pool, off the request handler's road. The import
+/// takes the owned block from the maker before it starts. (The revm-era
+/// build path also executed the frames' transactions by reference meanwhile;
+/// that half was removed in F6a and its fields after it.)
 pub fn copy_aside() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| n42_env::flag("N42_FOLLOWER_COPY_ASIDE", false))
@@ -1500,18 +1499,12 @@ pub fn copy_aside() -> bool {
 pub type MadeAside = Result<(RecoveredBlock<Block>, u64), String>;
 
 /// A described block whose owned block is still being made
-/// (`N42_FOLLOWER_COPY_ASIDE=1`): what the build path executes by reference,
-/// and where the owned block arrives.
+/// (`N42_FOLLOWER_COPY_ASIDE=1`): its transaction count and where the owned
+/// block arrives.
 #[derive(Debug)]
 pub struct DescribedAside {
-    /// The header, sealed by the hash the description checked it against.
-    pub header: SealedN42Header,
-    /// The withdrawals the body lists (`None` before Shanghai).
-    pub withdrawals: Option<Vec<alloy_eips::eip4895::Withdrawal>>,
-    /// The transactions, held by reference, in block order.
-    pub transactions: Arc<Vec<n42_engine_types::engine_validator::DescribedTx>>,
-    /// Their senders, this node's queue's.
-    pub senders: Arc<Vec<Address>>,
+    /// How many transactions the block describes.
+    pub tx_count: usize,
     /// The owned block, made beside the import.
     pub made: std::sync::mpsc::Receiver<MadeAside>,
 }
@@ -1531,7 +1524,7 @@ impl ForeignBlock {
     pub fn tx_count(&self) -> usize {
         match self {
             Self::Sealed(sealed) => sealed.body().transactions.len(),
-            Self::Aside(aside) => aside.transactions.len(),
+            Self::Aside(aside) => aside.tx_count,
         }
     }
 }

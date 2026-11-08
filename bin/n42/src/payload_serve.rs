@@ -3441,30 +3441,19 @@ where
                 let maker = described.maker(&payload);
                 let senders = std::mem::take(&mut described.senders);
                 // `N42_FOLLOWER_COPY_ASIDE=1`: the owned block is made on the
-                // worker pool beside the import, which executes the frames'
-                // transactions by reference meanwhile; nothing of it is on
-                // the road (`copy_ms` 0).
+                // worker pool and the import takes it from there; nothing of
+                // it is on the road (`copy_ms` 0).
                 let (made, senders) = if crate::follower_import::copy_aside() {
-                    let senders = std::sync::Arc::new(senders);
                     let (made_tx, made_rx) = std::sync::mpsc::sync_channel(1);
-                    let (validator, block_senders) = (std::sync::Arc::clone(&validator), std::sync::Arc::clone(&senders));
+                    let validator = std::sync::Arc::clone(&validator);
                     rayon::spawn(move || {
                         let made = maker
                             .make(&validator)
-                            .map(|made| {
-                                let senders = std::sync::Arc::unwrap_or_clone(block_senders);
-                                (reth_primitives_traits::RecoveredBlock::new_sealed(made.block, senders), made.copy_us)
-                            })
+                            .map(|made| (reth_primitives_traits::RecoveredBlock::new_sealed(made.block, senders), made.copy_us))
                             .map_err(|err| format!("the described block: {err}"));
                         let _ = made_tx.send(made);
                     });
-                    let aside = crate::follower_import::DescribedAside {
-                        header: reth_primitives_traits::SealedHeader::new(described.header.clone(), described.hash),
-                        withdrawals: described.withdrawals().map(<[_]>::to_vec),
-                        transactions: std::sync::Arc::clone(&described.transactions),
-                        senders,
-                        made: made_rx,
-                    };
+                    let aside = crate::follower_import::DescribedAside { tx_count: described.len(), made: made_rx };
                     ((crate::follower_import::ForeignBlock::Aside(aside), 0), None)
                 } else {
                     let made = maker.make(&validator).map_err(CompactRefusal::Refused)?;

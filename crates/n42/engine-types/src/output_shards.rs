@@ -2129,7 +2129,8 @@ impl FrozenShards {
     /// transfers' merge after the map) on a scoped thread of its own. Neither
     /// half reads the other's result; the bundle is assembled from both in
     /// the same order either way, so it is the same bundle
-    /// (`N42_SHARDS_MERGE_OFF_PATH`, `docs/INDUSTRY_SURVEY_2026_10.md` 11.12).
+    /// (`docs/INDUSTRY_SURVEY_2026_10.md` 11.12; the follower's
+    /// `N42_SHARDS_MERGE_OFF_PATH`, retired after F6a, chose `concurrent`).
     pub fn merged_timed(&self, residual: &BundleState, concurrent: bool) -> (BundleState, MergeSplit) {
         let started = std::time::Instant::now();
         let reverts_job = || {
@@ -2761,7 +2762,7 @@ mod frozen_tests {
         }
     }
 
-    /// `N42_SHARDS_MERGE_OFF_PATH`: the merge with its two halves at once is
+    /// The merge with its two halves at once is
     /// the same bundle as the merge one half after the other -- accounts,
     /// sizes, contracts and the sorted revert set -- in both modes, at a size
     /// that takes the parallel revert sort (4,096 and more), with conflicting

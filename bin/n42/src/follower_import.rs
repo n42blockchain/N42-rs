@@ -1511,6 +1511,9 @@ pub struct DescribedAside {
 
 /// The block a foreign import takes: owned, or described with its owned
 /// block made aside ([`copy_aside`]).
+// The sealed block is the common case and is moved once into the import;
+// boxing it would add an allocation per block for no reader's benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ForeignBlock {
     /// The owned, sealed block.
@@ -1521,7 +1524,7 @@ pub enum ForeignBlock {
 
 impl ForeignBlock {
     /// How many transactions the block carries.
-    pub fn tx_count(&self) -> usize {
+    pub const fn tx_count(&self) -> usize {
         match self {
             Self::Sealed(sealed) => sealed.body().transactions.len(),
             Self::Aside(aside) => aside.tx_count,

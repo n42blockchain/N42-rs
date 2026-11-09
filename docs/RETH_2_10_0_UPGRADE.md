@@ -274,3 +274,92 @@ after it, both are the reference roots. Suite and clippy:
 undo records), so v2.8.1, v2.9.0 and v2.10.0 all carry it; it is not a reth
 or evm2 regression. The test applied to main 1f173b278 (which contains the
 v2.9.0 merge 6703c576f) fails the same way. The fix should go to main as is.
+
+### Second occurrence (loop351, 2026-11-09): not explained yet, instrumented
+
+**Evidence.** X22 leg `loop351D2S12P30T64X11T16KA10MEMF` (natives from main
+0ed56c1da, which carries the G8 fix be647d52a) exited at 01:34:37.634876Z
+with `QMDB head cannot follow the canonical chain ... re-applying block
+0x236ad708... (7167) gave root 0x15bcc69b..., expected 0x79e7885f...`
+(`rust-fleet7-bench/bench-loop351D2S12P30T64X11T16KA10MEMF/node0-el.log`
+line 95131, `node0-v.log` around line 122600). As in GA1b it is an empty-block
+(txs=0, after the flood) tenure handover: node6 led through 7166 (0x44bf...),
+node0 leads view 7168. 7167 was executed three times on 0x44bf: **E1** at
+.583 is node6's chain build (`chained=true`, node6's beneficiary), **E2** at
+.584 is node0's FCU payload job (`build ahead requested` .553654, `given up
+resolved its payload job` .587281; its root job still files), **E3** at .614
+is node0's first build of the tenure (`chained=false`), which became
+0x236a. Node0's chain started 7168 on 0x236a at .617340; the forkchoice to
+7167 at .633066 had to move the tree back to 0x236a (so the tip was off its
+path, most likely moved by E2's late root job) and the replay failed. Every
+block in the leg is built twice on its parent (chain and FCU job), and 6143
+had the same three-build shape and passed.
+
+**Why be647d52a does not cover it.** That fix stops `insert` adopting a
+pending sibling with another root. Every forest path in this window
+(insert's early return and adoption, rename with its no-op and alternate
+fallback, `return_tree`'s re-parenting, `move_to`, the in-place and
+releasing canonical moves, trim bounds, deferred renames and aliases, the
+leased compute in `QmdbNodeState::with_leased_root`, the payload builder's
+`publish`) moves a record's parent, operations and root as one unit, and
+adoption on equal roots is exact. A replay mismatch therefore needs either
+the tree labelled 0x44bf not to hold 0x44bf's state, or an apply that is
+not a pure function of state and operations; neither is what be647d52a
+addressed.
+
+**What was excluded.** Randomised forest runs against a reference forest
+(debug builds, so the upper-tree cache's debug asserts are on), all passing:
+2,000 seeds of same-parent sibling builds (locked and leased roots, late and
+deferred inserts, renames to sealed hashes, canonical moves) and 150 seeds in
+entry-file mode with retain depth 3 and twig trimming (`ci/m-fuzz2.log`); the
+same under `N42_QMDB_PARALLEL_APPLY=1 N42_ROOT_UPPER_DIRTY=1`
+(`ci/m-fuzz3.log`); six seeds of 2,500 heights of empty system-contract
+blocks with deletions, seven beneficiaries, 1-3 builds per height and the
+child built ahead before canonical (`ci/m-fuzz4.log`). Reading excluded the
+QmdbOps identity guard of precomputed leaf hashes, the upper-tree stale
+flag, `apply_undo`'s index and revival paths, the key index's backward-shift
+delete, the entry file's cut, offsets truncation and the undo-list and twig
+pools. Not excluded: concurrency between `QmdbNodeState` lock holds beyond
+the sequence below, precomputed leaf hashes from `N42_ROOT_OPS_BEFORE_GATE`
+and ops-ahead merges, and real execution output.
+
+**Test.** `node_state::more_tests::a_handover_with_a_late_given_up_payload_job_replays_to_the_sealed_root`
+(d2eccf30e) replays the log's interleaving on one node state with empty
+system-contract blocks built through `sorted_operations_from_execution`:
+E1 filed, E2's root computed (before E3 or after C) and filed late, E3 filed
+and renamed to S, the chain-ahead child C on S, E2's late insert, then the
+forkchoice to S, which must stand at S's header root, and the next build on
+S must land on C's root. 64 variants (E2 sharing E3's built hash or not, C
+filed or not, leased or locked roots, heap or entry file, canonical head
+deferred or not): **all pass** (`ci/m-handover-test.log`). The leading
+hypothesis, that E2's late root job alone mislabels the tree, is refuted at
+this level.
+
+**Instrumentation** (32faaac44, `crates/n42/qmdb-state/src/forest.rs`), so
+the next recurrence names its interleaving. On target `n42.qmdb`: every
+`insert` with its outcome (early return with the held and offered roots and
+the pending block, adopted, or filed unapplied with the reverted pending
+block's parent and root), every `rename` (moved, already renamed, same-root
+no-op with `from` kept, refused), every tree move (from, target, common
+ancestor, pending block, reverted and replayed counts). These per-call lines
+are logged for blocks of at most 64 leaf operations -- an empty block's
+shape, where both occurrences were, and never a loaded block -- or for every
+block under `N42_QMDB_FOREST_TRACE=1`: a size gate rather than an env-only
+gate because the failure has only been seen on bench legs whose launch line
+we do not want to change, and the forest cannot know cheaply that a
+handover is in progress, whereas an empty block is visible in the record it
+already holds. Under load each event pays one length compare. Always on:
+after a move reverts anything (the pending block or records down to the
+common ancestor), the tree's root is compared with the root filed for the
+block the forest says it stands at, and a difference is an ERROR naming the
+block and both roots (`QMDB tree root after ... is not the root filed for
+the block it stands at (mislabelled tree)`): a mislabelled tree is reported
+at the move that exposes it, not at the later replay. Its cost is one root
+read per reverting move (a scan of the twig roots' leaf level, rehashing
+only what changed); moves that revert nothing pay nothing.
+
+Gates: `cargo check --workspace --tests` rc 0 (`ci/m-check.log`),
+`scripts/clippy-n42.sh` rc 0 (`ci/m-clippy-n42.log`), qmdb-state / qmdb-reth /
+engine-types / n42 tests 642 passed, 0 failed (`ci/m-tests.log`, the G8 test
+included). Natives with the instrumentation: `/data/n42-build/g8b-native/release`
+(`ci/m-natives.log`).

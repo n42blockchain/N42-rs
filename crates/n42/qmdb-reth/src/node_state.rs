@@ -3022,9 +3022,11 @@ impl QmdbNodeState {
 
     /// [`Self::portable_export`] in `format`, or (`None`) v1 unless a slot
     /// keeps only its leaf hash, then v2. v1 of a compacted tree is refused
-    /// ([`NodeStateError::PortableCompacted`]). v2 writes every hash-only slot
-    /// as a tombstone (kind 2) and never a whole-twig record (kind 3), which
-    /// an importer cannot rebuild (`docs/QMDB_COMPACTION_DESIGN.md` section 6).
+    /// ([`NodeStateError::PortableCompacted`]). v2 is the canonical tombstone
+    /// layout: every dead slot a tombstone (kind 2), every full twig without
+    /// a live slot one kind-3 record, so a tree exports to the same bytes on
+    /// either client however much of it is compacted
+    /// (`docs/QMDB_COMPACTION_DESIGN.md` section 6).
     pub fn portable_export_as(
         &self,
         chain_id: u64,
@@ -3064,7 +3066,7 @@ impl QmdbNodeState {
             root: root.0,
             slots: snapshot.tree,
         };
-        portable.encode(format, false).map_err(|e| NodeStateError::Portable(e.to_string()))
+        portable.encode(format).map_err(|e| NodeStateError::Portable(e.to_string()))
     }
 
     /// Whether [`Self::initialize`] has run.

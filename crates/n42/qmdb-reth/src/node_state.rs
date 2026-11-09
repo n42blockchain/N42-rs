@@ -717,6 +717,23 @@ fn poisoned_forest_guard<'a>(
 /// ([`QmdbNodeState::set_committed_source`]); `None` when not known.
 pub type CommittedSource = std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
+/// The committed block's number as the build guard reads it from the
+/// forkchoice's `safe` block number and the deferred-execution depth.
+///
+/// Under the `split` settlement tags `safe` is the block whose execution a
+/// committed child carries, so the committed block is `safe + depth` once
+/// the chain is past `depth` blocks. Until then `safe` stays at the genesis
+/// floor (the driver's `set_floor`) and the committed block is anywhere in
+/// `0..=depth`: genesis itself right after start. Taking `0 + depth` there
+/// refused the leader's build on genesis (its high-QC block) after a view-1
+/// timeout whose own block a build ahead had made canonical, for the whole
+/// tenure (devnet f5g1-seal2 / j-seal2). At the genesis floor the guard
+/// takes the committed block as genesis: it only lets a stale build within
+/// the first `depth` blocks through, where the forest holds no more.
+pub const fn committed_floor(safe: u64, depth: u64) -> u64 {
+    if safe == 0 { 0 } else { safe.saturating_add(depth) }
+}
+
 struct Inner {
     forest: Mutex<Option<QmdbForest>>,
     /// The entry-file compaction's schedule (`crate::entry_compaction`).

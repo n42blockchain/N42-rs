@@ -339,7 +339,9 @@ fn main() {
                                 } else {
                                     0
                                 };
-                                Some(safe.number.saturating_add(depth))
+                                // `safe` at the genesis floor: the committed block may be
+                                // genesis itself (`n42_qmdb_reth::committed_floor`).
+                                Some(n42_qmdb_reth::committed_floor(safe.number, depth))
                             })));
                         }
                         // The QMDB state is registered as the state reader on every QMDB

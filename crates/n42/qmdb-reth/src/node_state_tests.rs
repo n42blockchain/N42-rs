@@ -426,6 +426,33 @@ fn a_build_at_the_committed_block_below_the_head_builds() {
     }
 }
 
+/// f5g1-seal2 / j-seal2: on a deferred-execution chain (depth 1) the leader's
+/// own block 1 became the canonical head through a build ahead, view 1 timed
+/// out without a QC, and the next proposal built on genesis, the high-QC
+/// block. `safe` was still genesis, and the floor `safe + depth` = 1 refused
+/// genesis as stale for the whole tenure. At the genesis floor the committed
+/// block is taken as genesis; past it the floor is `safe + depth` as before.
+#[test]
+fn a_build_on_genesis_under_an_uncommitted_own_head_builds_at_the_genesis_floor() {
+    assert_eq!(crate::committed_floor(0, 1), 0);
+    assert_eq!(crate::committed_floor(0, 2), 0);
+    assert_eq!(crate::committed_floor(1, 1), 2);
+    assert_eq!(crate::committed_floor(7, 2), 9);
+    for offlock in [false, true] {
+        let (state, _view, hashes) = viewed(if offlock { "genesis-floor-offlock" } else { "genesis-floor" }, 1);
+        state.set_compute_offlock(offlock);
+        state.set_refuse_stale_builds(true);
+        // The old reading: safe 0 + depth 1 = 1, genesis refused.
+        state.set_committed_source(Some(Arc::new(|| Some(1))));
+        assert!(matches!(
+            state.compute_operations(hashes[0], changes_for(9).operations()),
+            Err(NodeStateError::State(StateError::StaleBuildParent { parent_number: 0, head_number: 1, .. }))
+        ), "the stall: genesis below the over-read floor");
+        state.set_committed_source(Some(Arc::new(|| Some(crate::committed_floor(0, 1)))));
+        assert!(state.compute_operations(hashes[0], changes_for(9).operations()).is_ok(), "genesis builds at the genesis floor");
+    }
+}
+
 #[test]
 fn a_build_on_a_parent_below_the_head_is_refused_and_the_view_stays_valid() {
     for offlock in [false, true] {

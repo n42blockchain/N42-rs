@@ -261,6 +261,30 @@ pub enum Refused {
     /// executor is left part-way and the build cannot go on with it. (The
     /// stock commit of a result with an empty write set does not fail.)
     Commit(String),
+    /// An Amsterdam rule the batches cannot reproduce on this block
+    /// ([`AmsterdamRefusal`], `docs/AMSTERDAM_PARALLEL_STEP.md`).
+    Amsterdam(AmsterdamRefusal),
+    /// The transaction at this index does not fit the block's remaining gas
+    /// at its position ([`InclusionGas`], the stock import's
+    /// `validate_transaction_gas_limit`): the stock import refuses the block.
+    InclusionGas(usize),
+}
+
+/// Why the batches' Amsterdam run does not equal the serial execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmsterdamRefusal {
+    /// An account one batch created is a recipient in another batch: its
+    /// EIP-8037 new-account charge (and whether a creating transfer halts)
+    /// depends on which comes first in the block.
+    CreatedAcrossBatches(Address),
+}
+
+impl std::fmt::Display for AmsterdamRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreatedAcrossBatches(address) => write!(f, "{address} is created by one batch and paid in another"),
+        }
+    }
 }
 
 impl std::fmt::Display for Refused {
@@ -271,6 +295,8 @@ impl std::fmt::Display for Refused {
             Self::Fold(err) => err.fmt(f),
             Self::Cache(address) => write!(f, "the executor already holds {address} at another value"),
             Self::Commit(err) => write!(f, "a receipt's commit failed: {err}"),
+            Self::Amsterdam(err) => err.fmt(f),
+            Self::InclusionGas(i) => write!(f, "transaction {i}'s gas limit is over the block's remaining gas"),
         }
     }
 }
@@ -286,6 +312,8 @@ impl Refused {
             Self::Fold(_) => "merge-refused",
             Self::Cache(_) => "cache-conflict",
             Self::Commit(_) => "commit-failed",
+            Self::Amsterdam(AmsterdamRefusal::CreatedAcrossBatches(_)) => "amsterdam-created-across",
+            Self::InclusionGas(_) => "inclusion-gas",
         }
     }
 }
@@ -370,6 +398,148 @@ fn install_entries<X>(
 /// keep used.
 pub const TRANSFER_GAS: u64 = 21_000;
 
+/// The Amsterdam rules the batches check on a block whose EVM version has
+/// EIP-2780 or EIP-8037 -- gov5's Amsterdam execution on a native chain
+/// past `glamsterdamTime` (`docs/AMSTERDAM_PARALLEL_STEP.md` 3.2). `None`
+/// on Prague and Osaka, whose checks stay as they were.
+#[derive(Debug, Clone)]
+pub struct AmsterdamRules {
+    version: evm2::Version,
+    block_gas_limit: u64,
+}
+
+impl AmsterdamRules {
+    /// The rules for a block on `version` with `block_gas_limit`, or `None`
+    /// when the version has neither EIP-2780 nor EIP-8037.
+    pub fn of(version: &evm2::Version, block_gas_limit: u64) -> Option<Self> {
+        (version.feature(evm2::EvmFeatures::EIP2780) || version.feature(evm2::EvmFeatures::EIP8037))
+            .then_some(Self { version: *version, block_gas_limit })
+    }
+
+    /// The intrinsic gas of a call from `caller` to `to` with `value`, no
+    /// input and no access list (EIP-2780: 21,000 with a value, 15,000
+    /// without, 12,000 to itself).
+    pub fn intrinsic(&self, caller: Address, to: Address, value: alloy_primitives::U256) -> u64 {
+        evm2::ethereum::intrinsic_and_floor_gas(
+            &self.version,
+            caller,
+            alloy_primitives::TxKind::Call(to),
+            &alloy_primitives::Bytes::new(),
+            0,
+            0,
+            value,
+        )
+        .0
+    }
+
+    /// EIP-8037's charge for a value transfer to an empty recipient; 0
+    /// without EIP-8037.
+    pub fn new_account_state_gas(&self) -> u64 {
+        if self.version.feature(evm2::EvmFeatures::EIP8037) {
+            self.version.gas_params.new_account_state_gas()
+        } else {
+            0
+        }
+    }
+
+    /// How many of the candidates, given by their gas limits in block order
+    /// and taken from an empty block, pass the stock inclusion check
+    /// whatever each of them turns out to be: a transfer the batches keep
+    /// spends at most 21,000 regular gas (its intrinsic) and at most the
+    /// new-account charge as state gas, and only when its gas limit can pay
+    /// it. The prefix is what the builder hands the batches, so that
+    /// [`InclusionGas::check`] cannot refuse what they keep (the builder
+    /// runs no check of its own; tests prove the bound).
+    pub fn take(&self, gas_limits: impl IntoIterator<Item = u64>) -> usize {
+        let charge = self.new_account_state_gas();
+        let inclusion = InclusionGas::of(&self.version, self.block_gas_limit);
+        let (mut regular, mut state, mut cumulative) = (0u64, 0u64, 0u64);
+        let mut taken = 0;
+        for gas_limit in gas_limits {
+            if !inclusion.fits(gas_limit, regular, state, cumulative) {
+                break;
+            }
+            // 12,000 is the least intrinsic of a plain call (a self-transfer).
+            let state_gas = if charge > 0 && gas_limit >= 12_000 + charge { charge } else { 0 };
+            regular = regular.saturating_add(TRANSFER_GAS);
+            state = state.saturating_add(state_gas);
+            cumulative = cumulative.saturating_add(TRANSFER_GAS + state_gas);
+            taken += 1;
+        }
+        taken
+    }
+}
+
+/// The stock executor's inclusion check (`validate_transaction_gas_limit`,
+/// which `commit_transaction` does not run, so the batches' receipts skip
+/// it) on every fork: a transaction's gas limit (capped by EIP-7825 for the
+/// regular dimension) against the block's remaining gas at its position;
+/// with EIP-8037 both the regular and the state dimension.
+#[derive(Debug, Clone, Copy)]
+pub struct InclusionGas {
+    block_gas_limit: u64,
+    tx_gas_limit_cap: u64,
+    separate: bool,
+}
+
+impl InclusionGas {
+    /// The check for a block on `version` with `block_gas_limit`.
+    pub fn of(version: &evm2::Version, block_gas_limit: u64) -> Self {
+        Self {
+            block_gas_limit,
+            tx_gas_limit_cap: version.tx_gas_limit_cap,
+            separate: version.feature(evm2::EvmFeatures::EIP8037),
+        }
+    }
+
+    /// `validate_transaction_gas_limit` at the given counters (the block's
+    /// regular and state gas with EIP-8037, its cumulative gas without).
+    pub fn fits(&self, gas_limit: u64, regular: u64, state: u64, cumulative: u64) -> bool {
+        let regular_limit = gas_limit.min(self.tx_gas_limit_cap);
+        if self.separate {
+            regular_limit <= self.block_gas_limit.saturating_sub(regular) && gas_limit <= self.block_gas_limit.saturating_sub(state)
+        } else {
+            regular_limit <= self.block_gas_limit.saturating_sub(cumulative)
+        }
+    }
+
+    /// The check over transactions in block order from an empty block, each
+    /// as (index, gas limit, regular gas, state gas, gas used): one
+    /// comparison per transaction on the running counters. `Err` names the
+    /// first that does not fit.
+    pub fn check(&self, spent: impl IntoIterator<Item = (usize, u64, u64, u64, u64)>) -> Result<(), usize> {
+        let (mut regular, mut state, mut cumulative) = (0u64, 0u64, 0u64);
+        for (index, gas_limit, tx_regular, tx_state, used) in spent {
+            if !self.fits(gas_limit, regular, state, cumulative) {
+                return Err(index);
+            }
+            regular = regular.saturating_add(tx_regular);
+            state = state.saturating_add(tx_state);
+            cumulative = cumulative.saturating_add(used);
+        }
+        Ok(())
+    }
+
+    /// [`Self::check`] over executed results: each item is (index, gas
+    /// limit, the result).
+    pub fn check_results<E>(
+        &self,
+        executed: impl IntoIterator<Item = (usize, u64, impl std::borrow::Borrow<evm2::TxResultExt<E>>)>,
+    ) -> Result<(), usize> {
+        self.check(executed.into_iter().map(|(index, gas_limit, result)| {
+            let result = result.borrow();
+            (index, gas_limit, result.execution_gas_spent(), result.state_gas_spent(), result.tx_gas_used())
+        }))
+    }
+}
+
+/// `N42_AMSTERDAM_PARALLEL` (default on; `0` sends every block under gov5's
+/// Amsterdam execution to the serial builder and import, as before stream H).
+pub fn amsterdam_parallel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| n42_env::flag("N42_AMSTERDAM_PARALLEL", true))
+}
+
 /// Which merged accounts the cache half writes into the executor's overlay.
 #[derive(Debug, Clone, Copy)]
 pub enum CacheScope<'a> {
@@ -432,17 +602,28 @@ where
 /// what [`commit_run`] has the executor build one by one when nothing was
 /// committed before (`N42ReceiptBuilder`), built off the executor (F5g7,
 /// `N42_EVM2_RECEIPTS_LATE`).
+///
+/// `separate_block_gas` (EIP-8037 on, the executor's own switch): the
+/// block's gas is then `max(sum of regular, sum of state)`, as `finish`
+/// reports it, while the receipts still cumulate each transaction's gas.
 pub fn late_receipts<X>(
     executed: impl IntoIterator<Item = (evm2::TxResultExt<X>, n42_tx_types::N42TxType)>,
+    separate_block_gas: bool,
 ) -> (Vec<n42_tx_types::Receipt>, u64) {
     let executed = executed.into_iter();
     let mut receipts = Vec::with_capacity(executed.size_hint().0);
     let mut cumulative = 0u64;
+    let (mut regular, mut state) = (0u64, 0u64);
     for (result, tx_type) in executed {
         cumulative += result.tx_gas_used();
+        if separate_block_gas {
+            regular = regular.saturating_add(result.execution_gas_spent());
+            state = state.saturating_add(result.state_gas_spent());
+        }
         receipts.push(n42_tx_types::Receipt { tx_type, success: result.status, cumulative_gas_used: cumulative, logs: result.logs });
     }
-    (receipts, cumulative)
+    let gas = if separate_block_gas { regular.max(state) } else { cumulative };
+    (receipts, gas)
 }
 
 /// Runs the candidates' transfers in batches on the build pool, each batch on
@@ -473,6 +654,7 @@ where
     EvmEnvFor<C>: Sync,
     D: evm2::evm::Database + Send + 'static,
     evm2::TxResult<TypesOf<C>>: Send + Default,
+    EvmTxOf<C>: alloy_consensus::Transaction,
 {
     execute_batches_into(config, env, keys, groups, convert, open, worst_case, beneficiary, dispatch, None, &[], direct)
 }
@@ -514,8 +696,14 @@ where
     EvmEnvFor<C>: Sync,
     D: evm2::evm::Database + Send + 'static,
     evm2::TxResult<TypesOf<C>>: Send + Default,
+    EvmTxOf<C>: alloy_consensus::Transaction,
 {
+    use reth_evm::EvmEnv as _;
     let before_at = std::time::Instant::now();
+    // gov5's Amsterdam execution (`docs/AMSTERDAM_PARALLEL_STEP.md`): the
+    // "ran no code" check on the intrinsic, the accounts each batch created,
+    // and the inclusion check over what the batches kept.
+    let amsterdam = AmsterdamRules::of(env.version(), env.block_env().gas_limit.saturating_to::<u64>());
     let groups = match groups {
         Some(groups) => groups,
         None => partition_by_sender(keys, beneficiary).map_err(Refused::NotParallel)?,
@@ -529,7 +717,7 @@ where
         Dispatch::Halves => batch_groups(&groups, keys.len(), workers),
     };
     let order = largest_first(&batches.iter().map(|b| b.iter().map(|g| g.len()).sum()).collect::<Vec<usize>>());
-    type BatchOut = Result<(Vec<usize>, reth_trie::bundle_state::BundleState, crate::parallel_common::BatchSpan, BatchInside), Refused>;
+    type BatchOut = Result<(Vec<usize>, reth_trie::bundle_state::BundleState, crate::parallel_common::BatchSpan, BatchInside, Vec<Address>), Refused>;
     let executed_slots: ScatterSlots<Executed<C>> = ScatterSlots::new(keys.len());
     let batches_at = std::time::Instant::now();
     let before_us = before_at.elapsed().as_micros() as u64;
@@ -574,10 +762,11 @@ where
                     std::time::Instant::now()
                 });
                 if let (Some(direct), Some(layer)) = (direct, layer.as_mut()) {
-                    let step = match direct.shape(&tx) {
+                    let shape = direct.shape(&tx);
+                    let step = match &shape {
                         Some(shape) => {
                             let ledger = &mut ledger;
-                            direct.apply(&shape, layer, &mut state, |before| {
+                            direct.apply(shape, layer, &mut state, |before| {
                                 worst_case.is_none_or(|cost| ledger.admit(shape.caller, first, before, cost(i)))
                             })
                         }
@@ -592,10 +781,14 @@ where
                         sampled_txs += 1;
                     }
                     match step {
-                        crate::direct_transfer::Step::Applied => {
+                        crate::direct_transfer::Step::Applied { state_gas } => {
                             direct_hits += 1;
                             first = false;
-                            executed_slots.put(i, Executed { index: i, result: direct.result() });
+                            let result = match &shape {
+                                Some(shape) => direct.result_for(shape, state_gas),
+                                None => direct.result(),
+                            };
+                            executed_slots.put(i, Executed { index: i, result });
                             continue;
                         }
                         crate::direct_transfer::Step::Refused => {
@@ -630,7 +823,17 @@ where
                         // leaves the batch's state as it was. One that used
                         // more than the intrinsic gas ran code, and code may
                         // read what another batch changes: not the batches'.
-                        if out.result.tx_gas_used() != TRANSFER_GAS {
+                        // On Amsterdam a transfer's gas is its EIP-2780
+                        // intrinsic plus any EIP-8037 state gas: the regular
+                        // part equal to the intrinsic is the same test.
+                        let plain = match &amsterdam {
+                            None => out.result.tx_gas_used() == TRANSFER_GAS,
+                            Some(rules) => {
+                                let value = alloy_consensus::Transaction::value(tx.inner());
+                                out.result.execution_gas_spent() == rules.intrinsic(keys[i].0, keys[i].1, value)
+                            }
+                        };
+                        if !plain {
                             broken = true;
                             skipped.push(i);
                             continue;
@@ -675,6 +878,18 @@ where
         inside.reads_us = scale(inside.reads_us);
         inside.commit_us = scale(inside.commit_us);
         let bundle = state.take_bundle();
+        // Amsterdam: the accounts this batch created (absent or empty in the
+        // parent), whose emptiness another batch's transfers read.
+        let created: Vec<Address> = if amsterdam.is_some() {
+            bundle
+                .state
+                .iter()
+                .filter(|(address, account)| **address != beneficiary && account.original_info.as_ref().is_none_or(|info| info.is_empty()))
+                .map(|(address, _)| *address)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let own = match sink {
             Some(sink) => {
                 let add_at = std::time::Instant::now();
@@ -687,7 +902,7 @@ where
             None => bundle,
         };
         let span = crate::parallel_common::BatchSpan::close(start_us, mark, seen, batches_at).with_open_us(open_us);
-        Ok((skipped, own, span, inside))
+        Ok((skipped, own, span, inside, created))
     };
     let slots: Vec<std::sync::OnceLock<BatchOut>> = (0..batches.len()).map(|_| std::sync::OnceLock::new()).collect();
     pool.scope(|scope| {
@@ -703,8 +918,14 @@ where
     let (mut skipped, mut bundles) = (Vec::new(), Vec::with_capacity(batches.len()));
     let mut spans = Vec::with_capacity(batches.len());
     let mut inside = BatchInside::default();
-    for slot in slots {
-        let (s, bundle, span, part) = slot.into_inner().unwrap_or(Err(Refused::NotParallel(NotParallel::NoState)))?;
+    let mut created_by: alloy_primitives::map::AddressMap<usize> = Default::default();
+    for (b, slot) in slots.into_iter().enumerate() {
+        let (s, bundle, span, part, created) = slot.into_inner().unwrap_or(Err(Refused::NotParallel(NotParallel::NoState)))?;
+        for address in created {
+            if created_by.insert(address, b).is_some() {
+                return Err(Refused::Amsterdam(AmsterdamRefusal::CreatedAcrossBatches(address)));
+            }
+        }
         skipped.extend(s);
         bundles.push(bundle);
         spans.push(span);
@@ -718,6 +939,18 @@ where
     }
     let spans = crate::parallel_common::BatchSpans::of(&mut spans, total_us);
     inside.before_us = before_us;
+    // Amsterdam: an account one batch created is paid by no other batch
+    // (its state gas would depend on the order), and what the batches kept
+    // fits the block's two gas dimensions.
+    if !created_by.is_empty() {
+        for (b, members) in batches.iter().enumerate() {
+            for &i in members.iter().flat_map(|group| group.iter()) {
+                if created_by.get(&keys[i].1).is_some_and(|&by| by != b) {
+                    return Err(Refused::Amsterdam(AmsterdamRefusal::CreatedAcrossBatches(keys[i].1)));
+                }
+            }
+        }
+    }
     let executed = executed_slots.into_ordered();
     skipped.sort_unstable();
     inside.gather_us = gather_at.elapsed().as_micros() as u64;
@@ -925,6 +1158,17 @@ where
     let batches_us = batches_at.elapsed().as_micros() as u64;
     if let Some(&i) = run.skipped.first() {
         return Err(refused(Refused::NotParallel(NotParallel::Failed(i, "refused by the EVM on the batches' view".to_owned()))));
+    }
+    // The stock import's inclusion check, which the receipts' commit skips:
+    // a block whose transaction does not fit the remaining gas is the stock
+    // import's to refuse (`docs/AMSTERDAM_PARALLEL_STEP.md` 5.5).
+    {
+        use reth_evm::EvmEnv as _;
+        InclusionGas::of(env.version(), env.block_env().gas_limit.saturating_to::<u64>())
+            .check_results::<<TypesOf<C> as evm2::EvmTypesHost>::TxResultExt>(
+                run.executed.iter().map(|e| (e.index, alloy_consensus::Transaction::gas_limit(&transactions[e.index]), &e.result)),
+            )
+            .map_err(|i| refused(Refused::InclusionGas(i)))?;
     }
     let finish_at = std::time::Instant::now();
     let ParallelRun { executed, merged, batches, groups, .. } = run;
@@ -1258,10 +1502,13 @@ mod tests {
         commit_run(&mut ex, std::iter::empty(), run.merged, CacheScope::All).expect("the cache half");
         let mut out = ex.finish().expect("the block finishes with the fold");
         assert!(out.result.receipts.is_empty());
-        let (receipts, gas) = late_receipts(run.executed.into_iter().map(|e| {
-            let tx_type = n42_tx_types::N42TxType::try_from(batch[e.index].ty()).expect("a type");
-            (e.result, tx_type)
-        }));
+        let (receipts, gas) = late_receipts(
+            run.executed.into_iter().map(|e| {
+                let tx_type = n42_tx_types::N42TxType::try_from(batch[e.index].ty()).expect("a type");
+                (e.result, tx_type)
+            }),
+            false,
+        );
         out.result.receipts = receipts;
         out.result.gas_used = gas;
         assert_same(&out, &reference);
@@ -1862,7 +2109,7 @@ mod tests {
                 let late_out = ex.finish().expect("the late finish");
                 late_finish.push(at.elapsed().as_micros());
                 let at = Instant::now();
-                let (receipts, gas) = late_receipts(executed.into_iter().zip(types).map(|(e, t)| (e.result, t)));
+                let (receipts, gas) = late_receipts(executed.into_iter().zip(types).map(|(e, t)| (e.result, t)), false);
                 late_build.push(at.elapsed().as_micros());
                 assert_eq!(receipts, out.result.receipts, "the late receipts");
                 assert_eq!(gas, out.result.gas_used, "the late gas");
@@ -2054,5 +2301,508 @@ mod tests {
                 t_drop / 1000,
             );
         }
+    }
+
+    // gov5's Amsterdam execution on a native chain (stream H,
+    // docs/AMSTERDAM_PARALLEL_STEP.md): the batches against the serial
+    // execution on evm2's Amsterdam.
+
+    const FRESH2: u64 = 0xf002;
+    const FRESH3: u64 = 0xf003;
+    const FRESH4: u64 = 0xf004;
+    /// Enough gas for a transfer that creates its recipient (EIP-8037:
+    /// 21,000 + 183,600).
+    const CREATING_GAS: u64 = 210_000;
+
+    /// A native chain (HotStuff, chain id 1) with `glamsterdamTime` 0: every
+    /// block executes on evm2's Amsterdam, reth's own Amsterdam stays off.
+    fn amsterdam() -> Config {
+        let json = r#"{"config":{"chainId":1,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"terminalTotalDifficultyPassed":true,"shanghaiTime":0,"cancunTime":0,"pragueTime":0,"osakaTime":0,"consensus":"hotstuff","glamsterdamTime":0},"alloc":{}}"#;
+        let genesis: alloy_genesis::Genesis = serde_json::from_str(json).expect("genesis");
+        N42EvmConfig::new(Arc::new(n42_header::N42ChainSpec::from(reth_chainspec::ChainSpec::from_genesis(genesis))))
+    }
+
+    fn amsterdam_header(gas_limit: u64) -> alloy_consensus::Header {
+        timing_header(alloy_consensus::Header {
+            number: 5,
+            timestamp: 1_000,
+            gas_limit,
+            base_fee_per_gas: Some(7),
+            beneficiary: addr(BENEFICIARY),
+            ..Default::default()
+        })
+    }
+
+    fn amsterdam_env(c: &Config, gas_limit: u64) -> reth_evm::EvmEnvFor<Config> {
+        let env = c.evm_env(&n42_header::N42Header::from(amsterdam_header(gas_limit))).expect("env");
+        assert_eq!(env.spec, evm2::SpecId::AMSTERDAM, "the native chain executes Amsterdam");
+        assert!(!reth_chainspec::EthereumHardforks::is_amsterdam_active_at_timestamp(c.chain_spec().as_ref(), 1_000), "reth's Amsterdam (a BAL) is off");
+        env
+    }
+
+    fn creating(from: u64, nonce: u64, to: Address, value: u64) -> Recovered<N42TxEnvelope> {
+        tx(from, nonce, to, value, CREATING_GAS, Bytes::new())
+    }
+
+    /// The batches' part of an Amsterdam block: transfers to existing
+    /// accounts (one shared), one creating its recipient with the gas for
+    /// it, one creating its recipient at 21,000 (a runtime out-of-gas halt
+    /// that still pays), a zero value (15,000), a sender paying one fresh
+    /// recipient twice in its batch (the second pays no state gas), a
+    /// legacy transfer and a 0x50 one.
+    fn amsterdam_batch_part() -> Vec<Recovered<N42TxEnvelope>> {
+        vec![
+            transfer(1, 0, addr(2), 100),
+            creating(3, 0, addr(FRESH), 100_000_000_000_000_000),
+            transfer(5, 0, addr(2), 300),
+            transfer(6, 0, addr(7), 0),
+            transfer(8, 0, addr(FRESH2), 5),
+            transfer(11, 0, addr(12), 6),
+            transfer(11, 1, addr(13), 7),
+            creating(14, 0, addr(FRESH3), 9),
+            creating(14, 1, addr(FRESH3), 4),
+            legacy_tx(15, 0, addr(16), 7, Some(1)),
+            alt_transfer(0),
+        ]
+    }
+
+    /// The serial tail: a contract call that writes storage (new slot:
+    /// EIP-8037 storage state gas), then the created account spending, a
+    /// batch recipient spending, a batch sender creating another account,
+    /// and a transfer to the beneficiary.
+    fn amsterdam_serial_part() -> Vec<Recovered<N42TxEnvelope>> {
+        vec![
+            tx(4, 0, addr(STORE), 0, 200_000, Bytes::from(B256::with_last_byte(0x2a).to_vec())),
+            transfer(FRESH, 0, addr(9), 10),
+            transfer(2, 0, addr(9), 50),
+            creating(1, 1, addr(FRESH4), 60),
+            transfer(10, 0, addr(BENEFICIARY), 5),
+        ]
+    }
+
+    /// `txs` executed transaction by transaction by the stock executor on
+    /// `env` over [`direct_parent`].
+    fn sequential_on(c: &Config, env: &reth_evm::EvmEnvFor<Config>, txs: &[Recovered<N42TxEnvelope>]) -> Output {
+        let w = withdrawals();
+        let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(direct_parent(), env.clone()), timing_ctx(&w));
+        ex.apply_pre_execution_changes().expect("pre");
+        for t in txs {
+            ex.execute_transaction(t.clone()).expect("the transaction executes");
+        }
+        ex.finish().expect("the block finishes")
+    }
+
+    fn run_on(
+        c: &Config,
+        env: &reth_evm::EvmEnvFor<Config>,
+        txs: &[Recovered<N42TxEnvelope>],
+        direct: bool,
+    ) -> Result<ParallelRun<Config>, Refused> {
+        let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);
+        let path = if direct { DirectTransfers::of_env(env, crate::direct_transfer::shape_of) } else { None };
+        execute_batches(c, env, &keys(txs), None, &convert, &|| Some(direct_parent()), None, addr(BENEFICIARY), Dispatch::LargestFirst(4), path.as_ref())
+    }
+
+    /// The batches' `run` of `batch`, committed and followed by `serial` and
+    /// the block's end.
+    fn finish_on(
+        c: &Config,
+        env: &reth_evm::EvmEnvFor<Config>,
+        batch: &[Recovered<N42TxEnvelope>],
+        run: ParallelRun<Config>,
+        serial: &[Recovered<N42TxEnvelope>],
+    ) -> Output {
+        use alloy_consensus::Typed2718 as _;
+        let w = withdrawals();
+        let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(direct_parent(), env.clone()), timing_ctx(&w));
+        ex.apply_pre_execution_changes().expect("pre");
+        let results = run.executed.into_iter().map(|e| {
+            let tx_type = n42_tx_types::N42TxType::try_from(batch[e.index].ty()).expect("a type");
+            (e.result, tx_type)
+        });
+        commit_run(&mut ex, results, run.merged, CacheScope::All).expect("the commit");
+        for t in serial {
+            ex.execute_transaction(t.clone()).expect("the transaction executes");
+        }
+        ex.finish().expect("the block finishes with the fold")
+    }
+
+    /// The Amsterdam receipts carry what the Prague ones do not: EIP-7708
+    /// logs, and a header gas below the last cumulative gas once a block
+    /// has state gas.
+    fn assert_amsterdam_shape(out: &Output) {
+        let logs: usize = out.result.receipts.iter().map(|r| r.logs.len()).sum();
+        assert!(logs > 0, "EIP-7708 transfer logs");
+        let last = out.result.receipts.last().map_or(0, |r| r.cumulative_gas_used);
+        assert!(out.result.gas_used < last, "max(regular, state) {} under the receipts' {}", out.result.gas_used, last);
+    }
+
+    /// A mixed Amsterdam block -- batched transfers of every shape above,
+    /// then a serial tail, then the withdrawals -- through the batches (on
+    /// evm2 alone, and with the direct path) equals the serial execution:
+    /// receipts (logs included), receipts root, gas, bundle, reverts,
+    /// contracts and QMDB root.
+    #[test]
+    fn the_amsterdam_parallel_build_equals_the_serial_execution() {
+        let c = amsterdam();
+        let env = amsterdam_env(&c, 30_000_000);
+        assert!(AmsterdamRules::of(&env.version, 30_000_000).is_some());
+        let (batch, serial) = (amsterdam_batch_part(), amsterdam_serial_part());
+        let all: Vec<_> = batch.iter().chain(&serial).cloned().collect();
+        let reference = sequential_on(&c, &env, &all);
+        assert_amsterdam_shape(&reference);
+        // The creating transfer paid 204,600; the one at 21,000 halted.
+        assert_eq!(reference.result.receipts[1].cumulative_gas_used - reference.result.receipts[0].cumulative_gas_used, 204_600);
+        assert!(!reference.result.receipts[4].success, "the creating transfer at 21,000 halts");
+        assert_eq!(reference.result.receipts[3].cumulative_gas_used - reference.result.receipts[2].cumulative_gas_used, 15_000);
+        for direct in [false, true] {
+            let run = run_on(&c, &env, &batch, direct).expect("the batches run");
+            assert!(run.skipped.is_empty(), "skipped {:?}", run.skipped);
+            assert!(run.batches >= 2, "{} batches", run.batches);
+            let ours = finish_on(&c, &env, &batch, run, &serial);
+            assert_same_import(&ours, &reference);
+            let alone = finish_on(&c, &env, &batch, run_on(&c, &env, &batch, direct).expect("the batches run"), &[]);
+            assert_same_import(&alone, &sequential_on(&c, &env, &batch));
+        }
+    }
+
+    /// The late receipts' gas on Amsterdam is the executor's
+    /// `max(regular, state)`, not the receipts' sum.
+    #[test]
+    fn the_amsterdam_late_receipts_equal_the_committed_ones() {
+        use alloy_consensus::Typed2718 as _;
+        let c = amsterdam();
+        let env = amsterdam_env(&c, 30_000_000);
+        let batch = amsterdam_batch_part();
+        let reference = sequential_on(&c, &env, &batch);
+        let run = run_on(&c, &env, &batch, false).expect("the batches run");
+        let w = withdrawals();
+        let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(direct_parent(), env.clone()), timing_ctx(&w));
+        ex.apply_pre_execution_changes().expect("pre");
+        commit_run(&mut ex, std::iter::empty(), run.merged, CacheScope::All).expect("the cache half");
+        let mut out = ex.finish().expect("the block finishes with the fold");
+        let executed: Vec<_> = run
+            .executed
+            .into_iter()
+            .map(|e| (e.result, n42_tx_types::N42TxType::try_from(batch[e.index].ty()).expect("a type")))
+            .collect();
+        let (_, summed) = late_receipts(executed.clone(), false);
+        let (receipts, gas) = late_receipts(executed, true);
+        assert!(summed > gas, "the sum {summed} is not the block's gas {gas}");
+        out.result.receipts = receipts;
+        out.result.gas_used = gas;
+        assert_same_import(&out, &reference);
+    }
+
+    /// The batches refuse what depends on the order across batches: an
+    /// account one batch creates and another pays, whether the other
+    /// creates it too or halts on it at 21,000; the serial execution
+    /// differs from what the batches would give.
+    #[test]
+    fn an_account_created_across_batches_is_refused() {
+        let c = amsterdam();
+        let env = amsterdam_env(&c, 30_000_000);
+        let fresh = addr(FRESH);
+        for txs in [
+            vec![creating(1, 0, fresh, 5), creating(3, 0, fresh, 7)],
+            vec![creating(3, 0, fresh, 7), transfer(1, 0, fresh, 5)],
+            vec![transfer(1, 0, fresh, 5), creating(3, 0, fresh, 7)],
+        ] {
+            for direct in [false, true] {
+                match run_on(&c, &env, &txs, direct) {
+                    Err(Refused::Amsterdam(AmsterdamRefusal::CreatedAcrossBatches(at))) => assert_eq!(at, fresh),
+                    other => panic!("{:?}", other.map(|run| run.batches)),
+                }
+            }
+            let block = amsterdam_block_of(&txs, 30_000_000);
+            assert!(matches!(amsterdam_import(&block), Err(Refused::Amsterdam(_))));
+        }
+        // In one sender's batch the order is the block's: equal.
+        let txs = vec![creating(1, 0, fresh, 7), transfer(1, 1, fresh, 5), transfer(3, 0, addr(4), 1)];
+        let reference = sequential_on(&c, &env, &txs);
+        let ours = finish_on(&c, &env, &txs, run_on(&c, &env, &txs, false).expect("the batches run"), &[]);
+        assert_same_import(&ours, &reference);
+    }
+
+    /// The two gas dimensions (EIP-8037): three creating transfers at
+    /// 210,000 fit a 450,000 block's regular gas but not its state gas
+    /// after two. The inclusion check refuses the third (the stock executor
+    /// refuses it as over the block's gas), the follower's import of such a
+    /// block is refused, and the builder's take stops before it.
+    #[test]
+    fn the_block_gas_dimensions_bound_the_batches() {
+        use reth_evm::execute::Executor as _;
+        let c = amsterdam();
+        let env = amsterdam_env(&c, 450_000);
+        let txs = vec![creating(1, 0, addr(FRESH), 5), creating(3, 0, addr(FRESH2), 7), creating(5, 0, addr(FRESH3), 9)];
+        let rules = AmsterdamRules::of(&env.version, 450_000).expect("Amsterdam");
+        assert_eq!(rules.take(txs.iter().map(|_| CREATING_GAS)), 2);
+        assert_eq!(rules.take([21_000; 30]), 21);
+        let run = run_on(&c, &env, &txs, false).expect("the batches run");
+        let inclusion = InclusionGas::of(&env.version, 450_000);
+        let check = |run: &ParallelRun<Config>| {
+            inclusion.check_results::<<TypesOf<Config> as evm2::EvmTypesHost>::TxResultExt>(
+                run.executed.iter().map(|e| (e.index, CREATING_GAS, &e.result)),
+            )
+        };
+        assert_eq!(check(&run), Err(2));
+        let block = amsterdam_block_of(&txs, 450_000);
+        assert!(c.executor(direct_parent()).execute(&block).is_err(), "the stock import refuses the block");
+        assert!(matches!(amsterdam_import(&block), Err(Refused::InclusionGas(2))));
+        assert_eq!(check(&run_on(&c, &env, &txs[..2], false).expect("the two kept")), Ok(()));
+        let w = withdrawals();
+        let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(direct_parent(), env.clone()), timing_ctx(&w));
+        ex.apply_pre_execution_changes().expect("pre");
+        ex.execute_transaction(txs[0].clone()).expect("first");
+        ex.execute_transaction(txs[1].clone()).expect("second");
+        assert!(ex.execute_transaction(txs[2].clone()).is_err(), "the stock executor refuses the third");
+        // The two the take keeps run and equal the serial execution.
+        let two = &txs[..2];
+        let ours = finish_on(&c, &env, two, run_on(&c, &env, two, false).expect("the batches run"), &[]);
+        assert_same_import(&ours, &sequential_on(&c, &env, two));
+    }
+
+    /// A zero-value call that runs code into an out-of-gas halt at 21,000
+    /// gas used: on Prague its gas is a transfer's, on Amsterdam its regular
+    /// gas is above the 15,000 intrinsic, so the batches skip it.
+    #[test]
+    fn code_run_at_a_transfers_gas_is_skipped_on_amsterdam() {
+        let c = amsterdam();
+        let env = amsterdam_env(&c, 30_000_000);
+        let txs = vec![transfer(1, 0, addr(2), 1), transfer(3, 0, addr(STORE), 0)];
+        let run = run_on(&c, &env, &txs, false).expect("the batches run");
+        assert_eq!(run.skipped, vec![1]);
+        assert!(matches!(amsterdam_import(&amsterdam_block_of(&txs, 30_000_000)), Err(Refused::NotParallel(NotParallel::Failed(1, _)))));
+        // Prague and Osaka keep their checks: no Amsterdam rules there.
+        for osaka in [false, true] {
+            let c = prague(osaka);
+            assert!(AmsterdamRules::of(&prague_env(&c).version, 30_000_000).is_none());
+        }
+    }
+
+    /// `txs` as a Prague (or Osaka) block of `gas_limit` over [`direct_parent`].
+    fn prague_block_of(txs: &[Recovered<N42TxEnvelope>], gas_limit: u64) -> reth_primitives_traits::RecoveredBlock<n42_tx_types::Block> {
+        let header = n42_header::N42Header::from(timing_header(alloy_consensus::Header {
+            number: 5,
+            timestamp: 1_000,
+            gas_limit,
+            base_fee_per_gas: Some(7),
+            beneficiary: addr(BENEFICIARY),
+            ..Default::default()
+        }));
+        let body = n42_tx_types::BlockBody {
+            transactions: txs.iter().map(|t| t.inner().clone()).collect(),
+            ommers: Vec::new(),
+            withdrawals: Some(withdrawals().into()),
+        };
+        reth_primitives_traits::RecoveredBlock::new_unhashed(n42_tx_types::Block::new(header, body), txs.iter().map(|t| t.signer()).collect())
+    }
+
+    /// The stock and the parallel import of `block` on `c`.
+    fn both_imports(c: &Config, block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> (Result<Output, String>, Result<Output, Refused>) {
+        use reth_evm::execute::Executor as _;
+        let stock = c.executor(direct_parent()).execute(block).map_err(|err| err.to_string());
+        let ours = import_block(c, block, direct_parent(), &|| Some(direct_parent()), Dispatch::LargestFirst(4), None).map(|(out, _)| out);
+        (stock, ours)
+    }
+
+    /// The follower's inclusion check on every fork (section 6 of the audit
+    /// note, fixed): a block whose leading transfer's gas limit is above the
+    /// block's remaining gas at its position is refused by the stock import
+    /// and by the parallel import (`inclusion-gas`), which leaves it to the
+    /// stock import; a block that fits is accepted by both with the same
+    /// receipts, receipts root and QMDB root.
+    #[test]
+    fn a_transfer_over_the_remaining_gas_is_refused_by_both_imports() {
+        let c = prague(false);
+        // 30,000,000 - 21,000 = 29,979,000 left for the second transfer.
+        let over = [transfer(1, 0, addr(2), 1), tx(3, 0, addr(4), 1, 29_979_001, Bytes::new())];
+        let (stock, ours) = both_imports(&c, &prague_block_of(&over, 30_000_000));
+        assert!(stock.is_err(), "the stock import refuses it");
+        assert!(matches!(ours, Err(Refused::InclusionGas(1))), "{:?}", ours.map(|_| ()));
+        assert_eq!(Refused::InclusionGas(1).reason(), "inclusion-gas");
+        let fits = [transfer(1, 0, addr(2), 1), tx(3, 0, addr(4), 1, 29_979_000, Bytes::new())];
+        let (stock, ours) = both_imports(&c, &prague_block_of(&fits, 30_000_000));
+        assert_same_import(&ours.expect("the parallel import"), &stock.expect("the stock import"));
+        // A small block, on Prague and on Osaka: the third 21,000 transfer
+        // is over 50,000 - 42,000; two fit 42,000 exactly.
+        for osaka in [false, true] {
+            let c = prague(osaka);
+            let three = [transfer(1, 0, addr(2), 1), transfer(3, 0, addr(4), 1), transfer(5, 0, addr(6), 1)];
+            let (stock, ours) = both_imports(&c, &prague_block_of(&three, 50_000));
+            assert!(stock.is_err(), "osaka {osaka}: the stock import refuses it");
+            assert!(matches!(ours, Err(Refused::InclusionGas(2))), "osaka {osaka}: {:?}", ours.map(|_| ()));
+            let (stock, ours) = both_imports(&c, &prague_block_of(&three[..2], 42_000));
+            assert_same_import(&ours.expect("the parallel import"), &stock.expect("the stock import"));
+        }
+    }
+
+    /// The builder runs no inclusion check of its own: what it hands the
+    /// batches always passes one. Before Amsterdam its candidates are
+    /// transfers of exactly 21,000 gas (`transfer_key`) from an empty block
+    /// (`transactions-before` refuses otherwise), at most the block's gas
+    /// over 21,000 of them (the budget), each using 21,000; one more would
+    /// fail, so the budget is exact. On Amsterdam [`AmsterdamRules::take`]'s
+    /// prefix passes whatever each transfer turns out to spend (its
+    /// intrinsic, a floor of at most 21,000, the new-account charge when its
+    /// gas limit can pay it).
+    #[test]
+    fn the_builders_take_always_passes_the_inclusion_check() {
+        for osaka in [false, true] {
+            let version = prague_env(&prague(osaka)).version;
+            for limit in [21_000u64, 41_999, 42_000, 50_000, 450_000, 30_000_000, 36_000_007] {
+                let budget = (limit / TRANSFER_GAS) as usize;
+                let inclusion = InclusionGas::of(&version, limit);
+                let spent = |n: usize| (0..n).map(|i| (i, TRANSFER_GAS, TRANSFER_GAS, 0, TRANSFER_GAS));
+                assert_eq!(inclusion.check(spent(budget)), Ok(()), "osaka {osaka} limit {limit}");
+                assert_eq!(inclusion.check(spent(budget + 1)), Err(budget), "osaka {osaka} limit {limit}");
+            }
+        }
+        let version = amsterdam_env(&amsterdam(), 30_000_000).version;
+        let charge = AmsterdamRules::of(&version, 30_000_000).expect("Amsterdam").new_account_state_gas();
+        let gas_limits = [21_000u64, 30_000, 12_000 + charge - 1, 12_000 + charge, 204_600, CREATING_GAS, 1_000_000];
+        let mut seed = 0x2780_8037u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            seed >> 33
+        };
+        for limit in [21_000u64, 450_000, 1_000_000, 5_000_000] {
+            let rules = AmsterdamRules::of(&version, limit).expect("Amsterdam");
+            let inclusion = InclusionGas::of(&version, limit);
+            for _ in 0..200 {
+                let cands: Vec<u64> = (0..(next() % 40) as usize).map(|_| gas_limits[(next() % gas_limits.len() as u64) as usize]).collect();
+                let kept = &cands[..rules.take(cands.iter().copied())];
+                // Every transfer at its worst (21,000 regular, the charge when
+                // its gas limit can pay it) and at a random lesser spend.
+                for worst in [true, false] {
+                    let spent: Vec<_> = kept
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &gas_limit)| {
+                            let payable = gas_limit >= 12_000 + charge;
+                            let regular = if worst { TRANSFER_GAS } else { [12_000, 15_000, TRANSFER_GAS][(next() % 3) as usize] };
+                            let state = if payable && (worst || next() % 2 == 0) { charge } else { 0 };
+                            (i, gas_limit, regular, state, regular + state)
+                        })
+                        .collect();
+                    assert_eq!(inclusion.check(spent), Ok(()), "limit {limit} kept {kept:?}");
+                }
+            }
+        }
+    }
+
+    /// `txs` as an Amsterdam block over [`direct_parent`] with [`withdrawals`].
+    fn amsterdam_block_of(txs: &[Recovered<N42TxEnvelope>], gas_limit: u64) -> reth_primitives_traits::RecoveredBlock<n42_tx_types::Block> {
+        let header = n42_header::N42Header::from(amsterdam_header(gas_limit));
+        let body = n42_tx_types::BlockBody {
+            transactions: txs.iter().map(|t| t.inner().clone()).collect(),
+            ommers: Vec::new(),
+            withdrawals: Some(withdrawals().into()),
+        };
+        reth_primitives_traits::RecoveredBlock::new_unhashed(n42_tx_types::Block::new(header, body), txs.iter().map(|t| t.signer()).collect())
+    }
+
+    fn amsterdam_import(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Result<(Output, ImportStats), Refused> {
+        import_block(&amsterdam(), block, direct_parent(), &|| Some(direct_parent()), Dispatch::LargestFirst(4), None)
+    }
+
+    /// The follower's parallel import of the mixed Amsterdam block (the
+    /// tail opens with the contract call) equals the stock import, and so
+    /// does a block of the batched transfers alone.
+    #[test]
+    fn the_amsterdam_parallel_import_equals_the_stock_import() {
+        use reth_evm::execute::Executor as _;
+        let txs: Vec<_> = amsterdam_batch_part().into_iter().chain(amsterdam_serial_part()).collect();
+        for (txs, tail) in [(txs, 5), (amsterdam_batch_part(), 0)] {
+            let block = amsterdam_block_of(&txs, 30_000_000);
+            let stock = amsterdam().executor(direct_parent()).execute(&block).expect("the stock import");
+            assert_amsterdam_shape(&stock);
+            let (ours, stats) = amsterdam_import(&block).expect("the parallel import");
+            assert_eq!((stats.txs, stats.tail), (11, tail), "{stats:?}");
+            assert_same_import(&ours, &stock);
+        }
+    }
+
+    /// [`direct_equals_evm2`] on Amsterdam: the batches with the direct
+    /// path against the batches on evm2 (with the stock Amsterdam handler,
+    /// or the fast one in batches), results (state gas and logs included),
+    /// skipped set, and the block after the commit and its end.
+    fn amsterdam_direct_equals_evm2(name: &str, txs: &[Recovered<N42TxEnvelope>], hits: u64) {
+        let c = amsterdam();
+        let env = amsterdam_env(&c, 30_000_000);
+        assert_eq!(crate::direct_transfer::refusal(env.spec, &env.version), None, "Amsterdam has the path");
+        let (stock, ours) = match (run_on(&c, &env, txs, false), run_on(&c, &env, txs, true)) {
+            (Err(stock), Err(ours)) => {
+                assert_eq!(ours.to_string(), stock.to_string(), "{name}: the refusal");
+                assert_eq!(hits, 0, "{name}: refused, so nothing applied");
+                return;
+            }
+            (Ok(stock), Ok(ours)) => (stock, ours),
+            (stock, ours) => panic!("{name}: {:?} against {:?}", stock.map(|_| ()), ours.map(|_| ())),
+        };
+        assert_eq!(ours.inside.direct_hits, hits, "{name}: applied directly");
+        assert_eq!(stock.inside.direct_hits, 0);
+        assert_eq!(ours.skipped, stock.skipped, "{name}: skipped");
+        let results = |run: &ParallelRun<Config>| run.executed.iter().map(|e| (e.index, format!("{:?}", e.result))).collect::<Vec<_>>();
+        assert_eq!(results(&ours), results(&stock), "{name}: results");
+        let executed: Vec<_> = stock.executed.iter().map(|e| txs[e.index].clone()).collect();
+        let reference = sequential_on(&c, &env, &executed);
+        let (ours, stock) = (finish_on(&c, &env, txs, ours, &[]), finish_on(&c, &env, txs, stock, &[]));
+        assert_same_import(&ours, &stock);
+        if stock.result.receipts.len() == txs.len() {
+            assert_same_import(&ours, &reference);
+        }
+    }
+
+    #[test]
+    fn the_amsterdam_direct_path_equals_evm2_on_qualifying_transfers() {
+        amsterdam_direct_equals_evm2("1559 to an existing account", &[transfer(1, 0, addr(2), 100)], 1);
+        amsterdam_direct_equals_evm2("1559 creating its recipient (EIP-8037)", &[creating(1, 0, addr(FRESH), 100)], 1);
+        amsterdam_direct_equals_evm2("creating, the charge to the gas limit", &[tx(1, 0, addr(FRESH), 100, 204_600, Bytes::new())], 1);
+        amsterdam_direct_equals_evm2("1559 over the intrinsic gas", &[tx(1, 0, addr(2), 100, 30_000, Bytes::new())], 1);
+        amsterdam_direct_equals_evm2("legacy", &[legacy_tx(2, 0, addr(3), 7, Some(1))], 1);
+        amsterdam_direct_equals_evm2("2930 with an empty access list", &[eip2930_tx(3, addr(4), 9, Default::default())], 1);
+        amsterdam_direct_equals_evm2("0x50 as 1559", &[alt_transfer(0)], 1);
+        amsterdam_direct_equals_evm2("zero value to an existing account (15,000)", &[transfer(4, 0, addr(5), 0)], 1);
+        amsterdam_direct_equals_evm2("zero value at its intrinsic", &[tx(4, 0, addr(5), 0, 15_000, Bytes::new())], 1);
+        amsterdam_direct_equals_evm2("a zero tip to an existing beneficiary", &[fee_tx(4, 0, addr(5), 3, 7, 0)], 1);
+    }
+
+    #[test]
+    fn the_amsterdam_direct_path_hands_everything_else_to_evm2() {
+        let access_list = alloy_eips::eip2930::AccessList(vec![alloy_eips::eip2930::AccessListItem { address: addr(6), storage_keys: vec![B256::ZERO] }]);
+        amsterdam_direct_equals_evm2("creating at 21,000 (the halt)", &[transfer(1, 0, addr(FRESH), 100)], 0);
+        amsterdam_direct_equals_evm2("creating one gas short", &[tx(1, 0, addr(FRESH), 100, 204_599, Bytes::new())], 0);
+        amsterdam_direct_equals_evm2("zero value to an empty account", &[transfer(1, 0, addr(FRESH), 0)], 0);
+        amsterdam_direct_equals_evm2("to a contract", &[tx(1, 0, addr(STORE), 1, 200_000, Bytes::new())], 0);
+        amsterdam_direct_equals_evm2("to a precompile", &[tx(1, 0, Address::with_last_byte(4), 1, 30_000, Bytes::new())], 0);
+        amsterdam_direct_equals_evm2("to itself", &[transfer(2, 0, addr(2), 5)], 0);
+        amsterdam_direct_equals_evm2("to the beneficiary", &[transfer(3, 0, addr(BENEFICIARY), 5)], 0);
+        amsterdam_direct_equals_evm2("with input", &[tx(4, 0, addr(5), 1, 30_000, Bytes::from_static(&[1, 2]))], 0);
+        amsterdam_direct_equals_evm2("2930 with an access list", &[eip2930_tx(5, addr(6), 1, access_list)], 0);
+        amsterdam_direct_equals_evm2("value the sender lacks", &[transfer(POOR, 0, addr(2), TWO_TRANSFERS)], 0);
+        amsterdam_direct_equals_evm2("a nonce ahead", &[transfer(6, 3, addr(2), 1)], 0);
+        amsterdam_direct_equals_evm2("an intrinsic gas too low", &[tx(7, 0, addr(2), 1, 20_000, Bytes::new())], 0);
+        amsterdam_direct_equals_evm2("zero value under its intrinsic", &[tx(7, 0, addr(2), 0, 14_999, Bytes::new())], 0);
+        amsterdam_direct_equals_evm2("a legacy transaction without a chain id", &[legacy_tx(8, 0, addr(3), 7, None)], 0);
+        amsterdam_direct_equals_evm2("a fee cap under the base fee", &[fee_tx(9, 0, addr(3), 7, 6, 0)], 0);
+        amsterdam_direct_equals_evm2("a priority fee over the fee cap", &[fee_tx(9, 0, addr(3), 7, 10, 11)], 0);
+        amsterdam_direct_equals_evm2("a sender with a delegation", &[transfer(DELEGATED, 0, addr(3), 7)], 0);
+    }
+
+    #[test]
+    fn the_amsterdam_direct_path_equals_evm2_on_sender_runs() {
+        let run: Vec<_> = (0..6).map(|n| creating(1, n, addr(FRESH + 0x100 + n), 100 + n)).collect();
+        amsterdam_direct_equals_evm2("a run of six creating transfers", &run, 6);
+        let twice = vec![creating(1, 0, addr(FRESH), 7), transfer(1, 1, addr(FRESH), 5), transfer(3, 0, addr(4), 1)];
+        amsterdam_direct_equals_evm2("one fresh recipient paid twice in a batch", &twice, 3);
+        let halt = vec![transfer(1, 0, addr(2), 1), transfer(1, 1, addr(FRESH), 5), transfer(1, 2, addr(3), 1)];
+        amsterdam_direct_equals_evm2("a halt mid-run, the rest on evm2", &halt, 1);
+        let poor: Vec<_> = (0..4).map(|n| transfer(POOR, n, addr(2 + n), 1_000)).collect();
+        amsterdam_direct_equals_evm2("the balance running out mid-run", &poor, 2);
+        let chained = vec![transfer(1, 0, addr(2), 5_000), transfer(2, 0, addr(3), 4_000), transfer(3, 0, addr(4), 3_000), transfer(1, 1, addr(3), 1)];
+        amsterdam_direct_equals_evm2("a recipient that sends later", &chained, 4);
+        let mixed = vec![transfer(1, 0, addr(2), 100), transfer(1, 1, addr(1), 5), transfer(1, 2, addr(3), 7), transfer(2, 0, addr(4), 9)];
+        amsterdam_direct_equals_evm2("a self-transfer mid-run", &mixed, 2);
     }
 }

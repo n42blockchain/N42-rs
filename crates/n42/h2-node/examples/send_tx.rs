@@ -19,6 +19,12 @@
 //! blocks says nothing about the costs that scale with transactions, which on
 //! gov5's fleet is where the dominant one was found.
 //!
+//! `--gas <n>` sets the gas limit (21,000 by default). `--fresh-to` sends each
+//! transfer to a new, empty address derived from `--to` and the nonce, so every
+//! one creates its recipient: on a chain under gov5's Amsterdam execution that
+//! costs EIP-8037's new-account state gas (~204,600 gas in all), so pair it with
+//! `--gas 210000`.
+//!
 //! One key is one nonce sequence, so one process is one sender. Load comes from
 //! running several against different funded accounts; two processes sharing a
 //! key race its nonce and most of what they send is rejected.
@@ -42,6 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut alg = "secp256k1".to_string();
     let mut tip = 1_000_000_000u128;
     let mut value = U256::from(1_000_000_000_000_000u64);
+    let mut gas_limit = 21_000u64;
+    let mut fresh_to = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -57,6 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--quiet" => quiet = true,
             "--tip" => tip = args.next().ok_or("--tip needs a number of wei")?.parse()?,
             "--value" => value = args.next().ok_or("--value needs a number of wei")?.parse()?,
+            "--gas" => gas_limit = args.next().ok_or("--gas needs a number")?.parse()?,
+            "--fresh-to" => fresh_to = true,
             "--alg" => alg = args.next().ok_or("--alg needs secp256k1 or ed25519")?,
             other => return Err(format!("unknown argument {other}").into()),
         }
@@ -117,10 +127,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::thread::sleep(wait);
             }
         }
+        // `--fresh-to`: a recipient no transaction has touched before.
+        let to = if fresh_to {
+            Address::from_slice(
+                &alloy_primitives::keccak256([to.as_slice(), &nonce.to_be_bytes()].concat())[12..],
+            )
+        } else {
+            to
+        };
         let tx = TxEip1559 {
             chain_id,
             nonce,
-            gas_limit: 21_000,
+            gas_limit,
             max_fee_per_gas: 5_000_000_000,
             max_priority_fee_per_gas: tip,
             to: TxKind::Call(to),

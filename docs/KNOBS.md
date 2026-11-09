@@ -108,6 +108,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | Knob | Default | Values | Meaning | Where read | Status |
 |---|---|---|---|---|---|
 | `N42_ANSWER_BEFORE_REVERTS` | off | `1` (or the knob's own value; see code) | Leader builds answer before their revert set is merged. | `deferred-reverts:lib.rs:41` | adopted |
+| `N42_AMSTERDAM_PARALLEL` | on | `0` turns it off | Whether the parallel builder (N42_PARALLEL_BUILD) and follower (N42_FOLLOWER_PARALLEL) also run blocks under gov5's Amsterdam execution (glamsterdamTime): the batches take the EIP-2780/8037 intrinsic and state gas, refuse an account created in one batch and paid in another; the builder takes only the gas limits both block gas dimensions admit (the follower checks inclusion on every fork, `inclusion-gas`). `0` sends those blocks to the serial path, as before stream H. docs/AMSTERDAM_PARALLEL_STEP.md. | `engine-types:parallel_build.rs:503` | default |
 | `N42_BUILDER_PREFETCH` | 0 | integer | Transactions the builder takes ahead of execution to prefetch accounts (0 = off). | `engine-types:payload.rs:5930` | default |
 | `N42_BUILDER_PULLER` | 0 | integer | Builder puller count (0 = execute inline). X22 base set: `1024` (compiled default differs). | `engine-types:payload.rs:5835` | adopted |
 | `N42_BUILDER_STALE_CHECK` | off | `1` (or the knob's own value; see code) | Builder stale-parent check. | `engine-types:payload.rs:5820` | unknown |

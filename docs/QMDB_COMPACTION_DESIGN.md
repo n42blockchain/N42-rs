@@ -407,6 +407,12 @@ Both clients import all three fixtures and each other's v2 exports to the same r
 leaf-store flush and reload, n42-rs after an entry-file close and reopen
 (`audit-notes/ci/k-cross.sh`, 2026-11-07: pass). Open: the gov5 PR (gh login), merging both
 branches together.
+**Canonical export (2026-11-09):** the v2 export is now a function of the tree alone -- every dead
+slot kind 2, every full twig without a live slot kind 3, on both clients (decision 4). The same
+tree exports to `v2.bin` byte for byte on either client, compacted or not, before or after a gov5
+leaf-store flush and reload, and from an import of any of the three fixtures
+(`audit-notes/ci/k-cross.sh` asserts it both ways). n42-rs branch
+`feat/qmdb-portable-snapshot-v2-canonical`, gov5 `feat/qmdb-portable-snapshot-v2`.
 
 
 Why: a v1 portable snapshot (`QmdbPortableSnapshot`, `verify_portable_stream`, gov5's
@@ -425,13 +431,14 @@ starts `[slot u64][kind u8]`:
 
 | kind | rest of the record | meaning | verifier |
 | --- | --- | --- | --- |
-| 0 | `[key 32][len u32][value]` | dead slot with its payload (as v1 `active = 0`) | leaf = `hash_leaf(key, value)`, bit 0 |
+| 0 | `[key 32][len u32][value]` | dead slot with its payload (as v1 `active = 0`); read, never written since 2026-11-09 (decision 4) | leaf = `hash_leaf(key, value)`, bit 0 |
 | 1 | `[key 32][len u32][value]` | live slot (as v1 `active = 1`) | leaf = `hash_leaf(key, value)`, bit 1 |
 | 2 | `[leaf_hash 32]` | tombstone: a dead slot whose payload was dropped | leaf = `leaf_hash`, bit 0 |
 | 3 | `[count u16][leaf_root 32]` | a run of `count` dead slots filling the rest of a twig from this slot, all tombstones | the twig's leaf tree root is `leaf_root`, every bit of the run 0; the next record's slot is `slot + count` |
 
 Kind 3 lets a twig that died entirely (rare under transfers, `docs/QMDB_UPGRADE_PLAN.md` 4b, but
-common under contract churn) cost 43 bytes. It is optional: an exporter may always write kind 2.
+common under contract churn) cost 43 bytes. (Originally optional; since 2026-11-09 every full twig
+without a live slot is written as kind 3, decision 4.)
 A kind 3 run may only start a twig (`slot % 2048 == 0`, `count == 2048`), so the verifier sets the
 twig's leaf root directly instead of rebuilding 2048 leaves; partial runs are written as kind 2.
 Records stay contiguous by slot (`slot` = the expected next slot, as v1), the value bound stays
@@ -490,18 +497,29 @@ the status line.)
    reopens on it, and its v2 export writes the twig back as kind 3 (`QmdbSnapshot::dead_twigs`
    carries it through the checkpoint), byte for byte the imported stream. The decoder still checks
    the record's shape (`count == 2048`, twig-aligned, inside `entry_count`;
-   `MisalignedDeadTwig`). gov5's exporter writes kind 3 for a twig whose leaves it no longer keeps
-   (a hollow twig) and, with `--whole-dead-twigs`, for any full rowless dead twig.
-4. *A gov5 node that persisted an imported tree exports its reclaimed dead rows as kind 2.*
-   gov5's `FlushTo` with a leaf store drops the entry row of every dead slot by design (the leaf
-   blob keeps its frozen hash), and a reload marks a sealed, wholly dead twig with neither a blob
-   nor a row (an imported kind-3 twig) as pruned from its meta alone. After a flush and reload, a
-   dead slot that arrived with its payload (kind 0) therefore exports as a kind-2 tombstone with
-   that payload's leaf hash, and v1 export is refused at the first dead slot (slot 0 on the
-   fixtures, `*HashOnlySlotError`) whichever fixture was imported. Root, live reads and every
-   other record are unchanged; the gov5 test pins the reloaded exports to the fixtures with exactly
-   that substitution (`reclaimedRows`). The Rust entry store keeps dead payloads, so a Rust node
-   re-exports the fixtures unchanged.
+   `MisalignedDeadTwig`). Both exporters write kind 3 for every full twig without a live slot
+   (decision 4); the Rust one computes its leaf root from the 2048 leaf hashes when it still
+   holds the payloads.
+4. *The v2 export is canonical (2026-11-09).* The first implementation wrote a dead slot with its
+   payload as kind 0 and kind 3 only on request, so the bytes depended on what the exporter still
+   held: gov5's `FlushTo` with a leaf store drops the entry row of every dead slot by design (the
+   leaf blob keeps its frozen hash), so after a flush and reload a dead slot that arrived as kind 0
+   re-exported as kind 2, and gov5's test pinned that substitution (`reclaimedRows`), while a Rust
+   node kept dead payloads and re-exported unchanged. Two clients holding one tree wrote different
+   bytes. The rule is now: **every dead slot is written as kind 2 (its leaf hash), whether or not
+   the payload is still held, and every full twig whose 2048 slots are all dead is written as one
+   kind-3 record (its leaf root), with no flag.** A dead payload is never needed by an importer:
+   a node that imports a snapshot at head H has no history below H, so no undo it can run revives
+   a slot that was dead at H, and the only paths that need a dead slot's key (undo revival, a v1
+   export) are already refused on hash-only slots. With the payloads gone the stream is a
+   function of the tree alone -- the same on either client, before or after compaction, a
+   leaf-store flush or a reload -- and two exports of one state can be compared by SHA-256.
+   Decoders keep accepting kind 0, so an older v2 stream (`v2-tombstones.bin`, frozen as the
+   pre-canonical fixture) stays importable; the header's `tombstones` stays "kind-2 plus kind-3
+   records"; v1 export is unchanged (payloads required, refused on a hash-only slot). gov5's
+   `n42-qmdb-export --whole-dead-twigs` is kept as a deprecated no-op that prints a warning. v1
+   export is refused at the first dead slot after a gov5 leaf-store flush and reload (slot 0 on
+   the fixtures, `*HashOnlySlotError`) whichever fixture was imported, as before.
 
 Where the paths that need a key refuse a tombstoned slot: Rust `QmdbUndoError::HashOnlySlot`
 (undo revival), `NodeStateError::PortableCompacted` / `QmdbPortableError::HashOnlySlot` (v1

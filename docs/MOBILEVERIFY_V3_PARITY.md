@@ -5,7 +5,8 @@ verification" at the end). Open:
 
 - a run on chain 94's genesis (all runs so far are on `n42_devnet.json`);
 - packet latency for Rust-built blocks: up to one 250 ms head poll, or one `newHeads` notification
-  with packetd `-ws` (gov5 8fe815dc; live measurement pending);
+  with packetd `-ws` (gov5 8fe815dc; measured 2026-11-09: p50 2.2 ms, max 4.7 ms with `-ws`
+  against p50 133 ms, max 251 ms on the poll);
 - registry index divergence between nodes when a registration straddles an epoch boundary (each
   node commits on its own timer, as in gov5);
 - the reward model (gov5 item 8);
@@ -495,7 +496,24 @@ Left for stage 3:
   poll. Run it as `mobileverify-packetd -rpc http://127.0.0.1:18545 -ws ws://127.0.0.1:18546 -mv …`
   (the execution layer needs `--ws`). Unit tests: `TestHeadSubscriberWakesOnEveryHeadAndReconnects`,
   `TestFollowerBuildsOnNewHeadWithoutWaitingForThePoll` (block built 0.6 ms after its notification
-  with a one-minute poll). A live devnet latency measurement with `-ws` is still to run.
+  with a one-minute poll).
+  **Measured live 2026-11-09** (rounds `d4-poll` and `d4-ws`, `audit-notes/devnet/d4-*/`, driver
+  `audit-notes/scripts/j-d4.sh`): two all-Rust `devnet-mobileanchor.sh --txload` rounds, 360 s each,
+  Rust natives of main 0ed56c1da, packetd built from 8fe815dc, the second with `PACKETD_WS=1`
+  (`scripts/devnet-fleet.sh`, 0a46be77a: EL `--ws` on 18546, packetd `-ws`). Latency is the EL's
+  `Canonical chain committed` line to packetd's `packetd: packet` line for the same block
+  (`audit-notes/scripts/j-d4-latency.py`, `<round>/latency.out`), 120 blocks each:
+
+  | round | commit to packet p50 / p90 / max | of which waiting to start | build |
+  | --- | --- | --- | --- |
+  | `d4-poll` (250 ms poll) | 133.3 / 227.4 / 251.0 ms | p50 130.2 ms | p50 2.9 ms |
+  | `d4-ws` (`newHeads`) | 2.2 / 2.8 / 4.7 ms | p50 -0.3 ms (the notification precedes the EL's log line) | p50 2.5 ms |
+
+  Both rounds otherwise read the same: 120 commits on every validator, 0 timeouts, EL errors 0,
+  packetd 120 packets for 120 blocks (the `-ws` round's one error line is genesis, "no parent
+  state", as in every mv round), device 20/20 certified on both devices with 0 skipped and 0
+  failures. The subscription stayed up the whole round (one `subscribed to newHeads`, no `lost`).
+  The sub-50 ms acceptance holds with a 10x margin.
 
 
 ## Gate verification

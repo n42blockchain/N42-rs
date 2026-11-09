@@ -2004,3 +2004,161 @@ fn cross_client_portable_v2() {
     drop(node);
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// An empty HotStuff block's execution as the builder's bundle holds it:
+/// the beacon-roots contract's two ring slots for the timestamp, the
+/// history-storage slot of the parent's number, the block reward credited
+/// to `beneficiary` as a withdrawal, and the Prague system caller.
+fn empty_block_bundle(number: u64, beneficiary: u8) -> reth_trie::bundle_state::BundleState {
+    use evm2::evm::AccountInfo;
+    use reth_trie::bundle_state::{AccountStatus, BundleAccount, BundleState, StorageSlot};
+    let beacon_roots = alloy_primitives::address!("000F3df6D732807Ef1319fB7B8bB8522d0Beac02");
+    let history = alloy_primitives::address!("0000F90827F1C53a10cb7A02335B175320002935");
+    let contract = AccountInfo { nonce: 1, ..Default::default() };
+    let timestamp = 1_000 + number;
+    let mut bundle = BundleState::default();
+    let mut beacon_storage = std::collections::HashMap::default();
+    beacon_storage.insert(U256::from(timestamp % 8191), StorageSlot::new_changed(U256::ZERO, U256::from(timestamp)));
+    beacon_storage.insert(
+        U256::from(timestamp % 8191 + 8191),
+        StorageSlot::new_changed(U256::ZERO, U256::from(number * 31 + 7)),
+    );
+    bundle.state.insert(
+        beacon_roots,
+        BundleAccount::new(Some(contract.clone()), Some(contract.clone()), beacon_storage, AccountStatus::Changed),
+    );
+    let mut history_storage = std::collections::HashMap::default();
+    history_storage
+        .insert(U256::from((number - 1) % 8191), StorageSlot::new_changed(U256::ZERO, U256::from(number * 17 + 3)));
+    bundle.state.insert(
+        history,
+        BundleAccount::new(Some(contract.clone()), Some(contract), history_storage, AccountStatus::Changed),
+    );
+    let reward = U256::from(1_000_000_000_000_000_000u128);
+    let before = AccountInfo { balance: reward * U256::from(number - 1), ..Default::default() };
+    let after = AccountInfo { balance: reward * U256::from(number) + U256::from(beneficiary), ..Default::default() };
+    bundle.state.insert(
+        Address::with_last_byte(0xE0 + beneficiary),
+        BundleAccount::new(Some(before), Some(after), Default::default(), AccountStatus::Changed),
+    );
+    bundle.state.insert(
+        crate::changes::PRAGUE_SYSTEM_CALLER,
+        BundleAccount::new(None, Some(AccountInfo::default()), Default::default(), AccountStatus::Changed),
+    );
+    bundle
+}
+
+fn empty_block_ops(number: u64, beneficiary: u8) -> QmdbOps {
+    crate::sorted_operations_from_execution(&empty_block_bundle(number, beneficiary), true)
+}
+
+/// The interleaving at the loop351 tenure handover (block 7167,
+/// `docs/RETH_2_10_0_UPGRADE.md`, second occurrence), on one node state
+/// shared by every validator as on the fleet's single execution layer:
+/// on parent P, E1 is the outgoing leader's chain build (another
+/// beneficiary, filed), E2 the incoming leader's FCU payload job (given
+/// up, its root filed late), E3 the incoming leader's own build, filed and
+/// renamed to the sealed hash S; the chain-ahead child C is built on S; then
+/// E2's late root job resolves and files; then the forkchoice to S must
+/// stand the tree at S with S's header root. Variants: E2 sharing E3's
+/// built hash (identical attributes) or not, E2's root computed early or
+/// late, C filed or not, leased or locked roots, heap or entry file, the
+/// canonical head deferred or not.
+#[test]
+fn a_handover_with_a_late_given_up_payload_job_replays_to_the_sealed_root() {
+    let chain = qmdb_chain();
+    let parent_ops = empty_block_ops(1, 6);
+    // The reference: S's root on a state that only ever saw P and S.
+    let reference_root = {
+        let dir = scratch("handover-reference");
+        let reference = QmdbNodeState::new(chain.clone(), &dir);
+        reference.initialize((0, chain.genesis_hash())).expect("initialize");
+        let p = reference.compute_operations(chain.genesis_hash(), parent_ops.clone()).expect("P");
+        reference.insert(B256::repeat_byte(0x10), 1, p).expect("insert P");
+        let s = reference.compute_operations(B256::repeat_byte(0x10), empty_block_ops(2, 0)).expect("S");
+        let other = reference.compute_operations(B256::repeat_byte(0x10), empty_block_ops(2, 6)).expect("E1");
+        assert_ne!(s.root, other.root, "the two leaders' blocks differ");
+        drop(reference);
+        let _ = std::fs::remove_dir_all(&dir);
+        s.root
+    };
+    let mut cases = 0;
+    for shared_hash in [false, true] {
+        for e2_compute_late in [false, true] {
+            for child_filed in [false, true] {
+                for offlock in [false, true] {
+                    for entry_file in [false, true] {
+                        for canonical_defer in [false, true] {
+                            let name = format!(
+                                "handover-{}{}{}{}{}{}",
+                                shared_hash as u8, e2_compute_late as u8, child_filed as u8, offlock as u8,
+                                entry_file as u8, canonical_defer as u8
+                            );
+                            let dir = scratch(&name);
+                            let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, entry_file);
+                            state.set_compute_offlock(offlock);
+                            state.set_canonical_defer(canonical_defer);
+                            state.initialize((0, chain.genesis_hash())).expect("initialize");
+                            let genesis = chain.genesis_hash();
+
+                            // P (block 1), canonical.
+                            let p = B256::repeat_byte(0x10);
+                            let prepared = state.compute_operations(genesis, parent_ops.clone()).expect("P");
+                            state.insert(p, 1, prepared).expect("insert P");
+                            state.on_canonical(p).expect("P canonical");
+
+                            let h1 = B256::repeat_byte(0x21);
+                            let h3 = B256::repeat_byte(0x23);
+                            let h2 = if shared_hash { h3 } else { B256::repeat_byte(0x22) };
+                            let s = B256::repeat_byte(0x33);
+                            let c = B256::repeat_byte(0x44);
+
+                            // E1: the outgoing leader's chain build, filed.
+                            let e1 = state.compute_operations(p, empty_block_ops(2, 6)).expect("E1");
+                            state.insert(h1, 2, e1).expect("insert E1");
+                            // E2's root computed now (its insert comes late).
+                            let mut e2 = (!e2_compute_late)
+                                .then(|| state.compute_operations(p, empty_block_ops(2, 0)).expect("E2 early"));
+                            // E3: the incoming leader's own build, filed and
+                            // renamed to its sealed hash.
+                            let e3 = state.compute_operations(p, empty_block_ops(2, 0)).expect("E3");
+                            let header_root = e3.root;
+                            assert_eq!(header_root, reference_root, "{name}: E3's root");
+                            state.insert(h3, 2, e3).expect("insert E3");
+                            state.rename(h3, s).expect("rename E3");
+                            // C: the chain-ahead child on S.
+                            let child = state.compute_operations(s, empty_block_ops(3, 0)).expect("C");
+                            let child_root = child.root;
+                            if child_filed {
+                                state.insert(c, 3, child).expect("insert C");
+                            }
+                            // E2's late root job resolves and files.
+                            if e2.is_none() {
+                                e2 = Some(state.compute_operations(p, empty_block_ops(2, 0)).expect("E2 late"));
+                            }
+                            let e2 = e2.expect("E2");
+                            assert_eq!(e2.root, header_root, "{name}: E2 and E3 are the same block");
+                            state.insert(h2, 2, e2).expect("insert E2");
+
+                            // The forkchoice to S.
+                            state.on_canonical(s).unwrap_or_else(|err| panic!("{name}: FCU to S: {err}"));
+                            state.settle_canonical().unwrap_or_else(|err| panic!("{name}: settle: {err}"));
+                            assert_eq!(state.root_of(&s), Some(header_root), "{name}: S's root");
+                            // And the next build on S lands where C did.
+                            let again = state.compute_operations(s, empty_block_ops(3, 0)).expect("C again");
+                            assert_eq!(again.root, child_root, "{name}: C's root on S");
+                            if child_filed {
+                                state.on_canonical(c).unwrap_or_else(|err| panic!("{name}: FCU to C: {err}"));
+                                assert_eq!(state.root_of(&c), Some(child_root), "{name}: C's root");
+                            }
+                            drop(state);
+                            let _ = std::fs::remove_dir_all(&dir);
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 64);
+}

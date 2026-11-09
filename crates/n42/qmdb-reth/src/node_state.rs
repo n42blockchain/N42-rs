@@ -734,6 +734,15 @@ pub const fn committed_floor(safe: u64, depth: u64) -> u64 {
     if safe == 0 { 0 } else { safe.saturating_add(depth) }
 }
 
+/// [`committed_floor`] for either settlement-tags mode. Under the `legacy`
+/// tags (`N42_SETTLEMENT_TAGS=legacy`) `safe` is the committed block itself,
+/// so the floor is `safe` and the depth plays no part: `safe + depth` would
+/// refuse the certified blocks above the committed one, which the next
+/// leader may build on.
+pub const fn committed_floor_for(safe: u64, depth: u64, legacy: bool) -> u64 {
+    if legacy { safe } else { committed_floor(safe, depth) }
+}
+
 struct Inner {
     forest: Mutex<Option<QmdbForest>>,
     /// The entry-file compaction's schedule (`crate::entry_compaction`).

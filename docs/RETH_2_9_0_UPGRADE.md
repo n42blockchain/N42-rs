@@ -926,6 +926,16 @@ Devnet check of the seal path (`ci/f5d-gate.log`, `devnet/f5g1-*`):
   head, and every later build on genesis was refused as stale. All builds in it were empty
   (`no-candidates`), so the evm2 seal path never ran. This is not a g1 effect; it is noted for the
   devnet's deferred start-up.
+  **Re-run 2026-11-09 as `j-seal2`** (same shape and env, `audit-notes/scripts/j-seal2.sh`, natives
+  `reth210-native/release` = main 0ed56c1da, log `audit-notes/ci/j-seal2.log`, fleet
+  `audit-notes/devnet/j-seal2/`): **it stalls the same way, to the count**: height 1, 0 commits on
+  every validator, 22/22/22/19 view timeouts over 11 views, the late EL at 0. Block 1 (empty,
+  `no-candidates`) became the main EL's canonical head 1 s after start (00:14:21Z), and every later
+  build is refused: `refused a build on block 0 (0x112489f0…): it is below the canonical head 1, a
+  stale parent` (11 times; the leader then logs `could not build a block to propose err=missing
+  payload`). g5's committed floor does not cover it, and with the identical numbers it looks
+  deterministic under `N42_SEAL_AT_EXEC=1` rather than a race (f5g1-seal without it, and
+  f5g5-fix with X22, both advanced: 98 and 56 blocks).
 
 #### E10, and the order after it
 
@@ -1650,8 +1660,9 @@ brings it back:
   against the serial Amsterdam execution. The `mobileverify-v3-parity` decision (gov5 runs
   Amsterdam on any IsGlamsterdam chain) is the user's and decides whether this lands before or
   after chain 94's flip.
-- **The deferred-genesis devnet start-up race** (f5g1-seal2). **Probably closed by g5; not
-  re-run.** Validator 0 proposed block 1 before the others were up, its block became the EL's
+- **The deferred-genesis devnet start-up race** (f5g1-seal2). **Not closed: re-run 2026-11-09
+  (`j-seal2`, today's natives) stalled at block 1 with the same counts and the same stale-parent
+  refusal (details at the f5g1-seal2 bullet above); still open.** Earlier note: Validator 0 proposed block 1 before the others were up, its block became the EL's
   canonical head, and every later build on genesis was refused as stale. g5's committed floor
   (020cb0de5: forkchoice safe + the deferred depth) lets a build on the committed block, genesis
   here, pass the stale-build guard, which is the refusal that stalled it. To confirm, rerun

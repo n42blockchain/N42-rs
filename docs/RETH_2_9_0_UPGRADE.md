@@ -921,21 +921,44 @@ Devnet check of the seal path (`ci/f5d-gate.log`, `devnet/f5g1-*`):
   - The run had X22's devnet timeouts (40 per validator, as in f5e-x22).
   - The seal-first phases line prints only for blocks of 1,000 transactions or more, so the devnet
     shows no count of early seals.
-- **f5g1-seal2** (deferred, tenure 8, seal-at-exec, no X22) stalled at block 1. It was a start-up race:
-  validator 0 proposed block 1 before the others were up, its own block became the EL's canonical
-  head, and every later build on genesis was refused as stale. All builds in it were empty
-  (`no-candidates`), so the evm2 seal path never ran. This is not a g1 effect; it is noted for the
-  devnet's deferred start-up.
-  **Re-run 2026-11-09 as `j-seal2`** (same shape and env, `audit-notes/scripts/j-seal2.sh`, natives
-  `reth210-native/release` = main 0ed56c1da, log `audit-notes/ci/j-seal2.log`, fleet
-  `audit-notes/devnet/j-seal2/`): **it stalls the same way, to the count**: height 1, 0 commits on
-  every validator, 22/22/22/19 view timeouts over 11 views, the late EL at 0. Block 1 (empty,
-  `no-candidates`) became the main EL's canonical head 1 s after start (00:14:21Z), and every later
-  build is refused: `refused a build on block 0 (0x112489f0…): it is below the canonical head 1, a
-  stale parent` (11 times; the leader then logs `could not build a block to propose err=missing
-  payload`). g5's committed floor does not cover it, and with the identical numbers it looks
-  deterministic under `N42_SEAL_AT_EXEC=1` rather than a race (f5g1-seal without it, and
-  f5g5-fix with X22, both advanced: 98 and 56 blocks).
+- **f5g1-seal2** (deferred, tenure 8, seal-at-exec, no X22) stalled at block 1. **Fixed 2026-11-09
+  (ec37fa9ca, branch `fix/deferred-genesis-stale-parent`; round `l-seal2` passed).**
+  - Re-run 2026-11-09 as `j-seal2` (natives of main 0ed56c1da, log `audit-notes/ci/j-seal2.log`, fleet
+    `audit-notes/devnet/j-seal2/`): the same stall, to the count: height 1, 0 commits on every
+    validator, 22/22/22/19 view timeouts over 11 views, the late EL at 0, and 11 refusals
+    `refused a build on block 0 (0x112489f0…): it is below the canonical head 1, a stale parent`.
+  - Mechanism. Validator 0 leads views 1-8 (tenure 8) and starts about 1 s before validators 1 and 2
+    (validator 3 is the late member). It proposed block 1 (empty) at 00:14:21.47Z. Validator 1 was
+    not up yet, so only validator 2 voted, and with v0's own vote that is 2 of 4: no QC. Right after
+    its own block's import, v0's build ahead sent a forkchoice to block 1 with attributes for block
+    2, and that forkchoice made the uncommitted block 1 the EL's canonical head. That is by design
+    (F5g5). View 1 timed out and the TC moved to view 2, again led by v0. Its proposal built on its
+    high-QC block, genesis, which is also correct. The QMDB stale-build guard refused that build. Its
+    committed floor (`bin/n42/src/main.rs`) was read as `safe + depth`, and at that point `safe` was
+    still the driver's genesis floor (0) while the deferred depth is 1, so the floor was 1. Genesis
+    sat below the floor and below the head, so the build was refused, and every later view of the
+    tenure failed the same way (`could not build a block to propose err=missing payload`).
+  - The wrong component is the guard's floor, not the forkchoice and not the builder's parent choice.
+    Under the split tags, `safe = committed - depth` holds only once the chain is past `depth` blocks.
+    Before that, `safe` sits at the genesis floor while the committed block can be anywhere in
+    `0..=depth`, and `safe + depth` overstates it. g5's floor (020cb0de5) covered the same case
+    higher up the chain but not at genesis.
+  - The same stall can happen with or without seal-at-exec. f5g1-seal passed because all three
+    early validators were up when view 1 started, and validator 1 led view 1, so view 1 got its QC.
+  - Fix. `n42_qmdb_reth::committed_floor(safe, depth)` is 0 while `safe` is at the genesis floor
+    and `safe + depth` after that. The guard behaves as before once the chain is past its first
+    `depth` blocks, so fleet7/X22 legs, which start from genesis, see a looser guard only for
+    blocks 1..=depth. Unit test
+    `a_build_on_genesis_under_an_uncommitted_own_head_builds_at_the_genesis_floor` (n42-qmdb-reth).
+  - Gates: `ci/l-check.log`, `ci/l-clippy.log` (clippy-n42, -D warnings), `ci/l-tests.log`
+    (n42-qmdb-reth, n42-qmdb-state, n42, n42-h2-execution: 467 passed, 0 failed), natives
+    `/data/n42-build/seal2-native/release` (`ci/l-natives.log`).
+  - Round `l-seal2` 2026-11-09 02:10-02:15Z (`audit-notes/scripts/l-seal2.sh`, the j-seal2 shape on
+    the fixed natives, log `ci/l-seal2-round.log`, fleet `audit-notes/devnet/l-seal2/`). The same
+    start-up hit again: v0's view-1 block 0x2e676b55… had no QC and became the EL head, and view 1
+    timed out. View 2 then built a sibling block 1 on genesis (0x25e1201d…) and the chain went on.
+    Results: 0 stale-parent refusals; commits 98/98/98/94, timeouts 2/2/2/0; main and late EL both
+    at height 100 with blocks 1..100 the same on both; 1,002 transactions in 83 blocks; EL ERROR 0.
 
 #### E10, and the order after it
 
@@ -1660,14 +1683,13 @@ brings it back:
   against the serial Amsterdam execution. The `mobileverify-v3-parity` decision (gov5 runs
   Amsterdam on any IsGlamsterdam chain) is the user's and decides whether this lands before or
   after chain 94's flip.
-- **The deferred-genesis devnet start-up race** (f5g1-seal2). **Not closed: re-run 2026-11-09
-  (`j-seal2`, today's natives) stalled at block 1 with the same counts and the same stale-parent
-  refusal (details at the f5g1-seal2 bullet above); still open.** Earlier note: Validator 0 proposed block 1 before the others were up, its block became the EL's
-  canonical head, and every later build on genesis was refused as stale. g5's committed floor
-  (020cb0de5: forkchoice safe + the deferred depth) lets a build on the committed block, genesis
-  here, pass the stale-build guard, which is the refusal that stalled it. To confirm, rerun
-  f5g1-seal2's shape (deferred, tenure 8, seal-at-exec, validators started apart). The F6 field
-  gate does not include that shape.
+- **The deferred-genesis devnet start-up race** (f5g1-seal2). **Fixed 2026-11-09 (ec37fa9ca,
+  branch `fix/deferred-genesis-stale-parent`).** The stale-build guard's committed floor `safe + depth`
+  overstated the committed block while `safe` was still at the genesis floor. After a view-1 timeout
+  whose uncommitted own block a build ahead had made canonical, the floor refused the next leader's
+  build on genesis for the whole tenure. `committed_floor()` now takes genesis as committed at that
+  floor. Round `l-seal2` (the j-seal2 shape) hit the same view-1 timeout, built on genesis and
+  committed 98/98/98/94 with the late EL at 100 (details at the f5g1-seal2 bullet above).
 - **The empty `N42_TX_INGEST`.** **Fixed in F6a.** `scripts/fleet7.sh` passes `N42_TX_INGEST=` to a
   node that serves no ingest, and `bin/n42` logged "N42_TX_INGEST is not an address" at ERROR once
   per node. An empty or blank value now reads as unset.

@@ -672,6 +672,36 @@ impl BlockChangesParts {
     }
 }
 
+/// Blocks of at most this many leaf operations are traced
+/// ([`forest_trace`]) without `N42_QMDB_FOREST_TRACE`: an empty block's
+/// system-contract writes and reward (~5-10 operations). Both same-parent
+/// root mismatches (`GA1b` at 8191, `loop351` at 7167) were at empty-block
+/// tenure handovers, and a loaded block never is this small.
+pub const FOREST_TRACE_SMALL_OPS: usize = 64;
+
+/// `N42_QMDB_FOREST_TRACE=1`: every forest insert, rename and tree move is
+/// logged on `n42.qmdb`, whatever the block's size. Read once.
+pub fn forest_trace_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_FOREST_TRACE").is_ok_and(|value| value == "1"))
+}
+
+/// Whether a forest event touching a block of `ops` leaf operations is
+/// logged: always under `N42_QMDB_FOREST_TRACE=1`, otherwise only for an
+/// empty-shaped block ([`FOREST_TRACE_SMALL_OPS`]), so a loaded leg pays one
+/// length compare per event.
+fn forest_trace(ops: usize) -> bool {
+    ops <= FOREST_TRACE_SMALL_OPS || forest_trace_env()
+}
+
+/// What [`QmdbForest::rename`] did, for its trace line.
+#[derive(Debug, Clone, Copy)]
+enum RenameOutcome {
+    Moved,
+    AlreadyRenamed,
+    SameRootHeld,
+}
+
 /// Says once per process which of the apply's switches this forest runs
 /// with (`N42_QMDB_PARALLEL_APPLY`).
 fn log_switches_once() {
@@ -1259,19 +1289,40 @@ impl QmdbForest {
         if from == to {
             return Ok(());
         }
+        let ops = self.records.get(&from).or_else(|| self.records.get(&to)).map_or(0, |record| record.ops.len());
+        let tip_before = self.tip;
+        let renamed = self.rename_inner(from, to);
+        if forest_trace(ops) {
+            let outcome = match &renamed {
+                Ok(RenameOutcome::Moved) => "moved",
+                Ok(RenameOutcome::AlreadyRenamed) => "from gone, to held: already renamed",
+                Ok(RenameOutcome::SameRootHeld) => "to already held with the same root: no-op, from kept",
+                Err(_) => "refused",
+            };
+            tracing::info!(
+                target: "n42.qmdb",
+                %from, %to, from_root = ?self.root_of(&from), to_root = ?self.root_of(&to),
+                tip_before = %tip_before, tip = %self.tip, error = ?renamed.as_ref().err(),
+                "forest rename: {outcome}",
+            );
+        }
+        renamed.map(drop)
+    }
+
+    fn rename_inner(&mut self, from: B256, to: B256) -> Result<RenameOutcome, StateError> {
         let Some(from_root) = self.root_of(&from) else {
             // Already renamed by an earlier caller -- the build-on-seal path
             // files a build under its sealed hash before the import's hand-off
             // gets to it, and both must succeed. A `from` that is gone while
             // `to` is held is that case; a `from` that is gone with no `to`
             // is a block this forest never had.
-            return if self.root_of(&to).is_some() { Ok(()) } else { Err(StateError::UnknownBlock(from)) };
+            return if self.root_of(&to).is_some() { Ok(RenameOutcome::AlreadyRenamed) } else { Err(StateError::UnknownBlock(from)) };
         };
         if let Some(existing) = self.root_of(&to) {
             // Already filed under the sealed hash -- by an earlier rename, or by
             // a validation that computed it -- with the same root: nothing to do.
             // A different root under that hash is a block this is not.
-            return if existing == from_root { Ok(()) } else { Err(StateError::UnknownBlock(to)) };
+            return if existing == from_root { Ok(RenameOutcome::SameRootHeld) } else { Err(StateError::UnknownBlock(to)) };
         }
         let mut record = self.records.remove(&from).ok_or(StateError::UnknownBlock(from))?;
         if let Some(delta) = record.delta.as_mut() {
@@ -1296,7 +1347,7 @@ impl QmdbForest {
                 child.parent = to;
             }
         }
-        Ok(())
+        Ok(RenameOutcome::Moved)
     }
 
     /// The state root at the canonical head.
@@ -1449,9 +1500,20 @@ impl QmdbForest {
     /// layer validates it — and both arrive at the same root.
     pub fn insert(&mut self, block_hash: B256, number: u64, prepared: PreparedBlock) -> Result<(), StateError> {
         self.refuse_poisoned()?;
-        if self.records.contains_key(&block_hash) {
+        let traced = forest_trace(prepared.ops.len());
+        if let Some(held) = self.records.get(&block_hash) {
+            if traced {
+                tracing::info!(
+                    target: "n42.qmdb",
+                    %block_hash, number, parent = %prepared.parent, offered_root = %prepared.root,
+                    held_parent = %held.parent, held_root = %held.root, same_root = held.root == prepared.root,
+                    pending = ?self.pending.as_ref().map(|(parent, _)| (*parent, self.pending_root)),
+                    tip = %self.tip, "forest insert: already held, kept (early return)",
+                );
+            }
             return Ok(());
         }
+        let pending_before = self.pending.as_ref().map(|(parent, _)| (*parent, self.pending_root));
         // The pending work is this very block, on the same parent: adopt it as
         // applied rather than reverting and replaying it. Another block
         // computed on the same parent since (a second build of the same
@@ -1472,6 +1534,18 @@ impl QmdbForest {
             None => None,
         };
         let applied = undo.is_some();
+        if traced {
+            let outcome = match (applied, pending_before) {
+                (true, _) => "adopted the pending application",
+                (false, Some(_)) => "filed unapplied, pending block reverted",
+                (false, None) => "filed unapplied, nothing pending",
+            };
+            tracing::info!(
+                target: "n42.qmdb",
+                %block_hash, number, parent = %prepared.parent, root = %prepared.root, ops = prepared.ops.len(),
+                pending = ?pending_before, tip_before = %self.tip, "forest insert: {outcome}",
+            );
+        }
         let delta = prepared.delta.map(|mut delta| {
             delta.head_number = number;
             delta.head_hash = block_hash;
@@ -1880,7 +1954,8 @@ impl QmdbForest {
         // Below both what is synced and what the log holds: a cut above the
         // logged cursor reverts only blocks no restart replays.
         let synced = self.flushed_slots.min(self.logged_slots);
-        if let Some((parent, undo)) = self.pending.take() {
+        let from = self.tip;
+        let pending_reverted = if let Some((parent, undo)) = self.pending.take() {
             if let Err(err) = self.tree.apply_undo(&undo) {
                 // A refused undo left the pending block applied: it stays
                 // pending (a failure part way poisons the forest).
@@ -1889,8 +1964,21 @@ impl QmdbForest {
                 return Err(err);
             }
             self.note_move(&undo);
-        }
+            Some((parent, self.pending_root))
+        } else {
+            None
+        };
         if self.tip == target {
+            if pending_reverted.is_some() {
+                self.check_tree_at(target, "reverting the pending block");
+                if self.records.get(&target).is_some_and(|record| forest_trace(record.ops.len())) {
+                    tracing::info!(
+                        target: "n42.qmdb",
+                        %from, %target, pending = ?pending_reverted, reverted = 0, replayed = 0,
+                        "forest move: pending block reverted, tree at the target",
+                    );
+                }
+            }
             return Ok(());
         }
         if !self.records.contains_key(&target) {
@@ -1940,6 +2028,10 @@ impl QmdbForest {
             self.tip = parent;
         }
         self.tip = common;
+        let reverted = up_from_tip.iter().take_while(|hash| **hash != common).count();
+        if reverted > 0 || pending_reverted.is_some() {
+            self.check_tree_at(common, "reverting to the common ancestor");
+        }
 
         // Re-apply, oldest first, down to the target. Each block must land on
         // the root it had before — the whole premise of reverting is that it
@@ -1949,6 +2041,20 @@ impl QmdbForest {
             .take_while(|hash| **hash != common)
             .copied()
             .collect();
+        let small = descend
+            .iter()
+            .chain(up_from_tip.iter().take(reverted))
+            .filter_map(|hash| self.records.get(hash))
+            .map(|record| record.ops.len())
+            .max()
+            .unwrap_or(0);
+        if forest_trace(small) {
+            tracing::info!(
+                target: "n42.qmdb",
+                %from, %target, %common, pending = ?pending_reverted, reverted, replayed = descend.len(),
+                "forest move",
+            );
+        }
         for hash in descend.iter().rev() {
             let record = self
                 .records
@@ -1996,6 +2102,24 @@ impl QmdbForest {
             self.cut_syncs += 1;
         }
         Ok(())
+    }
+
+    /// After a revert, whether the tree's root is the root the forest holds
+    /// for the block it now says the tree stands at. A difference is a
+    /// mislabelled tree -- the state under `at` is not `at`'s -- caught at
+    /// the move that exposes it rather than at a later replay; logged at
+    /// ERROR with both roots (`docs/RETH_2_10_0_UPGRADE.md`, second
+    /// occurrence). One root read per move that reverted something.
+    fn check_tree_at(&self, at: B256, what: &str) {
+        let Some(expected) = self.records.get(&at).map(|record| record.root) else { return };
+        let got = B256::from(self.tree.root());
+        if got != expected {
+            tracing::error!(
+                target: "n42.qmdb",
+                block = %at, expected = %expected, tree_root = %got,
+                "QMDB tree root after {what} is not the root filed for the block it stands at (mislabelled tree)",
+            );
+        }
     }
 
     /// `hash` and its held ancestors, nearest first.

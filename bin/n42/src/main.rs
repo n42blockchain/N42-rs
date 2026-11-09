@@ -325,10 +325,13 @@ fn main() {
                             // deferred-execution depth (`safe` is the block whose
                             // execution a committed child carries, under the default
                             // `split` settlement tags; under `legacy` it is the
-                            // committed block itself, and the floor is then stricter,
-                            // never looser, than the committed block).
+                            // committed block itself, and the floor is `safe`).
                             let provider = node.provider.clone();
                             let genesis = node.provider.chain_spec().genesis().clone();
+                            // The validator's `N42_SETTLEMENT_TAGS` (h2-execution
+                            // `settlement.rs`), read here too: under `legacy` the
+                            // floor is `safe` itself.
+                            let legacy_tags = std::env::var("N42_SETTLEMENT_TAGS").is_ok_and(|value| value.trim() == "legacy");
                             qmdb.set_committed_source(Some(std::sync::Arc::new(move || {
                                 let safe = reth_provider::BlockIdReader::safe_block_num_hash(&provider).ok()??;
                                 let now = std::time::SystemTime::now()
@@ -341,7 +344,7 @@ fn main() {
                                 };
                                 // `safe` at the genesis floor: the committed block may be
                                 // genesis itself (`n42_qmdb_reth::committed_floor`).
-                                Some(n42_qmdb_reth::committed_floor(safe.number, depth))
+                                Some(n42_qmdb_reth::committed_floor_for(safe.number, depth, legacy_tags))
                             })));
                         }
                         // The QMDB state is registered as the state reader on every QMDB

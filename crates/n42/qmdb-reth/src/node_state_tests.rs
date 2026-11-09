@@ -438,6 +438,10 @@ fn a_build_on_genesis_under_an_uncommitted_own_head_builds_at_the_genesis_floor(
     assert_eq!(crate::committed_floor(0, 2), 0);
     assert_eq!(crate::committed_floor(1, 1), 2);
     assert_eq!(crate::committed_floor(7, 2), 9);
+    // Legacy tags: `safe` is the committed block, the depth adds nothing.
+    assert_eq!(crate::committed_floor_for(0, 1, true), 0);
+    assert_eq!(crate::committed_floor_for(7, 2, true), 7);
+    assert_eq!(crate::committed_floor_for(7, 2, false), 9);
     for offlock in [false, true] {
         let (state, _view, hashes) = viewed(if offlock { "genesis-floor-offlock" } else { "genesis-floor" }, 1);
         state.set_compute_offlock(offlock);

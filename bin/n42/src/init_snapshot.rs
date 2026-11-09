@@ -29,7 +29,7 @@ use eyre::{bail, Context as _};
 use n42_engine_types::N42Node;
 use n42_qmdb_reth::{state_scheme, N42ChainSpecParser, QmdbNodeState, StateScheme};
 use n42_twig_core::qmdb_compat::{
-    encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbPortableSnapshot,
+    encode_gov5_account_value, gov5_account_key, gov5_storage_key, PortableFormat, QmdbCompatTree, QmdbPortableTree,
 };
 use reth_chainspec::EthChainSpec;
 use reth_cli_commands::{
@@ -118,6 +118,12 @@ struct ExportArgs {
     /// Where the portable QMDB snapshot goes.
     #[arg(long, value_name = "SNAPSHOT")]
     qmdb_out: PathBuf,
+    /// The portable layout: `v1` (every slot's key and value; refused on a
+    /// compacted tree) or `v2` (the tombstone layout,
+    /// `docs/QMDB_COMPACTION_DESIGN.md` section 6). Unset: v1, or v2 when the
+    /// tree has compacted twigs.
+    #[arg(long, value_name = "v1|v2")]
+    format: Option<PortableFormat>,
 }
 
 /// One account line of the JSONL, as reth's `init-state` reads it.
@@ -248,7 +254,8 @@ fn authenticated_tree(
     head: (u64, B256),
     root: B256,
 ) -> eyre::Result<QmdbCompatTree> {
-    let snapshot = QmdbPortableSnapshot::decode(portable).map_err(|e| eyre::eyre!("portable snapshot: {e}"))?;
+    // Either layout: v1, or v2 whose tombstones rebuild as hash-only slots.
+    let (_, snapshot) = QmdbPortableTree::decode(portable).map_err(|e| eyre::eyre!("portable snapshot: {e}"))?;
     let at = (snapshot.block_number, B256::from(snapshot.block_hash));
     if at != head {
         bail!("the portable snapshot is at block {} {}, the header at {} {}", at.0, at.1, head.0, head.1);
@@ -472,9 +479,10 @@ fn export(args: ExportArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     println!("header -> {}", header_path.display());
 
     let qmdb = QmdbNodeState::new(chain.inner().clone(), data_dir.data_dir().join("qmdb"));
-    let portable = qmdb.portable_export(chain.chain().id(), chain.genesis_hash())?;
+    let portable = qmdb.portable_export_as(chain.chain().id(), chain.genesis_hash(), args.format)?;
     fs::write(&args.qmdb_out, &portable)?;
-    println!("QMDB snapshot: {} bytes -> {}", portable.len(), args.qmdb_out.display());
+    let format = PortableFormat::detect(&portable).map_or_else(|| "?".to_owned(), |format| format.to_string());
+    println!("QMDB snapshot ({format}): {} bytes -> {}", portable.len(), args.qmdb_out.display());
     Ok(())
 }
 

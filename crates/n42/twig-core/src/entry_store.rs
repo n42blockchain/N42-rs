@@ -172,6 +172,15 @@ const RELOCATED_BIT: u64 = 1 << 63;
 const TAG_LIVE: u8 = 0x01;
 const TAG_DEAD: u8 = 0x02;
 const TAG_END: u8 = 0x03;
+/// A whole dead twig kept only as its leaf root: one record, `[tag][first
+/// slot u64][leaf_root 32]`, which every slot of the twig points at, then
+/// the trailer. Written for a twig imported from a kind-3 record of the
+/// tombstone portable snapshot (`docs/QMDB_COMPACTION_DESIGN.md` section 6):
+/// its 2048 leaf hashes were never known here.
+const TAG_ROOT: u8 = 0x04;
+/// What a slot of a root-only twig reads as: hash-only, with a placeholder
+/// hash. The twig's leaf root is the commitment; nothing hashes its slots.
+static ROOT_ONLY_SLOT: Hash = [0; 32];
 /// A relocated record's tag and slot, before the payload or the hash.
 const RELOCATED_HEAD: usize = 1 + 8;
 /// A dead record: tag, slot, leaf hash.
@@ -193,6 +202,19 @@ fn refused(message: String) -> io::Error {
 /// The record layout in the file: the key, the value's length, the value.
 const KEY_LEN: usize = 32;
 const LEN_LEN: usize = 4;
+/// The length field of a hash-only record in `entries.log`: the key field
+/// holds the slot's leaf hash and no value follows. Written for a dead slot
+/// imported from a portable tombstone (kind 2) outside a full twig, which a
+/// relocated group cannot hold yet (a gov5 node reclaims dead rows in its
+/// active twig too). No value reaches 4 GiB, so the length is free.
+const HASH_ONLY_LEN: u32 = u32::MAX;
+
+/// The bytes a `[key 32][len u32][value]` record at the start of `bytes`
+/// takes, a hash-only one included.
+fn main_record_len(bytes: &[u8]) -> usize {
+    let len = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+    KEY_LEN + LEN_LEN + if len == HASH_ONLY_LEN { 0 } else { len as usize }
+}
 /// The file is mapped in chunks of about this many bytes, each sealed and
 /// mapped once, with its page tables populated at that moment, so a read
 /// never takes a page fault afterwards: 133,000 random reads a block on a
@@ -612,6 +634,8 @@ struct RelocatedTwig {
     group_len: u64,
     /// The dead slots the latest group stored as hashes.
     dead: u32,
+    /// A root-only group's leaf root ([`TAG_ROOT`]).
+    leaf_root: Option<Hash>,
 }
 
 /// A byte range of one of the entry files.
@@ -659,8 +683,11 @@ pub(crate) struct Group {
     starts: Box<[u32]>,
     /// The slots stored as hashes.
     dead: u32,
-    /// Each slot's leaf hash, hashed from the group's own bytes.
+    /// Each slot's leaf hash, hashed from the group's own bytes; empty for
+    /// a root-only group.
     pub(crate) leaves: Box<[Hash]>,
+    /// A root-only group's leaf root.
+    leaf_root: Option<Hash>,
 }
 
 /// The append-only entry file, mapped for reads.
@@ -785,7 +812,10 @@ impl FileEntries {
                 break;
             }
             reader.read_exact(&mut header)?;
-            let value_len = u32::from_le_bytes([header[32], header[33], header[34], header[35]]) as u64;
+            let value_len = match u32::from_le_bytes([header[32], header[33], header[34], header[35]]) {
+                HASH_ONLY_LEN => 0,
+                value_len => u64::from(value_len),
+            };
             let end = at + (KEY_LEN + LEN_LEN) as u64 + value_len;
             if end > len {
                 break; // torn tail
@@ -901,6 +931,7 @@ impl FileEntries {
         let bytes = file.bytes_from(raw & !RELOCATED_BIT);
         match bytes[0] {
             TAG_DEAD => SlotRef::HashOnly(as_hash(&bytes[RELOCATED_HEAD..DEAD_RECORD])),
+            TAG_ROOT => SlotRef::HashOnly(&ROOT_ONLY_SLOT),
             tag => {
                 debug_assert_eq!(tag, TAG_LIVE, "slot {slot}'s relocated record");
                 payload_at(&bytes[RELOCATED_HEAD..])
@@ -994,7 +1025,7 @@ impl FileEntries {
     pub(crate) fn location(&self, slot: usize) -> Option<u64> {
         let raw = (slot < self.offsets.len()).then(|| self.raw(slot))?;
         if raw & RELOCATED_BIT == 0 {
-            return Some(raw);
+            return matches!(payload_at(self.main.bytes_from(raw)), SlotRef::Payload(..)).then_some(raw);
         }
         let file = self.relocated.as_ref()?;
         let at = raw & !RELOCATED_BIT;
@@ -1011,7 +1042,10 @@ impl FileEntries {
     pub(crate) fn key(&self, slot: usize) -> Option<&Hash> {
         let raw = self.raw(slot);
         if raw & RELOCATED_BIT == 0 {
-            return Some(as_hash(&self.main.bytes_from(raw)[..KEY_LEN]));
+            return match payload_at(self.main.bytes_from(raw)) {
+                SlotRef::Payload(key, _) => Some(key),
+                SlotRef::HashOnly(_) => None,
+            };
         }
         match self.read(slot) {
             SlotRef::Payload(key, _) => Some(key),
@@ -1046,6 +1080,11 @@ impl FileEntries {
         TWIG_SIZE as u32 - words.iter().map(|word| word.count_ones()).sum::<u32>()
     }
 
+    /// The leaf root of `twig` when its group keeps only that ([`TAG_ROOT`]).
+    pub(crate) fn dead_twig_root(&self, twig: usize) -> Option<Hash> {
+        self.twigs.get(&twig).and_then(|twig| twig.leaf_root)
+    }
+
     /// The dead slots `twig`'s latest group stored as hashes, if it has one.
     pub(crate) fn relocated_dead(&self, twig: usize) -> Option<u32> {
         self.twigs.get(&twig).map(|twig| twig.dead)
@@ -1066,6 +1105,33 @@ impl FileEntries {
         } else {
             self.active[slot / 64] &= !(1 << (slot % 64));
         }
+    }
+
+    /// Appends a dead hash-only slot as the next slot: a record carrying
+    /// only its leaf hash ([`HASH_ONLY_LEN`]).
+    pub(crate) fn push_hash_only(&mut self, leaf: &Hash) -> io::Result<()> {
+        self.main.writable()?;
+        let slot = self.offsets.len();
+        self.offsets.reserve(slot + 1)?;
+        let record_len = KEY_LEN + LEN_LEN;
+        let main = &mut self.main;
+        if !main.tail.is_empty() && main.tail.len() + record_len > CHUNK_BYTES {
+            main.seal_tail()?;
+        }
+        if main.tail.capacity() < CHUNK_BYTES {
+            main.tail.reserve_exact(CHUNK_BYTES.max(record_len) - main.tail.len());
+        }
+        main.populate_ahead();
+        crate::prefault::note_append(main.populate_epoch, main.tail.len() + record_len);
+        main.tail.extend_from_slice(leaf);
+        main.tail.extend_from_slice(&HASH_ONLY_LEN.to_le_bytes());
+        self.offsets.push(main.len_bytes)?;
+        main.len_bytes += record_len as u64;
+        if self.active.len() * 64 <= slot {
+            self.active.push(0);
+        }
+        self.set_active(slot, false);
+        Ok(())
     }
 
     /// Appends a live entry as the next slot: into the tail, which reaches
@@ -1431,7 +1497,36 @@ impl FileEntries {
         bytes.extend_from_slice(&(twig as u64).to_le_bytes());
         let crc = crc32fast::hash(&bytes);
         bytes.extend_from_slice(&crc.to_le_bytes());
-        Ok(Group { twig, bytes, starts: starts.into_boxed_slice(), dead, leaves: leaves.into_boxed_slice() })
+        Ok(Group { twig, bytes, starts: starts.into_boxed_slice(), dead, leaves: leaves.into_boxed_slice(), leaf_root: None })
+    }
+
+    /// A root-only group for full twig `twig`, every slot dead: one
+    /// [`TAG_ROOT`] record carrying `leaf_root`, which all 2048 slots point
+    /// at, and the trailer. The twig's leaves are not known (a kind-3 import).
+    pub(crate) fn dead_twig_group(&self, twig: usize, leaf_root: Hash) -> io::Result<Group> {
+        let base = twig * TWIG_SIZE;
+        if base + TWIG_SIZE > self.len() {
+            return Err(refused(format!("twig {twig} is not full ({} slots)", self.len())));
+        }
+        if let Some(slot) = (base..base + TWIG_SIZE).find(|slot| self.is_active(*slot)) {
+            return Err(refused(format!("slot {slot} of root-only twig {twig} is live")));
+        }
+        let mut bytes = Vec::with_capacity(DEAD_RECORD + TRAILER);
+        bytes.push(TAG_ROOT);
+        bytes.extend_from_slice(&(base as u64).to_le_bytes());
+        bytes.extend_from_slice(&leaf_root);
+        bytes.push(TAG_END);
+        bytes.extend_from_slice(&(twig as u64).to_le_bytes());
+        let crc = crc32fast::hash(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        Ok(Group {
+            twig,
+            bytes,
+            starts: vec![0; TWIG_SIZE].into_boxed_slice(),
+            dead: TWIG_SIZE as u32,
+            leaves: Box::new([]),
+            leaf_root: Some(leaf_root),
+        })
     }
 
     /// Appends `group` to `entries.relocated` (created on the first one),
@@ -1463,8 +1558,7 @@ impl FileEntries {
                 let first = self.offsets.at(base);
                 let last = self.offsets.at(base + TWIG_SIZE - 1);
                 debug_assert_eq!((first | last) & RELOCATED_BIT, 0);
-                let SlotRef::Payload(_, value) = payload_at(self.main.bytes_from(last)) else { unreachable!() };
-                FileRange { relocated: false, start: first, end: last + (KEY_LEN + LEN_LEN + value.len()) as u64 }
+                FileRange { relocated: false, start: first, end: last + main_record_len(self.main.bytes_from(last)) as u64 }
             }
         };
         if self.relocated.is_none() {
@@ -1489,7 +1583,10 @@ impl FileEntries {
         }
         let written = group.bytes.len() as u64;
         let starts = released.then_some(group.starts);
-        self.twigs.insert(twig, RelocatedTwig { group_start: start, starts, group_len: written, dead: group.dead });
+        self.twigs.insert(
+            twig,
+            RelocatedTwig { group_start: start, starts, group_len: written, dead: group.dead, leaf_root: group.leaf_root },
+        );
         self.release_segment_if_relocated(base / OFFSET_SEGMENT_SLOTS);
         Ok(Relocation { written, old })
     }
@@ -1517,7 +1614,11 @@ impl FileEntries {
 
 /// A `[key 32][len u32][value]` record at the start of `bytes`.
 fn payload_at(bytes: &[u8]) -> SlotRef<'_> {
-    let len = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]) as usize;
+    let len = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+    if len == HASH_ONLY_LEN {
+        return SlotRef::HashOnly(as_hash(&bytes[..KEY_LEN]));
+    }
+    let len = len as usize;
     SlotRef::Payload(as_hash(&bytes[..KEY_LEN]), &bytes[KEY_LEN + LEN_LEN..KEY_LEN + LEN_LEN + len])
 }
 
@@ -1604,7 +1705,8 @@ fn open_relocated(
             let mut dead_hash_count = 0u32;
             let mut kills_a_live_slot = false;
             let mut twig = None;
-            for (local, record_start) in starts.iter_mut().enumerate() {
+            let mut root_only = None;
+            for local in 0..TWIG_SIZE {
                 let mut head = [0u8; RELOCATED_HEAD];
                 if at + RELOCATED_HEAD as u64 > len || !read_whole(&mut reader, &mut head)? {
                     break 'groups;
@@ -1615,8 +1717,22 @@ fn open_relocated(
                     break 'groups;
                 }
                 crc.update(&head);
-                *record_start = at;
+                starts[local] = at;
                 match head[0] {
+                    // A root-only group: one record for the whole twig.
+                    TAG_ROOT if local == 0 => {
+                        let mut hash = [0u8; 32];
+                        if at + DEAD_RECORD as u64 > len || !read_whole(&mut reader, &mut hash)? {
+                            break 'groups;
+                        }
+                        crc.update(&hash);
+                        starts.fill(at);
+                        dead_hash_count = TWIG_SIZE as u32;
+                        kills_a_live_slot = (slot..slot + TWIG_SIZE).any(is_active);
+                        root_only = Some(hash);
+                        at += DEAD_RECORD as u64;
+                        break;
+                    }
                     TAG_LIVE => {
                         let mut header = [0u8; KEY_LEN + LEN_LEN];
                         if at + (RELOCATED_HEAD + KEY_LEN + LEN_LEN) as u64 > len || !read_whole(&mut reader, &mut header)? {
@@ -1681,11 +1797,17 @@ fn open_relocated(
                 continue;
             }
             let main = &mut offsets[base..base + TWIG_SIZE];
-            let entry =
-                twigs.entry(twig).or_insert_with(|| RelocatedTwig { group_start, starts: None, group_len: 0, dead: 0 });
+            let entry = twigs.entry(twig).or_insert_with(|| RelocatedTwig {
+                group_start,
+                starts: None,
+                group_len: 0,
+                dead: 0,
+                leaf_root: None,
+            });
             entry.group_start = group_start;
             entry.group_len = at - group_start;
             entry.dead = dead_hash_count;
+            entry.leaf_root = root_only;
             for (offset, start) in main.iter_mut().zip(&starts) {
                 *offset = start | RELOCATED_BIT;
             }
@@ -1829,6 +1951,15 @@ impl Entries {
     /// Appends a dead slot that keeps only its leaf hash (a heap tree
     /// rebuilt from a compacted tree's snapshot); refused in the file, where
     /// such a slot exists only in a relocated group.
+    /// The leaf root of a root-only twig of the file ([`TAG_ROOT`]); `None`
+    /// in the heap (the tree's twig keeps it there).
+    pub(crate) fn dead_twig_root(&self, twig: usize) -> Option<Hash> {
+        match self {
+            Self::Heap(_) => None,
+            Self::File(file) => file.dead_twig_root(twig),
+        }
+    }
+
     pub(crate) fn push_hash_only(&mut self, leaf_hash: Hash) -> io::Result<()> {
         match self {
             Self::Heap(entries) => {

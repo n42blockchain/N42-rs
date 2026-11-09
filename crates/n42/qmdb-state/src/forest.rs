@@ -1855,6 +1855,12 @@ impl QmdbForest {
         self.min_cursor = self.tree.next_slot();
     }
 
+    /// The value of raw QMDB key `key` at the canonical head, if it is live.
+    pub fn value_at_head(&mut self, key: &[u8; 32]) -> Option<Vec<u8>> {
+        self.move_to(self.head.1).ok()?;
+        self.tree.get(key).map(<[u8]>::to_vec)
+    }
+
     /// Proves an account at the canonical head.
     pub fn prove_account(&mut self, address: Address) -> Option<QmdbProof> {
         self.move_to(self.head.1).ok()?;

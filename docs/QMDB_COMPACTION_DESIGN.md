@@ -394,7 +394,20 @@ of the 512 twigs of its segment are relocated (`SEGMENT_MOP_UP_TWIGS`): such a t
 for the heap, not the disk. Released segments are released again at open. `offsets_bytes` counts
 the live segments at 8 MiB and each released twig's starts at 8 KiB.
 
-## 6. A v2 portable snapshot with tombstones (proposal to gov5, plan row E2)
+## 6. A v2 portable snapshot with tombstones (plan row E2)
+
+**Status (2026-11-07):** implemented on both clients, each on branch
+`feat/qmdb-portable-snapshot-v2` (n42-rs: `9b5c247e0` codec, verifier and fixtures, `07a6aac03` node export/import and `--format`, `498efe605` lock, `0d5e4ea30` kind-3 import, `2d1f5f431` hash-only log records, `a5ffb400f` cross-client test; gov5: `e037a535`, `8eac35e3` persistence of an imported tree, `cf3abd8b` cross-client test), neither merged. v1
+stays the default and is byte-for-byte unchanged. The layout below becomes the cross-client
+contract when both branches merge; until then it is a proposal with two implementations and a
+shared fixture set (`crates/n42/twig-core/testdata/portable_v2/`, copied into gov5's
+`lib/qmdb/testdata/portable_v2/`). Three gaps in the original text were filled while
+implementing, listed under "Decisions taken while implementing" at the end of this section.
+Both clients import all three fixtures and each other's v2 exports to the same root, gov5 after a
+leaf-store flush and reload, n42-rs after an entry-file close and reopen
+(`audit-notes/ci/k-cross.sh`, 2026-11-07: pass). Open: the gov5 PR (gh login), merging both
+branches together.
+
 
 Why: a v1 portable snapshot (`QmdbPortableSnapshot`, `verify_portable_stream`, gov5's
 `lib/qmdb` portable codec) is the complete positional slot log -- every slot, dead ones included,
@@ -405,8 +418,8 @@ keeps only their leaf hashes, so it cannot produce v1 (`portable_export` refuses
 bootstrap. Nothing below changes the root or what a verifier proves; it changes what a slot record
 may carry.
 
-**Format.** Header as v1 with the magic's version byte bumped (`N42QMDB\x02`, v1 is
-`N42QMDB\x01`) and one more header field after `entry_count`: `tombstones u64`, the number of records of
+**Format.** Header as v1 with the magic's version byte bumped (`N42QMDB\x03`, v1 is
+`N42QMDB\x01`; see decision 1 for why not `\x02`) and one more header field after `entry_count`: `tombstones u64`, the number of records of
 kind 2 and 3 below (so a reader can size and a v1-only reader stops at the magic). Each slot record
 starts `[slot u64][kind u8]`:
 
@@ -448,4 +461,51 @@ uncompacted copy and its v2 export from the compacted one, both verifying to the
 by SHA-256 of the raw bytes like the other cross-client fixtures. Until both clients read v2, a
 fleet that compacts must keep at least one archive node (compaction off) to serve bootstraps. No
 code is written for this section until gov5 agrees the layout.
+(Superseded 2026-11-06: the coordinator decided to implement it on branches on both sides; see
+the status line.)
+
+**Decisions taken while implementing (2026-11-07).**
+
+1. *Magic `N42QMDB\x03`, not `\x02`.* gov5 main already writes a different layout under
+   `N42QMDB\x02`: the leaf-form snapshot (gov5 `df01cff7`, `lib/qmdb/portable_v2.go`,
+   `n42-qmdb-export --leaf-form`: per twig leaf root, bits and optional leaf hashes, then live
+   entries only), used on 2026-08-29 to bootstrap a Rust validator onto chain 94 (its Rust reader
+   lives only on unmerged n42-rs branches). Two layouts must never share a magic, so the tombstone
+   layout takes version byte 3. The name "v2" is kept for the tombstone layout in this document
+   and in the flags (`--format v2`); gov5 calls the leaf form `leaf-form`.
+2. *`entry_count` still equals `next_slot`* (slots covered, not records), as v1; the header's
+   `tombstones` must equal the number of kind-2 plus kind-3 records or the snapshot is refused
+   (`TombstoneCount`). A kind-3 record counts once.
+3. *Both clients import kind 3.* A kind-3 run carries one leaf root, not 2048 leaf hashes.
+   gov5's tree holds such a twig natively (a pruned twig: leaf root, clear bits, no nodes). The
+   Rust entry store gained a leaf-root-only twig record for it: a relocated group whose body is
+   `[TAG_ROOT 0x04][base u64][leaf_root 32]` before the usual `[TAG_END][twig u64][crc32]`
+   trailer, written by `set_entry_file` for an imported whole-dead twig and read back on open
+   (`FileEntries::dead_twig_root`); the twig is rebuilt as root-only (no leaves, all bits clear)
+   and every slot in it reads as hash-only. A kind-2 tombstone outside a full twig (the partial
+   last twig, where a gov5 node that reclaimed its dead rows puts them) is kept in `entries.log`
+   as a hash-only record: the key field holds the leaf hash, the length field is `u32::MAX`, no
+   value follows; once the twig fills, compaction moves it into a relocated group like any dead
+   slot. So `initialize_from_portable` imports kind 3, the node
+   reopens on it, and its v2 export writes the twig back as kind 3 (`QmdbSnapshot::dead_twigs`
+   carries it through the checkpoint), byte for byte the imported stream. The decoder still checks
+   the record's shape (`count == 2048`, twig-aligned, inside `entry_count`;
+   `MisalignedDeadTwig`). gov5's exporter writes kind 3 for a twig whose leaves it no longer keeps
+   (a hollow twig) and, with `--whole-dead-twigs`, for any full rowless dead twig.
+4. *A gov5 node that persisted an imported tree exports its reclaimed dead rows as kind 2.*
+   gov5's `FlushTo` with a leaf store drops the entry row of every dead slot by design (the leaf
+   blob keeps its frozen hash), and a reload marks a sealed, wholly dead twig with neither a blob
+   nor a row (an imported kind-3 twig) as pruned from its meta alone. After a flush and reload, a
+   dead slot that arrived with its payload (kind 0) therefore exports as a kind-2 tombstone with
+   that payload's leaf hash, and v1 export is refused at the first dead slot (slot 0 on the
+   fixtures, `*HashOnlySlotError`) whichever fixture was imported. Root, live reads and every
+   other record are unchanged; the gov5 test pins the reloaded exports to the fixtures with exactly
+   that substitution (`reclaimedRows`). The Rust entry store keeps dead payloads, so a Rust node
+   re-exports the fixtures unchanged.
+
+Where the paths that need a key refuse a tombstoned slot: Rust `QmdbUndoError::HashOnlySlot`
+(undo revival), `NodeStateError::PortableCompacted` / `QmdbPortableError::HashOnlySlot` (v1
+export), and a heap-mode node refuses to import tombstones (its checkpoint layout has no hash-only
+slot); gov5 `*HashOnlySlotError` (`errors.Is(err, ErrHashOnlySlot)`) from `ApplyUndo`, the v1
+`PortableSlotSource` and `FlushTo` without a leaf store.
 

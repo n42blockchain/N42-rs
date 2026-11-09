@@ -9,7 +9,8 @@
 //! fold batch states instead and read the overlay directly. A launch script
 //! may still pass their knobs, so a node started with one of them set logs
 //! one warning naming it and otherwise ignores it (`docs/KNOBS.md`, status
-//! `retired`).
+//! `retired`). The follower's shard-merge knobs joined them when the
+//! runtime-dead build-path merge was removed after F6a (stream I1).
 
 use std::sync::Once;
 
@@ -18,10 +19,12 @@ pub const RETIRED_ON_EVM2: &[&str] = &[
     "N42_BUILD_GRAFT_NO_CACHE",
     "N42_BUILD_MLP",
     "N42_BUILD_PREFETCH",
+    "N42_FOLLOWER_CHECK_ON_SHARDS",
     "N42_FOLLOWER_GRAFT_INDEX",
     "N42_FOLLOWER_GRAFT_RANGES",
     "N42_FOLLOWER_GRAFT_STREAM",
     "N42_FOLLOWER_MERGE_BEHIND",
+    "N42_FOLLOWER_SHARDS_KEPT",
     "N42_GRAFT_BASE_SWAP",
     "N42_GRAFT_INDEX",
     "N42_GRAFT_PREFAULT",
@@ -30,6 +33,7 @@ pub const RETIRED_ON_EVM2: &[&str] = &[
     "N42_GRAFT_STREAM",
     "N42_PLAN_AHEAD_WARM",
     "N42_READ_SET",
+    "N42_SHARDS_MERGE_OFF_PATH",
 ];
 
 /// The knobs of [`RETIRED_ON_EVM2`] that are set to a non-empty value, in

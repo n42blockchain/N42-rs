@@ -1630,14 +1630,25 @@ The first launch of the mv step deadlocked for 3 h: the gate held `devnet/.round
 `devnet-mobileanchor.sh` (since d07633c91) takes that lock itself. The coordinator fixed it by
 passing `FLOCKER=$LOCK` and relaunched mv, k90 and k20. The rounds step's results stand.
 
-**Left behind, runtime-dead but not flagged by rustc.** These are `pub` or reached only through
-values that are now constant, so rustc does not flag them. They are a follow-up clean-up with no
-behaviour change:
+**Left behind, runtime-dead but not flagged by rustc.** These were `pub` or reached only through
+values that are now constant, so rustc did not flag them. **Done 2026-11-08** (stream I, branch
+`chore/f6a-dead-paths`, plan row I1), no behaviour change, each claim checked against every
+constructor and reader first:
 
-- the follower's shard-merge path (`sharded` is always `None`) and `StartedShards`;
-- the `LateBlock` waiting machinery that served the by-reference road;
-- the `ExecSplit` fields on the import line, which are always zero;
-- the copy-aside road's by-reference half (`N42_FOLLOWER_COPY_ASIDE` now only moves the copy).
+- the follower's shard-merge path (`sharded` was always `None`) and `StartedShards`, with the shard
+  store, `ParentLayer::Shards`, the merge modes and the build path's root line: c2fdb5686. Retired
+  knobs `N42_FOLLOWER_CHECK_ON_SHARDS`, `N42_FOLLOWER_SHARDS_KEPT`, `N42_SHARDS_MERGE_OFF_PATH`
+  (`retired.rs`, `docs/KNOBS.md`);
+- the `LateBlock` waiting machinery (only `LateBlock::ready` was ever built) and the zero
+  `copy_aside_ms` / `copy_wait_ms` vote-road fields: cb2aa67e5;
+- the `ExecSplit` fields on the import line (only `ExecSplit::default()`): the seven `exec_*` fields
+  are gone from the direct-import lines, `IMPORT_TIMES` 29 -> 22; the run-loop summaries print `-`
+  for an absent field: 8cf8df0ce;
+- the copy-aside road's by-reference half (`DescribedAside` keeps the transaction count and the
+  maker's channel; `N42_FOLLOWER_COPY_ASIDE` still moves the copy, X22 unchanged): 6cdd7349c;
+- follow-up e28c72a71 (retired-list order, clippy).
+
+About 640 lines of code removed net (766 deleted, 121 added over the five commits).
 
 **The witness recorder** (`docs/patches/0001-feat-witness-record-*.patch`) is parked. Its
 `StateReadObserver` hooks revm's `State`, which does not exist in reth v2.9.0. On evm2 it would hang
@@ -1692,8 +1703,9 @@ brings it back:
   - The vendored `EngineArgs` differs from upstream only by `--engine.state-trie-overlay`.
   - The F6 field gate's `roll --kill` k90 and k20 runs cover the SIGKILL recovery the reth-bump
     rule asks for.
-- **Runtime-dead code after F6a.** **Open, clean-up only.** See "F6a" above (the follower's
-  shard-merge path, `LateBlock` waiting, `ExecSplit` zeros, the by-reference half of copy-aside).
+- **Runtime-dead code after F6a.** **Done 2026-11-08** (c2fdb5686, cb2aa67e5, 8cf8df0ce,
+  6cdd7349c, e28c72a71; plan row I1). See "F6a" above (the follower's shard-merge path, `LateBlock`
+  waiting, `ExecSplit` zeros, the by-reference half of copy-aside).
 - **The tenure stall after a timed-out view, on main** (F5g5). **Open until the F6 merge.** Main
   0f3cb36e7 stalls at height 19 on the deferred devnet (f5g5-main): the stale-build guard refuses
   the build on the high-QC block once a build ahead has made an uncertified block canonical. The fix (020cb0de5, a committed

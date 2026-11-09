@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Branch tests for the follower import's helpers: the layers a child reads
-//! its parent through, the waits for a parent, the stores of kept outputs and
-//! shards, the late-made owned block, and the fork-to-spec mapping.
+//! its parent through, the waits for a parent, the store of kept outputs,
+//! the foreign block's forms, and the fork-to-spec mapping.
 //!
-//! The kept-output and kept-shards stores are process-wide queues that evict;
+//! The kept-output store is a process-wide queue that evicts;
 //! every test that writes to them takes [`publishing`] (the lock the parent
 //! output tests use), and every hash here is unique to its test.
 
@@ -56,72 +56,18 @@ fn a_merged_layer_answers_from_its_bundle_and_reports_code_one() {
 }
 
 #[test]
-fn a_shard_layer_answers_from_its_residual_and_leaves_the_rest_to_the_shards() {
-    let (residual_account, other) = (Address::with_last_byte(5), Address::with_last_byte(6));
-    let shards = Arc::new(n42_engine_types::output_shards::FrozenShards::default());
-    let layer = ParentLayer::Shards(shards, output_of(&[(residual_account, Some(info(2, 20)))]));
-    assert_eq!(layer.account(&residual_account).map(|a| (a.nonce, a.balance)), Some((2, U256::from(20))));
-    assert!(layer.account(&other).is_none(), "neither the residual nor the (empty) shards touched it");
-    assert_eq!(layer.code(), 2);
-}
-
-#[test]
 fn the_parent_read_names_follow_the_layer_codes() {
     assert_eq!(parent_read_name(1), "merged");
-    assert_eq!(parent_read_name(2), "shards");
+    assert_eq!(parent_read_name(2), "engine", "the build path's shards code is gone");
     assert_eq!(parent_read_name(0), "engine");
     assert_eq!(parent_read_name(77), "engine");
 }
 
 // --- the kept stores -----------------------------------------------------------
 
-fn keep(number: u64, parent: B256, tag: &str) -> reth_primitives_traits::SealedHeader<n42_header::N42Header> {
-    let header = header(number, parent, tag);
-    keep_follower_shards(
-        header.hash(),
-        header.clone(),
-        Arc::new(n42_engine_types::output_shards::FrozenShards::default()),
-        output_of(&[]),
-    );
-    header
-}
-
 #[test]
-fn only_the_last_two_blocks_keep_their_shards() {
+fn a_layer_is_the_blocks_published_output() {
     let _one_at_a_time = publishing();
-    let a = keep(1, B256::ZERO, "shards-a");
-    let b = keep(2, a.hash(), "shards-b");
-    assert!(follower_shards_of(a.hash()).is_some());
-    let c = keep(3, b.hash(), "shards-c");
-    assert!(follower_shards_of(a.hash()).is_none(), "the oldest is evicted past {FOLLOWER_SHARDS_KEPT}");
-    let (kept, layer) = follower_shards_of(b.hash()).expect("b is kept");
-    assert_eq!(kept.hash(), b.hash());
-    assert_eq!(layer.code(), 2);
-    assert!(follower_shards_of(c.hash()).is_some());
-    // Keeping a block again replaces its entry rather than costing a slot.
-    keep_follower_shards(
-        c.hash(),
-        c,
-        Arc::new(n42_engine_types::output_shards::FrozenShards::default()),
-        output_of(&[]),
-    );
-    assert!(follower_shards_of(b.hash()).is_some());
-    assert!(follower_shards_of(B256::repeat_byte(0xAA)).is_none());
-}
-
-#[test]
-fn a_layer_is_the_blocks_shards_when_held_else_its_published_output() {
-    let _one_at_a_time = publishing();
-    let both = header(10, B256::ZERO, "layer-both");
-    keep_follower_shards(
-        both.hash(),
-        both.clone(),
-        Arc::new(n42_engine_types::output_shards::FrozenShards::default()),
-        output_of(&[]),
-    );
-    publish_parent_output(both.hash(), both.clone(), output_of(&[]));
-    assert_eq!(layer_of(both.hash()).expect("held").1.code(), 2, "shards win over the published output");
-
     let published_only = header(11, B256::ZERO, "layer-published");
     publish_parent_output(published_only.hash(), published_only.clone(), output_of(&[]));
     let (found, layer) = layer_of(published_only.hash()).expect("published");
@@ -343,10 +289,6 @@ fn empty_sealed_block(number: u64) -> SealedBlock<Block> {
     })
 }
 
-fn recovered(number: u64) -> RecoveredBlock<Block> {
-    RecoveredBlock::new_sealed(empty_sealed_block(number), Vec::new())
-}
-
 #[test]
 fn a_sealed_foreign_block_counts_its_transactions() {
     let block: ForeignBlock = empty_sealed_block(3).into();
@@ -357,21 +299,8 @@ fn a_sealed_foreign_block_counts_its_transactions() {
 #[test]
 fn a_described_foreign_block_counts_the_transactions_it_describes() {
     let (_made_tx, made) = std::sync::mpsc::channel();
-    let aside = DescribedAside {
-        header: header(4, B256::ZERO, "aside"),
-        withdrawals: None,
-        transactions: Arc::new(Vec::new()),
-        senders: Arc::new(Vec::new()),
-        made,
-    };
+    let aside = DescribedAside { tx_count: 0, made };
     assert_eq!(ForeignBlock::Aside(aside).tx_count(), 0);
-}
-
-#[test]
-fn a_late_block_that_is_ready_is_handed_out_without_a_wait() {
-    let late = LateBlock::ready(Arc::new(recovered(1)));
-    assert_eq!(late.get().expect("ready").number, 1);
-    assert_eq!(late.times(), (0, 0));
 }
 
 // --- the intrinsic-gas spec ------------------------------------------------------
@@ -585,8 +514,5 @@ fn the_capacity_knobs_default_to_the_depth_one_values() {
     assert_eq!(kept_from_env("N42_TEST_KNOB_THAT_IS_NEVER_SET", PARENT_OUTPUTS_KEPT, 2..=16), PARENT_OUTPUTS_KEPT);
     if std::env::var_os("N42_PARENT_OUTPUTS_KEPT").is_none() {
         assert_eq!(parent_outputs_kept(), PARENT_OUTPUTS_KEPT);
-    }
-    if std::env::var_os("N42_FOLLOWER_SHARDS_KEPT").is_none() {
-        assert_eq!(follower_shards_kept(), FOLLOWER_SHARDS_KEPT);
     }
 }

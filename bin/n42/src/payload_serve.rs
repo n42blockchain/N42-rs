@@ -2094,7 +2094,7 @@ where
     // Another node's block: executed here and handed to the
     // engine as executed, when configured. Any failure logs
     // and leaves the block to the engine's own path.
-    let mut direct_ms: Option<[u64; 33]> = None;
+    let mut direct_ms: Option<[u64; 26]> = None;
     // The block's transaction hashes, known once the direct
     // import converted the payload: the prune below then
     // needs no keccak over the raw bytes.
@@ -2359,13 +2359,6 @@ where
                         phases[19],
                         phases[20],
                         phases[21],
-                        phases[22],
-                        phases[23],
-                        phases[24],
-                        phases[25],
-                        phases[26],
-                        phases[27],
-                        phases[28],
                     ]);
                 } else {
                     warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
@@ -2425,17 +2418,10 @@ where
                 root_end_ms = ms[19],
                 fields_ready_ms = ms[20],
                 parent_fields_wait_ms = ms[21],
-                exec_part_ms = ms[22],
-                exec_batches_ms = ms[23],
-                exec_graft_ms = ms[24],
-                exec_batches = ms[25],
-                exec_threads = ms[26],
-                exec_batch_max_ms = ms[27],
-                exec_batch_median_ms = ms[28],
-                parent_output_wait_ms = ms[29],
-                parent_read = crate::follower_import::parent_read_name(ms[30]),
-                handoff_wait_us = ms[31],
-                handoff_before_canonical = ms[32] != 0,
+                parent_output_wait_ms = ms[22],
+                parent_read = crate::follower_import::parent_read_name(ms[23]),
+                handoff_wait_us = ms[24],
+                handoff_before_canonical = ms[25] != 0,
                 answered_ms = answered,
                 once_reqs = oc.requests,
                 once_served = oc.served,
@@ -2628,17 +2614,10 @@ where
                     root_end_ms = ms[19],
                     fields_ready_ms = ms[20],
                     parent_fields_wait_ms = ms[21],
-                    exec_part_ms = ms[22],
-                    exec_batches_ms = ms[23],
-                    exec_graft_ms = ms[24],
-                    exec_batches = ms[25],
-                    exec_threads = ms[26],
-                    exec_batch_max_ms = ms[27],
-                    exec_batch_median_ms = ms[28],
-                    parent_output_wait_ms = ms[29],
-                    parent_read = crate::follower_import::parent_read_name(ms[30]),
-                    handoff_wait_us = ms[31],
-                    handoff_before_canonical = ms[32] != 0,
+                    parent_output_wait_ms = ms[22],
+                    parent_read = crate::follower_import::parent_read_name(ms[23]),
+                    handoff_wait_us = ms[24],
+                    handoff_before_canonical = ms[25] != 0,
                     engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
                     engine_remember_ms = remember_ms,
                     engine_listing_ms = listing_ms,
@@ -3462,31 +3441,19 @@ where
                 let maker = described.maker(&payload);
                 let senders = std::mem::take(&mut described.senders);
                 // `N42_FOLLOWER_COPY_ASIDE=1`: the owned block is made on the
-                // worker pool beside the import, which executes the frames'
-                // transactions by reference meanwhile; nothing of it is on
-                // the road (`copy_ms` 0, `copy_aside_ms` in the vote road's
-                // line).
+                // worker pool and the import takes it from there; nothing of
+                // it is on the road (`copy_ms` 0).
                 let (made, senders) = if crate::follower_import::copy_aside() {
-                    let senders = std::sync::Arc::new(senders);
                     let (made_tx, made_rx) = std::sync::mpsc::sync_channel(1);
-                    let (validator, block_senders) = (std::sync::Arc::clone(&validator), std::sync::Arc::clone(&senders));
+                    let validator = std::sync::Arc::clone(&validator);
                     rayon::spawn(move || {
                         let made = maker
                             .make(&validator)
-                            .map(|made| {
-                                let senders = std::sync::Arc::unwrap_or_clone(block_senders);
-                                (reth_primitives_traits::RecoveredBlock::new_sealed(made.block, senders), made.copy_us)
-                            })
+                            .map(|made| (reth_primitives_traits::RecoveredBlock::new_sealed(made.block, senders), made.copy_us))
                             .map_err(|err| format!("the described block: {err}"));
                         let _ = made_tx.send(made);
                     });
-                    let aside = crate::follower_import::DescribedAside {
-                        header: reth_primitives_traits::SealedHeader::new(described.header.clone(), described.hash),
-                        withdrawals: described.withdrawals().map(<[_]>::to_vec),
-                        transactions: std::sync::Arc::clone(&described.transactions),
-                        senders,
-                        made: made_rx,
-                    };
+                    let aside = crate::follower_import::DescribedAside { tx_count: described.len(), made: made_rx };
                     ((crate::follower_import::ForeignBlock::Aside(aside), 0), None)
                 } else {
                     let made = maker.make(&validator).map_err(CompactRefusal::Refused)?;

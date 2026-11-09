@@ -160,12 +160,11 @@
   立即唤醒子块的等待；集合有界（64）；父块走引擎自己的路径时仍按 canonical 判断（20 ms 轮询兜底），
   超时（3 s）行为不变。`direct import` 两行新增 `handoff_wait_us` 与 `handoff_before_canonical`
   （交接时父块是否尚未 canonical；开关关闭时恒为 false）。
-- `N42_SHARDS_MERGE_OFF_PATH=1|verify`（默认关）：构建路径上把分片合并成一个 `BundleState`
-  （引擎的已执行插入、持久化、已发布输出都要这个完整的 bundle，交接无法只拿一部分）时，账户表与
-  回滚集（复制并排序）两半同时做（`FrozenShards::merged_timed`，
-  `crates/n42/engine-types/src/output_shards.rs`），交接等较长的一半而不是两者之和；拼装顺序不变，
-  结果与原合并逐字段相同（测试覆盖）。`verify` 另外按原方式再合并一次并比较，计数打印在
-  `build path: the root's start after the execution` 一行的 `merge_verified` / `merge_mismatches`。
+- 构建路径的两半并行合并（`FrozenShards::merged_timed`，`crates/n42/engine-types/src/output_shards.rs`）：
+  账户表与回滚集两半同时做，拼装顺序不变，结果与原合并逐字段相同（测试覆盖）。原开关
+  `N42_SHARDS_MERGE_OFF_PATH`（连同 `N42_FOLLOWER_CHECK_ON_SHARDS`、`N42_FOLLOWER_SHARDS_KEPT`）
+  已随跟随者运行期死代码的分片合并路径一起退役（F6a / I1，2026-11-08；`crates/n42/env/src/retired.rs`，
+  设了只警告一次）。
   该行无论开关都新增 `merge_ms`、`merge_wait_ms`（交接在 join 处等了多久）、`merge_state_ms`、
   `merge_reverts_ms`、`merge_append_ms`、`merge_mode`，以前合并时长只在 debug 行里。
 
@@ -528,7 +527,7 @@
   `rename_fallbacks`（D=2 健康时应为 0）、`carried_depth`；D≥2 时 gas limit 不低于所携带的 `gasUsed`
   （`gas_limit_over_carried`）。
 - 跟随者：投票路等待祖先结果（`wait_for_ancestor_fields`）；可纳入性检查与执行仍读父块输出；根任务对父块树的
-  等待不变。容量开关 `N42_PARENT_OUTPUTS_KEPT`（2..=16，缺省 4）、`N42_FOLLOWER_SHARDS_KEPT`（1..=8，缺省 2）。
+  等待不变。容量开关 `N42_PARENT_OUTPUTS_KEPT`（2..=16，缺省 4）；`N42_FOLLOWER_SHARDS_KEPT` 已退役（F6a / I1）。
 - 结算：`ExecutionDriver::set_deferred_depth`，D=2 时提交 B 认证 B-2（`safe` = 已提交块的祖父，`finalized`
   仍受持久化高度限制）。
 - 测试向量：`crates/n42/n42-testing/testdata/deferred_execution_vectors_d2.json`（7 块 + 兄弟分叉）。

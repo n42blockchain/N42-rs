@@ -3,7 +3,7 @@
 
 //! The page faults a QMDB root takes on its own thread, block after block,
 //! on the fleet's allocator and the fleet's entry-file tree
-//! (BREAKTHROUGH_DESIGN 10.48: a root is 32 ms median, one in seven 66, with
+//! (`BREAKTHROUGH_DESIGN` 10.48: a root is 32 ms median, one in seven 66, with
 //! the root thread's minor faults 276 -> 1,923):
 //!
 //! ```text

@@ -363,3 +363,64 @@ Gates: `cargo check --workspace --tests` rc 0 (`ci/m-check.log`),
 engine-types / n42 tests 642 passed, 0 failed (`ci/m-tests.log`, the G8 test
 included). Natives with the instrumentation: `/data/n42-build/g8b-native/release`
 (`ci/m-natives.log`).
+
+### Second occurrence, log reading and the replay diagnosis (2026-11-10)
+
+A second pass over `bench-loop351D2S12P30T64X11T16KA10MEMF/node0-el.log`
+(lines 95085-95131) and `node0-v.log` / `node6-v.log` found no mechanism the
+log supports, so no fix is shipped. What the log rules out:
+
+- **The chain-ahead child moved the tree.** No line names block 7168 in the
+  execution layer's log before the fatal error (`number=7168`: 0 lines); C was
+  requested at .617340 but had not begun executing at .634876.
+- **A failed or aliased rename, a header-root refusal, a poisoned forest, a
+  stale-parent refusal.** None of `deferred rename failed`, `block's state
+  root does not match`, `poisoned`, `refused a build` appears near the
+  failure; the hand-off of 7167 renamed at once (`rename_deferred=false`
+  .618420).
+- **A handover shape the other six did not have.** 1023, 2047, ..., 6143 show
+  the same three executions in the execution layer's log (E1 `chained=true`,
+  E2 the resolved payload job ~0.5 ms later, E3 `chained=false` ~30 ms after,
+  the forkchoice ~15 ms after E3). The one difference is on node0's
+  validator: 7168 opens node0's *second* tenure, and its chain slot still
+  held the build of block 1023 from its first (`chain discarded ... the
+  request names another parent number=1023 lead_ms=214487`, .583413). That
+  discard is validator-side; the execution layer saw the same requests as at
+  6143. GA1b failed at node1's second tenure (8191) but passed node0's
+  (7167), so the second tenure is a correlation, not a cause.
+
+What the log implies: the forkchoice to 0x236a had to *replay* 0x236a, so
+after E3 was filed something left the tree off its path (E3's insert not
+adopting because another root was computed on 0x44bf in between, or a later
+compute on 0x44bf). Both orders are what the 64-variant node-state test
+drives, and pass. The forest keeps its invariants under every order the
+fuzzing tried, so a replay that misses its filed root needs one of three
+things, which the existing trace does not tell apart when the move reverted
+nothing:
+
+1. the tree under the replay's parent is not the parent's state (a wrong
+   undo, or changes applied with no record);
+2. the filed root was computed on a wrong base (a mislabelled tree at a
+   compute whose move reverted nothing, so `check_tree_at` did not run) or
+   the record names the wrong parent;
+3. the apply is not a pure function: the leased computation (leaf hashes
+   computed ahead, `N42_ROOT_OPS_BEFORE_GATE`) and the replay (serial
+   `apply_ops_recorded`) give different roots for the same operations on
+   the same base.
+
+**Instrumentation** (`crates/n42/qmdb-state/src/forest.rs`):
+`QmdbForest::diagnose_replay`, called on every replay mismatch (fatal on the
+fleet, so its second apply costs nothing in a healthy run), logs `QMDB
+replay missed its filed root` at ERROR with the record's parent and the
+parent's filed root, the tree's root before the replay, the root the same
+operations give through the leaf-hash path, the operations' count and
+digest, and a `verdict` naming which of 1-3 the fields support. A small
+block's computation (`forest_trace` size gate, the empty blocks of both
+occurrences) checks its base first: `TreeLease::check_base` on the leased
+path and `check_tree_at` on the locked one log `mislabelled tree` at the
+compute that would use it. The insert trace lines now carry an
+`ops_digest` (and, for an early return, the held and offered digests), so a
+record replayed later can be matched to the computation that filed it, and
+two builds filed under one hash with different operations are visible.
+Tests: `forest::tests::a_replay_that_misses_its_filed_root_is_diagnosed`,
+`forest::tests::a_mislabelled_base_is_named_at_the_compute_and_at_the_replay`.

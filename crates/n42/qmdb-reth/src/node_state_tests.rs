@@ -2019,7 +2019,7 @@ fn cross_client_portable_v2() {
     println!("rust wrote rust-v2.bin ({} bytes), its export of the gov5 import", from_gov5.len());
 }
 
-/// An empty HotStuff block's execution as the builder's bundle holds it:
+/// An empty `HotStuff` block's execution as the builder's bundle holds it:
 /// the beacon-roots contract's two ring slots for the timestamp, the
 /// history-storage slot of the parent's number, the block reward credited
 /// to `beneficiary` as a withdrawal, and the Prague system caller.

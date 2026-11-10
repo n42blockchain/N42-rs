@@ -38,3 +38,8 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
 ## 3. Log
 
 - 2026-11-10: P1 pairs PA1/PA2 queued 06:06Z behind foreign box claims (n26, qs). S1/Q1 branch merged.
+- 2026-11-10 14:13Z: PA1/PA2 never ran. `launch-loop351.sh` waits in its pre-gate for up to 4 h and files
+  no box request there, while the foreign E1N26 chain re-requests the box within 3-6 minutes of each
+  ~2.5 h round, so the launcher had no FIFO position and gave up twice (06:06-10:07Z, 10:08-14:09Z).
+  Requeued with `audit-notes/scripts/pairs-request-keeper.sh`, which keeps `.box-request-rust` live
+  while the queue has lines and no runner is up.

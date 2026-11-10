@@ -25,7 +25,7 @@ mechanism is unknown. A fleet that can exit on an empty-block handover does not 
 
 | # | Item | Method | Verification | Status |
 | --- | --- | --- | --- | --- |
-| P1 | Is the drop code or box? | pairs with the tagged natives (`wt-port`, 47b8180ab) as the candidate against today's `main` natives, same runner, same day | two pairs; tag legs >= 3% over main legs in both = code | running (PA1, PA2) |
+| P1 | Is the drop code or box? | pairs with the tagged natives (`wt-port`, 47b8180ab) as the candidate against today's `main` natives, same runner, same day | two pairs; tag legs >= 3% over main legs in both = code | **done 11-10: code** (tag +4.5% / +5.3% over main in PA1 / PA2) |
 | P2 | If code: find the step | natives at the merge points between 47b8180ab and `main` (maturity audit 8ff447481, compaction c992a5ee4, N42Header b87fa2884, reth v2.9.0 6703c576f, v2.10.0, Amsterdam step 235076649, today), halving by pairs | the step that separates >= 3% twice | waits for P1 |
 | P3 | Fix or gate the step | per finding; a knob in the X22 profile if the cost buys something `main` needs | pair back in the 5.0-5.2M band, twice | waits for P2 |
 | P4 | If box: re-baseline | record the band of the tagged build today as the reference; the goal is judged against it | docs | waits for P1 |
@@ -43,3 +43,9 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   ~2.5 h round, so the launcher had no FIFO position and gave up twice (06:06-10:07Z, 10:08-14:09Z).
   Requeued with `audit-notes/scripts/pairs-request-keeper.sh`, which keeps `.box-request-rust` live
   while the queue has lines and no runner is up.
+- 2026-11-10 16:24Z: **P1 = code.** Pairs PA1/PA2 (legs a/b = tag natives 47b8180ab, 0/0b = main natives
+  ba379f5ad), window 1: PA1 tag 5.173 / 5.073M vs main 4.967 / 4.840M (+4.5%); PA2 tag 5.179 / 5.053M vs
+  main 4.873 / 4.840M (+5.3%). The tagged build still reads 5.05-5.18M on today's box, so the box is not
+  the cause; eight legs, no fatal, no replay miss, no mislabelled tree. P2 starts: natives at d07ec6584
+  (10-30, before N42Header), 6d373bbbe (11-04, before reth v2.9.0), 6703c576f (v2.9.0) and 0ed56c1da
+  (v2.10.0), each paired against the tag natives.

@@ -49,3 +49,11 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   the cause; eight legs, no fatal, no replay miss, no mislabelled tree. P2 starts: natives at d07ec6584
   (10-30, before N42Header), 6d373bbbe (11-04, before reth v2.9.0), 6703c576f (v2.9.0) and 0ed56c1da
   (v2.10.0), each paired against the tag natives.
+- 2026-11-10 18:44Z: P2 round 1, each point against the tag natives (window 1, M TPS; legs a/b point, 0/0b tag):
+  d07ec6584 5.000 / 4.858 vs 5.107 / 5.200 (-4.3%); 6d373bbbe 4.993 / 4.933 vs 5.073 / 4.911 (-0.6%);
+  6703c576f (reth v2.9.0) 4.873 / 4.960 vs 5.193 / 5.173 (-5.1%); 0ed56c1da (v2.10.0) 4.972 / 4.937 vs
+  4.951 / 5.127 (-1.7%). Pooled: the four points read 4.86-5.00 (eight legs, mean 4.94), the tag 4.91-5.20
+  (twelve legs with PA, mean 5.10), `main` 4.88. Most of the step is therefore already in at d07ec6584:
+  it lies in 47b8180ab..d07ec6584 (10-24..10-30), and the reth bumps are not it. All 16 legs clean.
+  Round 2: 6eb585176 (maturity audit), 8ff447481 (design items), 62bc01b59 (QC embed + leftovers),
+  134b9c215 (before compaction stages 1-2).

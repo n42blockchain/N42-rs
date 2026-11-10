@@ -130,29 +130,114 @@ fn shard_of(key: &Hash) -> usize {
     (x >> 56) as usize
 }
 
-/// The positions `0..n` grouped by the shard of `key(i)`, each group in
-/// position order, and where each shard's group starts (`starts[SHARDS]` is
-/// `n`): a counting sort, so a batch inserts one shard's keys at a time.
-fn group_by_shard<'k>(n: usize, key: impl Fn(usize) -> &'k Hash) -> Result<(Vec<u32>, Box<[usize; SHARDS + 1]>), IndexError> {
+/// Keys per unit of [`partition_by_shard`]'s parallel passes.
+const PARTITION_CHUNK: usize = 8192;
+
+/// A raw pointer the partition's and the batches' parallel passes write
+/// through, each to positions no other task writes.
+struct SyncPtr<T>(*mut T);
+
+// By hand: a derive would ask `T: Copy`.
+impl<T> Clone for SyncPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for SyncPtr<T> {}
+
+// SAFETY: only used for writes to disjoint positions of one allocation that
+// outlives the parallel pass (see each use).
+unsafe impl<T: Send> Send for SyncPtr<T> {}
+// SAFETY: as above.
+unsafe impl<T: Send> Sync for SyncPtr<T> {}
+
+impl<T> SyncPtr<T> {
+    /// The pointer to position `at` (a method, so a closure captures the
+    /// whole `SyncPtr` rather than its raw-pointer field).
+    #[inline]
+    const fn at(self, at: usize) -> *mut T {
+        self.0.wrapping_add(at)
+    }
+}
+
+/// A batch's items grouped by shard: shard `s`'s are
+/// `items[starts[s]..starts[s + 1]]`, in batch order.
+struct ShardRuns<T> {
+    items: Vec<T>,
+    starts: Box<[usize; SHARDS + 1]>,
+}
+
+/// `item(i)` for every `i < n`, grouped by `shard(key(i))` and copied
+/// into one contiguous run a shard (a stable counting sort), so each
+/// shard's pass reads its items in sequence. Both passes -- the shards and
+/// their counts, then the scatter -- run on the worker pool, a chunk of
+/// [`PARTITION_CHUNK`] positions a task; only the prefix sums over the
+/// chunks' counts are serial.
+fn partition_by_shard<'k, T: Send>(
+    n: usize,
+    shard: impl Fn(&Hash) -> usize + Sync,
+    key: impl Fn(usize) -> &'k Hash + Sync,
+    item: impl Fn(usize) -> T + Sync,
+) -> Result<ShardRuns<T>, IndexError> {
     if u32::try_from(n).is_err() {
         return Err(IndexError::BatchTooLarge(n));
     }
-    let shards: Vec<u8> = (0..n).map(|i| shard_of(key(i)) as u8).collect();
+    let mut shards = vec![0u8; n];
+    let count = |(chunk, out): (usize, &mut [u8])| -> [u32; SHARDS] {
+        let mut counts = [0u32; SHARDS];
+        let base = chunk * PARTITION_CHUNK;
+        for (i, chosen) in out.iter_mut().enumerate() {
+            let s = shard(key(base + i));
+            *chosen = s as u8;
+            counts[s] += 1;
+        }
+        counts
+    };
+    #[cfg(feature = "rayon")]
+    let counts: Vec<[u32; SHARDS]> = {
+        use rayon::prelude::*;
+        shards.par_chunks_mut(PARTITION_CHUNK).enumerate().map(count).collect()
+    };
+    #[cfg(not(feature = "rayon"))]
+    let counts: Vec<[u32; SHARDS]> = shards.chunks_mut(PARTITION_CHUNK).enumerate().map(count).collect();
+    // Each chunk's first position in each shard's run: shard by shard, the
+    // chunks in order, so a run keeps the batch's order.
+    let mut next = vec![[0u32; SHARDS]; counts.len()];
     let mut starts = Box::new([0usize; SHARDS + 1]);
-    for shard in &shards {
-        starts[*shard as usize + 1] += 1;
-    }
+    let mut at = 0u32;
     for shard in 0..SHARDS {
-        starts[shard + 1] += starts[shard];
+        starts[shard] = at as usize;
+        for (chunk, counts) in counts.iter().enumerate() {
+            next[chunk][shard] = at;
+            at += counts[shard];
+        }
     }
-    let mut next = starts.clone();
-    let mut order = vec![0u32; n];
-    for (i, shard) in shards.iter().enumerate() {
-        let at = &mut next[*shard as usize];
-        order[*at] = i as u32;
-        *at += 1;
+    starts[SHARDS] = n;
+    let mut items: Vec<T> = Vec::with_capacity(n);
+    let dst = SyncPtr(items.as_mut_ptr());
+    let scatter = |(chunk, (shards, mut next)): (usize, (&[u8], [u32; SHARDS]))| {
+        let base = chunk * PARTITION_CHUNK;
+        for (i, shard) in shards.iter().enumerate() {
+            let at = &mut next[*shard as usize];
+            // SAFETY: `*at < n`, inside the capacity reserved above; the
+            // prefix sums give every (chunk, shard) its own range of
+            // positions, so no two writes, in this task or another, meet.
+            unsafe { dst.at(*at as usize).write(item(base + i)) };
+            *at += 1;
+        }
+    };
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+        shards.par_chunks(PARTITION_CHUNK).zip(next.into_par_iter()).enumerate().for_each(scatter);
     }
-    Ok((order, starts))
+    #[cfg(not(feature = "rayon"))]
+    shards.chunks(PARTITION_CHUNK).zip(next).enumerate().for_each(scatter);
+    // SAFETY: the scatter wrote every position below `n` exactly once (the
+    // counts sum to `n`); a panic in `item` unwinds before this, leaving the
+    // vector empty (its written items leak, nothing is read uninitialised).
+    unsafe { items.set_len(n) };
+    Ok(ShardRuns { items, starts })
 }
 
 /// The key's 24-bit fingerprint: splitmix64's finalizer over `key[8..16]` and the seed.
@@ -427,49 +512,27 @@ impl TagIndex {
 
     /// Inserts `(key, slot)` pairs with distinct keys, one shard at a time
     /// on the worker pool. An error (a shard full) leaves the pairs before it
-    /// in that shard, and other shards', inserted.
+    /// in that shard, and other shards', inserted. In the seeded mode the
+    /// pairs are copied into one run a shard first ([`partition_by_shard`]);
+    /// in the key0 mode, `pairs` sorted by key, every shard's pairs already
+    /// are one contiguous run (the walk before the seeded shards).
     pub(crate) fn insert_sorted(&mut self, pairs: &[(Hash, u64)], key_at: impl Fn(u64) -> Hash + Sync) -> Result<(), IndexError> {
         if self.key0 {
-            return self.insert_sorted_key0(pairs, key_at);
+            let starts = key0_runs(pairs.len(), |i| &pairs[i].0);
+            return self.insert_runs(pairs, &starts, key_at);
         }
-        let (order, starts) = group_by_shard(pairs.len(), |i| &pairs[i].0)?;
-        let max_bits = self.max_bits;
-        let work = |(index, shard): (usize, &mut Shard)| -> Result<(), IndexError> {
-            let run = &order[starts[index]..starts[index + 1]];
-            if run.is_empty() {
-                return Ok(());
-            }
-            shard.ensure_capacity(shard.len + run.len(), max_bits)?;
-            // The table does not grow inside the run (capacity reserved
-            // above), so a bucket prefetched ahead is the one probed.
-            for i in run.iter().take(PREFETCH_AHEAD) {
-                shard.prefetch(&pairs[*i as usize].0);
-            }
-            for (at, i) in run.iter().enumerate() {
-                if let Some(ahead) = run.get(at + PREFETCH_AHEAD) {
-                    shard.prefetch(&pairs[*ahead as usize].0);
-                }
-                let (key, slot) = &pairs[*i as usize];
-                shard.insert(key, *slot, &key_at, max_bits)?;
-            }
-            Ok(())
-        };
-        #[cfg(feature = "rayon")]
-        {
-            use rayon::prelude::*;
-            self.shards.par_iter_mut().enumerate().try_for_each(work)
-        }
-        #[cfg(not(feature = "rayon"))]
-        {
-            self.shards.iter_mut().enumerate().try_for_each(work)
-        }
+        let runs = partition_by_shard(pairs.len(), shard_of, |i| &pairs[i].0, |i| pairs[i])?;
+        self.insert_runs(&runs.items, &runs.starts, key_at)
     }
 
-    /// [`Self::insert_sorted`] in the key0 mode: `pairs` sorted by key, so
-    /// every shard's pairs are one contiguous run (the walk before the
-    /// seeded shards).
-    fn insert_sorted_key0(&mut self, pairs: &[(Hash, u64)], key_at: impl Fn(u64) -> Hash + Sync) -> Result<(), IndexError> {
-        let starts = key0_runs(pairs.len(), |i| &pairs[i].0);
+    /// Inserts shard `s`'s pairs `pairs[starts[s]..starts[s + 1]]`, the
+    /// shards in parallel on the worker pool.
+    fn insert_runs(
+        &mut self,
+        pairs: &[(Hash, u64)],
+        starts: &[usize; SHARDS + 1],
+        key_at: impl Fn(u64) -> Hash + Sync,
+    ) -> Result<(), IndexError> {
         let max_bits = self.max_bits;
         let work = |(index, shard): (usize, &mut Shard)| -> Result<(), IndexError> {
             let run = &pairs[starts[index]..starts[index + 1]];
@@ -477,6 +540,8 @@ impl TagIndex {
                 return Ok(());
             }
             shard.ensure_capacity(shard.len + run.len(), max_bits)?;
+            // The table does not grow inside the run (capacity reserved
+            // above), so a bucket prefetched ahead is the one probed.
             for (key, _) in run.iter().take(PREFETCH_AHEAD) {
                 shard.prefetch(key);
             }
@@ -631,47 +696,47 @@ impl SharedOffsetIndex {
         if self.key0 {
             return self.apply_sorted_key0(changes, key_at);
         }
-        let (order, starts) = group_by_shard(changes.len(), |i| &changes[i].0)?;
-        let work = |shard: usize| -> Result<Vec<Option<u64>>, IndexError> {
-            let run = &order[starts[shard]..starts[shard + 1]];
+        // One run a shard, each change with its position; every shard's
+        // pass writes its answers straight to their positions.
+        let runs = partition_by_shard(changes.len(), shard_of, |i| &changes[i].0, |i| (i as u32, changes[i]))?;
+        let mut out = vec![None; changes.len()];
+        let dst = SyncPtr(out.as_mut_ptr());
+        let work = |shard: usize| -> Result<(), IndexError> {
+            let run = &runs.items[runs.starts[shard]..runs.starts[shard + 1]];
             if run.is_empty() {
-                return Ok(Vec::new());
+                return Ok(());
             }
             let mut guard = self.write(shard);
-            let inserts = run.iter().filter(|i| changes[**i as usize].1.is_some()).count();
+            let inserts = run.iter().filter(|(_, (_, value))| value.is_some()).count();
             let len = guard.len;
             guard.ensure_capacity(len + inserts, MAX_BITS)?;
             // No growth inside the run (capacity reserved above): a bucket
             // prefetched ahead is the one probed.
-            for i in run.iter().take(PREFETCH_AHEAD) {
-                guard.prefetch(&changes[*i as usize].0);
+            for (_, (key, _)) in run.iter().take(PREFETCH_AHEAD) {
+                guard.prefetch(key);
             }
-            run.iter()
-                .enumerate()
-                .map(|(at, i)| {
-                    if let Some(ahead) = run.get(at + PREFETCH_AHEAD) {
-                        guard.prefetch(&changes[*ahead as usize].0);
-                    }
-                    let (key, value) = &changes[*i as usize];
-                    match value {
-                        Some(value) => guard.insert(key, *value, &key_at, MAX_BITS),
-                        None => Ok(guard.remove(key, &key_at)),
-                    }
-                })
-                .collect()
+            for (at, (position, (key, value))) in run.iter().enumerate() {
+                if let Some((_, (ahead, _))) = run.get(at + PREFETCH_AHEAD) {
+                    guard.prefetch(ahead);
+                }
+                let previous = match value {
+                    Some(value) => guard.insert(key, *value, &key_at, MAX_BITS)?,
+                    None => guard.remove(key, &key_at),
+                };
+                // SAFETY: `position < changes.len() == out.len()`, and the
+                // partition names every position exactly once, so no two
+                // tasks write one.
+                unsafe { *dst.at(*position as usize) = previous };
+            }
+            Ok(())
         };
         #[cfg(feature = "rayon")]
-        let pieces: Vec<Vec<Option<u64>>> = {
+        {
             use rayon::prelude::*;
-            (0..SHARDS).into_par_iter().map(work).collect::<Result<_, _>>()?
-        };
-        #[cfg(not(feature = "rayon"))]
-        let pieces: Vec<Vec<Option<u64>>> = (0..SHARDS).map(work).collect::<Result<_, _>>()?;
-        // Back into `changes`' order: `order` lists each shard's positions.
-        let mut out = vec![None; changes.len()];
-        for (at, previous) in order.iter().zip(pieces.into_iter().flatten()) {
-            out[*at as usize] = previous;
+            (0..SHARDS).into_par_iter().try_for_each(work)?;
         }
+        #[cfg(not(feature = "rayon"))]
+        (0..SHARDS).try_for_each(work)?;
         Ok(out)
     }
 
@@ -1085,6 +1150,28 @@ mod tests {
         assert_eq!(shared_seeded.len(), shared_key0.len());
         for (key, _) in &changes {
             assert_eq!(shared_seeded.get(key, key_at), shared_key0.get(key, key_at));
+        }
+    }
+
+    /// The partition is a stable grouping by shard: every position once,
+    /// each shard's run in the batch's order.
+    #[test]
+    fn the_partition_groups_by_shard_in_batch_order() {
+        let keys: Vec<Hash> = (0..50_000u64).map(|n| key_of(n, None)).collect();
+        for n in [0usize, 1, 7, PARTITION_CHUNK, PARTITION_CHUNK + 1, keys.len()] {
+            let runs = partition_by_shard(n, shard_of, |i| &keys[i], |i| i).unwrap();
+            assert_eq!(runs.items.len(), n);
+            assert_eq!(runs.starts[SHARDS], n);
+            let mut seen = vec![false; n];
+            for shard in 0..SHARDS {
+                let run = &runs.items[runs.starts[shard]..runs.starts[shard + 1]];
+                assert!(run.windows(2).all(|pair| pair[0] < pair[1]), "shard {shard} in batch order");
+                for i in run {
+                    assert_eq!(shard_of(&keys[*i]), shard);
+                    assert!(!std::mem::replace(&mut seen[*i], true));
+                }
+            }
+            assert!(seen.iter().all(|seen| *seen));
         }
     }
 

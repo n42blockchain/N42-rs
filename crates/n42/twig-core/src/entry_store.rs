@@ -2226,7 +2226,8 @@ mod tests {
         for i in 1000..1200 {
             file.push(&key(i), &[7u8; 3]).unwrap();
         }
-        assert_eq!(file.value(500), &vec![(500 % 256) as u8; 1 + 500 % 50][..]);
+        let slot = 500usize;
+        assert_eq!(file.value(slot), &vec![(slot % 256) as u8; 1 + slot % 50][..]);
         assert_eq!(file.value(1100), &[7u8; 3]);
         // Truncate into the sealed chunk, then append over it.
         file.truncate(800).unwrap();

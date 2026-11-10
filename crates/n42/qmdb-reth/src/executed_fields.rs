@@ -278,7 +278,7 @@ mod tests {
         let carrying = alloy_consensus::Header { number: 153, parent_hash: child.hash_slow(), state_root: B256::repeat_byte(3), gas_used: 21_000, ..Default::default() };
         assert_eq!(fields_from_descendants(&ancestor, &[child.clone(), carrying.clone()], 2), Some(fields_from_child_header(&carrying)));
         assert_ne!(fields_from_child_header(&ancestor), fields_from_child_header(&carrying));
-        assert_eq!(fields_from_descendants(&ancestor, &[child.clone()], 2), None);
+        assert_eq!(fields_from_descendants(&ancestor, std::slice::from_ref(&child), 2), None);
         assert_eq!(fields_from_descendants(&ancestor, &[child.clone(), carrying.clone()], 1), None);
         let mut wrong = carrying;
         wrong.parent_hash = B256::ZERO;
@@ -286,7 +286,7 @@ mod tests {
         let mut gap = child.clone();
         gap.number += 1;
         assert_eq!(fields_from_descendants(&ancestor, &[gap], 1), None);
-        assert_eq!(fields_from_descendants(&ancestor, &[child.clone()], 1), Some(fields_from_child_header(&child)));
+        assert_eq!(fields_from_descendants(&ancestor, std::slice::from_ref(&child), 1), Some(fields_from_child_header(&child)));
     }
 
     #[test]

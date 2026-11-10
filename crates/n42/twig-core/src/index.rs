@@ -842,9 +842,13 @@ mod tests {
         });
     }
 
+    /// What [`shared_fixture`] returns: the store, the index over it, and
+    /// the batch of keys with their held offsets.
+    type SharedFixture = (Vec<Hash>, SharedOffsetIndex, Vec<(Hash, Option<u64>)>);
+
     /// A shared index over `live` keys (offsets are store positions) and a
     /// sorted batch of `batch` keys, half of them held, half misses.
-    fn shared_fixture(live: u64, batch: u64) -> (Vec<Hash>, SharedOffsetIndex, Vec<(Hash, Option<u64>)>) {
+    fn shared_fixture(live: u64, batch: u64) -> SharedFixture {
         let store: Vec<Hash> = (0..live).map(|n| key_of(n, None)).collect();
         let index = SharedOffsetIndex::default();
         let mut pairs: Vec<(Hash, Option<u64>)> = store.iter().enumerate().map(|(i, k)| (*k, Some(i as u64))).collect();

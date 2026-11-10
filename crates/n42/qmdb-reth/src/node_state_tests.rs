@@ -1090,7 +1090,13 @@ fn a_rename_while_the_tree_is_leased_is_followed_and_tree_readers_wait_for_it() 
             held
         })
     };
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // The reader counts its wait right before it blocks on the lease; under
+    // load it may take longer than any fixed sleep to get there.
+    let started = std::time::Instant::now();
+    while state.offlock_counters().tree_waits == 0 {
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "the tree reader never reached the lease wait");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "a tree reader waited for the lease");
 
     let computed = lease.compute(changes_for(5).ops());

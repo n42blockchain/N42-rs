@@ -66,3 +66,14 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   0ed56c1da and `main`. Two-leg pairs cannot resolve steps this small, so the next reading is by phase:
   the per-leg phase and timer files of all 39 legs, grouped by binary (in progress). Round 3 on the box:
   `main` natives rebuilt from current `main`, then 0ed56c1da vs `main` twice and 6eb585176 vs tag twice.
+- 2026-11-10 21:30Z: P2 by phase (39 legs; `audit-notes/ci/phase-diff/REPORT.md`). The whole loss is the
+  leader's build-start-to-seal time: mean gap 39.13 ms (tag) / 40.14 (points) / 41.10 (`main`), tracking
+  `sealed_at_ms` (r = 0.98); consensus timings unchanged. (1) Maturity merge, about +1.0 ms: the root job
+  is ~3 ms slower (roots 35.1 -> 38.3 ms, root_index 5.68 -> 7.0-7.6, root_leaves 6.0 -> 7.1-10), so the
+  seal waits for the grandparent's fields; first candidate 1f5dc72e6, the seeded shard choice of the key
+  index (`twig-core/src/index.rs` `shard_of`, `group_by_shard`). (2) reth v2.9.0 port, about +0.5 ms:
+  a 3.4-3.8 ms fee/gas reduce between execution end and the seal (`payload.rs`, `evm2_fees_us`) and
+  par_exec +1.8 ms. (3) 0ed56c1da -> `main` +0.4 ms, within noise. CD0 was not a stall: one of the
+  18,750 funding transfers was refused ("insufficient funds ... have 0"), funding never mined.
+  P3 started on two branches: `perf/index-shard-cost` (attribution knob `N42_INDEX_SHARD_KEY0`, then the
+  seeded path made as fast) and `perf/evm2-fees-in-exec` (fees summed inside the execution workers).

@@ -264,6 +264,7 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | Knob | Default | Values | Meaning | Where read | Status |
 |---|---|---|---|---|---|
 | `N42_ENGINE_EXEC_CACHE` | skip (on restores reth cache update) | see Default | on keeps reth cache update on executed inserts for QMDB chains (A/B). | `qmdb-reth:exec_cache.rs:49` | default |
+| `N42_INDEX_SHARD_KEY0` | off | `1` | The QMDB key index (tree and read view) chooses its shard by `key[0]` and walks a sorted batch one contiguous run a shard, as before the seeded shards of the QMDB hardening (1f5dc72e6): the attribution knob for their cost on a fleet pair. Read once. Gives back the hardening (ground keys can fill one shard and halt the node); never on a product node. In memory only, nothing persisted depends on it. | `twig-core:index.rs` | bench-only |
 | `N42_QMDB_APPEND_AHEAD_MB` | 64 | integer | MB of the QMDB append file populated ahead (0 = off). | `twig-core:prefault.rs:79` | default |
 | `N42_QMDB_APPEND_REWALK` | 0 (off) | integer | Rewalk the append window not only when half is left. | `twig-core:prefault.rs:456` | default |
 | `N42_QMDB_APPLY_SCRATCH` | 1 (on; 0 disables) | integer | Reuse apply temporaries between blocks. | `twig-core:prefault.rs:157` | default |

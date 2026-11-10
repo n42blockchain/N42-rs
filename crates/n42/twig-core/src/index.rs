@@ -1107,6 +1107,102 @@ mod tests {
     }
 
     /// `cargo test -p n42-twig-core --release --features rayon --lib -- --ignored
+    /// --nocapture shard_mode_bench`: the root job's three index batch paths
+    /// at a fleet7 block's shape, key0 shards (`N42_INDEX_SHARD_KEY0`) against
+    /// seeded ones, both in one process. The index holds `IDXBENCH_LIVE` keys
+    /// (default 32M) laid out as the tree lays them out (each block's keys
+    /// appended in sorted order); every round is a sorted block of
+    /// `IDXBENCH_BATCH` keys (default 400k), three quarters held: the
+    /// held-slot pass (`held_slots`: 1024-key chunks of `get_into` on the
+    /// pool), the tree's `insert_sorted` of the block's appends, and the read
+    /// view's `apply_sorted` of the same keys at new offsets. On a pool of
+    /// `IDXBENCH_THREADS` (default 16, a fleet node's cores). Medians of
+    /// `IDXBENCH_ROUNDS` (default 9) rounds, in microseconds.
+    #[cfg(feature = "rayon")]
+    #[test]
+    #[ignore = "timing; run by hand in release"]
+    fn shard_mode_bench() {
+        use rayon::prelude::*;
+        let var = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let (live, batch, rounds, threads) =
+            (var("IDXBENCH_LIVE", 32_000_000), var("IDXBENCH_BATCH", 400_000), var("IDXBENCH_ROUNDS", 9), var("IDXBENCH_THREADS", 16));
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let block = batch;
+        // The store as the tree appends it: each block's keys in sorted order.
+        let mut store: Vec<Hash> = pool.install(|| (0..live as u64).into_par_iter().map(|n| key_of(n, None)).collect());
+        pool.install(|| store.par_chunks_mut(block).for_each(|chunk| chunk.sort_unstable()));
+        // Every round's block: held keys (distinct) and fresh ones, sorted.
+        let mut stream = Stream(42);
+        let held_per = batch * 3 / 4;
+        let blocks: Vec<Vec<Hash>> = (0..rounds)
+            .map(|round| {
+                let mut keys: Vec<Hash> = (0..held_per).map(|_| store[(stream.next() % live as u64) as usize]).collect();
+                keys.extend((0..batch - held_per).map(|j| key_of((live + round * batch + j) as u64, None)));
+                keys.sort_unstable();
+                keys.dedup();
+                keys
+            })
+            .collect();
+        let median = |mut v: Vec<u128>| {
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        let base = store.len();
+        for key0 in [true, false, true, false] {
+            store.truncate(base);
+            let mut tag = TagIndex::with_key0(key0);
+            let shared = SharedOffsetIndex::with_key0(key0);
+            {
+                let key_at = |slot: u64| store[slot as usize];
+                pool.install(|| {
+                    tag.reserve(live);
+                    for (at, chunk) in store.chunks(block).enumerate() {
+                        let pairs: Vec<(Hash, u64)> =
+                            chunk.iter().enumerate().map(|(i, key)| (*key, (at * block + i) as u64)).collect();
+                        tag.insert_sorted(&pairs, key_at).unwrap();
+                        let changes: Vec<(Hash, Option<u64>)> = pairs.iter().map(|(key, slot)| (*key, Some(*slot))).collect();
+                        shared.apply_sorted(&changes, key_at).unwrap();
+                    }
+                });
+            }
+            let (mut held_us, mut insert_us, mut apply_us, mut found) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
+            for keys in &blocks {
+                let first = store.len() as u64;
+                store.extend_from_slice(keys);
+                let key_at = |slot: u64| store[slot as usize];
+                let pairs: Vec<(Hash, u64)> = keys.iter().enumerate().map(|(i, key)| (*key, first + i as u64)).collect();
+                let changes: Vec<(Hash, Option<u64>)> = pairs.iter().map(|(key, slot)| (*key, Some(*slot))).collect();
+                let mut out = vec![None; keys.len()];
+                pool.install(|| {
+                    let at = std::time::Instant::now();
+                    out.par_chunks_mut(1024).enumerate().for_each(|(chunk, held)| {
+                        let base = chunk * 1024;
+                        tag.get_into(held, |i| &keys[base + i], key_at);
+                    });
+                    held_us.push(at.elapsed().as_micros());
+                    found += out.iter().flatten().count();
+                    let at = std::time::Instant::now();
+                    tag.insert_sorted(&pairs, key_at).unwrap();
+                    insert_us.push(at.elapsed().as_micros());
+                    let at = std::time::Instant::now();
+                    found += shared.apply_sorted(&changes, key_at).unwrap().iter().flatten().count();
+                    apply_us.push(at.elapsed().as_micros());
+                });
+            }
+            println!(
+                "{} live {} batch {} threads {}: held_slots {} us, insert_sorted {} us, apply_sorted {} us (sink {found})",
+                if key0 { "key0  " } else { "seeded" },
+                tag.len(),
+                blocks[0].len(),
+                threads,
+                median(held_us),
+                median(insert_us),
+                median(apply_us),
+            );
+        }
+    }
+
+    /// `cargo test -p n42-twig-core --release --features rayon --lib -- --ignored
     /// --nocapture batch_lookup_bench`: the read view's `apply_sorted` (its
     /// overwrite path, every key held) and the tree's held-slot pass, one
     /// lookup a key against `get_into`, over a 4M-key index and a 326k-key

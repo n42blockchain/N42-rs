@@ -583,6 +583,9 @@ pub struct TreeLease {
     tree: QmdbCompatTree,
     parent: B256,
     move_us: u64,
+    /// The parent's filed root, for the base check of a small block's
+    /// computation ([`TreeLease::compute_with_leaves`]).
+    parent_root: Option<B256>,
 }
 
 /// A root computed on a [`TreeLease`], to be handed back with the tree.
@@ -611,6 +614,26 @@ impl TreeLease {
         self.parent
     }
 
+    /// The parent's filed root and the leased tree's root, when they differ:
+    /// a computation on this lease would stand on a state that is not the
+    /// parent's. Checked (and logged at ERROR) before a small block's
+    /// computation ([`forest_trace`]), so a mislabelled base is named at the
+    /// compute that uses it rather than at a later replay -- the case the
+    /// revert-time check cannot see, a lease whose move reverted nothing.
+    pub fn check_base(&self) -> Option<(B256, B256)> {
+        let expected = self.parent_root?;
+        let got = B256::from(self.tree.root());
+        if got == expected {
+            return None;
+        }
+        tracing::error!(
+            target: "n42.qmdb",
+            parent = %self.parent, expected = %expected, tree_root = %got,
+            "QMDB leased tree is not its parent's state before a computation (mislabelled tree)",
+        );
+        Some((expected, got))
+    }
+
     /// [`QmdbForest::compute_operations`]'s apply, on the leased tree: the
     /// root, the undo, the delta and the appended slots' entry-file offsets.
     /// Nothing outside the tree is touched; [`QmdbForest::return_tree`] files
@@ -627,6 +650,9 @@ impl TreeLease {
         let mut ops = ops.into();
         if !ops.is_sorted() {
             ops.sort();
+        }
+        if forest_trace(ops.len()) {
+            self.check_base();
         }
         let applied_at = std::time::Instant::now();
         let (root, undo, phases) = self.tree.apply_ops_recorded_phased_with(&ops, leaves)?;
@@ -692,6 +718,69 @@ pub fn forest_trace_env() -> bool {
 /// length compare per event.
 fn forest_trace(ops: usize) -> bool {
     ops <= FOREST_TRACE_SMALL_OPS || forest_trace_env()
+}
+
+/// A digest of a block's leaf operations (keys and values, in order) for
+/// the trace lines: an insert and a later replay of one record carry the
+/// same operations exactly when their digests match. Only computed for
+/// blocks [`forest_trace`] logs.
+fn ops_digest(ops: &QmdbOps) -> B256 {
+    let mut bytes = Vec::with_capacity(ops.len() * 40 + ops.value_bytes());
+    for (key, value) in ops.iter() {
+        bytes.extend_from_slice(key);
+        match value {
+            Some(value) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(value);
+            }
+            None => bytes.push(0),
+        }
+    }
+    alloy_primitives::keccak256(bytes)
+}
+
+/// What a replay that missed its filed root says about itself
+/// ([`QmdbForest::diagnose_replay`]), logged with the mismatch. The three
+/// explanations the log of loop351's block 7167 could not tell apart
+/// (`docs/RETH_2_10_0_UPGRADE.md`, second occurrence) are each one field:
+/// the base the replay stood on, the other apply path on the same base and
+/// operations, and the record's own parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayDiagnosis {
+    /// The block whose replay missed.
+    pub block: B256,
+    /// The record's parent: the block the tree stood at for the replay.
+    pub parent: B256,
+    /// The parent's filed root.
+    pub parent_root: Option<B256>,
+    /// The tree's root before the replay (after its undo).
+    pub base_root: B256,
+    /// The root the record was filed with.
+    pub expected: B256,
+    /// The root the replay (the serial apply path) gave.
+    pub got: B256,
+    /// The root the same operations give on the same base through the
+    /// leaf-hash path a leased root computation takes; `None` if that apply
+    /// failed.
+    pub leaf_path_root: Option<B256>,
+    /// How many leaf operations the record holds, and their digest.
+    pub ops: usize,
+    /// [`ops_digest`] of the record's operations.
+    pub ops_digest: B256,
+}
+
+impl ReplayDiagnosis {
+    /// Which explanation the fields support.
+    pub fn verdict(&self) -> &'static str {
+        if self.parent_root != Some(self.base_root) {
+            "the tree under the replay's parent is not that parent's state (mislabelled tree before the replay)"
+        } else if self.leaf_path_root != Some(self.got) {
+            "the leaf-hash apply and the serial apply disagree on the same operations and base (the apply is not a pure function)"
+        } else {
+            "the filed root was not computed on this parent's state (a wrong base when it was computed, or a wrong parent in its record)"
+        }
+    }
 }
 
 /// What [`QmdbForest::rename`] did, for its trace line.
@@ -941,7 +1030,8 @@ impl QmdbForest {
         let move_us = moved_at.elapsed().as_micros() as u64;
         let tree = std::mem::take(&mut self.tree);
         self.leased_at = Some(tree.next_slot());
-        Ok(TreeLease { tree, parent, move_us })
+        let parent_root = self.records.get(&parent).map(|record| record.root);
+        Ok(TreeLease { tree, parent, move_us, parent_root })
     }
 
     /// Puts a leased tree back and files what was computed on it as pending
@@ -1382,6 +1472,9 @@ impl QmdbForest {
         self.move_to(parent)?;
         let mut ops = changes.ops();
         ops.sort();
+        if forest_trace(ops.len()) {
+            self.check_tree_at(parent, "standing at the parent of a block about to be computed");
+        }
         // Applied from the arena the record keeps: no clone of the block.
         let (root, undo) = match self.tree.apply_ops_recorded(&ops) {
             Ok(applied) => applied,
@@ -1415,6 +1508,9 @@ impl QmdbForest {
         let move_us = moved_at.elapsed().as_micros() as u64;
         if !ops.is_sorted() {
             ops.sort();
+        }
+        if forest_trace(ops.len()) {
+            self.check_tree_at(parent, "standing at the parent of a block about to be computed");
         }
         // Applied from the arena the record keeps: no clone of the block.
         let applied_at = std::time::Instant::now();
@@ -1507,6 +1603,7 @@ impl QmdbForest {
                     target: "n42.qmdb",
                     %block_hash, number, parent = %prepared.parent, offered_root = %prepared.root,
                     held_parent = %held.parent, held_root = %held.root, same_root = held.root == prepared.root,
+                    offered_ops_digest = %ops_digest(&prepared.ops), held_ops_digest = %ops_digest(&held.ops),
                     pending = ?self.pending.as_ref().map(|(parent, _)| (*parent, self.pending_root)),
                     tip = %self.tip, "forest insert: already held, kept (early return)",
                 );
@@ -1543,7 +1640,8 @@ impl QmdbForest {
             tracing::info!(
                 target: "n42.qmdb",
                 %block_hash, number, parent = %prepared.parent, root = %prepared.root, ops = prepared.ops.len(),
-                pending = ?pending_before, tip_before = %self.tip, "forest insert: {outcome}",
+                ops_digest = %ops_digest(&prepared.ops), pending = ?pending_before, tip_before = %self.tip,
+                "forest insert: {outcome}",
             );
         }
         let delta = prepared.delta.map(|mut delta| {
@@ -2073,7 +2171,22 @@ impl QmdbForest {
                 // at `tip` as the forest says; if that fails, nothing the
                 // tree computes can be trusted.
                 match self.tree.apply_undo(&undo) {
-                    Ok(()) => self.note_move(&undo),
+                    Ok(()) => {
+                        self.note_move(&undo);
+                        // Rare and fatal on the fleet: worth the second apply
+                        // that names the cause.
+                        if let Some(diagnosis) = self.diagnose_replay(*hash, root) {
+                            tracing::error!(
+                                target: "n42.qmdb",
+                                block = %diagnosis.block, parent = %diagnosis.parent,
+                                parent_root = ?diagnosis.parent_root, base_root = %diagnosis.base_root,
+                                expected = %diagnosis.expected, got = %diagnosis.got,
+                                leaf_path_root = ?diagnosis.leaf_path_root, ops = diagnosis.ops,
+                                ops_digest = %diagnosis.ops_digest, verdict = diagnosis.verdict(),
+                                "QMDB replay missed its filed root",
+                            );
+                        }
+                    }
                     Err(err) => self.poison(format!(
                         "re-applying block {hash} gave root {root}, expected {expected}, and its undo failed: {err}"
                     )),
@@ -2111,15 +2224,62 @@ impl QmdbForest {
     /// ERROR with both roots (`docs/RETH_2_10_0_UPGRADE.md`, second
     /// occurrence). One root read per move that reverted something.
     fn check_tree_at(&self, at: B256, what: &str) {
-        let Some(expected) = self.records.get(&at).map(|record| record.root) else { return };
-        let got = B256::from(self.tree.root());
-        if got != expected {
+        if let Some((expected, got)) = self.tree_mismatch(at) {
             tracing::error!(
                 target: "n42.qmdb",
                 block = %at, expected = %expected, tree_root = %got,
                 "QMDB tree root after {what} is not the root filed for the block it stands at (mislabelled tree)",
             );
         }
+    }
+
+    /// The filed root of `at` and the tree's root, when they differ.
+    fn tree_mismatch(&self, at: B256) -> Option<(B256, B256)> {
+        let expected = self.records.get(&at)?.root;
+        let got = B256::from(self.tree.root());
+        (got != expected).then_some((expected, got))
+    }
+
+    /// Why the replay of `block` gave `got` instead of its filed root, with
+    /// the tree standing at the record's parent again (after the replay's
+    /// undo): the base's root against the parent's filed root, and the
+    /// same operations applied once more through the leaf-hash path (the
+    /// path a leased root computation takes, `LeafHashes` computed ahead)
+    /// and undone. `None` when the tree is not at the record's parent or
+    /// the record is gone. A diagnostic for a fatal error: it costs a second
+    /// apply of one block, only then.
+    pub fn diagnose_replay(&mut self, block: B256, got: B256) -> Option<ReplayDiagnosis> {
+        let record = self.records.get(&block)?;
+        if record.parent != self.tip || self.pending.is_some() || self.leased_at.is_some() {
+            return None;
+        }
+        let (parent, expected, ops) = (record.parent, record.root, Arc::clone(&record.ops));
+        let parent_root = self.records.get(&parent).map(|record| record.root);
+        let base_root = B256::from(self.tree.root());
+        let leaves = LeafHashes::of(&ops);
+        let leaf_path_root = match self.tree.apply_ops_recorded_phased_with(&ops, Some(&leaves)) {
+            Ok((root, undo, _)) => {
+                self.note_move(&undo);
+                if let Err(err) = self.tree.apply_undo(&undo) {
+                    self.poison(format!("undoing the diagnostic apply of block {block} failed: {err}"));
+                } else {
+                    self.note_move(&undo);
+                }
+                Some(B256::from(root))
+            }
+            Err(_) => None,
+        };
+        Some(ReplayDiagnosis {
+            block,
+            parent,
+            parent_root,
+            base_root,
+            expected,
+            got,
+            leaf_path_root,
+            ops: ops.len(),
+            ops_digest: ops_digest(&ops),
+        })
     }
 
     /// `hash` and its held ancestors, nearest first.
@@ -3114,7 +3274,7 @@ mod tests {
         assert_eq!(restored.prove_account(probe), Some(proof));
         assert_eq!(restored.entry_stats().relocated_bytes, report.bytes_written);
         // Version 1: no relocated length, in either direction.
-        let v1 = ForestCheckpoint { version: 1, relocated_len: 0, ..ckpt.clone() };
+        let v1 = ForestCheckpoint { version: 1, relocated_len: 0, ..ckpt };
         let json = serde_json::to_string(&v1).unwrap();
         assert!(!json.contains("relocated_len"), "{json}");
         assert_eq!(serde_json::from_str::<ForestCheckpoint>(&json).unwrap(), v1);
@@ -3136,7 +3296,7 @@ mod tests {
     /// Two builds on one parent, computed before either is filed (the
     /// payload builder computes a root and files it in two separate holds
     /// of the node's lock, so a second build's compute can land between
-    /// the first's compute and its insert; GA1b, 2026-11-06). The insert of
+    /// the first's compute and its insert; `GA1b`, 2026-11-06). The insert of
     /// the first must not adopt the second's pending application as its
     /// own: the tree would then stand at the second block under the first's
     /// name, every root computed on the first would be computed on the
@@ -3179,5 +3339,75 @@ mod tests {
         assert_eq!(computed, child_root, "the child of P was computed on P' state (replay: {moved:?})");
         moved.expect("P and its child replay onto the roots they were filed with");
         assert_eq!(forest.root(), child_root);
+    }
+
+    /// A record filed with a root its operations do not give on its parent
+    /// (the shape of loop351's block 7167): the replay misses, and the
+    /// diagnosis finds the base and both apply paths in agreement -- the
+    /// filed root itself is what is wrong. The diagnostic apply leaves the
+    /// tree at the parent.
+    #[test]
+    fn a_replay_that_misses_its_filed_root_is_diagnosed() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(1)).unwrap();
+        forest.apply(GENESIS, h(1), 1, &changes(2)).unwrap();
+        forest.set_canonical(h(1)).unwrap();
+        let mut prepared = forest.compute(h(1), &changes(3)).unwrap();
+        let true_root = prepared.root;
+        let filed = B256::repeat_byte(0x77);
+        prepared.root = filed;
+        // Not adopted (the pending root differs): filed unapplied.
+        forest.insert(h(2), 2, prepared).unwrap();
+        assert_eq!(forest.tip(), h(1));
+        match forest.set_canonical(h(2)) {
+            Err(StateError::Replay { block, expected, got }) => {
+                assert_eq!((block, expected, got), (h(2), filed, true_root));
+            }
+            other => panic!("expected a replay mismatch, got {other:?}"),
+        }
+        let diagnosis = forest.diagnose_replay(h(2), true_root).expect("the tree stands at the parent");
+        assert_eq!(diagnosis.parent, h(1));
+        assert_eq!(diagnosis.parent_root, Some(diagnosis.base_root));
+        assert_eq!(diagnosis.leaf_path_root, Some(true_root));
+        assert_eq!(diagnosis.ops, changes(3).ops().len());
+        assert!(diagnosis.verdict().starts_with("the filed root was not computed"), "{}", diagnosis.verdict());
+        assert_eq!(forest.tip(), h(1));
+        assert_eq!(forest.tree_mismatch(h(1)), None, "the diagnostic apply was undone");
+        assert!(forest.poisoned().is_none());
+    }
+
+    /// A tree whose state is not the state of the block it is labelled with
+    /// -- changes applied with no record -- is named by the base check of a
+    /// small block's leased computation, and a replay on it is diagnosed as
+    /// standing on a mislabelled tree, not as a wrong filed root.
+    #[test]
+    fn a_mislabelled_base_is_named_at_the_compute_and_at_the_replay() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(1)).unwrap();
+        forest.apply(GENESIS, h(1), 1, &changes(2)).unwrap();
+        forest.set_canonical(h(1)).unwrap();
+        // Two builds on block 1, neither adopted: both filed unapplied.
+        let built = forest.compute(h(1), &changes(3)).unwrap();
+        let sibling = forest.compute(h(1), &changes(4)).unwrap();
+        forest.insert(h(2), 2, built).unwrap();
+        forest.insert(h(0x22), 2, sibling).unwrap();
+        assert_eq!(forest.tip(), h(1));
+        let lease = forest.lease_tree(h(1)).unwrap();
+        assert_eq!(lease.check_base(), None, "a correct base passes");
+        assert!(forest.return_tree(lease, Err(StateError::TreeLeased)).is_err());
+        assert!(forest.poisoned().is_none());
+        // Behind the forest's back.
+        let mut stray = changes(9).ops();
+        stray.sort();
+        forest.tree.apply_ops_recorded(&stray).unwrap();
+        assert!(forest.tree_mismatch(h(1)).is_some());
+        let lease = forest.lease_tree(h(1)).unwrap();
+        let (expected, got) = lease.check_base().expect("the leased base is not block 1");
+        assert_eq!(Some(expected), forest.root_of(&h(1)));
+        assert_ne!(got, expected);
+        assert!(forest.return_tree(lease, Err(StateError::TreeLeased)).is_err());
+        assert!(forest.poisoned().is_none());
+        let Err(StateError::Replay { got, .. }) = forest.set_canonical(h(2)) else { panic!("the replay on a stray base must miss") };
+        let diagnosis = forest.diagnose_replay(h(2), got).expect("the tree stands at the parent");
+        assert_ne!(diagnosis.parent_root, Some(diagnosis.base_root));
+        assert!(diagnosis.verdict().starts_with("the tree under the replay's parent"), "{}", diagnosis.verdict());
     }
 }

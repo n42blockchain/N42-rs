@@ -2023,6 +2023,7 @@ mod tests {
         let (mut exec, mut root, mut fold_all, mut fold_only, mut finish) = (vec![], vec![], vec![], vec![], vec![]);
         let (mut shard_exec, mut freeze, mut shard_commit, mut shard_finish) = (vec![], vec![], vec![], vec![]);
         let (mut body_serial, mut body_pool) = (vec![], vec![]);
+        let mut fees_pass = vec![];
         let (mut late_finish, mut late_build) = (vec![], vec![]);
         for round in 0..rounds {
             let mut reference: Option<BundleState> = None;
@@ -2038,11 +2039,50 @@ mod tests {
             let keys = keys(&txs);
             let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);
             let open = || Some(base.clone());
+            // The fees counted on the batches, as the leader does, unless
+            // `F5G_TIP=0`; the post-execution pass they replace is timed
+            // after (`fees_pass_ms`).
+            let base_fee = reth_evm::EvmEnv::block_base_fee(&env);
+            let tip_of = |i: usize| alloy_consensus::Transaction::effective_tip_per_gas(txs[i].inner(), base_fee).unwrap_or_default();
+            let tip_on = std::env::var("F5G_TIP").map_or(true, |v| v != "0");
             let at = Instant::now();
-            let run = execute_batches(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), direct)
-                .expect("the batches run");
+            let run = execute_batches_into(
+                &c,
+                &env,
+                &keys,
+                None,
+                &convert,
+                &open,
+                None,
+                addr(BENEFICIARY),
+                Dispatch::from_env(),
+                None,
+                &[],
+                direct,
+                tip_on.then_some(&tip_of as &(dyn Fn(usize) -> u128 + Sync)),
+            )
+            .expect("the batches run");
             exec.push(at.elapsed().as_micros());
             assert_eq!(run.executed.len(), txs.len(), "skipped {}", run.skipped.len());
+            let at = Instant::now();
+            let pass = {
+                use rayon::prelude::*;
+                build_pool().install(|| {
+                    run.executed
+                        .par_iter()
+                        .with_min_len(4096)
+                        .map(|e| {
+                            let used = e.result.tx_gas_used();
+                            (U256::from(tip_of(e.index)) * U256::from(used), used)
+                        })
+                        .reduce(|| (U256::ZERO, 0u64), |a, b| (a.0 + b.0, a.1 + b.1))
+                })
+            };
+            fees_pass.push(at.elapsed().as_micros());
+            assert_eq!(run.gas, pass.1, "the gas counted on the batches");
+            if tip_on {
+                assert_eq!(run.fees, Some(pass.0), "the fees counted on the batches");
+            }
             let at = Instant::now();
             let signed: Vec<N42TxEnvelope> = txs.iter().map(|t| t.inner().clone()).collect();
             let _ = crate::assembler::parallel_transaction_root(&signed);
@@ -2220,6 +2260,7 @@ mod tests {
             median(fold_only) as f64 / 1000.0,
             median(finish) as f64 / 1000.0,
         );
+        eprintln!("evm2_step_bound fees: counted on the batches {} pass_after_ms={:.2}", std::env::var("F5G_TIP").map_or(true, |v| v != "0"), median(fees_pass) as f64 / 1000.0);
         eprintln!(
             "evm2_step_bound shard path medians: exec_ms={:.1} exec_without_direct_ms={:.1} freeze_ms={:.1} commit_ms={:.1} finish_ms={:.1}",
             median(shard_exec) as f64 / 1000.0,

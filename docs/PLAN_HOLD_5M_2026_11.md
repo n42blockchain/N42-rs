@@ -77,3 +77,9 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   18,750 funding transfers was refused ("insufficient funds ... have 0"), funding never mined.
   P3 started on two branches: `perf/index-shard-cost` (attribution knob `N42_INDEX_SHARD_KEY0`, then the
   seeded path made as fast) and `perf/evm2-fees-in-exec` (fees summed inside the execution workers).
+- 2026-11-10 23:17Z: round 3. 0ed56c1da vs `main` (natives rebuilt from b99f46d17, with the replay
+  diagnosis): DA 4.933 / 4.904 vs 4.867 / 4.893, DB 4.927 / 4.899 vs 4.847 (+1.0% over seven legs).
+  6eb585176 vs tag: EA 5.100 / 4.987 vs 5.113 / 5.167, EB 5.020 / 5.080 vs 5.004 / 5.160 (-1.3%).
+  Consistent in sign with the phase reading, each step near the leg noise. `perf/evm2-fees-in-exec`
+  handed back (fees and gas summed on the batches, batch transactions converted from a reference; tests
+  and the clippy gate green); natives building, pairs FA/FB against `main` queued.

@@ -2279,9 +2279,11 @@ where
         if refused.is_none() {
             let keys = keys.unwrap_or_default();
             let exec_at = std::time::Instant::now();
+            // From a reference: only the unsigned fields are copied, not the
+            // signature and hash a whole clone would drop again.
             let convert = |i: usize| {
-                let (tx, sender) = cands[i].to_consensus().into_parts();
-                reth_primitives_traits::Recovered::new_unchecked(evm2::ethereum::TxEnvelope::from(tx), sender)
+                let candidate = &cands[i];
+                reth_primitives_traits::Recovered::new_unchecked(n42_tx_types::evm::evm_tx_of(pooled_consensus(candidate)), candidate.sender())
             };
             let worst_case = |i: usize| crate::frame_scan::tx_cost(pooled_consensus(&cands[i]));
             let open = || {

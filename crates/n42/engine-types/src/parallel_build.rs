@@ -1185,7 +1185,7 @@ where
     };
     let tail = keys.len()..transactions.len();
     let tail_len = tail.len();
-    let convert = |i: usize| Recovered::new_unchecked(evm2::ethereum::TxEnvelope::from(transactions[i].clone()), senders[i]);
+    let convert = |i: usize| Recovered::new_unchecked(n42_tx_types::evm::evm_tx_of(&transactions[i]), senders[i]);
     let batches_at = std::time::Instant::now();
     let direct = DirectTransfers::for_env(&env, crate::direct_transfer::shape_of);
     let run = execute_batches(config, &env, &keys, Some(groups), &convert, open, None, beneficiary, dispatch, direct.as_ref()).map_err(refused)?;
@@ -2037,7 +2037,8 @@ mod tests {
                 }
             }
             let keys = keys(&txs);
-            let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);
+            // As the leader converts: from a reference, the unsigned fields only.
+            let convert = |i: usize| Recovered::new_unchecked(n42_tx_types::evm::evm_tx_of(txs[i].inner()), txs[i].signer());
             let open = || Some(base.clone());
             // The fees counted on the batches, as the leader does, unless
             // `F5G_TIP=0`; the post-execution pass they replace is timed

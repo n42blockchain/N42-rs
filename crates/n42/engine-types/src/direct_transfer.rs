@@ -166,12 +166,16 @@ impl<D: Database> Layered<D> {
     }
 
     fn account(&mut self, address: &Address) -> Result<Option<AccountInfo>, D::Error> {
-        if let Some(account) = self.accounts.get(address) {
-            return Ok(account.clone());
+        // One probe of the map, hit or miss (a recipient is nearly always a
+        // miss on a block of transfers); nothing kept on a read error.
+        match self.accounts.entry(*address) {
+            alloy_primitives::map::Entry::Occupied(entry) => Ok(entry.get().clone()),
+            alloy_primitives::map::Entry::Vacant(entry) => {
+                let account = self.inner.get_account(address)?;
+                entry.insert(account.clone());
+                Ok(account)
+            }
         }
-        let account = self.inner.get_account(address)?;
-        self.accounts.insert(*address, account.clone());
-        Ok(account)
     }
 }
 

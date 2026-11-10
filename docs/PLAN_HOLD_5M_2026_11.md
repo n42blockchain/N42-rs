@@ -29,10 +29,12 @@ mechanism is unknown. A fleet that can exit on an empty-block handover does not 
 | P2 | If code: find the step | natives at the merge points between 47b8180ab and `main` (maturity audit 8ff447481, compaction c992a5ee4, N42Header b87fa2884, reth v2.9.0 6703c576f, v2.10.0, Amsterdam step 235076649, today), halving by pairs | the step that separates >= 3% twice | waits for P1 |
 | P3 | Fix or gate the step | per finding; a knob in the X22 profile if the cost buys something `main` needs | pair back in the 5.0-5.2M band, twice | waits for P2 |
 | P4 | If box: re-baseline | record the band of the tagged build today as the reference; the goal is judged against it | docs | waits for P1 |
-| S1 | G8 mechanism | every pair leg runs with the forest trace; a deterministic reproducer of the empty-block tenure handover (three executions of one block on one parent, child built ahead) in the crate tests | the reproducer fails on `main` and passes with the fix | agent |
-| Q1 | `cargo clippy -- -D warnings` is red again on N42 crates (`twig-core` `entry_store.rs`, `index.rs`; `qmdb-reth` `executed_fields.rs`, `node_state_tests.rs`) | fix the warnings, no behaviour change | clippy clean on the crates d07ec6584 covered | agent |
+| S1 | G8 mechanism | every pair leg runs with the forest trace; a deterministic reproducer of the empty-block tenure handover (three executions of one block on one parent, child built ahead) in the crate tests | the reproducer fails on `main` and passes with the fix | no mechanism found in the 7167 log (second reading, `docs/RETH_2_10_0_UPGRADE.md`); replay diagnosis merged 2026-11-10 (38bf5f76f): the next recurrence logs a verdict among three causes; open until then |
+| Q1 | `cargo clippy -- -D warnings` is red again on N42 crates (`twig-core` `entry_store.rs`, `index.rs`; `qmdb-reth` `executed_fields.rs`, `node_state_tests.rs`) | fix the warnings, no behaviour change | clippy clean on the crates d07ec6584 covered | **done 2026-11-10**: the d07ec6584 gate (`scripts/clippy-n42.sh`) was green all along; the named sites were test targets, fixed in 74b6bdba2; `--all-targets` across all N42 crates has a backlog in tests and benches, not in scope |
 
 Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items plan), chain 94 Amsterdam date
 (scheduling), per-crate `-D warnings` beyond the set d07ec6584 covered.
 
 ## 3. Log
+
+- 2026-11-10: P1 pairs PA1/PA2 queued 06:06Z behind foreign box claims (n26, qs). S1/Q1 branch merged.

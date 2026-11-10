@@ -76,6 +76,13 @@ pub struct ParallelRun<C: ConfigureEvm> {
     pub spans: crate::parallel_common::BatchSpans,
     /// Inside the batches, by part, summed over the batches (F5g9).
     pub inside: BatchInside,
+    /// The gas the executed transfers used, summed on the batches.
+    pub gas: u64,
+    /// With a `tip_of` ([`execute_batches_into`]): the executed transfers'
+    /// fees, tip per gas times gas used, summed on the batches while each
+    /// transaction is hot, so that nothing O(transactions) runs between the
+    /// execution's end and the seal. `None` without one.
+    pub fees: Option<alloy_primitives::U256>,
 }
 
 /// The evm2 batches' time by part, microseconds summed over every batch
@@ -656,7 +663,7 @@ where
     evm2::TxResult<TypesOf<C>>: Send + Default,
     EvmTxOf<C>: alloy_consensus::Transaction,
 {
-    execute_batches_into(config, env, keys, groups, convert, open, worst_case, beneficiary, dispatch, None, &[], direct)
+    execute_batches_into(config, env, keys, groups, convert, open, worst_case, beneficiary, dispatch, None, &[], direct, None)
 }
 
 /// [`execute_batches`] with each batch's bundle handed to `sink` on the
@@ -690,6 +697,7 @@ pub fn execute_batches_into<C, D>(
     sink: Option<&(dyn Fn(reth_trie::bundle_state::BundleState) + Sync)>,
     kept: &[Address],
     direct: Option<&DirectTransfers<EvmTxOf<C>>>,
+    tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>,
 ) -> Result<ParallelRun<C>, Refused>
 where
     C: ConfigureEvm + Sync,
@@ -698,6 +706,7 @@ where
     evm2::TxResult<TypesOf<C>>: Send + Default,
     EvmTxOf<C>: alloy_consensus::Transaction,
 {
+    use alloy_primitives::U256;
     use reth_evm::EvmEnv as _;
     let before_at = std::time::Instant::now();
     // gov5's Amsterdam execution (`docs/AMSTERDAM_PARALLEL_STEP.md`): the
@@ -717,7 +726,25 @@ where
         Dispatch::Halves => batch_groups(&groups, keys.len(), workers),
     };
     let order = largest_first(&batches.iter().map(|b| b.iter().map(|g| g.len()).sum()).collect::<Vec<usize>>());
-    type BatchOut = Result<(Vec<usize>, reth_trie::bundle_state::BundleState, crate::parallel_common::BatchSpan, BatchInside, Vec<Address>), Refused>;
+    /// A batch's gas used and fees (tip per gas times gas used, with a
+    /// `tip_of`), summed as it executes.
+    #[derive(Default)]
+    struct Counted {
+        gas: u64,
+        fees: U256,
+    }
+    impl Counted {
+        /// Candidate `i`, which used `used`, counted.
+        #[inline]
+        fn add(&mut self, tip_of: Option<&(dyn Fn(usize) -> u128 + Sync)>, i: usize, used: u64) {
+            self.gas += used;
+            if let Some(tip_of) = tip_of {
+                self.fees += U256::from(tip_of(i)) * U256::from(used);
+            }
+        }
+    }
+    type BatchOut =
+        Result<(Vec<usize>, reth_trie::bundle_state::BundleState, crate::parallel_common::BatchSpan, BatchInside, Vec<Address>, Counted), Refused>;
     let executed_slots: ScatterSlots<Executed<C>> = ScatterSlots::new(keys.len());
     let batches_at = std::time::Instant::now();
     let before_us = before_at.elapsed().as_micros() as u64;
@@ -744,6 +771,7 @@ where
         let mut state = BatchState::with_capacity(txs * 2 + 1);
         let mut skipped = Vec::new();
         let mut ledger = crate::includability::RunLedger::new();
+        let mut counted = Counted::default();
         for group in members {
             // A sender's transfers in nonce order; once one is refused the
             // rest of the group cannot execute here either.
@@ -788,6 +816,7 @@ where
                                 Some(shape) => direct.result_for(shape, state_gas),
                                 None => direct.result(),
                             };
+                            counted.add(tip_of, i, result.tx_gas_used());
                             executed_slots.put(i, Executed { index: i, result });
                             continue;
                         }
@@ -859,6 +888,7 @@ where
                         if let Some(at) = commit_at {
                             inside.commit_us += at.elapsed().as_nanos() as u64;
                         }
+                        counted.add(tip_of, i, out.result.tx_gas_used());
                         executed_slots.put(i, Executed { index: i, result: out.result });
                     }
                     Err(_) => {
@@ -902,7 +932,7 @@ where
             None => bundle,
         };
         let span = crate::parallel_common::BatchSpan::close(start_us, mark, seen, batches_at).with_open_us(open_us);
-        Ok((skipped, own, span, inside, created))
+        Ok((skipped, own, span, inside, created, counted))
     };
     let slots: Vec<std::sync::OnceLock<BatchOut>> = (0..batches.len()).map(|_| std::sync::OnceLock::new()).collect();
     pool.scope(|scope| {
@@ -919,8 +949,9 @@ where
     let mut spans = Vec::with_capacity(batches.len());
     let mut inside = BatchInside::default();
     let mut created_by: alloy_primitives::map::AddressMap<usize> = Default::default();
+    let mut total = Counted::default();
     for (b, slot) in slots.into_iter().enumerate() {
-        let (s, bundle, span, part, created) = slot.into_inner().unwrap_or(Err(Refused::NotParallel(NotParallel::NoState)))?;
+        let (s, bundle, span, part, created, counted) = slot.into_inner().unwrap_or(Err(Refused::NotParallel(NotParallel::NoState)))?;
         for address in created {
             if created_by.insert(address, b).is_some() {
                 return Err(Refused::Amsterdam(AmsterdamRefusal::CreatedAcrossBatches(address)));
@@ -929,6 +960,8 @@ where
         skipped.extend(s);
         bundles.push(bundle);
         spans.push(span);
+        total.gas += counted.gas;
+        total.fees += counted.fees;
         inside.reads_us += part.reads_us;
         inside.transact_us += part.transact_us;
         inside.commit_us += part.commit_us;
@@ -960,7 +993,8 @@ where
     inside.merge_us = merge_at.elapsed().as_micros() as u64;
     let count = batches.len();
     drop(batches);
-    Ok(ParallelRun { executed, skipped, merged, batches: count, groups, split, spans, inside })
+    let fees = tip_of.map(|_| total.fees);
+    Ok(ParallelRun { executed, skipped, merged, batches: count, groups, split, spans, inside, gas: total.gas, fees })
 }
 
 /// `addresses`' accounts and reverts taken out of `bundle` into a bundle of
@@ -1633,8 +1667,26 @@ mod tests {
             let direct = DirectTransfers::of_env(&env, crate::direct_transfer::shape_of).expect("Prague and Osaka have the path");
             let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);
             let keys = keys(txs);
+            // The fees counted on the batches (`tip_of`) checked below
+            // against a pass over the executed set.
+            let base_fee = reth_evm::EvmEnv::block_base_fee(&env);
+            let tip_of = |i: usize| alloy_consensus::Transaction::effective_tip_per_gas(txs[i].inner(), base_fee).unwrap_or_default();
             let run = |direct: Option<&DirectTransfers<evm2::ethereum::TxEnvelope>>| {
-                execute_batches(&c, &env, &keys, None, &convert, &|| Some(direct_parent()), None, addr(BENEFICIARY), Dispatch::LargestFirst(4), direct)
+                execute_batches_into(
+                    &c,
+                    &env,
+                    &keys,
+                    None,
+                    &convert,
+                    &|| Some(direct_parent()),
+                    None,
+                    addr(BENEFICIARY),
+                    Dispatch::LargestFirst(4),
+                    None,
+                    &[],
+                    direct,
+                    Some(&tip_of),
+                )
             };
             let (stock, ours) = match (run(None), run(Some(&direct))) {
                 (Err(stock), Err(ours)) => {
@@ -1650,6 +1702,14 @@ mod tests {
             assert_eq!(ours.skipped, stock.skipped, "{name} (osaka {osaka}): skipped");
             let results = |run: &ParallelRun<Config>| run.executed.iter().map(|e| (e.index, format!("{:?}", e.result))).collect::<Vec<_>>();
             assert_eq!(results(&ours), results(&stock), "{name} (osaka {osaka}): results");
+            for run in [&stock, &ours] {
+                let (fees, gas) = run.executed.iter().fold((U256::ZERO, 0u64), |(fees, gas), e| {
+                    let used = e.result.tx_gas_used();
+                    (fees + U256::from(tip_of(e.index)) * U256::from(used), gas + used)
+                });
+                assert_eq!(run.fees, Some(fees), "{name} (osaka {osaka}): fees counted on the batches");
+                assert_eq!(run.gas, gas, "{name} (osaka {osaka}): gas counted on the batches");
+            }
             let w = withdrawals();
             let finish = |run: ParallelRun<Config>| {
                 let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(direct_parent(), env.clone()), timing_ctx(&w));
@@ -2048,7 +2108,7 @@ mod tests {
             let sink = |bundle: BundleState| shards.add(bundle);
             let at = Instant::now();
             let recipients: Vec<Address> = w.iter().map(|w| w.address).collect();
-            let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink), &recipients, direct)
+            let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink), &recipients, direct, None)
                 .expect("the sharded batches run");
             shard_exec.push(at.elapsed().as_micros());
             // The same shard run on evm2 alone, for the split beside it.
@@ -2056,7 +2116,7 @@ mod tests {
                 let shards_off = crate::output_shards::OutputShards::new(addr(BENEFICIARY), keys.len(), shard_count);
                 let sink_off = |bundle: BundleState| shards_off.add(bundle);
                 let at = Instant::now();
-                let off = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink_off), &recipients, None)
+                let off = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink_off), &recipients, None, None)
                     .expect("the evm2-only sharded run");
                 shard_exec_off.push(at.elapsed().as_micros());
                 eprintln!(
@@ -2097,7 +2157,7 @@ mod tests {
                 let shards2 = crate::output_shards::OutputShards::new(addr(BENEFICIARY), keys.len(), shard_count);
                 let sink2 = |bundle: BundleState| shards2.add(bundle);
                 let recipients2: Vec<Address> = w.iter().map(|w| w.address).collect();
-                let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink2), &recipients2, direct)
+                let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, addr(BENEFICIARY), Dispatch::from_env(), Some(&sink2), &recipients2, direct, None)
                     .expect("the late-receipts run");
                 let frozen2 = shards2.freeze();
                 let ParallelRun { executed, merged, .. } = run;

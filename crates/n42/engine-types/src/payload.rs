@@ -2321,6 +2321,11 @@ where
             // The batches apply plain transfers straight to their accounts
             // (F5g10) unless `N42_BATCH_DIRECT_TRANSFER=0`.
             let direct = crate::direct_transfer::DirectTransfers::for_env(&group_env, crate::direct_transfer::shape_of);
+            // The batches count the block's gas and fees as they execute (a
+            // candidate's tip read beside its conversion, while it is hot),
+            // as the revm-era step's `tip_of` did: no pass over the executed
+            // set between the execution's end and the seal.
+            let tip_of = |i: usize| pooled_consensus(&cands[i]).effective_tip_per_gas(base_fee).unwrap_or_default();
             evm2_pre_exec_us = par_at.elapsed().as_micros() as u64;
             let run = crate::parallel_build::execute_batches_into(
                 &evm_config,
@@ -2335,6 +2340,7 @@ where
                 sink,
                 &kept,
                 direct.as_ref(),
+                Some(&tip_of),
             );
             par_exec_ms = exec_at.elapsed().as_millis() as u64;
             let exec_end = std::time::Instant::now();
@@ -2345,28 +2351,16 @@ where
                     warn!(target: "n42::parallel_build", number = header.number, %err, "the parallel step refused; the block is built serially");
                 }
                 Ok(run) => {
-                    let crate::parallel_build::ParallelRun { mut executed, skipped, merged, batches, groups, split, spans, inside } = run;
+                    let crate::parallel_build::ParallelRun {
+                        mut executed, skipped, merged, batches, groups, split, spans, inside, gas, fees,
+                    } = run;
                     par_batch_spans = spans;
                     evm2_inside = inside;
+                    // The fees and gas were summed on the batches (`tip_of`);
+                    // the timer stays for the phases line and reads ~0.
                     let fees_at = std::time::Instant::now();
-                    let indices: Vec<usize> = executed.iter().map(|e| e.index).collect();
-                    // The fees and gas over the executed set on the build
-                    // pool (F5g8): serial, 200,000 candidates' cold tips
-                    // were read between the execution and the seal.
-                    let (fees, gas) = {
-                        use rayon::prelude::*;
-                        crate::parallel_transfer::build_pool().install(|| {
-                            executed
-                                .par_iter()
-                                .with_min_len(4096)
-                                .map(|e| {
-                                    let used = e.result.tx_gas_used();
-                                    let tip = pooled_consensus(&cands[e.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
-                                    (U256::from(tip) * U256::from(used), used)
-                                })
-                                .reduce(|| (U256::ZERO, 0u64), |a, b| (a.0 + b.0, a.1 + b.1))
-                        })
-                    };
+                    let fees = fees.unwrap_or_default();
+                    let executed_len = executed.len();
                     evm2_fees_us = fees_at.elapsed().as_micros() as u64;
                     // `N42_SEAL_AT_EXEC=1` on evm2 (F5g1): under deferred
                     // execution the header carries the parent's execution, so
@@ -2382,11 +2376,11 @@ where
                     let gas_left_after = block_gas_limit.saturating_sub(cumulative_gas_used + gas);
                     let full_after = gas_left_after < MIN_TRANSACTION_GAS
                         || par_drained
-                        || (!indices.is_empty() && gas_left_after <= seal_shortfall(block_gas_limit));
+                        || (executed_len != 0 && gas_left_after <= seal_shortfall(block_gas_limit));
                     let seal_here = seal_at_exec()
                         && seal_early_possible
                         && block_blob_count == 0
-                        && !indices.is_empty()
+                        && executed_len != 0
                         && full_after
                         && early_seal.is_some();
                     if seal_here && let Some(EarlySeal { hook, parent_built: _ }) = early_seal.take() {
@@ -2403,7 +2397,7 @@ where
                         let body_at = std::time::Instant::now();
                         let made = prepared_body.take().filter(|(transactions, _, hashes, _)| {
                             skipped.is_empty()
-                                && indices.len() == cands.len()
+                                && executed_len == cands.len()
                                 && transactions.len() == cands.len()
                                 && body_matches_pull(hashes, &cands, |hash| *hash, |tx| *tx.hash())
                         });
@@ -2419,10 +2413,11 @@ where
                                 #[allow(clippy::type_complexity)]
                                 let (transactions, (senders, hashes)): (Vec<TransactionSigned>, (Vec<alloy_primitives::Address>, Vec<B256>)) =
                                     crate::parallel_transfer::build_pool().install(|| {
-                                        indices
+                                        executed
                                             .par_iter()
                                             .with_min_len(1024)
-                                            .map(|&i| (pooled_consensus(&cands[i]).clone(), (cands[i].sender(), *cands[i].hash())))
+                                            .map(|e| e.index)
+                                            .map(|i| (pooled_consensus(&cands[i]).clone(), (cands[i].sender(), *cands[i].hash())))
                                             .unzip()
                                     });
                                 direct_body = Some((transactions, senders));
@@ -2455,7 +2450,7 @@ where
                         if from_bulk
                             && crate::frame_blocks::plan_ahead_body_wanted()
                             && skipped.is_empty()
-                            && indices.len() == cands.len()
+                            && executed_len == cands.len()
                             && cands.len() == bulk_len
                         {
                             let last = cands.len() - 1;
@@ -2471,6 +2466,10 @@ where
                         sealed_ahead = Some(sealed);
                     }
                     let sealed_here = sealed_ahead.is_some();
+                    // The executed candidates' indices, for the serial loop's
+                    // builder when the block did not seal here (after the
+                    // seal otherwise, and then not needed).
+                    let indices: Vec<usize> = if sealed_here { Vec::new() } else { executed.iter().map(|e| e.index).collect() };
                     fold_at = std::time::Instant::now();
                     // The shards frozen (one task a shard on the pool). A block
                     // that did not seal here goes back to one merge: the
@@ -2616,13 +2615,13 @@ where
                                 total_fees += fees;
                             }
                             cumulative_gas_used += committed_gas;
-                            tx_count += indices.len() as u64;
-                            par_txs = indices.len() as u64;
+                            tx_count += executed_len as u64;
+                            par_txs = executed_len as u64;
                             par_groups = groups.len();
                             par_batches = batches;
                             par_skipped = skipped.len();
                             deferred.extend(skipped_txs.take().unwrap_or_default());
-                            line = (indices.len(), par_skipped, batches, None);
+                            line = (executed_len, par_skipped, batches, None);
                             // Freed behind the build (`N42_FREEZE_POOL=own`: on
                             // its own pool) rather than on the builder's thread.
                             let spent = (std::mem::take(&mut cands), groups);

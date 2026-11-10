@@ -57,3 +57,12 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   it lies in 47b8180ab..d07ec6584 (10-24..10-30), and the reth bumps are not it. All 16 legs clean.
   Round 2: 6eb585176 (maturity audit), 8ff447481 (design items), 62bc01b59 (QC embed + leftovers),
   134b9c215 (before compaction stages 1-2).
+- 2026-11-10 21:04Z: P2 round 2, against the tag natives: 6eb585176 5.044 / 4.807 vs 5.093 / 5.011 (-2.5%);
+  8ff447481 5.047 / 4.904 vs 5.007 / 5.113 (-1.7%); 62bc01b59 5.073 / 5.013 vs 5.147 / 5.093 (-1.5%);
+  134b9c215 5.007 / 5.013 vs 5.120 (-2.1%; tag leg CD0 stalled, exit 1, tc=7, an engine idle over 5 s).
+  Over both rounds: tag 5.10 (19 legs), the eight points 4.97 (16 legs, no trend between them), `main`
+  4.88 (4 legs today, 4.89 over the 14 before). No single step: about -2.5% is already in at 6eb585176,
+  the first point after the tag (the maturity-audit merges), and about -1.5% more lies between
+  0ed56c1da and `main`. Two-leg pairs cannot resolve steps this small, so the next reading is by phase:
+  the per-leg phase and timer files of all 39 legs, grouped by binary (in progress). Round 3 on the box:
+  `main` natives rebuilt from current `main`, then 0ed56c1da vs `main` twice and 6eb585176 vs tag twice.

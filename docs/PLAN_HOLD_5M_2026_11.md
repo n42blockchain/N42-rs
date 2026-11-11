@@ -83,3 +83,12 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   Consistent in sign with the phase reading, each step near the leg noise. `perf/evm2-fees-in-exec`
   handed back (fees and gas summed on the batches, batch transactions converted from a reference; tests
   and the clippy gate green); natives building, pairs FA/FB against `main` queued.
+- 2026-11-11 01:30Z: P3 first readings (window-1 means of the leader's build line; `ci/phase-diff/quick.py`).
+  `perf/evm2-fees-in-exec` vs `main` (FA/FB): exec_end_to_seal 3.3-3.5 ms -> 0.0006 ms, but sealed_at
+  38.9-39.4 vs 38.8-40.2 and window 1 4.81-4.91M vs 4.75-4.94M (+0.9%): the seal is bound by the root job
+  (roots 37-39 ms against 32-34 on the tag legs), so the saved time is waited away. `integ/hold-5m`
+  (fees + `perf/index-shard-cost`) vs `main` (HA/HB): 4.87-4.93M vs 4.79-4.92M (+0.7%), root_index 7.9-8.1
+  ms against 7.1-7.8 on `main` and 5.5 on the tag: the microbench gain of the partitioned seeded batch
+  (insert 3.7 -> 2.5 ms, apply 5.6 -> 3.8 ms on a 33M-key index) does not show on the 480M-account fleet.
+  Next: the attribution knob itself, KA/KB = integ natives with `N42_INDEX_SHARD_KEY0=1` against the same
+  natives without it (runner hook `LOOP351_QC_ENV`, bench tree 54c749f99).

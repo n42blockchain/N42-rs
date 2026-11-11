@@ -1465,97 +1465,131 @@ mod tests {
     }
 
     /// `cargo test -p n42-twig-core --release --features rayon --lib -- --ignored
-    /// --nocapture shard_mode_bench`: the root job's three index batch paths
-    /// at a fleet7 block's shape, key0 shards (`N42_INDEX_SHARD_KEY0`) against
-    /// seeded ones, both in one process. The index holds `IDXBENCH_LIVE` keys
-    /// (default 32M) laid out as the tree lays them out (each block's keys
-    /// appended in sorted order); every round is a sorted block of
-    /// `IDXBENCH_BATCH` keys (default 400k), three quarters held: the
-    /// held-slot pass (`held_slots`: 1024-key chunks of `get_into` on the
-    /// pool), the tree's `insert_sorted` of the block's appends, and the read
-    /// view's `apply_sorted` of the same keys at new offsets. On a pool of
-    /// `IDXBENCH_THREADS` (default 16, a fleet node's cores). Medians of
-    /// `IDXBENCH_ROUNDS` (default 9) rounds, in microseconds.
+    /// --nocapture shard_mode_bench`: the root job's index paths at a fleet7
+    /// X22 leader's shape, key0 shards (`N42_INDEX_SHARD_KEY0`) against
+    /// seeded ones, both in one process. The fleet's index holds ~2.03M live
+    /// keys (33.5 MB of tables) over an entry file of ~440M records of ~39
+    /// bytes, and a block touches ~400k keys, nearly all held: so the index
+    /// holds `IDXBENCH_LIVE` keys (default 2M), the store keeps 40-byte
+    /// records on 4 KB pages as each block appended them (sorted), and every
+    /// block is `IDXBENCH_BATCH` sorted keys (default 400k), `IDXBENCH_NEW`
+    /// per mille of them new (default 10). `IDXBENCH_WARM` blocks (default
+    /// 30) spread the live keys over recent blocks before `IDXBENCH_ROUNDS`
+    /// (default 15) are timed. Before each timed step the caches are swept
+    /// with 512 MB of other traffic (`IDXBENCH_SWEEP_MB`, 0 = off), as the
+    /// block's execution sweeps them between root jobs. Per mode: the
+    /// held-slot pass as chunks of `get_into` and as `get_batch`, the tree's
+    /// `insert_sorted` and `insert_sorted_known` (alternate rounds), the read
+    /// view's `apply_sorted`; medians in microseconds, on a pool of
+    /// `IDXBENCH_THREADS` (default 16).
     #[cfg(feature = "rayon")]
     #[test]
     #[ignore = "timing; run by hand in release"]
     fn shard_mode_bench() {
         use rayon::prelude::*;
+        const RECORD: usize = 40;
         let var = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
-        let (live, batch, rounds, threads) =
-            (var("IDXBENCH_LIVE", 32_000_000), var("IDXBENCH_BATCH", 400_000), var("IDXBENCH_ROUNDS", 9), var("IDXBENCH_THREADS", 16));
+        let (live, batch, new_pm, warm, rounds, threads, sweep_mb) = (
+            var("IDXBENCH_LIVE", 2_000_000),
+            var("IDXBENCH_BATCH", 400_000),
+            var("IDXBENCH_NEW", 10),
+            var("IDXBENCH_WARM", 30),
+            var("IDXBENCH_ROUNDS", 15),
+            var("IDXBENCH_THREADS", 16),
+            var("IDXBENCH_SWEEP_MB", 512),
+        );
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
-        let block = batch;
-        // The store as the tree appends it: each block's keys in sorted order.
-        let mut store: Vec<Hash> = pool.install(|| (0..live as u64).into_par_iter().map(|n| key_of(n, None)).collect());
-        pool.install(|| store.par_chunks_mut(block).for_each(|chunk| chunk.sort_unstable()));
-        // Every round's block: held keys (distinct) and fresh ones, sorted.
+        // Every block's keys, decided up front so both modes see the same.
         let mut stream = Stream(42);
-        let held_per = batch * 3 / 4;
-        let blocks: Vec<Vec<Hash>> = (0..rounds)
-            .map(|round| {
-                let mut keys: Vec<Hash> = (0..held_per).map(|_| store[(stream.next() % live as u64) as usize]).collect();
-                keys.extend((0..batch - held_per).map(|j| key_of((live + round * batch + j) as u64, None)));
-                keys.sort_unstable();
-                keys.dedup();
-                keys
-            })
-            .collect();
+        let mut keys_live: Vec<Hash> = (0..live as u64).map(|n| key_of(n, None)).collect();
+        let mut next_new = live as u64;
+        let mut blocks: Vec<Vec<Hash>> = keys_live.chunks(batch).map(|chunk| {
+            let mut chunk = chunk.to_vec();
+            chunk.sort_unstable();
+            chunk
+        }).collect();
+        let first_timed = blocks.len() + warm;
+        for _ in 0..warm + rounds {
+            let fresh = batch * new_pm / 1000;
+            let mut keys: Vec<Hash> = (0..batch - fresh).map(|_| keys_live[(stream.next() % keys_live.len() as u64) as usize]).collect();
+            for _ in 0..fresh {
+                keys_live.push(key_of(next_new, None));
+                keys.push(key_of(next_new, None));
+                next_new += 1;
+            }
+            keys.sort_unstable();
+            keys.dedup();
+            blocks.push(keys);
+        }
+        let total: usize = blocks.iter().map(Vec::len).sum();
         let median = |mut v: Vec<u128>| {
             v.sort_unstable();
-            v[v.len() / 2]
+            v.get(v.len() / 2).copied().unwrap_or(0)
         };
-        let base = store.len();
+        let mut sweep = vec![0u64; sweep_mb << 17];
+        let mut sweep_now = |pool: &rayon::ThreadPool| {
+            pool.install(|| sweep.par_chunks_mut(1 << 16).for_each(|chunk| chunk.iter_mut().for_each(|word| *word = word.wrapping_add(1))));
+        };
         for key0 in [true, false, true, false] {
-            store.truncate(base);
+            // The entry store: 40-byte records, on 4 KB pages like the
+            // mapped entry file.
+            let mut store: Vec<[u8; RECORD]> = Vec::with_capacity(total);
+            #[cfg(target_os = "linux")]
+            // SAFETY: advice on this vector's own (not yet touched) allocation.
+            unsafe {
+                libc::madvise(store.as_mut_ptr().cast(), total * RECORD, libc::MADV_NOHUGEPAGE);
+            }
             let mut tag = TagIndex::with_key0(key0);
             let shared = SharedOffsetIndex::with_key0(key0);
-            {
-                let key_at = |slot: u64| store[slot as usize];
-                pool.install(|| {
-                    tag.reserve(live);
-                    for (at, chunk) in store.chunks(block).enumerate() {
-                        let pairs: Vec<(Hash, u64)> =
-                            chunk.iter().enumerate().map(|(i, key)| (*key, (at * block + i) as u64)).collect();
-                        tag.insert_sorted(&pairs, key_at).unwrap();
-                        let changes: Vec<(Hash, Option<u64>)> = pairs.iter().map(|(key, slot)| (*key, Some(*slot))).collect();
-                        shared.apply_sorted(&changes, key_at).unwrap();
-                    }
-                });
-            }
-            let (mut held_us, mut insert_us, mut apply_us, mut found) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
-            for keys in &blocks {
+            let (mut chunked_us, mut batch_us, mut insert_us, mut known_us, mut apply_us, mut sink) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0usize);
+            for (number, keys) in blocks.iter().enumerate() {
+                let timed = number >= first_timed;
                 let first = store.len() as u64;
-                store.extend_from_slice(keys);
-                let key_at = |slot: u64| store[slot as usize];
+                store.extend(keys.iter().map(|key| {
+                    let mut record = [0u8; RECORD];
+                    record[..32].copy_from_slice(key);
+                    record
+                }));
+                let key_at = |slot: u64| -> Hash { store[slot as usize][..32].try_into().unwrap() };
                 let pairs: Vec<(Hash, u64)> = keys.iter().enumerate().map(|(i, key)| (*key, first + i as u64)).collect();
                 let changes: Vec<(Hash, Option<u64>)> = pairs.iter().map(|(key, slot)| (*key, Some(*slot))).collect();
-                let mut out = vec![None; keys.len()];
-                pool.install(|| {
+                let mut held = vec![None; keys.len()];
+                let mut time = |into: &mut Vec<u128>, f: &mut (dyn FnMut() + Send)| {
+                    if timed && sweep_mb > 0 {
+                        sweep_now(&pool);
+                    }
                     let at = std::time::Instant::now();
-                    out.par_chunks_mut(1024).enumerate().for_each(|(chunk, held)| {
-                        let base = chunk * 1024;
-                        tag.get_into(held, |i| &keys[base + i], key_at);
-                    });
-                    held_us.push(at.elapsed().as_micros());
-                    found += out.iter().flatten().count();
-                    let at = std::time::Instant::now();
-                    tag.insert_sorted(&pairs, key_at).unwrap();
-                    insert_us.push(at.elapsed().as_micros());
-                    let at = std::time::Instant::now();
-                    found += shared.apply_sorted(&changes, key_at).unwrap().iter().flatten().count();
-                    apply_us.push(at.elapsed().as_micros());
-                });
+                    pool.install(&mut *f);
+                    if timed {
+                        into.push(at.elapsed().as_micros());
+                    }
+                };
+                let mut chunked = vec![None; keys.len()];
+                time(&mut chunked_us, &mut || tag.get_batch_chunked(&mut chunked, |i| &keys[i], key_at));
+                time(&mut batch_us, &mut || tag.get_batch(&mut held, |i| &keys[i], key_at));
+                assert_eq!(held, chunked);
+                sink += held.iter().flatten().count();
+                if number % 2 == 0 {
+                    time(&mut insert_us, &mut || tag.insert_sorted(&pairs, key_at).unwrap());
+                } else {
+                    time(&mut known_us, &mut || tag.insert_sorted_known(&pairs, &held, key_at).unwrap());
+                }
+                time(&mut apply_us, &mut || sink += shared.apply_sorted(&changes, key_at).unwrap().iter().flatten().count());
             }
+            assert_eq!(tag.len(), shared.len());
             println!(
-                "{} live {} batch {} threads {}: held_slots {} us, insert_sorted {} us, apply_sorted {} us (sink {found})",
+                "{} live {} batch ~{} threads {}: held chunked {} us get_batch {} us, insert_sorted {} us insert_known {} us, apply_sorted {} us (index {} MB, sink {sink})",
                 if key0 { "key0  " } else { "seeded" },
                 tag.len(),
-                blocks[0].len(),
+                blocks[first_timed].len(),
                 threads,
-                median(held_us),
+                median(chunked_us),
+                median(batch_us),
                 median(insert_us),
+                median(known_us),
                 median(apply_us),
+                tag.memory_bytes() >> 20,
             );
         }
     }

@@ -43,7 +43,7 @@ use alloy_rpc_types_engine::{
 };
 use n42_h2_primitives::bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
 pub use n42_header::N42Header;
-use n42_header::engine::{block_with_payload_root, put_header_tail};
+use n42_header::engine::{block_with_payload_root, put_header_tail_or_keep};
 
 /// Which header shape a chain's blocks have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -528,10 +528,12 @@ pub fn execution_data_from_raw_parts(
 /// ([`n42_header::engine::put_header_tail`]). A root on a header with no
 /// Cancun fields has no payload form: it is reported, and the payload then
 /// cannot reproduce the block's hash, so the execution layer refuses it.
+/// The payload is moved, never cloned: this runs on every 200,000-transaction
+/// hand-off, where a clone cost ~6 ms (`payload_ms` 3 -> 9.8).
 fn with_header_tail(payload: ExecutionPayload, header: &N42Header) -> ExecutionPayload {
-    match put_header_tail(payload.clone(), header) {
+    match put_header_tail_or_keep(payload, header) {
         Ok(payload) => payload,
-        Err(err) => {
+        Err((payload, err)) => {
             tracing::error!(target: "n42::h2", %err, "the registry root has no payload form; the block will not reproduce");
             payload
         }

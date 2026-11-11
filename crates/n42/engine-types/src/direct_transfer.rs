@@ -11,17 +11,17 @@
 //! fee and its nonce bumped, the recipient credited, the beneficiary paid
 //! the tip) and a fixed result.
 //!
-//! [`DirectTransfers::apply`] does exactly that against the batch's own read
-//! layer ([`Layered`]: the accounts the batch has read or written, over the
-//! parent's state) and records the three accounts in the batch state, for a
+//! [`DirectTransfers::apply`] does exactly that against the batch state
+//! ([`BatchState::read`]: one map for the accounts the batch has read and
+//! those it changed, over the parent's state), for a
 //! transaction that qualifies by the rules the handler uses plus every check
 //! the stock `prepare` would make: chain id, fee caps against the base fee,
 //! gas limit against the block's and the transaction cap, the sender without
 //! code, its nonce, and its balance against the gas limit at the fee cap
 //! plus the value. Anything else is [`Step::Fallback`]: nothing has been
 //! written and the batch hands the transaction to evm2. A batch's EVM reads
-//! through the same [`Layered`] view, so the transfers applied before it was
-//! made are what it sees.
+//! through a [`Layered`] view of the accounts the transfers before it
+//! changed, over the parent's state, so those transfers are what it sees.
 //!
 //! On Amsterdam (gov5's Amsterdam execution on a native chain) it applies
 //! EIP-2780's intrinsic (21,000 with a value, 15,000 without), EIP-8037's
@@ -149,10 +149,9 @@ pub fn shape_of(tx: &Recovered<TxEnvelope>) -> Option<TxShape> {
     }
 }
 
-/// A batch's read layer: the accounts the batch has read or written, over
-/// the parent's state. The direct path reads and writes the accounts; the
-/// batch's EVM, when one is made, reads through it, so it sees every
-/// transfer applied before it.
+/// A batch EVM's read layer: the accounts the batch's direct transfers
+/// changed before the EVM was made, over the parent's state, so the EVM
+/// sees every transfer applied before it.
 #[derive(Debug)]
 pub struct Layered<D> {
     accounts: AddressMap<Option<AccountInfo>>,
@@ -165,13 +164,12 @@ impl<D: Database> Layered<D> {
         Self { accounts: AddressMap::with_capacity_and_hasher(accounts, Default::default()), inner }
     }
 
-    fn account(&mut self, address: &Address) -> Result<Option<AccountInfo>, D::Error> {
-        if let Some(account) = self.accounts.get(address) {
-            return Ok(account.clone());
-        }
-        let account = self.inner.get_account(address)?;
-        self.accounts.insert(*address, account.clone());
-        Ok(account)
+    /// `inner` under the accounts a batch's direct transfers changed
+    /// ([`BatchState::changed_infos`]), for the EVM a batch makes at its first
+    /// transaction the direct path does not apply: it reads those at their
+    /// present values and every other account from `inner`.
+    pub fn over(inner: D, state: &BatchState) -> Self {
+        Self { accounts: state.changed_infos().collect(), inner }
     }
 }
 
@@ -375,23 +373,25 @@ impl<X> DirectTransfers<X> {
         }
     }
 
-    /// Applies `tx` to `layer` and records it in `state` when it qualifies
-    /// and `admit` (given the sender's balance before it) lets it in; see
-    /// [`Step`]. A read error is a fallback: evm2 reads again and reports it.
+    /// Applies `tx` to the batch's accounts in `state` (read from `parent`,
+    /// the parent's state, when the batch has not met them,
+    /// [`BatchState::read`]) when it qualifies and `admit` (given the
+    /// sender's balance before it) lets it in; see [`Step`]. A read error is
+    /// a fallback: evm2 reads again and reports it.
     pub fn apply<D: Database>(
         &self,
         tx: &TxShape,
-        layer: &mut Layered<D>,
+        parent: &mut D,
         state: &mut BatchState,
         admit: impl FnOnce(U256) -> bool,
     ) -> Step {
-        self.try_apply(tx, layer, state, admit).unwrap_or(Step::Fallback)
+        self.try_apply(tx, parent, state, admit).unwrap_or(Step::Fallback)
     }
 
     fn try_apply<D: Database>(
         &self,
         tx: &TxShape,
-        layer: &mut Layered<D>,
+        parent: &mut D,
         state: &mut BatchState,
         admit: impl FnOnce(U256) -> bool,
     ) -> Option<Step> {
@@ -421,11 +421,11 @@ impl<X> DirectTransfers<X> {
             return Some(Step::Fallback);
         }
         let max_upfront = U256::from(tx.gas_limit).checked_mul(tx.max_fee)?.checked_add(tx.value)?;
-        let sender = layer.account(&caller).ok()??;
+        let sender = state.read(&caller, parent).ok()??;
         if !sender.is_empty_code_hash() || sender.nonce != tx.nonce || tx.nonce == u64::MAX || sender.balance < max_upfront {
             return Some(Step::Fallback);
         }
-        let recipient = layer.account(&to).ok()?;
+        let recipient = state.read(&to, parent).ok()?;
         if recipient.as_ref().is_some_and(|r| !r.is_empty_code_hash()) {
             return Some(Step::Fallback);
         }
@@ -450,7 +450,7 @@ impl<X> DirectTransfers<X> {
         let used = (intrinsic + state_gas).max(floor_gas);
         let fee = U256::from(used).checked_mul(price)?;
         let reward = U256::from(used).checked_mul(tip)?;
-        let paid = layer.account(&beneficiary).ok()?;
+        let paid = state.read(&beneficiary, parent).ok()?;
         if reward.is_zero() && !alive(&paid) {
             return Some(Step::Fallback);
         }
@@ -464,15 +464,12 @@ impl<X> DirectTransfers<X> {
         if !admit(sender.balance) {
             return Some(Step::Refused);
         }
-        state.commit_info(caller, Some(&sender), &sender_after);
-        layer.accounts.insert(caller, Some(sender_after));
+        state.change_held(caller, Some(&sender), sender_after);
         if !tx.value.is_zero() {
-            state.commit_info(to, recipient.as_ref(), &recipient_after);
-            layer.accounts.insert(to, Some(recipient_after));
+            state.change_held(to, recipient.as_ref(), recipient_after);
         }
         if !reward.is_zero() {
-            state.commit_info(beneficiary, paid.as_ref(), &paid_after);
-            layer.accounts.insert(beneficiary, Some(paid_after));
+            state.change_held(beneficiary, paid.as_ref(), paid_after);
         }
         Some(Step::Applied { state_gas })
     }

@@ -28,8 +28,8 @@
 //! this is only the accumulator.
 
 use alloy_primitives::{map::AddressMap, Address};
-use evm2::evm::{AccountChanges, AccountInfo, PendingState};
-use reth_trie::bundle_state::{AccountStatus, BundleRetention, BundleState, TransitionAccount, TransitionState};
+use evm2::evm::{AccountChanges, AccountInfo, Database, PendingState};
+use reth_trie::bundle_state::{AccountStatus, BundleAccount, BundleState, TransitionAccount};
 
 /// A change [`BatchState::commit`] does not model: the transfer path never
 /// makes one, and a batch that meets one sends the block to the serial
@@ -48,7 +48,11 @@ impl std::error::Error for Unsupported {}
 /// A build or import batch's account transitions against the parent's state.
 #[derive(Debug, Default)]
 pub struct BatchState {
-    transitions: AddressMap<TransitionAccount>,
+    /// Each changed account as the bundle will hold it: its info now, its
+    /// info at the batch's start (`original_info`, the transition's
+    /// `previous_info`) and its status. [`Self::take_bundle`] turns this map
+    /// into the bundle's in place, without a second map to fill.
+    accounts: AddressMap<BundleAccount>,
 }
 
 /// The status of an account as it was loaded, before its first change
@@ -59,6 +63,13 @@ fn loaded_status(info: Option<&AccountInfo>) -> AccountStatus {
         Some(info) if info.is_empty() => AccountStatus::LoadedEmptyEIP161,
         Some(_) => AccountStatus::Loaded,
     }
+}
+
+/// Whether the batch changed `entry` (an entry only read keeps the status
+/// it was loaded with; a change never leaves an account at a loaded status,
+/// `AccountStatus::on_changed`).
+fn changed(entry: &BundleAccount) -> bool {
+    entry.status != loaded_status(entry.original_info.as_ref())
 }
 
 /// An account info without its code, as reth's bundle keeps it (code lives
@@ -72,22 +83,72 @@ fn without_code(info: &AccountInfo) -> AccountInfo {
 impl BatchState {
     /// A batch with room for `accounts` transitions without regrowing.
     pub fn with_capacity(accounts: usize) -> Self {
-        Self { transitions: AddressMap::with_capacity_and_hasher(accounts, Default::default()) }
+        Self { accounts: AddressMap::with_capacity_and_hasher(accounts, Default::default()) }
     }
 
     /// Accounts the batch has changed so far.
     pub fn len(&self) -> usize {
-        self.transitions.len()
+        self.accounts.values().filter(|entry| changed(entry)).count()
     }
 
     /// Whether the batch has changed nothing.
     pub fn is_empty(&self) -> bool {
-        self.transitions.is_empty()
+        !self.accounts.values().any(changed)
     }
 
     /// Whether the batch has changed `address`.
     pub fn holds(&self, address: &Address) -> bool {
-        self.transitions.contains_key(address)
+        self.accounts.get(address).is_some_and(changed)
+    }
+
+    /// `address` as the batch sees it now: its info after the batch's
+    /// changes, or as read when it has none; read from `inner` and kept here
+    /// (as read, no change) when the batch has not met it. The direct
+    /// transfer path's read layer (F5g10): one map for what the batch read
+    /// and what it changed, one probe for each. An account only read stays
+    /// out of the bundle ([`Self::take_bundle`]). The info is without its
+    /// code, as the state provider gives it; nothing is kept on a read error.
+    pub fn read<D: Database>(&mut self, address: &Address, inner: &mut D) -> Result<Option<AccountInfo>, D::Error> {
+        match self.accounts.entry(*address) {
+            alloy_primitives::map::Entry::Occupied(entry) => Ok(entry.get().info.clone()),
+            alloy_primitives::map::Entry::Vacant(entry) => {
+                let read = inner.get_account(address)?.map(|mut info| {
+                    info.code = None;
+                    info
+                });
+                entry.insert(BundleAccount {
+                    info: read.clone(),
+                    original_info: read.clone(),
+                    storage: Default::default(),
+                    status: loaded_status(read.as_ref()),
+                });
+                Ok(read)
+            }
+        }
+    }
+
+    /// [`Self::commit_info`] of `address`, which the batch holds (read
+    /// through [`Self::read`] or changed), from `before` (its info now) to
+    /// `current` (`before` is `None` for an account that does not exist):
+    /// the entry's info replaced and its status moved on, by the same rule,
+    /// without copying the infos again.
+    pub fn change_held(&mut self, address: Address, before: Option<&AccountInfo>, mut current: AccountInfo) {
+        let had_no_nonce_and_code = before.is_none_or(|i| i.nonce == 0 && i.is_empty_code_hash());
+        current.code = None;
+        match self.accounts.get_mut(&address) {
+            Some(account) => {
+                account.status = account.status.on_changed(had_no_nonce_and_code);
+                account.info = Some(current);
+            }
+            None => self.commit_info(address, before, &current),
+        }
+    }
+
+    /// The batch's changed accounts at their present infos: what a read layer
+    /// over the parent's state must answer for them once the batch hands its
+    /// transactions to an EVM (accounts only read are the parent's).
+    pub fn changed_infos(&self) -> impl Iterator<Item = (Address, Option<AccountInfo>)> + '_ {
+        self.accounts.iter().filter(|(_, entry)| changed(entry)).map(|(address, entry)| (*address, entry.info.clone()))
     }
 
     /// Folds one finalised transaction's changes into the batch.
@@ -129,16 +190,14 @@ impl BatchState {
         let original = original.map(without_code);
         let current = without_code(current);
         let had_no_nonce_and_code = original.as_ref().is_none_or(|i| i.nonce == 0 && i.is_empty_code_hash());
-        match self.transitions.entry(address) {
+        match self.accounts.entry(address) {
             alloy_primitives::map::Entry::Vacant(entry) => {
                 let previous_status = loaded_status(original.as_ref());
-                entry.insert(TransitionAccount {
+                entry.insert(BundleAccount {
                     info: Some(current),
                     status: previous_status.on_changed(had_no_nonce_and_code),
-                    previous_info: original,
-                    previous_status,
+                    original_info: original,
                     storage: Default::default(),
-                    storage_was_destroyed: false,
                 });
             }
             alloy_primitives::map::Entry::Occupied(mut entry) => {
@@ -152,10 +211,42 @@ impl BatchState {
     /// The batch's changes against the parent with their reverts: the bundle
     /// `BlockState::into_bundle` makes of the same transitions. The batch
     /// holds nothing afterwards.
+    ///
+    /// What `apply_transitions_and_create_reverts` does for a transition new
+    /// to an empty bundle, done in this map: an entry is the transition's
+    /// present bundle account already, so it stays where it is when the
+    /// transition has a revert and is dropped otherwise -- no second map
+    /// filled entry by entry (the revm-era batch state's one pass).
     pub fn take_bundle(&mut self) -> BundleState {
-        let transitions = std::mem::take(&mut self.transitions);
+        let mut accounts = std::mem::take(&mut self.accounts);
         let mut bundle = BundleState::default();
-        bundle.apply_transitions_and_create_reverts(TransitionState { transitions }, BundleRetention::Reverts);
+        let mut reverts = Vec::with_capacity(accounts.len());
+        let (mut state_size, mut reverts_size) = (0usize, 0usize);
+        accounts.retain(|address, entry| {
+            if !changed(entry) {
+                return false;
+            }
+            let transition = TransitionAccount {
+                info: entry.info.clone(),
+                status: entry.status,
+                previous_info: entry.original_info.clone(),
+                previous_status: loaded_status(entry.original_info.as_ref()),
+                storage: Default::default(),
+                storage_was_destroyed: false,
+            };
+            if let Some((hash, code)) = transition.has_new_contract() {
+                bundle.contracts.insert(hash, code.clone());
+            }
+            let Some(revert) = transition.create_revert() else { return false };
+            state_size += entry.size_hint();
+            reverts_size += revert.size_hint();
+            reverts.push((*address, revert));
+            true
+        });
+        bundle.state = accounts;
+        bundle.reverts.push(reverts);
+        bundle.state_size = state_size;
+        bundle.reverts_size = reverts_size;
         bundle
     }
 }
@@ -318,6 +409,35 @@ mod tests {
         let txs = vec![Recovered::new_unchecked(N42TxEnvelope::from(reth_ethereum_primitives::TransactionSigned::from(signed)), addr(8)), tx(9, 0, addr(8), 1, Bytes::new())];
         let (theirs, ours) = run(&txs);
         assert_same(&ours.expect("modelled"), &theirs);
+    }
+
+    /// Accounts only read through `read` (one there, one missing) stay out of
+    /// the bundle, and an account read and then changed folds exactly as the
+    /// same change committed without the read.
+    #[test]
+    fn a_read_account_folds_as_an_unread_one() {
+        let mut db = parent();
+        let (a, b, missing) = (addr(1), addr(2), addr(0xdead));
+        let mut read_first = BatchState::with_capacity(4);
+        let before = read_first.read(&a, &mut db).expect("read").expect("an account");
+        assert!(read_first.read(&b, &mut db).expect("read").is_some());
+        assert!(read_first.read(&missing, &mut db).expect("read").is_none());
+        assert!(read_first.is_empty(), "nothing changed yet");
+        let mut after = before.clone();
+        after.balance -= U256::from(5u64);
+        after.nonce += 1;
+        read_first.change_held(a, Some(&before), after.clone());
+        // A second change on top of the first.
+        let mut again = after.clone();
+        again.nonce += 1;
+        read_first.change_held(a, Some(&after), again.clone());
+        assert_eq!(read_first.read(&a, &mut db).expect("read"), Some(again.clone()), "the read answers the change");
+        let mut plain = BatchState::with_capacity(4);
+        plain.commit_info(a, Some(&before), &after);
+        plain.commit_info(a, Some(&after), &again);
+        assert_eq!(read_first.len(), 1);
+        assert!(read_first.holds(&a) && !read_first.holds(&b) && !read_first.holds(&missing));
+        assert_same(&read_first.take_bundle(), &plain.take_bundle());
     }
 
     /// A storage write is not the transfer path's: refused, naming the

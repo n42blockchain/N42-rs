@@ -1283,20 +1283,20 @@ fn held_slots<O: LeafOps + ?Sized>(index: &KeyIndex, entries: &Entries, operatio
     out.clear();
     let count = operations.op_count();
     out.resize(count, None);
-    // A chunk of keys at a time, each chunk's buckets prefetched a few keys
-    // ahead (`TagIndex::get_into`): the same answers as one `get` a key, with
-    // the probes' cache misses overlapped instead of taken one by one.
-    let work = |(chunk, held): (usize, &mut [Option<u64>])| {
-        let base = chunk * LEAF_CHUNK;
-        index.get_into(held, |i| operations.op_key(base + i), |slot| entries.key(slot as usize));
-    };
-    #[cfg(feature = "rayon")]
-    {
-        use rayon::prelude::*;
-        out.par_chunks_mut(LEAF_CHUNK).enumerate().for_each(work);
+    // On the worker pool, buckets prefetched a few keys ahead
+    // (`TagIndex::get_batch`): the same answers as one `get` a key, with the
+    // probes' cache misses overlapped instead of taken one by one.
+    index.get_batch(out, |i| operations.op_key(i), |slot| entries.key(slot as usize));
+}
+
+/// What each appended pair's key held before the block, for
+/// `TagIndex::insert_sorted_known`: `held` itself when every operation
+/// appends (a transfer block), else `held` of the appending operations.
+fn held_of_appended<'h>(held: &'h [Option<u64>], appended: usize, appends: impl Fn(usize) -> bool) -> std::borrow::Cow<'h, [Option<u64>]> {
+    if appended == held.len() {
+        return std::borrow::Cow::Borrowed(held);
     }
-    #[cfg(not(feature = "rayon"))]
-    out.chunks_mut(LEAF_CHUNK).enumerate().for_each(work);
+    std::borrow::Cow::Owned(held.iter().enumerate().filter(|(i, _)| appends(*i)).map(|(_, held)| *held).collect())
 }
 
 /// Clears every slot `held` names in its twig's bit set and marks the twig
@@ -2805,6 +2805,10 @@ impl QmdbCompatTree {
         phases.writes_faults = faults_hash.saturating_sub(faults_writes);
         let at = std::time::Instant::now();
         let entries = &self.entries;
+        // The appended keys' slots before the block (the held-slot pass's
+        // answers), so the inserts read no key.
+        let held_appended = held_of_appended(held, appended.len(), |i| appends(i).is_some());
+        let held_appended = &*held_appended;
         if parallel {
             // The index inserts and the twigs' rehash touch disjoint
             // structures: beside each other on the pool.
@@ -2813,7 +2817,7 @@ impl QmdbCompatTree {
                 let (index, twigs, dirty) = (&mut self.index, &mut self.twigs, &dirty);
                 let ((indexed, index_us), rehash_us) = rayon::join(
                     || {
-                        let indexed = index.insert_sorted(appended, |slot| entries.key(slot as usize));
+                        let indexed = index.insert_sorted_known(appended, held_appended, |slot| entries.key(slot as usize));
                         (indexed, at.elapsed().as_micros() as u64)
                     },
                     || {
@@ -2827,7 +2831,7 @@ impl QmdbCompatTree {
             phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
         } else {
             self.index
-                .insert_sorted(appended, |slot| entries.key(slot as usize))
+                .insert_sorted_known(appended, held_appended, |slot| entries.key(slot as usize))
                 .map_err(|e| QmdbOperationError::Index(e.to_string()))?;
             phases.index_us = at.elapsed().as_micros() as u64;
             phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);

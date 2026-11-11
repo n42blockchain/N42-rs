@@ -52,6 +52,16 @@ pub fn block_with_root<T>(block: Block<T>, root: Option<B256>) -> Block<T, N42He
 /// A root on a header that has no V3 fields (no Cancun) cannot be carried and
 /// is refused rather than dropped.
 pub fn put_header_tail(payload: ExecutionPayload, header: &N42Header) -> Result<ExecutionPayload, RootNotCarried> {
+    put_header_tail_or_keep(payload, header).map_err(|(_, err)| err)
+}
+
+/// [`put_header_tail`] that hands the payload back, unchanged, when it
+/// refuses: a caller that sends the payload on regardless does not need to
+/// clone it first (a clone of a 200,000-transaction payload is ~6 ms).
+pub fn put_header_tail_or_keep(
+    payload: ExecutionPayload,
+    header: &N42Header,
+) -> Result<ExecutionPayload, (ExecutionPayload, RootNotCarried)> {
     let needs_v4 = header.slot_number.is_some() || header.mobile_registry_root.is_some();
     let payload = match payload {
         ExecutionPayload::V4(mut v4) => {
@@ -59,10 +69,7 @@ pub fn put_header_tail(payload: ExecutionPayload, header: &N42Header) -> Result<
             ExecutionPayload::V4(v4)
         }
         ExecutionPayload::V3(v3) if needs_v4 => ExecutionPayload::V4(v4_from_v3(v3, header)),
-        other if header.mobile_registry_root.is_some() => {
-            let _ = other;
-            return Err(RootNotCarried(header.number));
-        }
+        other if header.mobile_registry_root.is_some() => return Err((other, RootNotCarried(header.number))),
         other => other,
     };
     Ok(payload)
@@ -196,5 +203,35 @@ mod tests {
         let mut json = json;
         json["mobileRegistryRoot"] = serde_json::json!(B256::repeat_byte(1));
         assert!(serde_json::from_value::<ExecutionPayload>(json).is_err());
+    }
+
+    /// A root on a pre-Cancun payload is refused, and the payload comes back
+    /// as it was, transactions included.
+    #[test]
+    fn a_refused_tail_hands_the_payload_back() {
+        let v1 = alloy_rpc_types_engine::ExecutionPayloadV1 {
+            parent_hash: B256::ZERO,
+            fee_recipient: Default::default(),
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Default::default(),
+            prev_randao: B256::ZERO,
+            block_number: 1001,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Bytes::new(),
+            base_fee_per_gas: U256::ZERO,
+            block_hash: B256::ZERO,
+            transactions: vec![Bytes::from_static(&[1, 2, 3])],
+            difficulty: U256::ZERO,
+            nonce: Default::default(),
+        };
+        let payload = ExecutionPayload::V1(v1);
+        let h = header(None, None, Some(B256::repeat_byte(1)));
+        let (back, err) = put_header_tail_or_keep(payload.clone(), &h).expect_err("a V1 payload cannot carry a root");
+        assert_eq!(err, RootNotCarried(1001));
+        assert_eq!(back, payload);
+        assert_eq!(put_header_tail(payload, &h), Err(RootNotCarried(1001)));
     }
 }

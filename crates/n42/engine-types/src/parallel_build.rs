@@ -755,9 +755,10 @@ where
         let open_at = std::time::Instant::now();
         let txs = members.iter().map(|g| g.len()).sum::<usize>();
         let db = TimedDb(open().ok_or(Refused::NotParallel(NotParallel::NoState))?);
-        // The direct path's accounts, which the batch's EVM reads through
-        // when one is made.
-        let mut layer = Some(Layered::new(db, if direct.is_some() { txs * 2 + 1 } else { 0 }));
+        // The parent's state: the direct path reads through it into the
+        // batch state, and the batch's EVM, when one is made, reads it under
+        // the accounts the direct path changed (`Layered::over`).
+        let mut parent = Some(db);
         let open_us = open_at.elapsed().as_micros() as u64;
         let mut inside = BatchInside::default();
         let mut sampled_txs = 0u64;
@@ -789,12 +790,12 @@ where
                     READ_TIMING.with(|cell| cell.set((true, 0, 0)));
                     std::time::Instant::now()
                 });
-                if let (Some(direct), Some(layer)) = (direct, layer.as_mut()) {
+                if let (Some(direct), Some(parent)) = (direct, parent.as_mut()) {
                     let shape = direct.shape(&tx);
                     let step = match &shape {
                         Some(shape) => {
                             let ledger = &mut ledger;
-                            direct.apply(shape, layer, &mut state, |before| {
+                            direct.apply(shape, parent, &mut state, |before| {
                                 worst_case.is_none_or(|cost| ledger.admit(shape.caller, first, before, cost(i)))
                             })
                         }
@@ -834,7 +835,8 @@ where
                 let evm = match &mut evm {
                     Some(evm) => evm,
                     None => {
-                        let Some(layer) = layer.take() else { return Err(Refused::NotParallel(NotParallel::NoState)) };
+                        let Some(parent) = parent.take() else { return Err(Refused::NotParallel(NotParallel::NoState)) };
+                        let layer = Layered::over(parent, &state);
                         evm.insert(crate::fast_handler::as_batch(|| config.evm_with_env(layer, env.clone())))
                     }
                 };

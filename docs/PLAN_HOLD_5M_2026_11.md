@@ -26,8 +26,8 @@ mechanism is unknown. A fleet that can exit on an empty-block handover does not 
 | # | Item | Method | Verification | Status |
 | --- | --- | --- | --- | --- |
 | P1 | Is the drop code or box? | pairs with the tagged natives (`wt-port`, 47b8180ab) as the candidate against today's `main` natives, same runner, same day | two pairs; tag legs >= 3% over main legs in both = code | **done 11-10: code** (tag +4.5% / +5.3% over main in PA1 / PA2) |
-| P2 | If code: find the step | natives at the merge points between 47b8180ab and `main` (maturity audit 8ff447481, compaction c992a5ee4, N42Header b87fa2884, reth v2.9.0 6703c576f, v2.10.0, Amsterdam step 235076649, today), halving by pairs | the step that separates >= 3% twice | waits for P1 |
-| P3 | Fix or gate the step | per finding; a knob in the X22 profile if the cost buys something `main` needs | pair back in the 5.0-5.2M band, twice | waits for P2 |
+| P2 | If code: find the step | natives at the merge points between 47b8180ab and `main` (maturity audit 8ff447481, compaction c992a5ee4, N42Header b87fa2884, reth v2.9.0 6703c576f, v2.10.0, Amsterdam step 235076649, today), halving by pairs | the step that separates >= 3% twice | done 11-10: no single step; phase diff named three costs |
+| P3 | Fix or gate the step | per finding; a knob in the X22 profile if the cost buys something `main` needs | pair back in the 5.0-5.2M band, twice | done 11-11: main 5.06-5.12M on four legs |
 | P4 | If box: re-baseline | record the band of the tagged build today as the reference; the goal is judged against it | docs | waits for P1 |
 | S1 | G8 mechanism | every pair leg runs with the forest trace; a deterministic reproducer of the empty-block tenure handover (three executions of one block on one parent, child built ahead) in the crate tests | the reproducer fails on `main` and passes with the fix | no mechanism found in the 7167 log (second reading, `docs/RETH_2_10_0_UPGRADE.md`); replay diagnosis merged 2026-11-10 (38bf5f76f): the next recurrence logs a verdict among three causes; open until then |
 | Q1 | `cargo clippy -- -D warnings` is red again on N42 crates (`twig-core` `entry_store.rs`, `index.rs`; `qmdb-reth` `executed_fields.rs`, `node_state_tests.rs`) | fix the warnings, no behaviour change | clippy clean on the crates d07ec6584 covered | **done 2026-11-10**: the d07ec6584 gate (`scripts/clippy-n42.sh`) was green all along; the named sites were test targets, fixed in 74b6bdba2; `--all-targets` across all N42 crates has a backlog in tests and benches, not in scope |
@@ -126,3 +126,24 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   Every leg fatal=0, no replay miss. Mean +1.4% over `main`, about half of the gap to the tag. Merged
   into `main`. Still open for P3: the import side (import +10 ms, persist +30% over the tag; branch
   `perf/import-persist-cost` in work), root_leaves 7.2-8.9 ms, and H5Bb's seal at 39.9 with roots at 35.5.
+- 2026-11-11 06:25Z: `main` reads back in the band. `perf/import-persist-cost` handed back one import
+  cost: `with_header_tail` (N42Header merge, 2bad5b091) cloned the whole 200,000-transaction payload on
+  every hand-off (`payload_ms` 3 -> 9.8 ms); the payload now moves, and comes back unchanged on a
+  refusal. The QMDB persist growth is `settle_through` waiting for the tree lease on the parallel
+  persist thread (delta log settled before the database commits); the save scope grew 1.3 s a leg,
+  inside the spread, so the guarantee stays as it is. Pairs H5C/H5D, the fix against the new `main`
+  natives (c13ecf9bf), gate green (17 results ok, clippy clean), every leg fatal=0, no replay miss:
+
+  | window-1 mean | fix (4 legs) | `main` c13ecf9bf (4 legs) |
+  |---|---|---|
+  | TPS | 5.093 / 5.147 / 5.025 / 4.940M | 5.120 / 5.071 / 5.085 / 5.060M |
+  | sealed_at ms | 37.1 / 36.9 / 37.3 / 38.4 | 37.1 / 37.5 / 37.4 / 37.8 |
+  | engine import ms | 64.7 / 64.9 / 61.8 / 56.5 | 69.4 / 67.2 / 69.9 / 66.7 |
+  | own-block import ms | 66.8 / 66.9 / 62.7 / 56.3 | 76.2 / 71.6 / 76.8 / 71.4 |
+
+  The import cut is exact (5-10 ms) and does not move the round: the import is beside the cycle. Merged.
+  P3's bar (in the 5.0-5.2M band, twice) is met by the `main` legs of both pairs: four of four at
+  5.06-5.12M, mean 5.084M, against 4.84-4.97M before the three fixes. Seven of eight legs of the round
+  are past 5M. Open, none blocking: sealed_at is 37.1-37.8 ms against the tag's 36.6-36.7
+  (root_leaves 7.3-9.0 ms, par_exec 28.5-30.0); forkchoice `syncing` answers are still twice the tag's
+  count, cause unknown; S1 (hold it) continues with A/A legs on later merges.

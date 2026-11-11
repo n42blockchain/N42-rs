@@ -100,3 +100,29 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   microbench called level. The branch goes back for a fix measured at the real entry count. The knob
   still leaves roots ~3 ms over the tag (32-34 ms); par_exec is +1.5 ms since the evm2 port and the root
   job starts from its output, so a third branch, `perf/evm2-par-exec`, profiles the batch execution.
+- 2026-11-11 03:10Z: the second index fix holds on the fleet. The branch now probes a seeded batch by
+  shard on the pool and confirms in key order, measured at the fleet's shape (2.03M live keys, 33.5 MB
+  of index tables, 440M entry slots; the earlier "many-GB tables" guess was wrong, the cost was
+  out-of-order entry-file reads across 256 tables). Legs LA0 / LA0b / LB0: root_index 4.2 ms (tag 5.5,
+  `main` 7.1-7.5, key0 knob 6.0-6.9), window 1 4.917 / 4.953 / 5.017M against the knob's 4.984 / 4.880M.
+  The seeded shard choice stays; the knob stays bench-only and off.
+- 2026-11-11 03:40Z: `perf/evm2-par-exec` handed back. The direct path kept two maps per batch (the
+  bundle and a second layered read map); `BatchState` now holds the bundle accounts and is the read
+  layer. Microbench `par_exec_profile`: 6.5-6.7 -> 5.6 ms a batch set, ~700 -> ~600 ns a transfer.
+  `perf` is not usable on this box (`kernel.perf_event_paranoid` is 4).
+- 2026-11-11 05:13Z: `integ/hold-5m` (fees on the batches + index locality + the read layer) passed the
+  gate (17 results ok, 0 failures, clippy clean) and pairs H5A/H5B against `main` natives:
+
+  | window-1 mean | integ (4 legs) | `main` (2 legs) | tag (earlier legs) |
+  |---|---|---|---|
+  | TPS | 4.987 / 5.060 / 4.973 / 4.784M | 4.847 / 4.920M | 5.05-5.18M |
+  | sealed_at ms | 37.7 / 37.7 / 38.1 / 39.9 | 39.5 / 38.9 | 36.6-36.7 |
+  | roots ms | 37.2 / 36.8 / 34.8 / 35.5 | 38.6 / 38.2 | 32-34 |
+  | root_index ms | 4.4 / 4.4 / 4.0 / 4.0 | 7.8 / 7.6 | 5.5 |
+  | par_exec ms | 27.3 / 28.8 / 27.7 / 27.3 | 29.9 / 30.3 | - |
+  | engine import ms | 69.4 / 69.9 / 65.0 / 64.5 | 73.2 / 71.5 | 55-60 |
+  | QMDB persist s/leg | 56.5 / 57.9 / 52.4 / 53.2 | 64.1 / 63.9 | 37-41 |
+
+  Every leg fatal=0, no replay miss. Mean +1.4% over `main`, about half of the gap to the tag. Merged
+  into `main`. Still open for P3: the import side (import +10 ms, persist +30% over the tag; branch
+  `perf/import-persist-cost` in work), root_leaves 7.2-8.9 ms, and H5Bb's seal at 39.9 with roots at 35.5.

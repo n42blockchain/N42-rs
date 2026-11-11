@@ -29,7 +29,7 @@
 
 use alloy_primitives::{map::AddressMap, Address};
 use evm2::evm::{AccountChanges, AccountInfo, PendingState};
-use reth_trie::bundle_state::{AccountStatus, BundleRetention, BundleState, TransitionAccount, TransitionState};
+use reth_trie::bundle_state::{AccountStatus, BundleAccount, BundleState, TransitionAccount};
 
 /// A change [`BatchState::commit`] does not model: the transfer path never
 /// makes one, and a batch that meets one sends the block to the serial
@@ -48,7 +48,11 @@ impl std::error::Error for Unsupported {}
 /// A build or import batch's account transitions against the parent's state.
 #[derive(Debug, Default)]
 pub struct BatchState {
-    transitions: AddressMap<TransitionAccount>,
+    /// Each changed account as the bundle will hold it: its info now, its
+    /// info at the batch's start (`original_info`, the transition's
+    /// `previous_info`) and its status. [`Self::take_bundle`] turns this map
+    /// into the bundle's in place, without a second map to fill.
+    accounts: AddressMap<BundleAccount>,
 }
 
 /// The status of an account as it was loaded, before its first change
@@ -72,22 +76,22 @@ fn without_code(info: &AccountInfo) -> AccountInfo {
 impl BatchState {
     /// A batch with room for `accounts` transitions without regrowing.
     pub fn with_capacity(accounts: usize) -> Self {
-        Self { transitions: AddressMap::with_capacity_and_hasher(accounts, Default::default()) }
+        Self { accounts: AddressMap::with_capacity_and_hasher(accounts, Default::default()) }
     }
 
     /// Accounts the batch has changed so far.
     pub fn len(&self) -> usize {
-        self.transitions.len()
+        self.accounts.len()
     }
 
     /// Whether the batch has changed nothing.
     pub fn is_empty(&self) -> bool {
-        self.transitions.is_empty()
+        self.accounts.is_empty()
     }
 
     /// Whether the batch has changed `address`.
     pub fn holds(&self, address: &Address) -> bool {
-        self.transitions.contains_key(address)
+        self.accounts.contains_key(address)
     }
 
     /// Folds one finalised transaction's changes into the batch.
@@ -129,16 +133,14 @@ impl BatchState {
         let original = original.map(without_code);
         let current = without_code(current);
         let had_no_nonce_and_code = original.as_ref().is_none_or(|i| i.nonce == 0 && i.is_empty_code_hash());
-        match self.transitions.entry(address) {
+        match self.accounts.entry(address) {
             alloy_primitives::map::Entry::Vacant(entry) => {
                 let previous_status = loaded_status(original.as_ref());
-                entry.insert(TransitionAccount {
+                entry.insert(BundleAccount {
                     info: Some(current),
                     status: previous_status.on_changed(had_no_nonce_and_code),
-                    previous_info: original,
-                    previous_status,
+                    original_info: original,
                     storage: Default::default(),
-                    storage_was_destroyed: false,
                 });
             }
             alloy_primitives::map::Entry::Occupied(mut entry) => {
@@ -152,10 +154,39 @@ impl BatchState {
     /// The batch's changes against the parent with their reverts: the bundle
     /// `BlockState::into_bundle` makes of the same transitions. The batch
     /// holds nothing afterwards.
+    ///
+    /// What `apply_transitions_and_create_reverts` does for a transition new
+    /// to an empty bundle, done in this map: an entry is the transition's
+    /// present bundle account already, so it stays where it is when the
+    /// transition has a revert and is dropped otherwise -- no second map
+    /// filled entry by entry (the revm-era batch state's one pass).
     pub fn take_bundle(&mut self) -> BundleState {
-        let transitions = std::mem::take(&mut self.transitions);
+        let mut accounts = std::mem::take(&mut self.accounts);
         let mut bundle = BundleState::default();
-        bundle.apply_transitions_and_create_reverts(TransitionState { transitions }, BundleRetention::Reverts);
+        let mut reverts = Vec::with_capacity(accounts.len());
+        let (mut state_size, mut reverts_size) = (0usize, 0usize);
+        accounts.retain(|address, entry| {
+            let transition = TransitionAccount {
+                info: entry.info.clone(),
+                status: entry.status,
+                previous_info: entry.original_info.clone(),
+                previous_status: loaded_status(entry.original_info.as_ref()),
+                storage: Default::default(),
+                storage_was_destroyed: false,
+            };
+            if let Some((hash, code)) = transition.has_new_contract() {
+                bundle.contracts.insert(hash, code.clone());
+            }
+            let Some(revert) = transition.create_revert() else { return false };
+            state_size += entry.size_hint();
+            reverts_size += revert.size_hint();
+            reverts.push((*address, revert));
+            true
+        });
+        bundle.state = accounts;
+        bundle.reverts.push(reverts);
+        bundle.state_size = state_size;
+        bundle.reverts_size = reverts_size;
         bundle
     }
 }

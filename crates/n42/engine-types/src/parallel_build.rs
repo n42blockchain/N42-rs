@@ -755,9 +755,10 @@ where
         let open_at = std::time::Instant::now();
         let txs = members.iter().map(|g| g.len()).sum::<usize>();
         let db = TimedDb(open().ok_or(Refused::NotParallel(NotParallel::NoState))?);
-        // The direct path's accounts, which the batch's EVM reads through
-        // when one is made.
-        let mut layer = Some(Layered::new(db, if direct.is_some() { txs * 2 + 1 } else { 0 }));
+        // The parent's state: the direct path reads through it into the
+        // batch state, and the batch's EVM, when one is made, reads it under
+        // the accounts the direct path changed (`Layered::over`).
+        let mut parent = Some(db);
         let open_us = open_at.elapsed().as_micros() as u64;
         let mut inside = BatchInside::default();
         let mut sampled_txs = 0u64;
@@ -789,12 +790,12 @@ where
                     READ_TIMING.with(|cell| cell.set((true, 0, 0)));
                     std::time::Instant::now()
                 });
-                if let (Some(direct), Some(layer)) = (direct, layer.as_mut()) {
+                if let (Some(direct), Some(parent)) = (direct, parent.as_mut()) {
                     let shape = direct.shape(&tx);
                     let step = match &shape {
                         Some(shape) => {
                             let ledger = &mut ledger;
-                            direct.apply(shape, layer, &mut state, |before| {
+                            direct.apply(shape, parent, &mut state, |before| {
                                 worst_case.is_none_or(|cost| ledger.admit(shape.caller, first, before, cost(i)))
                             })
                         }
@@ -834,7 +835,8 @@ where
                 let evm = match &mut evm {
                     Some(evm) => evm,
                     None => {
-                        let Some(layer) = layer.take() else { return Err(Refused::NotParallel(NotParallel::NoState)) };
+                        let Some(parent) = parent.take() else { return Err(Refused::NotParallel(NotParallel::NoState)) };
+                        let layer = Layered::over(parent, &state);
                         evm.insert(crate::fast_handler::as_batch(|| config.evm_with_env(layer, env.clone())))
                     }
                 };
@@ -2906,5 +2908,100 @@ mod tests {
         amsterdam_direct_equals_evm2("a recipient that sends later", &chained, 4);
         let mixed = vec![transfer(1, 0, addr(2), 100), transfer(1, 1, addr(1), 5), transfer(1, 2, addr(3), 7), transfer(2, 0, addr(4), 9)];
         amsterdam_direct_equals_evm2("a self-transfer mid-run", &mixed, 2);
+    }
+
+    /// Profile bench (perf/evm2-par-exec): the leader's batch step on a
+    /// 200,000-transfer block, 400 senders of 500 to recipients drawn from
+    /// 2,000,000 spread addresses, an in-memory parent, 16 output shards,
+    /// the direct path, fees counted -- the revm-era `par_exec_profile`'s
+    /// shape. Ignored; `PX_ROUNDS` rounds:
+    ///
+    /// ```text
+    /// N42_PARALLEL_BUILD_THREADS=32 cargo test --profile profiling -p n42-engine-types --lib \
+    ///   par_exec_profile -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing"]
+    fn par_exec_profile() {
+        let rounds: usize = std::env::var("PX_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        let spread = |i: u64| {
+            let mut a = [0u8; 20];
+            a[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+            a[12..].copy_from_slice(&i.to_be_bytes());
+            Address::from(a)
+        };
+        let (senders, per) = (400u64, 500u64);
+        let beneficiary = spread(1);
+        let mut base = CacheDB::new(EmptyDB::default());
+        base.insert_account_info(&beneficiary, AccountInfo { balance: U256::from(1u64), ..Default::default() });
+        for s in 0..senders {
+            base.insert_account_info(&spread(100 + s), AccountInfo { balance: U256::from(10u128.pow(24)), ..Default::default() });
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut txs = Vec::with_capacity((senders * per) as usize);
+        for s in 0..senders {
+            for k in 0..per {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let inner = TxEip1559 {
+                    chain_id: 1,
+                    nonce: k,
+                    gas_limit: 21_000,
+                    max_fee_per_gas: 10_000_000_000,
+                    max_priority_fee_per_gas: 1_000_000_000,
+                    to: TxKind::Call(spread(1_000_000 + seed % 2_000_000)),
+                    value: U256::from(1_000 + k),
+                    input: Bytes::new(),
+                    ..Default::default()
+                };
+                let signed = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
+                txs.push(Recovered::new_unchecked(N42TxEnvelope::from(reth_ethereum_primitives::TransactionSigned::from(signed)), spread(100 + s)));
+            }
+        }
+        let header = timing_header(alloy_consensus::Header {
+            number: 20_000_000,
+            beneficiary,
+            gas_limit: 21_000 * (senders * per + 1),
+            base_fee_per_gas: Some(1_000_000_000),
+            timestamp: 1_800_000_000,
+            ..Default::default()
+        });
+        let c = timing_config();
+        let env = c.evm_env(&n42_header::N42Header::from(header)).expect("env");
+        let direct = DirectTransfers::of_env(&env, crate::direct_transfer::shape_of).expect("a direct path");
+        let keys = keys(&txs);
+        let convert = |i: usize| Recovered::new_unchecked(n42_tx_types::evm::evm_tx_of(txs[i].inner()), txs[i].signer());
+        let open = || Some(base.clone());
+        let tip_of = |i: usize| alloy_consensus::Transaction::effective_tip_per_gas(txs[i].inner(), 1_000_000_000).unwrap_or_default();
+        let (mut took, mut cpu) = (Vec::new(), Vec::new());
+        for round in 0..rounds {
+            let shards = crate::output_shards::OutputShards::new(beneficiary, keys.len(), 16);
+            let sink = |bundle: BundleState| shards.add(bundle);
+            let at = std::time::Instant::now();
+            let run = execute_batches_into(&c, &env, &keys, None, &convert, &open, None, beneficiary, Dispatch::from_env(), Some(&sink), &[], Some(&direct), Some(&tip_of))
+                .expect("the batches run");
+            let us = at.elapsed().as_micros();
+            assert_eq!(run.executed.len(), keys.len(), "skipped {}", run.skipped.len());
+            took.push(us);
+            eprintln!(
+                "round {round}: exec_us={us} before_us={} gather_us={} merge_us={} last_start_us={} last_end_us={} wall_sum_us={} cpu_sum_us={} minflt={} shard_add_us={}",
+                run.inside.before_us, run.inside.gather_us, run.inside.merge_us, run.spans.last_start_us, run.spans.last_end_us,
+                run.spans.wall_sum_us, run.spans.cpu_sum_us, run.spans.minflt, run.inside.shard_add_us,
+            );
+            cpu.push(u128::from(run.spans.cpu_sum_us));
+            drop(run);
+            drop(shards);
+        }
+        took.sort_unstable();
+        cpu.sort_unstable();
+        eprintln!(
+            "par_exec_profile new: threads={} median_us={} min_us={} cpu_sum_median_us={} cpu_ns_per_transfer={}",
+            build_pool().current_num_threads(),
+            took[took.len() / 2],
+            took[0],
+            cpu[cpu.len() / 2],
+            cpu[cpu.len() / 2] * 1000 / keys.len() as u128,
+        );
     }
 }

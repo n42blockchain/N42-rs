@@ -92,3 +92,11 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   (insert 3.7 -> 2.5 ms, apply 5.6 -> 3.8 ms on a 33M-key index) does not show on the 480M-account fleet.
   Next: the attribution knob itself, KA/KB = integ natives with `N42_INDEX_SHARD_KEY0=1` against the same
   natives without it (runner hook `LOOP351_QC_ENV`, bench tree 54c749f99).
+- 2026-11-11 02:26Z: attribution confirmed. KA/KB, integ natives with `N42_INDEX_SHARD_KEY0=1` against the
+  same natives without it (four legs each, window-1 means): root_index 5.8-6.2 vs 7.8-8.2 ms, root_leaves
+  5.7-6.7 vs 6.9-9.0, roots 35.8-36.6 vs 36.7-39.1, sealed_at 37.6-38.0 vs 38.4-39.0; window 1
+  5.020 / 5.073 / 4.824 / 5.011M vs 4.887 / 4.973 / 4.973 / 4.865M (+1.2%). The seeded shard choice is
+  the cost and the first fix missed it: at fleet scale the loss is in the lookup paths the 33M-key
+  microbench called level. The branch goes back for a fix measured at the real entry count. The knob
+  still leaves roots ~3 ms over the tag (32-34 ms); par_exec is +1.5 ms since the evm2 port and the root
+  job starts from its output, so a third branch, `perf/evm2-par-exec`, profiles the batch execution.

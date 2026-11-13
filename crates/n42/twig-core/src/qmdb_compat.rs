@@ -1286,7 +1286,14 @@ fn held_slots<O: LeafOps + ?Sized>(index: &KeyIndex, entries: &Entries, operatio
     // On the worker pool, buckets prefetched a few keys ahead
     // (`TagIndex::get_batch`): the same answers as one `get` a key, with the
     // probes' cache misses overlapped instead of taken one by one.
-    index.get_batch(out, |i| operations.op_key(i), |slot| entries.key(slot as usize));
+    // The confirmations' entry reads (an offset, then a record, in a file
+    // store) are prefetched ahead of them (`TagIndex::get_batch_ahead`).
+    index.get_batch_ahead(
+        out,
+        |i| operations.op_key(i),
+        |slot| entries.key(slot as usize),
+        |slot, stage| entries.prefetch_key(slot as usize, stage),
+    );
 }
 
 /// What each appended pair's key held before the block, for

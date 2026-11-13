@@ -429,8 +429,12 @@ async fn step_until(
 async fn a_single_validator_leads_commits_and_announces_each_block() {
     let rig = node(1, 0, None).await;
     let mut svc = rig.svc.with_payload_attributes(|context| Some(attributes_for(&context)));
-    let events = step_until(&mut svc, |_, events| {
+    // A commit to an own block whose import is still in flight runs when the
+    // import's report comes back (`ExecutionDriver::commit`), so the
+    // execution layer is told a step after the Decide at the earliest.
+    let events = step_until(&mut svc, |svc, events| {
         events.iter().filter(|e| matches!(e, ServiceEvent::Committed { .. })).count() >= 2
+            && svc.driver.finalized() != ID.genesis_hash
     })
     .await;
     let views: Vec<u64> = events

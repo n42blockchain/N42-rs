@@ -711,6 +711,41 @@ async fn the_commit_that_was_answered_syncing_runs_again_when_the_own_block_land
     assert!(driver.own_block_imported(built.hash).await.is_none(), "once");
 }
 
+/// A commit heard while this node's own import of the block is still in
+/// flight is not sent: the engine would answer SYNCING and start a download
+/// of the block that, without peers, never ends (reth's
+/// `active_block_downloads` grew by one per such answer). It is kept the way
+/// that answer kept it, and runs once when the import lands.
+#[tokio::test]
+async fn a_commit_to_an_own_block_still_importing_waits_for_the_import_without_a_forkchoice() {
+    let built = MockExecutionLayer::built_block(1);
+    // The own import has no verdict yet: it keeps trying.
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        new_payload_status: PayloadStatusEnum::Syncing,
+        forkchoice_status: PayloadStatusEnum::Syncing,
+        ..Default::default()
+    });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_own_import_backoff(vec![Duration::from_millis(50); 40]);
+    let mut own = driver.take_own_imports().expect("channel");
+    driver.spawn_import_own_block(&built);
+    assert!(driver.is_importing_own_block(&built.hash));
+
+    assert!(matches!(driver.handle_output(&committed(built.hash)).await, DriverAction::Ignored));
+    assert_eq!(count(&el, |c| matches!(c, ElCall::ForkchoiceUpdated(_))), 0, "no forkchoice while the import runs");
+    assert_eq!(driver.commits_held_for_own_import(), 1);
+    assert_ne!(driver.head(), built.hash);
+
+    // The import lands; the kept commit runs once, and lands.
+    el.set_behaviour(MockBehaviour::default());
+    assert_eq!(tokio::time::timeout(Duration::from_secs(10), own.recv()).await.expect("in time"), Some(built.hash));
+    let replay = driver.own_block_imported(built.hash).await.expect("the commit runs when the import lands");
+    assert_eq!(replay.finalized_block(), Some(built.hash));
+    assert_eq!(driver.head(), built.hash);
+    assert_eq!(count(&el, |c| matches!(c, ElCall::ForkchoiceUpdated(_))), 1);
+    assert!(driver.own_block_imported(built.hash).await.is_none(), "once");
+}
+
 // ---------------------------------------------------------------------------
 // Commits
 // ---------------------------------------------------------------------------

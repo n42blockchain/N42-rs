@@ -868,6 +868,9 @@ pub struct ExecutionDriver<E> {
     /// Commit forkchoices answered so far, for rate-limiting the
     /// measurement line to every sixteenth.
     commits_answered: u64,
+    /// Commits to an own block kept unsent because its import was still in
+    /// flight (see `commit`).
+    commits_held_for_own_import: u64,
     /// Where a spawned commit forkchoice reports.
     commit_reports: tokio::sync::mpsc::UnboundedSender<CommitReport>,
     /// The receiving end, until the loop takes it.
@@ -1096,6 +1099,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             commit_seq: 0,
             commit_landed: 0,
             commits_answered: 0,
+            commits_held_for_own_import: 0,
             commit_reports: commit_tx,
             commit_reports_rx: Some(commit_rx),
             settlement: crate::settlement::Settlement::new(crate::settlement::settlement_tags()),
@@ -3053,6 +3057,30 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             self.pending_commits.insert(block_hash);
             return DriverAction::Ignored;
         }
+        if !self.imported.contains(&block_hash) && self.is_importing_own_block(&block_hash) {
+            // This node's own block, its import still on the way into the
+            // execution layer: the Decide came before the import's answer (a
+            // leader hears its commit ~11 ms after the proposal; an own import
+            // that is not answered at once takes 20-70 ms). The forkchoice
+            // would be answered SYNCING and kept in `pending_commits` for
+            // `own_block_imported` to run again -- and reth would also start a
+            // download of the block for every such answer, which on a layer
+            // without peers never ends and is never cleared
+            // (`active_block_downloads` grew by one per answer, ~2000 a bench
+            // leg, every one polled on each engine-task wake). So the commit
+            // is kept without being sent, in exactly the state that answer
+            // left it in: in `pending_commits`, remembered as ahead, its
+            // commit order fixed now (the order it was heard in, as a send
+            // would have fixed it). `own_block_imported` runs it when the
+            // import lands; an import that never lands leaves it waiting, as
+            // the SYNCING answer did.
+            self.commit_order_of(block_hash);
+            self.remember_commit_ahead(block_hash);
+            self.pending_commits.insert(block_hash);
+            self.commits_held_for_own_import = self.commits_held_for_own_import.saturating_add(1);
+            debug!(target: "n42.h2.el", block = ?block_hash, "commit to an own block whose import is in flight; it runs when the import lands");
+            return DriverAction::Ignored;
+        }
         // `finalized` moves only on the engine's Valid answer (`apply_commit`):
         // a forkchoice that failed or was refused did not make the block
         // canonical, and later forkchoices must not name it as finalised.
@@ -3372,6 +3400,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// The failed commit waiting to be sent again, if any.
     pub fn commit_retry_pending(&self) -> Option<B256> {
         self.commit_retry.as_ref().map(|retry| retry.block_hash)
+    }
+
+    /// Commits to an own block kept unsent since start because the block's
+    /// import was still in flight; each runs when the import lands.
+    pub const fn commits_held_for_own_import(&self) -> u64 {
+        self.commits_held_for_own_import
     }
 
     /// Commit forkchoices the execution layer refused (Invalid) since start.

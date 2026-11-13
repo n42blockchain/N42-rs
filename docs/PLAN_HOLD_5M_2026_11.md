@@ -147,3 +147,22 @@ Not reopened: QMDB compaction stage 1 read view (C1 closed in the open-items pla
   are past 5M. Open, none blocking: sealed_at is 37.1-37.8 ms against the tag's 36.6-36.7
   (root_leaves 7.3-9.0 ms, par_exec 28.5-30.0); forkchoice `syncing` answers are still twice the tag's
   count, cause unknown; S1 (hold it) continues with A/A legs on later merges.
+- 2026-11-13: **forkchoice `syncing` placed and fixed (branch perf/forkchoice-syncing).** Every
+  SYNCING answer is a leader's commit forkchoice to its *own* block, sent while the own import was
+  still in flight (all seven validators' logs: `commit forkchoice ... ahead_of_import=true
+  outcome=Syncing` equals the engine counter, 1996/1996 on PA10, 491/491 on PA1a; 90% then
+  replayed by `own_block_imported`). An own import that is not pre-answered (~2,300 a leg, round trip
+  20-70 ms) races a Decide heard ~11 ms after the proposal; the tag loses that race on 22-40% of
+  them, main on 85-90%. The step is gradual over the merge points (tag 491-964 per leg; 6eb585176
+  942-1209; 8ff447481 / 62bc01b59 / 134b9c215 / d07ec6584 962-1758; 6d373bbbe 1823-1970 and flat
+  through 6703c576f / 0ed56c1da / main), tracking the slower own-import tail (p90 39-40 -> 41-45 ms).
+  The cost is not the answer itself but reth's handling of it: `handle_missing_block` starts a
+  download of the head for every SYNCING forkchoice, and on a layer with no peers the download never
+  ends and is never cleared -- `active_block_downloads` equals the SYNCING count at the end of every
+  leg (1996 on PA10), and the downloader polls every one of them on each engine-task wake. An
+  unbounded leak on a long-running node (~20 a second at bench rate), small per leg.
+  Fix (h2-execution `commit`): a commit to an own block whose import is in flight is not sent; it is
+  kept exactly as the SYNCING answer kept it (`pending_commits`, remembered ahead, commit order fixed
+  at hearing) and runs when `own_block_imported` reports the import. Test
+  `a_commit_to_an_own_block_still_importing_waits_for_the_import_without_a_forkchoice`. Expected on a
+  leg: `forkchoice_updated_syncing` and `active_block_downloads` near the follower-only remainder.

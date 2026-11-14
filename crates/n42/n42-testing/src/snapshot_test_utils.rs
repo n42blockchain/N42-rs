@@ -3,7 +3,7 @@
 
 use alloy_primitives::Address;
 use reth_network::config::SecretKey;
-use secp256k1::{PublicKey, Secp256k1};
+use secp256k1::PublicKey;
 use std::{collections::HashMap, str::FromStr};
 use tiny_keccak::{Hasher, Keccak};
 
@@ -26,15 +26,12 @@ impl TesterAccountPool {
             return Address::from_str("0x0000000000000000000000000000000000000000").unwrap();
         }
         if !self.accounts.contains_key(account) {
-            let secret_key = SecretKey::new(&mut secp256k1::rand::thread_rng());
+            let secret_key = SecretKey::new(&mut secp256k1::rand::rng());
             self.accounts.insert(account.to_string(), secret_key);
         }
-        // Initialize secp256k1 context
-        let secp = Secp256k1::new();
-
         // Get the corresponding public key
         let secret_key = self.accounts.get(account).unwrap();
-        let public_key = PublicKey::from_secret_key(&secp, secret_key);
+        let public_key = PublicKey::from_secret_key(secret_key);
 
         // Serialize the public key in uncompressed format (65 bytes)
         let public_key_uncompressed = public_key.serialize_uncompressed();
@@ -52,7 +49,7 @@ impl TesterAccountPool {
 
     pub fn secret_key(&mut self, account: &str) -> SecretKey {
         if !self.accounts.contains_key(account) {
-            let secret_key = SecretKey::new(&mut secp256k1::rand::thread_rng());
+            let secret_key = SecretKey::new(&mut secp256k1::rand::rng());
             self.accounts.insert(account.to_string(), secret_key);
         }
         *self.accounts.get(account).unwrap()

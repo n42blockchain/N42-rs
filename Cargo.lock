@@ -7450,7 +7450,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "reth-cli",
- "secp256k1 0.33.1",
+ "secp256k1 0.30.0",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

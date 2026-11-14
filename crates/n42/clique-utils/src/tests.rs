@@ -9,7 +9,7 @@ use crate::clique::{
 };
 use reth_primitives_traits::Header;
 use alloy_primitives::{keccak256, Address, Bloom, Bytes, B256, B64, U256};
-use secp256k1::{ecdsa::RecoveryId, Message, PublicKey, SecretKey, SECP256K1};
+use secp256k1::{ecdsa::RecoveryId, Message, PublicKey, SecretKey};
 
 /// Create a test header with default values
 fn create_test_header() -> Header {
@@ -51,14 +51,13 @@ fn sign_header(header: &mut Header, secret_key: &SecretKey) {
 
     // Create message and sign
     let message = Message::from_digest(hash.into());
-    let (recovery_id, sig) = SECP256K1
-        .sign_ecdsa_recoverable(&message, secret_key)
+    let (recovery_id, sig) = secp256k1::ecdsa::RecoverableSignature::sign_ecdsa_recoverable(message, secret_key)
         .serialize_compact();
 
     // Build extra_data: 32 bytes vanity + signature (64 + 1)
     let mut extra_data = vec![0u8; 32]; // 32 byte vanity
     extra_data.extend_from_slice(&sig);
-    extra_data.push(i32::from(recovery_id) as u8);
+    extra_data.push(recovery_id.to_u8());
 
     header.extra_data = Bytes::from(extra_data);
 }
@@ -155,8 +154,8 @@ fn test_recover_address_short_extra_data() {
 
 #[test]
 fn test_sign_and_recover_address() {
-    let secret_key = SecretKey::from_slice(&[0x01; 32]).expect("valid key");
-    let public_key = PublicKey::from_secret_key(SECP256K1, &secret_key);
+    let secret_key = SecretKey::from_secret_bytes([0x01; 32]).expect("valid key");
+    let public_key = PublicKey::from_secret_key(&secret_key);
     let expected_address = public_key_to_address(public_key);
 
     let mut header = create_test_header();
@@ -171,7 +170,7 @@ fn test_sign_and_recover_address() {
 
 #[test]
 fn test_recover_address_generic_consistency() {
-    let secret_key = SecretKey::from_slice(&[0x02; 32]).expect("valid key");
+    let secret_key = SecretKey::from_secret_bytes([0x02; 32]).expect("valid key");
 
     let mut header = create_test_header();
     sign_header(&mut header, &secret_key);
@@ -198,14 +197,14 @@ fn test_seal_hash_generic_consistency() {
 #[test]
 fn test_public_key_to_address() {
     // Use a known test vector
-    let secret_key = SecretKey::from_slice(&[
+    let secret_key = SecretKey::from_secret_bytes([
         0xac, 0x03, 0x74, 0x67, 0x3e, 0xe4, 0x13, 0x56, 0x1f, 0x8e, 0xf5, 0x7d, 0x87, 0x8a, 0x4b,
         0x5d, 0x71, 0x82, 0x25, 0x2d, 0x86, 0x67, 0x77, 0x90, 0x5e, 0x1d, 0x8d, 0x15, 0x4a, 0x19,
         0x8f, 0x3c,
     ])
     .expect("valid key");
 
-    let public_key = PublicKey::from_secret_key(SECP256K1, &secret_key);
+    let public_key = PublicKey::from_secret_key(&secret_key);
     let address = public_key_to_address(public_key);
 
     // Address should be 20 bytes
@@ -256,11 +255,11 @@ fn test_seal_hash_without_base_fee() {
 #[test]
 fn test_multiple_signers() {
     let keys: Vec<SecretKey> = (1..=5u8)
-        .map(|i| SecretKey::from_slice(&[i; 32]).expect("valid key"))
+        .map(|i| SecretKey::from_secret_bytes([i; 32]).expect("valid key"))
         .collect();
 
     for key in &keys {
-        let public_key = PublicKey::from_secret_key(SECP256K1, key);
+        let public_key = PublicKey::from_secret_key(key);
         let expected_address = public_key_to_address(public_key);
 
         let mut header = create_test_header();
@@ -273,7 +272,7 @@ fn test_multiple_signers() {
 
 #[test]
 fn test_header_with_various_extra_data_lengths() {
-    let secret_key = SecretKey::from_slice(&[0x03; 32]).expect("valid key");
+    let secret_key = SecretKey::from_secret_bytes([0x03; 32]).expect("valid key");
 
     // Test with different vanity lengths (before signature)
     for vanity_len in [32, 64, 128] {
@@ -282,14 +281,13 @@ fn test_header_with_various_extra_data_lengths() {
         // Compute seal hash before signing
         let hash = seal_hash(&header);
         let message = Message::from_digest(hash.into());
-        let (recovery_id, sig) = SECP256K1
-            .sign_ecdsa_recoverable(&message, &secret_key)
+        let (recovery_id, sig) = secp256k1::ecdsa::RecoverableSignature::sign_ecdsa_recoverable(message, &secret_key)
             .serialize_compact();
 
         // Build extra_data with varying vanity length
         let mut extra_data = vec![0u8; vanity_len];
         extra_data.extend_from_slice(&sig);
-        extra_data.push(i32::from(recovery_id) as u8);
+        extra_data.push(recovery_id.to_u8());
         header.extra_data = Bytes::from(extra_data);
 
         let result = recover_address(&header);

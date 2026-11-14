@@ -81,7 +81,7 @@ fn secp_key(index: usize) -> secp256k1::SecretKey {
     seed.extend_from_slice(&(index as u64).to_be_bytes());
     let mut bytes = keccak256(seed);
     loop {
-        match secp256k1::SecretKey::from_slice(bytes.as_slice()) {
+        match secp256k1::SecretKey::from_secret_bytes(bytes.0) {
             Ok(key) => return key,
             Err(_) => bytes = keccak256(bytes),
         }
@@ -128,11 +128,11 @@ fn eth_block(count: usize, keys: usize) -> Vec<reth_ethereum_primitives::Transac
             };
             let message = secp256k1::Message::from_digest(tx.signature_hash().0);
             let (recovery_id, compact) =
-                secp256k1::SECP256K1.sign_ecdsa_recoverable(&message, key).serialize_compact();
+                secp256k1::ecdsa::RecoverableSignature::sign_ecdsa_recoverable(message, key).serialize_compact();
             let signature = Signature::new(
                 U256::from_be_slice(&compact[..32]),
                 U256::from_be_slice(&compact[32..]),
-                i32::from(recovery_id) != 0,
+                recovery_id.to_u8() != 0,
             );
             tx.into_signed(signature).into()
         })

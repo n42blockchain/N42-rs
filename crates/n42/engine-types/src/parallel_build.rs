@@ -1976,6 +1976,115 @@ mod tests {
         assert!(matches!(import(&block_of(&to_contract)), Err(Refused::NotParallel(NotParallel::Failed(1, _)))));
     }
 
+    /// R3-E2, the rule every Rust import path follows: an account a block
+    /// touches but leaves unchanged writes no QMDB leaf. Every transfer of
+    /// the block pays a zero tip, so the funded beneficiary is credited
+    /// nothing, and two of them send nothing to a funded account that stays
+    /// as it was. reth's bundle keeps an account only when its transition
+    /// has a revert (`BundleState::apply_transitions_and_create_reverts`),
+    /// and a batch's bundle only an account whose status a change moved
+    /// (`BatchState::take_bundle`), so neither account is in any path's
+    /// bundle, and `sorted_operations_from_execution` writes no leaf for
+    /// either: the stock import (evm2, no fast handler), the batches on evm2
+    /// with the fast handler, the batches with the direct transfer path, and
+    /// the follower's `import_block` with the plan made inside and ahead.
+    /// gov5 matches this only under its `UnchangedAccountNoOpTime` rule
+    /// (docs/audit/2026-10-5m/R3_E2.md). Ported from the revm-era
+    /// `an_unchanged_account_writes_no_leaf_on_any_path` (f163ff525), removed
+    /// with `parallel_transfer.rs`.
+    #[test]
+    fn an_unchanged_account_writes_no_leaf_on_any_import_path() {
+        use alloy_consensus::Typed2718 as _;
+        use reth_evm::execute::Executor as _;
+        let unchanged = addr(5);
+        let beneficiary = addr(BENEFICIARY);
+        let txs = vec![
+            fee_tx(1, 0, addr(2), 100, 100, 0),
+            fee_tx(3, 0, unchanged, 0, 100, 0),
+            fee_tx(6, 0, addr(7), 400, 100, 0),
+            fee_tx(8, 0, unchanged, 0, 100, 0),
+            fee_tx(11, 0, addr(12), 6, 100, 0),
+            fee_tx(11, 1, addr(13), 7, 100, 0),
+        ];
+        let block = prague_block_of(&txs, 30_000_000);
+        let leaf_keys = [
+            n42_twig_core::qmdb_compat::gov5_account_key(&beneficiary.0 .0),
+            n42_twig_core::qmdb_compat::gov5_account_key(&unchanged.0 .0),
+        ];
+        for osaka in [false, true] {
+            let c = prague(osaka);
+            let env = prague_env(&c);
+            let mut outputs: Vec<(String, Output)> = Vec::new();
+
+            let stock = c.executor(direct_parent()).execute(&block).expect("the stock import");
+            outputs.push(("the stock import".to_owned(), stock));
+
+            // The batches, on evm2 alone and with the direct path, committed
+            // into the block's executor and finished as the import does.
+            let direct = DirectTransfers::of_env(&env, crate::direct_transfer::shape_of).expect("Prague and Osaka have the path");
+            let convert = |i: usize| txs[i].clone().map(evm2::ethereum::TxEnvelope::from);
+            let keys = keys(&txs);
+            let base_fee = reth_evm::EvmEnv::block_base_fee(&env);
+            let tip_of = |i: usize| alloy_consensus::Transaction::effective_tip_per_gas(txs[i].inner(), base_fee).unwrap_or_default();
+            let w = withdrawals();
+            for (what, direct, hits) in [("the batches on evm2", None, false), ("the batches with the direct path", Some(&direct), true)] {
+                let run = execute_batches_into(
+                    &c,
+                    &env,
+                    &keys,
+                    None,
+                    &convert,
+                    &|| Some(direct_parent()),
+                    None,
+                    beneficiary,
+                    Dispatch::LargestFirst(4),
+                    None,
+                    &[],
+                    direct,
+                    Some(&tip_of),
+                )
+                .expect("the batches run");
+                assert!(run.skipped.is_empty(), "{what}: skipped {:?}", run.skipped);
+                assert_eq!(run.inside.direct_hits > 0, hits, "{what}: applied directly");
+                assert_eq!(run.fees, Some(U256::ZERO), "{what}: no tip");
+                let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(direct_parent(), env.clone()), timing_ctx(&w));
+                ex.apply_pre_execution_changes().expect("pre");
+                let results = run.executed.into_iter().map(|e| {
+                    let tx_type = n42_tx_types::N42TxType::try_from(txs[e.index].ty()).expect("a type");
+                    (e.result, tx_type)
+                });
+                commit_run(&mut ex, results, run.merged, CacheScope::All).expect("the commit");
+                outputs.push((what.to_owned(), ex.finish().expect("the finish")));
+            }
+
+            // The follower's import as the node runs it, the plan made inside
+            // and made ahead.
+            for plan in [None, Some(plan_import(&block))] {
+                let what = format!("import_block (plan ahead {})", plan.is_some());
+                let (out, stats) = import_block(&c, &block, direct_parent(), &|| Some(direct_parent()), Dispatch::LargestFirst(4), plan)
+                    .unwrap_or_else(|err| panic!("{what}: {err:?}"));
+                assert_eq!((stats.txs, stats.tail), (txs.len(), 0), "{what}: {stats:?}");
+                outputs.push((what, out));
+            }
+
+            let stock_ops = n42_qmdb_reth::sorted_operations_from_execution(&outputs[0].1.state, true);
+            for (what, out) in &outputs {
+                let what = format!("{what} (osaka {osaka})");
+                for address in [beneficiary, unchanged] {
+                    assert!(!out.state.state.contains_key(&address), "{what}: {address} in the bundle");
+                }
+                let ops = n42_qmdb_reth::sorted_operations_from_execution(&out.state, true);
+                let list = ops.to_operations();
+                assert!(!list.is_empty(), "{what}: the block writes leaves");
+                for key in &leaf_keys {
+                    assert!(list.iter().all(|op| op.key != *key), "{what}: a leaf for an unchanged account");
+                }
+                assert_eq!(ops, stock_ops, "{what}: the QMDB operations");
+                assert_same_import(out, &outputs[0].1);
+            }
+        }
+    }
+
     /// The cache half refuses, writing nothing, when the executor already
     /// holds a batch account at another value than the batches' original.
     #[test]

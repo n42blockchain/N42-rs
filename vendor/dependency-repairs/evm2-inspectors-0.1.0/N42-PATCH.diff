@@ -1,18 +1,19 @@
---- upstream-592bf18/src/tracing/debug.rs
+--- upstream-66687c18/src/tracing/debug.rs
 +++ n42/src/tracing/debug.rs
 @@ -7,9 +7,9 @@
+ use alloy_consensus::{Transaction, transaction::Recovered};
  use alloy_primitives::{Address, Log, U256};
- use alloy_rpc_types_eth::TransactionInfo;
  use alloy_rpc_types_trace::geth::{
--    CallConfig, FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
-+    AccountState, CallConfig, FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
-     GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, NoopFrame, PreStateConfig,
+-    CallConfig, FlatCallConfig, FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
+-    GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, NoopFrame, PreStateConfig,
 -    StateGasTrace, erc7562::Erc7562Config, mux::MuxConfig,
-+    PreStateFrame, StateGasTrace, erc7562::Erc7562Config, mux::MuxConfig,
++    AccountState, CallConfig, FlatCallConfig, FourByteFrame, GethDebugBuiltInTracerType,
++    GethDebugTracerType, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, NoopFrame,
++    PreStateConfig, PreStateFrame, StateGasTrace, erc7562::Erc7562Config, mux::MuxConfig,
  };
  use evm2::{
-     DatabaseError, EvmTypes, EvmTypesHost, Inspector, NoopInspector, TxResultWithState,
-@@ -260,11 +260,36 @@
+     DatabaseError, EvmTypes, EvmTypesHost, Inspector, InspectorConfig, NoopInspector,
+@@ -255,11 +255,36 @@
              }
              Self::PreStateTracer(inspector, config) => {
                  inspector.set_transaction_gas_limit(tx.gas_limit());

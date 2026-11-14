@@ -7,7 +7,6 @@ use crate::tracing::{
         call_kind_js_string, to_bigint, to_uint8_array, to_uint8_array_value,
         uint8_array_from_block,
     },
-    tx_state::TxState,
     types::CallKind,
 };
 use alloc::{
@@ -34,9 +33,10 @@ use core::{
 };
 use evm2::{
     bytecode::Bytecode,
-    evm::{AccountInfo, DbResult, DynDatabase, State},
+    evm::{AccountInfo, DbResult, DynDatabase, PendingState, State},
     interpreter::{
         Word,
+        instructions::{decode_pair, decode_single},
         opcode::{
             OpCode, op as opcode,
             op::{PUSH0, PUSH32},
@@ -112,7 +112,7 @@ fn state_fn<T: 'static>(
     .build()
 }
 
-fn type_error(message: String) -> JsError {
+pub(crate) fn type_error(message: String) -> JsError {
     JsError::from_native(JsNativeError::typ().with_message(message))
 }
 
@@ -241,6 +241,8 @@ pub(crate) struct PreStep<'a> {
     pub(crate) pc: u64,
     /// Opcode to be executed
     pub(crate) op: u8,
+    /// Byte after the opcode, or 0 if the bytecode ends there
+    pub(crate) immediate: u8,
     /// Remaining gas before step execution
     pub(crate) gas_remaining: u64,
     /// Stack before step execution
@@ -270,6 +272,24 @@ pub(crate) struct StepInfo<'a> {
     pub(crate) input: &'a Bytes,
     /// Id of the current call, see `CallStackItem::id`
     pub(crate) call_id: u64,
+}
+
+impl Default for StepInfo<'_> {
+    /// The log of a tracer whose step hook never ran: everything is zero.
+    fn default() -> Self {
+        static NO_INPUT: Bytes = Bytes::new();
+        Self {
+            cost: 0,
+            refund: 0,
+            depth: 0,
+            error: None,
+            caller: Address::ZERO,
+            contract: Address::ZERO,
+            value: U256::ZERO,
+            input: &NO_INPUT,
+            call_id: 0,
+        }
+    }
 }
 
 /// Revokes the JS log object's access to the interpreter's stack and memory when dropped.
@@ -312,8 +332,15 @@ impl ReusableCallFrame {
         let get_to = state_fn(ctx, state.clone(), 0, |state, _, ctx| {
             address_to_uint8_array_value(state.borrow().contract, ctx)
         });
-        let get_value =
-            state_fn(ctx, state.clone(), 0, |state, _, _| Ok(to_bigint(state.borrow().value)));
+        // Geth passes no value for STATICCALL, which `getValue()` reports as undefined.
+        let get_value = state_fn(ctx, state.clone(), 0, |state, _, _| {
+            let state = state.borrow();
+            Ok(if matches!(state.kind, FrameKind::Call(CallKind::StaticCall)) {
+                JsValue::undefined()
+            } else {
+                to_bigint(state.value)
+            })
+        });
         let get_input = state_fn(ctx, state.clone(), 0, |state, _, ctx| {
             to_uint8_array_value(state.borrow().input.clone(), ctx)
         });
@@ -456,10 +483,10 @@ impl ReusableEvmDb {
         self.with_scope(&mut StateDbReader { state }, f)
     }
 
-    /// Borrows a transaction's materialized changes and backing database during a callback.
+    /// Borrows a transaction's pending state and backing database during a callback.
     pub(crate) fn with_changes_scope<R>(
         &self,
-        changes: &TxState,
+        changes: &PendingState,
         db: &mut dyn DynDatabase,
         f: impl FnOnce() -> R,
     ) -> R {
@@ -527,7 +554,7 @@ impl EvmDbReader for StateDbReader<'_, '_> {
     }
 
     fn read_code(&mut self, address: &Address) -> DbResult<Bytecode> {
-        self.state.account(address)?.load_code()
+        self.state.code_untracked(address)
     }
 
     fn read_state(&mut self, address: &Address, slot: &Word) -> DbResult<Word> {
@@ -536,7 +563,7 @@ impl EvmDbReader for StateDbReader<'_, '_> {
 }
 
 struct ChangesDbReader<'a> {
-    changes: &'a TxState,
+    changes: &'a PendingState,
     db: &'a mut dyn DynDatabase,
 }
 
@@ -557,13 +584,16 @@ impl ChangesDbReader<'_> {
 
 impl EvmDbReader for ChangesDbReader<'_> {
     fn read_basic(&mut self, address: &Address) -> DbResult<Option<AccountInfo>> {
-        if let Some(account) = self.changes.accounts.get(address) {
-            return Ok(account.current.clone());
+        if let Some(account) = self.changes.account_changes_for(address) {
+            return Ok(account.current.cloned());
         }
         self.db.get_account(address)
     }
 
     fn read_code(&mut self, address: &Address) -> DbResult<Bytecode> {
+        if let Some((_, code)) = self.changes.account_changes_for(address).and_then(|a| a.code) {
+            return Ok(code.clone());
+        }
         let Some(info) = self.read_basic(address)? else {
             return Ok(Bytecode::default());
         };
@@ -620,12 +650,12 @@ pub(crate) struct StepSnapshot {
 impl StepSnapshot {
     /// Records everything about a step that must be captured before the opcode executes.
     pub(crate) fn record(&mut self, step: PreStep<'_>) {
-        let PreStep { pc, op, gas_remaining, stack, memory } = step;
+        let PreStep { pc, op, immediate, gas_remaining, stack, memory } = step;
         let state = self;
         state.pc = pc;
         state.op = op;
         state.gas_remaining = gas_remaining;
-        state.stack.record(op, stack);
+        state.stack.record(op, immediate, stack);
         state.memory.record(op, stack, memory);
     }
 }
@@ -702,6 +732,9 @@ impl OpcodeNames {
 /// An opcode only touches its top `inputs` items, so the pre-execution stack is the post-execution
 /// stack below those items followed by the saved inputs. This holds for halted opcodes too, which
 /// pop at most `inputs` items.
+///
+/// SWAPN and EXCHANGE declare no inputs but swap items at depths decoded from their immediate, so
+/// they save every item down to the deepest one they touch.
 #[derive(Debug, Default)]
 struct StackView {
     /// Pre-execution length.
@@ -713,9 +746,17 @@ struct StackView {
 }
 
 impl StackView {
-    fn record(&mut self, op: u8, stack: &[U256]) {
+    fn record(&mut self, op: u8, immediate: u8, stack: &[U256]) {
         self.len = stack.len();
-        let inputs = OpCode::new(op).map_or(0, |op| op.inputs() as usize).min(stack.len());
+        let inputs = match op {
+            // An invalid immediate halts the opcode before it touches the stack.
+            opcode::SWAPN => decode_single(immediate).map_or(0, |n| usize::from(n) + 1),
+            opcode::EXCHANGE => {
+                decode_pair(immediate).map_or(0, |(n, m)| usize::from(n.max(m)) + 1)
+            }
+            _ => OpCode::new(op).map_or(0, |op| op.inputs() as usize),
+        }
+        .min(stack.len());
         self.saved.clear();
         self.saved.extend_from_slice(&stack[stack.len() - inputs..]);
     }
@@ -726,16 +767,18 @@ impl StackView {
     }
 
     /// Returns the item `idx` positions from the top of the pre-execution stack.
-    fn peek(&self, idx: usize) -> JsResult<U256> {
+    fn peek(&self, idx: i64) -> JsResult<U256> {
         let Some(post) = self.post else {
             return Err(type_error("tracer accessed stack outside of a callback".to_string()));
         };
         let saved = self.saved.len();
-        let item = if idx < saved {
-            Some(self.saved[saved - 1 - idx])
-        } else {
-            (idx < self.len).then(|| post.get(self.len - 1 - idx).copied()).flatten()
-        };
+        let item = usize::try_from(idx).ok().and_then(|idx| {
+            if idx < saved {
+                Some(self.saved[saved - 1 - idx])
+            } else {
+                (idx < self.len).then(|| post.get(self.len - 1 - idx).copied()).flatten()
+            }
+        });
         item.ok_or_else(|| {
             type_error(format!(
                 "tracer accessed out of bound stack: size {}, index {idx}",
@@ -813,7 +856,7 @@ fn memory_write_range(op: u8, stack: &[U256]) -> Option<(usize, usize)> {
     let peek = |n: usize| stack.len().checked_sub(n + 1).map(|i| stack[i]);
     let (offset, size) = match op {
         opcode::MSTORE => (peek(0)?, U256::from(32)),
-        opcode::MSTORE8 => (peek(0)?, U256::from(1)),
+        opcode::MSTORE8 => (peek(0)?, U256::ONE),
         opcode::MCOPY | opcode::CALLDATACOPY | opcode::CODECOPY | opcode::RETURNDATACOPY => {
             (peek(0)?, peek(2)?)
         }
@@ -865,8 +908,7 @@ fn build_step_stack_object(state: Shared<StepLogState>, ctx: &mut Context) -> Js
         Ok(JsValue::from(state.borrow().stack.len()))
     });
     let peek = state_fn(ctx, state, 1, |state, args, ctx| {
-        let len = state.borrow().stack.len();
-        let idx = parse_stack_index(args.get_or_undefined(0), len, ctx)?;
+        let idx = to_int64(args.get_or_undefined(0), ctx)?;
         Ok(to_bigint(state.borrow().stack.peek(idx)?))
     });
 
@@ -881,37 +923,35 @@ fn build_step_memory_object(state: Shared<StepLogState>, ctx: &mut Context) -> J
         Ok(JsValue::from(state.borrow().memory.len() as u64))
     });
     let slice = state_fn(ctx, state.clone(), 2, |state, args, ctx| {
-        let len = state.borrow().memory.len();
-        let start = parse_memory_offset(args.get_or_undefined(0), "start", ctx)?;
-        let end = parse_memory_offset(args.get_or_undefined(1), "end", ctx)?;
-        if end == start {
+        let begin = to_int64(args.get_or_undefined(0), ctx)?;
+        let end = to_int64(args.get_or_undefined(1), ctx)?;
+        if end == begin {
             return uint8_array_from_block(AlignedVec::from_iter(0, core::iter::empty()), ctx);
         }
-        if end < start {
-            return Err(memory_out_of_bounds_error(len, start, end.saturating_sub(start)));
+        if end < begin || begin < 0 {
+            return Err(type_error(format!(
+                "tracer accessed out of bound memory: offset {begin}, end {end}"
+            )));
         }
-        if end > len {
-            let padding = end - len;
-            if padding > MEMORY_PAD_LIMIT {
-                return Err(type_error(format!(
-                    "reached limit for padding memory slice: {padding}"
-                )));
-            }
+        let len = state.borrow().memory.len();
+        let padding = end - len as i64;
+        if padding > MEMORY_PAD_LIMIT {
+            return Err(type_error(format!("reached limit for padding memory slice: {padding}")));
         }
-        let bytes = state.borrow().memory.bytes(start..end)?;
+        let bytes = state.borrow().memory.bytes(begin as usize..end as usize)?;
         uint8_array_from_block(bytes, ctx)
     });
     let get_uint = state_fn(ctx, state, 1, |state, args, ctx| {
         let len = state.borrow().memory.len();
-        let offset = parse_memory_index(args.get_or_undefined(0), "offset", len, ctx)?;
-        let Some(end) = offset.checked_add(32) else {
-            return Err(memory_out_of_bounds_error(len, offset, 32));
-        };
-        if end > len {
-            return Err(memory_out_of_bounds_error(len, offset, 32));
+        let offset = to_int64(args.get_or_undefined(0), ctx)?;
+        if offset < 0 || offset.saturating_add(32) > len as i64 {
+            return Err(type_error(format!(
+                "tracer accessed out of bound memory: available {len}, offset {offset}, size 32"
+            )));
         }
-        let bytes = state.borrow().memory.bytes(offset..end)?;
-        uint8_array_from_block(bytes, ctx)
+        let offset = offset as usize;
+        let bytes = state.borrow().memory.bytes(offset..offset + 32)?;
+        Ok(to_bigint(U256::from_be_slice(bytes.as_slice())))
     });
 
     obj.set(js_string!("slice"), slice, false, ctx)?;
@@ -944,59 +984,27 @@ fn build_step_contract_object(
     Ok(obj)
 }
 
-fn parse_stack_index(value: &JsValue, len: usize, ctx: &mut Context) -> JsResult<usize> {
-    let index = value.to_numeric_number(ctx)?;
-    if !index.is_finite() || index < 0. || index > usize::MAX as f64 {
-        return Err(type_error(format!(
-            "tracer accessed out of bound stack: size {len}, index {index}"
-        )));
-    }
-    Ok(index as usize)
-}
-
-fn invalid_memory_index_error(name: &str, index: impl core::fmt::Display) -> JsError {
-    type_error(format!("invalid memory {name}: {index}"))
-}
-
-const MEMORY_PAD_LIMIT: usize = 1024 * 1024;
-
-fn memory_out_of_bounds_error(len: usize, offset: usize, size: usize) -> JsError {
-    type_error(format!(
-        "tracer accessed out of bound memory: available {len}, offset {offset}, size {size}"
-    ))
-}
-
-fn parse_memory_index(
-    value: &JsValue,
-    name: &str,
-    len: usize,
-    ctx: &mut Context,
-) -> JsResult<usize> {
-    let index = parse_memory_offset(value, name, ctx)?;
-    if index > len {
-        return Err(invalid_memory_index_error(name, index));
-    }
-    Ok(index)
-}
-
-fn parse_memory_offset(value: &JsValue, name: &str, ctx: &mut Context) -> JsResult<usize> {
-    if value.is_undefined() {
-        return Err(invalid_memory_index_error(name, "undefined"));
-    }
-    if let Some(index) = value.as_number()
-        && (!index.is_finite() || index < 0.)
-    {
-        return Err(invalid_memory_index_error(name, index));
-    }
-    if let Some(index) = value.as_bigint() {
-        // Boa's `ToIndex` rejects BigInt, but stack-derived tracer values are BigInt.
-        let index = index.to_string();
-        index.parse::<usize>().map_err(|_| invalid_memory_index_error(name, &index))
+/// Converts a JS argument to the `int64` goja passes to a Go callback.
+///
+/// NaN and infinities become 0, fractions truncate toward zero and values outside the `int64`
+/// range become `i64::MIN`, as Go's float conversion does on amd64.
+fn to_int64(value: &JsValue, ctx: &mut Context) -> JsResult<i64> {
+    // Boa's `ToNumber` rejects BigInt, but stack-derived tracer values are BigInt. Geth's bigint
+    // objects reach goja through their `Number` value, so go through a float as well.
+    let number = match value.as_bigint() {
+        Some(value) => value.to_f64(),
+        None => value.to_number(ctx)?,
+    };
+    Ok(if !number.is_finite() {
+        0
+    } else if (-(2f64.powi(63))..2f64.powi(63)).contains(&number) {
+        number as i64
     } else {
-        let index = value.to_index(ctx)?;
-        usize::try_from(index).map_err(|_| invalid_memory_index_error(name, index))
-    }
+        i64::MIN
+    })
 }
+
+const MEMORY_PAD_LIMIT: i64 = 1024 * 1024;
 
 /// Represents the contract object
 #[derive(Clone, Debug, Default)]
@@ -1047,10 +1055,8 @@ pub(crate) struct JsEvmContext {
     pub(crate) gas: u64,
     /// Number, amount of gas used in executing the transaction (excludes txdata costs)
     pub(crate) gas_used: u64,
-    /// Number, gas price configured in the transaction being executed
-    pub(crate) gas_price: u64,
-    /// Number, intrinsic gas for the transaction being executed
-    pub(crate) intrinsic_gas: u64,
+    /// big.int, effective gas tip of the transaction being executed
+    pub(crate) gas_price: U256,
     /// big.int Amount to be transferred in wei
     pub(crate) value: U256,
     /// Number, block number
@@ -1058,8 +1064,6 @@ pub(crate) struct JsEvmContext {
     /// Address, miner of the block
     pub(crate) coinbase: Address,
     pub(crate) output: Bytes,
-    /// Number, block timestamp
-    pub(crate) time: String,
     pub(crate) transaction_ctx: TransactionContext,
     /// returns information about the error if one occurred, otherwise returns undefined
     pub(crate) error: Option<String>,
@@ -1075,12 +1079,10 @@ impl JsEvmContext {
             gas,
             gas_used,
             gas_price,
-            intrinsic_gas,
             value,
             block,
             coinbase,
             output,
-            time,
             transaction_ctx,
             error,
         } = self;
@@ -1099,21 +1101,19 @@ impl JsEvmContext {
         obj.set(js_string!("input"), to_uint8_array(input, ctx)?, false, ctx)?;
         obj.set(js_string!("gas"), gas, false, ctx)?;
         obj.set(js_string!("gasUsed"), gas_used, false, ctx)?;
-        obj.set(js_string!("gasPrice"), gas_price, false, ctx)?;
-        obj.set(js_string!("intrinsicGas"), intrinsic_gas, false, ctx)?;
+        obj.set(js_string!("gasPrice"), to_bigint(gas_price), false, ctx)?;
         obj.set(js_string!("value"), to_bigint(value), false, ctx)?;
         obj.set(js_string!("block"), block, false, ctx)?;
         obj.set(js_string!("coinbase"), address_to_uint8_array(coinbase, ctx)?, false, ctx)?;
         obj.set(js_string!("output"), to_uint8_array(output, ctx)?, false, ctx)?;
-        obj.set(js_string!("time"), js_string!(time), false, ctx)?;
-        if let Some(block_hash) = transaction_ctx.block_hash {
+        // Like geth, the transaction fields are only set for a non-zero block and transaction hash.
+        if let Some(block_hash) = transaction_ctx.block_hash.filter(|hash| !hash.is_zero()) {
             obj.set(js_string!("blockHash"), to_uint8_array(block_hash, ctx)?, false, ctx)?;
-        }
-        if let Some(tx_index) = transaction_ctx.tx_index {
-            obj.set(js_string!("txIndex"), tx_index as u64, false, ctx)?;
-        }
-        if let Some(tx_hash) = transaction_ctx.tx_hash {
-            obj.set(js_string!("txHash"), to_uint8_array(tx_hash, ctx)?, false, ctx)?;
+            if let Some(tx_hash) = transaction_ctx.tx_hash.filter(|hash| !hash.is_zero()) {
+                let tx_index = transaction_ctx.tx_index.unwrap_or_default();
+                obj.set(js_string!("txIndex"), tx_index as u64, false, ctx)?;
+                obj.set(js_string!("txHash"), to_uint8_array(tx_hash, ctx)?, false, ctx)?;
+            }
         }
         if let Some(error) = error {
             obj.set(js_string!("error"), js_string!(error), false, ctx)?;
@@ -1132,7 +1132,8 @@ mod tests {
     use alloc::vec;
     use boa_engine::{Source, object::builtins::JsUint8Array};
     use core::convert::Infallible;
-    use evm2::evm::{CacheDB, Database, Db, EmptyDB};
+    use evm2::evm::{Database, Db, InMemoryDB};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     /// Records and enters a step with the given pre- and post-execution stack.
     fn with_step<'a, R>(
@@ -1144,7 +1145,14 @@ mod tests {
         f: impl FnOnce() -> R,
     ) -> R {
         let mut snapshot = StepSnapshot::default();
-        snapshot.record(PreStep { pc: 0, op, gas_remaining: 0, stack, memory: &memory.borrow() });
+        snapshot.record(PreStep {
+            pc: 0,
+            op,
+            immediate: 0,
+            gas_remaining: 0,
+            stack,
+            memory: &memory.borrow(),
+        });
         log.with_scope(
             &mut snapshot,
             stack,
@@ -1251,8 +1259,8 @@ mod tests {
 
         let f = result.as_callable().unwrap();
 
-        let mut db = CacheDB::new(EmptyDB::default());
-        let state = TxState::default();
+        let mut db = InMemoryDB::default();
+        let state = PendingState::default();
         let reusable_db = ReusableEvmDb::new(&mut context).unwrap();
         {
             let addr = JsValue::from(js_string!(Address::default().to_string()));
@@ -1304,8 +1312,8 @@ mod tests {
         let result_fn = obj.get(js_string!("result"), &mut context).unwrap().as_object().unwrap();
         let setup_fn = obj.get(js_string!("setup"), &mut context).unwrap().as_object().unwrap();
 
-        let mut db = CacheDB::new(EmptyDB::default());
-        let state = TxState::default();
+        let mut db = InMemoryDB::default();
+        let state = PendingState::default();
         {
             let reusable_db = ReusableEvmDb::new(&mut context).unwrap();
             let addr = JsValue::from(js_string!(Address::default().to_string()));
@@ -1373,7 +1381,7 @@ mod tests {
             .with_nonce(9)
             .with_code(code.clone());
         let mut db = Db::new(BackingDb { address, account, slot, value });
-        let changes = TxState::default();
+        let changes = PendingState::default();
         let reusable_db = ReusableEvmDb::new(&mut context).unwrap();
         reusable_db.with_changes_scope(&changes, &mut db, || {
             let js_db = reusable_db.value().as_object().unwrap();
@@ -1539,8 +1547,6 @@ mod tests {
 
     #[test]
     fn test_scopes_revoke_access_on_return_error_and_unwind() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
         let mut ctx = Context::default();
         register_builtins(&mut ctx).unwrap();
         let log = ReusableStepLog::new(&mut ctx, OpcodeNames::new()).unwrap();
@@ -1552,13 +1558,13 @@ mod tests {
             let stack = vec![U256::from(42)];
             let memory = RefCell::new(vec![7u8; 32]);
             let contract = Contract::default();
-            let state = TxState::default();
-            let mut database = CacheDB::new(EmptyDB::default());
+            let state = PendingState::default();
+            let mut database = InMemoryDB::default();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 db.with_changes_scope(&state, &mut database, || {
                     with_step(&log, opcode::STOP, &stack, &memory, &contract, || {
                         assert!(ctx.eval(Source::from_bytes(
-                            "savedLog.stack.peek(0) === 42n && savedLog.memory.getUint(0)[0] === 7 && savedDb.getBalance('00') === 0n"
+                            "savedLog.stack.peek(0) === 42n && savedLog.memory.getUint(0) >> 248n === 7n && savedDb.getBalance('00') === 0n"
                         )).unwrap().as_boolean().unwrap());
                         match outcome {
                             0 => Ok(JsValue::undefined()),
@@ -1595,23 +1601,23 @@ mod tests {
     #[test]
     fn test_stack_view_reconstructs_pre_execution_stack() {
         // SWAP1 touches the top two items, DUP1 one item, ADD two items
-        let pre = [U256::from(1), U256::from(2), U256::from(3)];
+        let pre = [U256::ONE, U256::from(2), U256::from(3)];
         for (op, post) in [
-            (opcode::SWAP1, vec![U256::from(1), U256::from(3), U256::from(2)]),
-            (opcode::DUP1, vec![U256::from(1), U256::from(2), U256::from(3), U256::from(3)]),
-            (opcode::ADD, vec![U256::from(1), U256::from(5)]),
-            (opcode::POP, vec![U256::from(1), U256::from(2)]),
+            (opcode::SWAP1, vec![U256::ONE, U256::from(3), U256::from(2)]),
+            (opcode::DUP1, vec![U256::ONE, U256::from(2), U256::from(3), U256::from(3)]),
+            (opcode::ADD, vec![U256::ONE, U256::from(5)]),
+            (opcode::POP, vec![U256::ONE, U256::from(2)]),
             // halted before pushing, e.g. out of gas after popping the inputs
-            (opcode::MSTORE, vec![U256::from(1)]),
+            (opcode::MSTORE, vec![U256::ONE]),
             (opcode::STOP, pre.to_vec()),
         ] {
             let mut view = StackView::default();
-            view.record(op, &pre);
+            view.record(op, 0, &pre);
             let post: &'static [U256] = post.leak();
             view.post = Some(post);
             assert_eq!(view.len(), 3);
             for (idx, expected) in pre.iter().rev().enumerate() {
-                assert_eq!(view.peek(idx).unwrap(), *expected, "op {op:#x} idx {idx}");
+                assert_eq!(view.peek(idx as i64).unwrap(), *expected, "op {op:#x} idx {idx}");
             }
             assert!(view.peek(3).is_err());
         }
@@ -1633,7 +1639,7 @@ mod tests {
         view.post = Some(post.leak());
 
         assert_eq!(view.len(), 64);
-        assert_eq!(view.bytes(0..64).unwrap().as_slice(), pre.as_slice());
+        assert_eq!(view.bytes(0..64).unwrap().as_slice(), pre);
         assert_eq!(view.bytes(10..20).unwrap().as_slice(), &pre[10..20]);
 
         // writes beyond the pre-execution length only expand memory
@@ -1651,7 +1657,7 @@ mod tests {
         let mut view = MemoryView::default();
         view.record(
             opcode::EXTCODECOPY,
-            &[U256::from(2), U256::ZERO, U256::from(4), U256::from(1)],
+            &[U256::from(2), U256::ZERO, U256::from(4), U256::ONE],
             &pre,
         );
         assert_eq!(view.patch_offset, 4);

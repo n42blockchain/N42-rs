@@ -3,21 +3,32 @@
 
 //! From what the execution client produced to what the commitment consumes.
 //!
-//! The one question this module answers is *which leaves a block writes*, and
-//! it has to answer it the way gov5 does, because a QMDB root is a function of
-//! every write that happened — a leaf written with its existing value still
-//! consumes a slot and still moves the root. So this is not "the state diff";
-//! it is gov5's dirty set, reconstructed from revm's bundle.
+//! The one question this module answers is *which leaves a block writes*. A
+//! QMDB root is a function of every write -- a leaf written with its existing
+//! value still consumes a slot and still moves the root -- so this is the
+//! block's write set, not merely its state diff, and gov5 has to agree on it.
 //!
-//! gov5 (`IntraBlockState.computeRootViaComputer`) passes every account in
-//! `stateObjectsDirty` — the journal's touched set — to the root computer,
-//! copying the whole account whether or not a field changed, and for each of
-//! those the slots in `dirtyStorage`, which Erigon only populates for a store
-//! whose value differs from the previous one. revm's bundle is the same shape
-//! from the other side: [`BundleState::state`] holds exactly the accounts a
-//! transaction touched, and a bundle account's storage holds the slots whose
-//! present value differs from the original. The mapping is therefore direct,
-//! and deliberately does not filter "unchanged" accounts out.
+//! The mapping from the bundle is direct and filters nothing: every account in
+//! [`BundleState::state`] writes its leaf (or deletes it), with the slots its
+//! storage holds, which are those whose present value differs from the
+//! original. What keeps a touched but unchanged account out (a beneficiary
+//! credited a zero tip, the existing recipient of a zero-value transfer) is the
+//! bundle itself: reth's `BundleState::apply_transitions_and_create_reverts`
+//! (reth v2.10.0, `crates/trie/common/src/bundle_state/bundle_state.rs`)
+//! inserts an account only when its transition has a revert, and the evm2
+//! batches' bundle keeps only an account a change moved
+//! (`n42_engine_types::batch_state::BatchState::take_bundle`). So an unchanged
+//! account writes no leaf on any import path (pinned by
+//! `n42_engine_types::parallel_build::tests::an_unchanged_account_writes_no_leaf_on_any_import_path`).
+//!
+//! gov5 (`IntraBlockState.computeRootViaComputer`) writes every account in its
+//! dirty set, and its serial path dirties an account whose first access in a
+//! block is a zero `AddBalance`. It leaves such an account out only under its
+//! gated rule (`UnchangedAccountNoOpTime`, decided on every gov5 path by
+//! `IntraBlockState.ApplyUnchangedAccountRule`); the two clients' roots agree
+//! on a block that touches an unchanged account only where that rule is
+//! active (`docs/audit/2026-10-5m/R3_E2.md`). Slots agree either way: gov5's
+//! `dirtyStorage` holds only stores that changed the value.
 //!
 //! What cannot be reconstructed from a bundle is the full pre-block slot set
 //! of a self-destructed contract, which gov5 wipes leaf by leaf. Post-EIP-6780

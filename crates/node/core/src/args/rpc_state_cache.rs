@@ -25,6 +25,11 @@ pub struct RpcStateCacheArgs {
     )]
     pub max_receipts: u32,
 
+    /// N42: accepted and ignored, as before v2.11.0 (upstream removed this no-op flag; launch
+    /// lines such as `scripts/fleet7-env.sh` still pass it, and older binaries need it kept).
+    #[arg(long = "rpc-cache.max-headers", alias = "rpc-cache.max-envs", hide = true)]
+    pub n42_legacy_max_headers: Option<u32>,
+
     /// Max number of block access lists in cache.
     #[arg(
         long = "rpc-cache.max-bals",
@@ -107,6 +112,7 @@ impl Default for RpcStateCacheArgs {
         Self {
             max_blocks: DEFAULT_BLOCK_CACHE_MAX_LEN,
             max_receipts: DEFAULT_RECEIPT_CACHE_MAX_LEN,
+            n42_legacy_max_headers: None,
             max_bals: DEFAULT_BAL_CACHE_MAX_LEN,
             max_blocks_bytes: DEFAULT_BLOCK_CACHE_MAX_BYTES,
             max_receipts_bytes: DEFAULT_RECEIPT_CACHE_MAX_BYTES,
@@ -136,6 +142,12 @@ mod tests {
     fn rpc_cache_defaults() {
         let args = CommandParser::parse_from(["reth"]).args;
         assert_eq!(args, RpcStateCacheArgs::default());
+
+        // N42: the removed no-op flag still parses.
+        for flag in ["--rpc-cache.max-headers", "--rpc-cache.max-envs"] {
+            let args = CommandParser::parse_from(["reth", flag, "123"]).args;
+            assert_eq!(args.n42_legacy_max_headers, Some(123));
+        }
     }
 
     #[test]

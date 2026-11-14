@@ -237,9 +237,13 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
     /// poll.
     ///
     /// Returns `true` if at least one message was handed to the connection.
+    ///
+    /// A readiness error closes the session: a satellite connection reports messages it already
+    /// accepted but the wire rejected through its readiness.
     fn poll_send_queued(&mut self, cx: &mut Context<'_>) -> Result<bool, EthStreamError> {
         let mut progress = false;
-        while self.conn.poll_ready_unpin(cx).is_ready() {
+        while let Poll::Ready(ready) = self.conn.poll_ready_unpin(cx) {
+            ready?;
             let Some(msg) = self.queued_outgoing.pop_front() else { break };
             progress = true;
             let res = match msg {
@@ -1346,7 +1350,7 @@ mod tests {
     use reth_network_p2p::error::RequestResult;
     use reth_network_peers::pk2id;
     use reth_network_types::session::config::PROTOCOL_BREACH_REQUEST_TIMEOUT;
-    use secp256k1::{SecretKey, SECP256K1};
+    use secp256k1::SecretKey;
     use tokio::{
         net::{TcpListener, TcpStream},
         sync::mpsc,
@@ -1354,7 +1358,7 @@ mod tests {
 
     /// Returns a testing `HelloMessage` and new secretkey
     fn eth_hello(server_key: &SecretKey) -> HelloMessageWithProtocols {
-        HelloMessageWithProtocols::builder(pk2id(&server_key.public_key(SECP256K1))).build()
+        HelloMessageWithProtocols::builder(pk2id(&server_key.public_key())).build()
     }
 
     struct SessionBuilder<N: NetworkPrimitives = EthNetworkPrimitives> {
@@ -1391,8 +1395,8 @@ mod tests {
             let fork_filter = self.fork_filter.clone();
             let local_peer_id = self.local_peer_id;
             let mut hello = self.hello.clone();
-            let key = SecretKey::new(&mut rand_08::thread_rng());
-            hello.id = pk2id(&key.public_key(SECP256K1));
+            let key = SecretKey::new(&mut rand::rng());
+            hello.id = pk2id(&key.public_key());
             Box::pin(async move {
                 let outgoing = TcpStream::connect(local_addr).await.unwrap();
                 let sink = ECIESStream::connect(outgoing, key, local_peer_id).await.unwrap();
@@ -1500,7 +1504,7 @@ mod tests {
         fn default() -> Self {
             let (active_session_tx, active_session_rx) = mpsc::channel(100);
 
-            let (secret_key, pk) = SECP256K1.generate_keypair(&mut rand_08::thread_rng());
+            let (secret_key, pk) = secp256k1::generate_keypair(&mut rand::rng());
             let local_peer_id = pk2id(&pk);
 
             Self {
@@ -1603,6 +1607,41 @@ mod tests {
                 ))
                 .unwrap();
             client_stream.flush().await.unwrap();
+
+            let msg = client_stream.next().await.unwrap().unwrap_err();
+            assert_eq!(msg.as_disconnected(), Some(DisconnectReason::ProtocolBreach));
+        });
+
+        let (tx, rx) = oneshot::channel();
+
+        tokio::task::spawn(async move {
+            let (incoming, _) = listener.accept().await.unwrap();
+            let session = builder.connect_incoming(incoming).await;
+            session.await;
+
+            tx.send(()).unwrap();
+        });
+
+        fut.await;
+        rx.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unsolicited_response_disconnects_with_protocol_breach() {
+        let mut builder = SessionBuilder::default();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let fut = builder.with_client_stream(local_addr, async move |mut client_stream| {
+            assert_eq!(client_stream.version(), EthVersion::Eth71);
+            client_stream
+                .send(EthMessage::BlockAccessLists(RequestPair {
+                    request_id: 7,
+                    message: BlockAccessLists(vec![None; 1024]),
+                }))
+                .await
+                .unwrap();
 
             let msg = client_stream.next().await.unwrap().unwrap_err();
             assert_eq!(msg.as_disconnected(), Some(DisconnectReason::ProtocolBreach));

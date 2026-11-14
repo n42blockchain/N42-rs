@@ -1014,6 +1014,12 @@ impl<N: ProviderNodeTypes> PruneCheckpointReader for ConsistentProvider<N> {
     fn get_prune_checkpoints(&self) -> ProviderResult<Vec<(PruneSegment, PruneCheckpoint)>> {
         self.storage_provider.get_prune_checkpoints()
     }
+
+    fn get_prune_checkpoints_for_availability(
+        &self,
+    ) -> ProviderResult<Vec<(PruneSegment, PruneCheckpoint)>> {
+        self.storage_provider.get_prune_checkpoints_for_availability()
+    }
 }
 
 impl<N: ProviderNodeTypes> ChainSpecProvider for ConsistentProvider<N> {

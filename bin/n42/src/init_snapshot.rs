@@ -30,6 +30,7 @@ use n42_engine_types::N42Node;
 use n42_qmdb_reth::{state_scheme, N42ChainSpecParser, QmdbNodeState, StateScheme};
 use n42_twig_core::qmdb_compat::{
     encode_gov5_account_value, gov5_account_key, gov5_storage_key, PortableFormat, QmdbCompatTree, QmdbPortableTree,
+    verify_portable_stream,
 };
 use reth_chainspec::EthChainSpec;
 use reth_cli_commands::{
@@ -255,6 +256,18 @@ fn authenticated_tree(
     root: B256,
 ) -> eyre::Result<QmdbCompatTree> {
     // Either layout: v1, or v2 whose tombstones rebuild as hash-only slots.
+    // The stream is authenticated first with bounded memory (chain, genesis,
+    // head and root), so a malformed snapshot is refused before `decode`
+    // expands its dead twigs into placeholder slots.
+    let verified = verify_portable_stream(portable, chain.chain().id(), &chain.genesis_hash().0)
+        .map_err(|e| eyre::eyre!("portable snapshot: {e}"))?;
+    let at = (verified.block_number, B256::from(verified.block_hash));
+    if at != head {
+        bail!("the portable snapshot is at block {} {}, the header at {} {}", at.0, at.1, head.0, head.1);
+    }
+    if B256::from(verified.root) != root {
+        bail!("the portable snapshot's root {} is not the header's state root {root}", B256::from(verified.root));
+    }
     let (_, snapshot) = QmdbPortableTree::decode(portable).map_err(|e| eyre::eyre!("portable snapshot: {e}"))?;
     let at = (snapshot.block_number, B256::from(snapshot.block_hash));
     if at != head {

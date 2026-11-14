@@ -424,3 +424,50 @@ record replayed later can be matched to the computation that filed it, and
 two builds filed under one hash with different operations are visible.
 Tests: `forest::tests::a_replay_that_misses_its_filed_root_is_diagnosed`,
 `forest::tests::a_mislabelled_base_is_named_at_the_compute_and_at_the_replay`.
+
+### Second occurrence, exhaustive interleavings (plan S1, 2026-11-14)
+
+`crates/n42/qmdb-state/src/forest_interleavings.rs` (923c8ee9c) runs every
+order the node's forest lock allows of the 7167 handover on one forest:
+E1, E2 and E3 computed on P and inserted, the hand-off rename of E3's built
+hash to S, the chain-ahead child C (rename of its parent, compute on S,
+insert) and the forkchoice to S, under locked computes, leased computes
+(`N42_QMDB_COMPUTE_OFFLOCK`; renames and `set_canonical_in_place` may run
+while the tree is out, everything else waits) and leased computes with
+leaf hashes computed ahead; E2 and E3 distinct, equal content under two
+hashes, or one hash; heap and entry file; the height's appends inside a
+twig or across a twig boundary above a trimmed twig. After every step the
+tree must be the filed (or pending) root of the block the forest stands
+at and every filed or computed root must be its block's reference; at
+every end state every record is moved to and replayed (through the
+parent's parent and a sibling of P) and a fresh child of S must land on
+C's reference.
+
+Result: 54 variants, 35,640 (locked) / 72,078 (leased) schedules each,
+571-907 distinct states, **all pass** (`ci/s1-interleave-3.log`, release,
+693 s). The checker has the power to find this class: with be647d52a's
+root check removed from `insert`'s adoption it fails in five steps
+(`ci/s1-interleave-mutant2.log`: E1, E2 computed and E3 computed, E2
+inserted -> mislabelled tree at E2). The default test (leased, heap,
+216,234 schedules, ~330 s in a debug build) runs in CI; the matrix is
+`--ignored`.
+
+Covered: the forest API under the node's lock rules for this handover,
+including every rename / insert / adoption / early-return / lease-return /
+in-place canonical order. Not covered, and therefore where the mechanism
+must be: (1) anything that makes an execution's operations differ from
+what a re-execution gives (E3's ops are taken as given; two executions
+under one built hash with different ops would be filed by the early return
+consistently, so this alone does not mislabel); (2) the twig-core tree at
+production size (undo across many full trimmed twigs, entry-file
+compaction, the parallel apply's leaf path on ~200k-op blocks just before
+the empty ones); (3) callers outside this model: persistence moves
+(`restore_path_to`, `checkpoint`, `delta_since`), the reader keep and
+retention cuts with a 16-deep window, follower `insert_block_operations`
+/ `validate_block_operations` on the same EL, and a second handover
+interleaved with this one. The next most likely candidate is (2): the
+mismatch needs the state labelled P to change between E3's compute and
+the forkchoice replay, which under every order here it does not, so it
+must come from an undo/replay of the tree itself that is not exact at
+production shape; the replay diagnosis (38bf5f76f) tells (1) from (2) at
+the next recurrence.

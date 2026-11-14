@@ -2555,7 +2555,7 @@ where
                     let receipts_late_here = sealed_here
                         && refused.is_none()
                         && (frozen.is_some() || pending_freeze.is_some())
-                        && builder.executor.receipts.is_empty()
+                        && reth_evm::BlockExecutor::receipts(&builder.executor).is_empty()
                         && evm2_receipts_late();
                     // The skipped candidates, taken before the late receipts'
                     // thread takes the candidates with it.

@@ -71,6 +71,13 @@
   （`ExecutionOverlay::layered`：按块从新到旧逐读查各块的 `BundleState`，不摊平、不缓存）；
   状态树叠加层（MPT 根/证明用）仍按需在调用线程上计算。由 `--engine.state-trie-overlay`
   （见模块6）选择
+  （reth v2.11.0 起上游把管理器的共享状态收进一个 `Arc<OverlayManagerInner>`；N42 的 `layered`
+  标志留在外层结构上，克隆仍只是一次引用计数加一）
+- `vendor/dependency-repairs/reth-nippy-jar-2.11.0/src/writer.rs`：N42 的 `append_encoded_rows`
+  （静态文件按块整段写入）在写入前先执行 `apply_pending_truncation()`——reth v2.11.0 把回滚时的
+  截断推迟到提交（`prune_rows_deferred`），不先截断的话整段追加会写在被裁掉的字节之后；
+  测试 `append_encoded_rows_after_a_deferred_prune_matches_per_row_append`。
+  `static_file/writer.rs` 在上游的延迟截断之后再做 `N42_SF_DROP_CACHE` 的页缓存释放
 - `crates/storage/provider/src/providers/n42_persist.rs`（N42 新增文件）：持久化批次的计时器与开关
   （`docs/PERSISTENCE_COST_STUDY.md`）。计时器与上游 `save_blocks_*` 同在 `storage.providers.database`
   作用域：`save_blocks_pre_scope` / `_plain_reverts` / `_scope` / `_post_scope` / `_qmdb_persisted`、
@@ -135,6 +142,9 @@
   `OverlayManager::new(池)` 或 `OverlayManager::without_state_trie_overlay()`；
   `crates/ethereum/cli/src/app.rs` 在 false 时把运行时的 `state-ovly` 池缩到 1 个（空闲）线程
   （reth v2.7.0 默认 4 个，loop309/310 每轮约 22k CPU 单位，见 `docs/RETH_2_7_0_UPGRADE.md`）
+- `--rpc-cache.max-headers`（别名 `--rpc-cache.max-envs`）：reth v2.11.0 删除了这个本就无效的参数；
+  `crates/node/core/src/args/rpc_state_cache.rs` 以隐藏字段 `n42_legacy_max_headers` 保留它（接受并忽略），
+  因为 `scripts/fleet7-env.sh` 仍传它，A/B 对照用同一启动行跑新旧两版二进制
 - `N42_ENGINE_EXEC_CACHE=on`（未设置或其他值即跳过；不改任何 fork 的 reth crate，代码在
   `crates/n42/qmdb-reth/src/exec_cache.rs`，由 `QmdbEngineValidatorBuilder` 包装引擎树的验证器）：
   QMDB 链上默认跳过——以"已执行"方式插入引擎的块不再写入 reth 的跨块执行缓存

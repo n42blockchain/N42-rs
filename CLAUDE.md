@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this repo is
 
 N42 is a **partial fork of [reth](https://github.com/paradigmxyz/reth)**. Most of reth is consumed as a
-git dependency pinned to a tag (`reth = { git = "...", tag = "v2.10.0" }` — grep `Cargo.toml` for the tag
+git dependency pinned to a tag (`reth = { git = "...", tag = "v2.11.0" }` — grep `Cargo.toml` for the tag
 to confirm the current version); a subset of reth crates is vendored under `crates/` and substituted into
 the whole dependency graph via `[patch.'https://github.com/paradigmxyz/reth.git']` in the root `Cargo.toml`.
 N42-specific code lives under `crates/n42/` and `bin/n42/`.
@@ -300,7 +300,7 @@ Three N42 clients live side by side on this host, and code moves between them:
   1.97) with HotStuff-2 and QMDB. Depends on reth by local path (`../reth`).
 - `../reth` — a checkout of the n42blockchain/reth fork with upstream tags
   fetched; `scripts/reth-sync.py` reads upstream revisions from it. This repo
-  itself pins upstream paradigmxyz/reth by tag (`v2.10.0` as of 2026-11-06).
+  itself pins upstream paradigmxyz/reth by tag (`v2.11.0` as of 2026-11-14).
 
 The `n42-{bmt-core,twig-core,h2-primitives,h2-wire,h2-consensus,mobile-verify,h2-net,h2-execution}`
 crates came from `../N42-26` (`h2-net` is new, modelled on its `n42-network`;
@@ -336,7 +336,7 @@ recorder and replayer must share one revm version.
 
 ## Upgrading reth
 
-The repo is on reth **v2.10.0** (upstream tag, since 2026-11-06; evm2 git rev `592bf18c` in
+The repo is on reth **v2.11.0** (upstream tag, since 2026-11-14; evm2 git rev `66687c18` in
 place of revm / alloy-evm since v2.9.0, alloy 2.5, reth-core crates 0.8.2 at git rev `275ce4cf`
 through `[patch.crates-io]`, edition 2024).
 `docs/RETH_2_4_1_UPGRADE.md` records the 1.11.0 → 2.4.1 move (22 of 121 reth
@@ -350,7 +350,10 @@ one (upstream replaced revm with evm2: an EVM-layer port, F3-F6a, with the fast 
 parallel builder and follower import rebuilt as evm2 paths); `docs/RETH_2_10_0_UPGRADE.md` the
 2.9.0 → 2.10.0 one (one conflict; evm2 moved six commits, one callback signature followed; the
 evm2 patch through the `DaniPopes/evm2` URL is required, because reth-core still pins the old evm2
-rev and the graph otherwise holds two copies). `scripts/reth-sync.py` resolves `../reth` from
+rev and the graph otherwise holds two copies); `docs/RETH_2_11_0_UPGRADE.md` the 2.10.0 → 2.11.0
+one (five conflicts; evm2 moved ~165 commits with no N42 source change; secp256k1 0.33 / enr 0.14 /
+discv5 0.12; the nippy-jar repair's bulk append must apply upstream's deferred truncation first).
+`scripts/reth-sync.py` resolves `../reth` from
 the repository root (`N42_RETH_SOURCE` overrides it; point it at the real checkout when running
 from a worktree). It does not see `vendor/dependency-repairs/reth-{nippy-jar,transaction-pool}-*`
 (their paths do not exist upstream): merge those by hand and rename them to the new version,

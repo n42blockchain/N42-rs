@@ -315,9 +315,15 @@ impl QmdbPortableTree {
         if entry_count != next_slot {
             return Err(QmdbPortableError::NonPositional { entries: entry_count, next_slot });
         }
-        // A kind-3 run covers a twig in 43 bytes, any other record one slot
-        // in at least 41: a header claiming more slots than that is a lie.
-        let most = (reader.remaining() / DEAD_TWIG_RECORD_SIZE + 1) as u64 * TWIG_SIZE as u64;
+        // A kind-3 run covers a twig in 43 bytes and counts as one of the
+        // header's tombstones; any other record covers one slot in at least
+        // 41 bytes. A header claiming more slots than the bytes and its own
+        // tombstone count allow is a lie, refused before anything is expanded.
+        let remaining = reader.remaining() as u64;
+        let dead_twig_records = claimed_tombstones.min(remaining / DEAD_TWIG_RECORD_SIZE as u64);
+        let most = dead_twig_records
+            .saturating_mul(TWIG_SIZE as u64)
+            .saturating_add(remaining / TOMBSTONE_RECORD_SIZE as u64);
         if entry_count > most {
             return Err(QmdbPortableError::Truncated);
         }
@@ -344,6 +350,9 @@ impl QmdbPortableTree {
                 }
                 PORTABLE_KIND_TOMBSTONE => {
                     tombstones += 1;
+                    if tombstones > claimed_tombstones {
+                        return Err(QmdbPortableError::TombstoneCount { header: claimed_tombstones, records: tombstones });
+                    }
                     let leaf_hash = reader.hash()?;
                     entries.push(QmdbEntrySnapshot {
                         key: NULL_HASH,
@@ -357,6 +366,12 @@ impl QmdbPortableTree {
                     let leaf_root = reader.hash()?;
                     check_dead_twig_run(slot, count, entry_count)?;
                     tombstones += 1;
+                    // Bound the expansion by the header's own total: a run
+                    // past the claimed tombstones is refused before its 2048
+                    // placeholders are allocated.
+                    if tombstones > claimed_tombstones {
+                        return Err(QmdbPortableError::TombstoneCount { header: claimed_tombstones, records: tombstones });
+                    }
                     // A root-only twig: its slots are placeholders.
                     dead_twigs.push((slot / TWIG_SIZE as u64, leaf_root));
                     entries.extend((0..TWIG_SIZE).map(|_| QmdbEntrySnapshot {
@@ -828,6 +843,62 @@ mod tests {
         let digest = blake3::hash(&v1);
         v1.extend_from_slice(digest.as_bytes());
         assert_eq!(verify(&v1), Err(QmdbPortableError::InvalidActiveFlag { slot: 0, flag: 2 }));
+    }
+
+    /// A malformed snapshot is refused before its kind-3 twigs expand: by
+    /// the header's own totals in `decode`, and by chain identity and the
+    /// streamed root in the bounded-memory verifier an import runs first.
+    #[test]
+    fn a_malformed_snapshot_is_refused_before_kind_3_expansion() {
+        let twigs = 64_u64;
+        let runs: Vec<u8> = (0..twigs).flat_map(|twig| dead_twig(twig * TWIG_SIZE as u64, 2048)).collect();
+        let entry_count = twigs * TWIG_SIZE as u64;
+        // The header claims one tombstone, so the bytes cannot cover the runs.
+        assert_eq!(QmdbPortableTree::decode(&stream(entry_count, 1, &runs)), Err(QmdbPortableError::Truncated));
+        // Padded live slots make the bytes cover them: the second run is
+        // refused by the header's total before its placeholders are allocated.
+        let padded: Vec<u8> = (0..TWIG_SIZE as u64)
+            .flat_map(|slot| {
+                let mut out = slot.to_le_bytes().to_vec();
+                out.push(PORTABLE_KIND_LIVE);
+                out.extend_from_slice(&tag(slot as u8));
+                out.extend_from_slice(&100u32.to_le_bytes());
+                out.extend_from_slice(&[7; 100]);
+                out
+            })
+            .chain(dead_twig(TWIG_SIZE as u64, 2048))
+            .chain(dead_twig(2 * TWIG_SIZE as u64, 2048))
+            .collect();
+        assert_eq!(
+            QmdbPortableTree::decode(&stream(3 * TWIG_SIZE as u64, 1, &padded)),
+            Err(QmdbPortableError::TombstoneCount { header: 1, records: 2 })
+        );
+        // More slots than the claimed tombstones and the bytes can cover:
+        // refused from the header alone.
+        assert_eq!(QmdbPortableTree::decode(&stream(entry_count, 0, &runs)), Err(QmdbPortableError::Truncated));
+        assert_eq!(QmdbPortableTree::decode(&stream(u64::MAX / 2, twigs, &runs)), Err(QmdbPortableError::Truncated));
+        // Well formed but with a made-up root: `decode` alone expands it, the
+        // streamed verification refuses it without materializing a slot.
+        let lie = stream(entry_count, twigs, &runs);
+        assert_eq!(QmdbPortableTree::decode(&lie).map(|(_, tree)| tree.slots.entries.len() as u64), Ok(entry_count));
+        assert_eq!(verify(&lie), Err(QmdbPortableError::RootMismatch));
+        assert_eq!(
+            verify_portable_stream(lie.as_slice(), CHAIN_ID + 1, &tag(0x11)),
+            Err(QmdbPortableError::WrongChainId { expected: CHAIN_ID + 1, got: CHAIN_ID })
+        );
+        assert_eq!(verify_portable_stream(lie.as_slice(), CHAIN_ID, &tag(0x12)), Err(QmdbPortableError::WrongGenesisHash));
+    }
+
+    /// The header bounds accept every valid layout: the committed fixtures
+    /// and the encoder's output decode as before.
+    #[test]
+    fn valid_snapshots_pass_the_header_bounds() {
+        let (plain, compacted) = trees();
+        for bytes in [plain.encode(PortableFormat::V1).unwrap(), compacted.encode(PortableFormat::V2).unwrap(), legacy()] {
+            let (_, tree) = QmdbPortableTree::decode(&bytes).unwrap();
+            assert_eq!(tree.verify_and_build(CHAIN_ID, &tag(0x11)).unwrap().root(), plain.root);
+            assert_eq!(verify(&bytes).unwrap().root, plain.root);
+        }
     }
 
     #[test]

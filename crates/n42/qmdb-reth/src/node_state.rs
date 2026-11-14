@@ -2947,6 +2947,28 @@ impl QmdbNodeState {
         Ok(with_configured_retention(forest))
     }
 
+    /// A portable snapshot's head and root against the header the caller
+    /// trusts, refused by name.
+    fn check_portable_head_and_root(
+        at: (u64, B256),
+        root: B256,
+        expected_head: (u64, B256),
+        expected_root: B256,
+    ) -> Result<(), NodeStateError> {
+        if at != expected_head {
+            return Err(NodeStateError::Portable(format!(
+                "snapshot is at block {} {:?}, the header at {} {:?}",
+                at.0, at.1, expected_head.0, expected_head.1
+            )));
+        }
+        if root != expected_root {
+            return Err(NodeStateError::Portable(format!(
+                "snapshot root {root:?} is not the header's state root {expected_root:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Restores the forest from a cross-client portable snapshot — gov5's
     /// `n42-qmdb-export` output, or this node's own [`Self::portable_export`]
     /// — for a database being initialised at the snapshot's block rather than
@@ -2964,25 +2986,32 @@ impl QmdbNodeState {
     ) -> Result<(), NodeStateError> {
         use n42_twig_core::qmdb_compat::QmdbPortableTree;
         // Either layout (`docs/QMDB_COMPACTION_DESIGN.md` section 6): a v2
-        // tombstone becomes a hash-only slot of the rebuilt tree.
+        // tombstone becomes a hash-only slot of the rebuilt tree. The stream
+        // is authenticated first with bounded memory (chain, genesis, head
+        // and root), so a malformed snapshot is refused before `decode`
+        // expands its dead twigs into placeholder slots.
+        let verified =
+            n42_twig_core::qmdb_compat::verify_portable_stream(portable, chain_id, &genesis_hash.0)
+                .map_err(|e| NodeStateError::Portable(e.to_string()))?;
+        Self::check_portable_head_and_root(
+            (verified.block_number, B256::from(verified.block_hash)),
+            B256::from(verified.root),
+            expected_head,
+            expected_root,
+        )?;
         let (_, snapshot) =
             QmdbPortableTree::decode(portable).map_err(|e| NodeStateError::Portable(e.to_string()))?;
-        let at = (snapshot.block_number, B256::from(snapshot.block_hash));
-        if at != expected_head {
-            return Err(NodeStateError::Portable(format!(
-                "snapshot is at block {} {:?}, the header at {} {:?}",
-                at.0, at.1, expected_head.0, expected_head.1
-            )));
-        }
         let tree = snapshot
             .verify_and_build(chain_id, &genesis_hash.0)
             .map_err(|e| NodeStateError::Portable(e.to_string()))?;
+        // The rebuilt tree must say what the stream did.
         let root = B256::from(tree.root());
-        if root != expected_root {
-            return Err(NodeStateError::Portable(format!(
-                "snapshot root {root:?} is not the header's state root {expected_root:?}"
-            )));
-        }
+        Self::check_portable_head_and_root(
+            (snapshot.block_number, B256::from(snapshot.block_hash)),
+            root,
+            expected_head,
+            expected_root,
+        )?;
         if !self.inner.entry_file && tree.has_hash_only_slots() {
             // The heap checkpoint's layout has no hash-only slot (it would
             // lose the hash): only the entry file holds one.

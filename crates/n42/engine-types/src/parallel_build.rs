@@ -1095,10 +1095,18 @@ pub struct ImportPlan {
 
 /// The block's [`ImportPlan`]: its leading plain transfers -- every
 /// transaction up to the first that is not one or that names the
-/// beneficiary -- and their partition by sender.
+/// beneficiary -- and their partition by sender. Made ahead of the import,
+/// it takes the header's beneficiary; [`import_block`] makes it again with
+/// the EVM's fee recipient when they differ (an APoS block credits its
+/// recovered signer).
 pub fn plan_import(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> ImportPlan {
     use alloy_consensus::BlockHeader as _;
-    let beneficiary = block.header().beneficiary();
+    plan_import_for(block, block.header().beneficiary())
+}
+
+/// [`plan_import`] against `beneficiary`, the address the block's EVM
+/// credits the fees to.
+fn plan_import_for(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>, beneficiary: Address) -> ImportPlan {
     let keys: Vec<(Address, Address)> = block
         .body()
         .transactions
@@ -1170,11 +1178,11 @@ where
     let env = config.evm_env(block.header()).map_err(|err| refused(commit_err(&err)))?;
     let beneficiary = env.block.beneficiary;
     // A plan made ahead is the block's own; one made for another fee
-    // recipient than the EVM's is made again here.
+    // recipient than the EVM's is made again here, against the EVM's.
     let planned = plan.is_some();
     let ImportPlan { keys, groups, .. } = match plan {
         Some(plan) if plan.beneficiary == beneficiary => plan,
-        _ => plan_import(block),
+        _ => plan_import_for(block, beneficiary),
     };
     if keys.is_empty() {
         return Err(refused(Refused::NotParallel(NotParallel::NotATransfer(0))));
@@ -1894,6 +1902,24 @@ mod tests {
         let (ahead, stats) = import_block(&config(), &block, parent(), &|| Some(parent()), Dispatch::LargestFirst(4), Some(plan)).expect("the import on the plan");
         assert!(stats.planned);
         assert_same_import(&ahead, &stock);
+    }
+
+    /// The import plans against the fee recipient the EVM credits: on an
+    /// APoS block that is the recovered signer, not the header's
+    /// beneficiary, so the leading transfers stop at the first one that
+    /// names the signer, and the partition is made at the signer.
+    #[test]
+    fn the_import_plan_stops_at_the_evm_fee_recipient() {
+        let signer = addr(5);
+        let block = block_of(&[transfer(1, 0, addr(2), 1), transfer(3, 0, signer, 1), transfer(4, 0, addr(6), 1)]);
+        let header = plan_import(&block);
+        assert_eq!((header.keys.len(), header.beneficiary), (3, addr(BENEFICIARY)));
+        let evm = plan_import_for(&block, signer);
+        assert_eq!((evm.keys.len(), evm.beneficiary), (1, signer));
+        assert!(evm.groups.is_some());
+        // The signer as a sender stops the plan as well.
+        let block = block_of(&[transfer(1, 0, addr(2), 1), transfer(5, 0, addr(7), 1)]);
+        assert_eq!(plan_import_for(&block, signer).keys.len(), 1);
     }
 
     /// Leading transfers that spend in-block credits: a recipient with a

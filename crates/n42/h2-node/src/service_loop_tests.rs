@@ -415,6 +415,10 @@ async fn step_until(
         loop {
             let events = svc.step().await.expect("a step");
             all.extend(events);
+            // A single validator's step never waits (its votes are its own),
+            // and on this single-threaded runtime the tasks it spawns -- its
+            // own blocks' imports -- run only when the test yields.
+            tokio::task::yield_now().await;
             if done(svc, &all) {
                 return;
             }

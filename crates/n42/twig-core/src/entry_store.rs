@@ -442,6 +442,19 @@ impl LogFile {
         }
     }
 
+    /// A read hint for the record head (key and length) at `start`; nothing
+    /// past the file's bytes.
+    #[inline]
+    fn prefetch_head(&self, start: u64) {
+        if start >= self.len_bytes {
+            return;
+        }
+        let head = self.bytes_from(start).as_ptr();
+        crate::index::prefetch_line(head);
+        // A head that crosses a line: its second line too.
+        crate::index::prefetch_line(head.wrapping_add(KEY_LEN + LEN_LEN - 1));
+    }
+
     /// Appends `bytes` as one unit that no chunk boundary splits: the tail is
     /// sealed first if they would not fit in it. Returns where they start.
     /// No populate: this is the relocated file's append, off the hot path.
@@ -1050,6 +1063,25 @@ impl FileEntries {
         match self.read(slot) {
             SlotRef::Payload(key, _) => Some(key),
             SlotRef::HashOnly(_) => None,
+        }
+    }
+
+    /// Read hints for [`Self::key`] of `slot` ([`crate::index::KeyRead`]):
+    /// its offset's word, or (that word in cache by now) its record's head.
+    /// A slot past the length, in a released segment or in the relocated
+    /// file is left to the read itself.
+    #[inline]
+    pub(crate) fn prefetch_key(&self, slot: usize, stage: crate::index::KeyRead) {
+        if slot >= self.offsets.len() {
+            return;
+        }
+        match stage {
+            crate::index::KeyRead::Locate => self.offsets.prefetch(slot),
+            crate::index::KeyRead::Record => {
+                if let Some(raw) = self.offsets.try_at(slot).filter(|raw| raw & RELOCATED_BIT == 0) {
+                    self.main.prefetch_head(raw);
+                }
+            }
         }
     }
 
@@ -1898,6 +1930,22 @@ impl Entries {
                 debug_assert!(false, "the key of hash-only slot {slot} was read");
                 NULL_HASH
             }
+        }
+    }
+
+    /// Read hints for [`Self::key`] of `slot`, a stage at a time
+    /// ([`crate::index::KeyRead`]); they change nothing.
+    #[inline]
+    pub(crate) fn prefetch_key(&self, slot: usize, stage: crate::index::KeyRead) {
+        match self {
+            Self::Heap(entries) => {
+                if stage == crate::index::KeyRead::Record
+                    && let Some(entry) = entries.get(slot)
+                {
+                    crate::index::prefetch_line(&entry.key);
+                }
+            }
+            Self::File(file) => file.prefetch_key(slot, stage),
         }
     }
 

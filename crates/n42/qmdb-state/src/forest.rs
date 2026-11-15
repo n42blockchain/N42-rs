@@ -3411,3 +3411,7 @@ mod tests {
         assert!(diagnosis.verdict().starts_with("the tree under the replay's parent"), "{}", diagnosis.verdict());
     }
 }
+
+#[cfg(test)]
+#[path = "forest_interleavings.rs"]
+mod interleavings;

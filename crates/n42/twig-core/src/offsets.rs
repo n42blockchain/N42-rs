@@ -205,6 +205,17 @@ impl Offsets {
         self.inner.segment(slot).map(|segment| segment[slot & MASK].load(Ordering::Relaxed))
     }
 
+    /// A read hint for `slot`'s offset word; nothing past the length or in a
+    /// released segment.
+    #[inline]
+    pub(crate) fn prefetch(&self, slot: usize) {
+        if slot < self.len()
+            && let Some(segment) = self.inner.segment(slot)
+        {
+            crate::index::prefetch_line(&segment[slot & MASK]);
+        }
+    }
+
     /// Frees segment `index` (slots `index << OFFSET_SEGMENT_BITS ..`): its
     /// slots' offsets are kept elsewhere from now on (a compacted twig's
     /// group base and `u32` starts, `docs/QMDB_COMPACTION_DESIGN.md` stage

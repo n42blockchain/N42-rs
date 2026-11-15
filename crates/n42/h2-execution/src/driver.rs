@@ -680,11 +680,19 @@ pub const OWN_IMPORT_BACKOFF: [std::time::Duration; 5] = [
 struct OwnImportDone {
     importing: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>>,
     hash: B256,
+    /// Set once the import was reported Valid on the own-imports channel.
+    reported: bool,
+    /// Where an import that ends without that report says so, after the
+    /// block is off the set ([`ExecutionDriver::take_own_import_ends`]).
+    ended: tokio::sync::mpsc::UnboundedSender<B256>,
 }
 
 impl Drop for OwnImportDone {
     fn drop(&mut self) {
         self.importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.hash);
+        if !self.reported {
+            let _ = self.ended.send(self.hash);
+        }
     }
 }
 
@@ -717,6 +725,16 @@ pub struct ExecutionDriver<E> {
     own_imports: tokio::sync::mpsc::UnboundedSender<B256>,
     /// The receiving end, until the loop takes it.
     own_imports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
+    /// Where an own import that ends without a Valid report -- refused, no
+    /// verdict after every retry, or a task that died -- says so, for the
+    /// loop to run a commit held for it ([`Self::own_import_ended`]).
+    own_import_ends: tokio::sync::mpsc::UnboundedSender<B256>,
+    /// The receiving end, until the loop takes it.
+    own_import_ends_rx: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
+    /// Commits to own blocks held unsent while their import ran (see
+    /// `commit`): run by [`Self::own_block_imported`] or
+    /// [`Self::own_import_ended`], whichever comes.
+    held_for_own_import: std::collections::HashSet<B256>,
     /// This node's own blocks whose import task has not ended. See
     /// [`Self::is_importing_own_block`].
     own_importing: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>>,
@@ -868,6 +886,9 @@ pub struct ExecutionDriver<E> {
     /// Commit forkchoices answered so far, for rate-limiting the
     /// measurement line to every sixteenth.
     commits_answered: u64,
+    /// Commits to an own block kept unsent because its import was still in
+    /// flight (see `commit`).
+    commits_held_for_own_import: u64,
     /// Where a spawned commit forkchoice reports.
     commit_reports: tokio::sync::mpsc::UnboundedSender<CommitReport>,
     /// The receiving end, until the loop takes it.
@@ -1039,6 +1060,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Builds a driver whose head and finalised block are `genesis`.
     pub fn new(el: E, genesis: B256) -> Self {
         let (own_imports_tx, own_imports_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (own_ends_tx, own_ends_rx) = tokio::sync::mpsc::unbounded_channel();
         let (foreign_tx, foreign_rx) = tokio::sync::mpsc::unbounded_channel();
         let (commit_tx, commit_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -1051,6 +1073,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             last_build_timing: BuildTiming::default(),
             own_imports: own_imports_tx,
             own_imports_rx: Some(own_imports_rx),
+            own_import_ends: own_ends_tx,
+            own_import_ends_rx: Some(own_ends_rx),
+            held_for_own_import: std::collections::HashSet::new(),
             own_importing: Default::default(),
             own_refused: Default::default(),
             own_import_backoff: OWN_IMPORT_BACKOFF.into(),
@@ -1096,6 +1121,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             commit_seq: 0,
             commit_landed: 0,
             commits_answered: 0,
+            commits_held_for_own_import: 0,
             commit_reports: commit_tx,
             commit_reports_rx: Some(commit_rx),
             settlement: crate::settlement::Settlement::new(crate::settlement::settlement_tags()),
@@ -1887,9 +1913,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let refused = std::sync::Arc::clone(&self.own_refused);
         let backoff = std::sync::Arc::clone(&self.own_import_backoff);
         self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash);
-        let done = OwnImportDone { importing: std::sync::Arc::clone(&self.own_importing), hash };
+        let done = OwnImportDone {
+            importing: std::sync::Arc::clone(&self.own_importing),
+            hash,
+            reported: false,
+            ended: self.own_import_ends.clone(),
+        };
         tokio::spawn(async move {
-            let _done = done;
+            let mut done = done;
             let started = std::time::Instant::now();
             // An outcome that is not a verdict -- the layer down or past its
             // deadline, SYNCING, ACCEPTED -- is tried again: the service
@@ -1918,6 +1949,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     );
                     if status.status.is_valid() {
                         let _ = imported.send(hash);
+                        done.reported = true;
                     } else if let PayloadStatusEnum::Invalid { validation_error } = &status.status {
                         // The builder and the executor of one node disagree:
                         // the block this node proposed is one it would not
@@ -1977,6 +2009,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         // import lands first and the commit runs on its own a moment later,
         // so there is nothing here and no second forkchoice is sent.
         self.commits_ahead.remove(&block_hash);
+        self.held_for_own_import.remove(&block_hash);
         if !self.pending_commits.remove(&block_hash) {
             return None;
         }
@@ -2076,6 +2109,33 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// The channel [`Self::spawn_import_own_block`] reports on, once.
     pub fn take_own_imports(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<B256>> {
         self.own_imports_rx.take()
+    }
+
+    /// The channel an own import that ended without a Valid report says so
+    /// on, once. A loop that takes both this and [`Self::take_own_imports`]
+    /// hears every own import's end, and only then does `commit` hold a
+    /// commit to an own block whose import is in flight.
+    pub fn take_own_import_ends(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<B256>> {
+        self.own_import_ends_rx.take()
+    }
+
+    /// Whether a loop hears every own import's end (both channels taken).
+    fn own_import_ends_heard(&self) -> bool {
+        self.own_imports_rx.is_none() && self.own_import_ends_rx.is_none()
+    }
+
+    /// An own import ended without a Valid report. A commit held for it is
+    /// sent now, as it was before it was held: the engine answers it --
+    /// Valid if the block reached the tree after all, SYNCING (kept, as
+    /// ever) if it did not -- instead of it waiting for a report that will
+    /// not come.
+    pub async fn own_import_ended(&mut self, block_hash: B256) -> Option<DriverAction> {
+        if !self.held_for_own_import.remove(&block_hash) {
+            return None;
+        }
+        self.pending_commits.remove(&block_hash);
+        info!(target: "n42.h2.el", block = ?block_hash, "own import ended without a verdict; the commit held for it is sent");
+        Some(self.commit(block_hash).await)
     }
 
     /// The channel a spawned follower import reports on, once.
@@ -3053,6 +3113,35 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             self.pending_commits.insert(block_hash);
             return DriverAction::Ignored;
         }
+        if self.own_import_ends_heard()
+            && !self.imported.contains(&block_hash)
+            && self.is_importing_own_block(&block_hash)
+        {
+            // This node's own block, its import still on the way into the
+            // execution layer: the Decide came before the import's answer (a
+            // leader hears its commit ~11 ms after the proposal; an own import
+            // that is not answered at once takes 20-70 ms). The forkchoice
+            // would be answered SYNCING and kept in `pending_commits` for
+            // `own_block_imported` to run again -- and reth would also start a
+            // download of the block for every such answer, which on a layer
+            // without peers never ends and is never cleared
+            // (`active_block_downloads` grew by one per answer, ~2000 a bench
+            // leg, every one polled on each engine-task wake). So the commit
+            // is kept without being sent, in exactly the state that answer
+            // left it in: in `pending_commits`, remembered as ahead, its
+            // commit order fixed now (the order it was heard in, as a send
+            // would have fixed it). `own_block_imported` runs it when the
+            // import lands; an import that ends without landing sends it
+            // through `own_import_ended`, as it would have gone unheld. Only
+            // while a loop hears both channels (`own_import_ends_heard`).
+            self.commit_order_of(block_hash);
+            self.remember_commit_ahead(block_hash);
+            self.pending_commits.insert(block_hash);
+            self.held_for_own_import.insert(block_hash);
+            self.commits_held_for_own_import = self.commits_held_for_own_import.saturating_add(1);
+            debug!(target: "n42.h2.el", block = ?block_hash, "commit to an own block whose import is in flight; it runs when the import lands");
+            return DriverAction::Ignored;
+        }
         // `finalized` moves only on the engine's Valid answer (`apply_commit`):
         // a forkchoice that failed or was refused did not make the block
         // canonical, and later forkchoices must not name it as finalised.
@@ -3372,6 +3461,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// The failed commit waiting to be sent again, if any.
     pub fn commit_retry_pending(&self) -> Option<B256> {
         self.commit_retry.as_ref().map(|retry| retry.block_hash)
+    }
+
+    /// Commits to an own block kept unsent since start because the block's
+    /// import was still in flight; each runs when the import lands.
+    pub const fn commits_held_for_own_import(&self) -> u64 {
+        self.commits_held_for_own_import
     }
 
     /// Commit forkchoices the execution layer refused (Invalid) since start.

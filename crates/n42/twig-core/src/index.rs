@@ -37,8 +37,42 @@ pub const MAX_INDEX_VALUE: u64 = MAX_SLOT;
 const MIN_BITS: u32 = 4;
 /// How many keys ahead a batch lookup prefetches its bucket.
 const PREFETCH_AHEAD: usize = 8;
-/// Keys a task of [`TagIndex::get_batch_chunked`] (and the seeded
-/// [`TagIndex::get_batch`]'s confirming pass) takes (the tree's `LEAF_CHUNK`).
+/// [`TagIndex::get_batch_ahead`]'s distances, counted from the key
+/// being confirmed: its bucket is prefetched [`PIPE_BUCKET`] keys ahead, read
+/// [`PIPE_LOCATE`] keys ahead (the candidate's location then asked for), and
+/// the record asked for [`PIPE_RECORD`] keys ahead: each miss has eight
+/// keys' work to land in.
+const PIPE_BUCKET: usize = 24;
+const PIPE_LOCATE: usize = 16;
+const PIPE_RECORD: usize = 8;
+
+/// The stage of a key read [`TagIndex::get_batch_ahead`] asks to be
+/// prefetched, ahead of `key_at`: a store whose key read is two dependent
+/// loads (a slot's location, then its record) has the first started
+/// [`PIPE_LOCATE`] keys ahead and the second [`PIPE_RECORD`] keys ahead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyRead {
+    /// What locates the slot's record (an offsets table's word).
+    Locate,
+    /// The record's key.
+    Record,
+}
+
+/// A read hint for the cache line at `ptr` (a no-op off x86_64). It reads
+/// nothing and never faults, so any address is safe to pass.
+#[inline(always)]
+pub(crate) fn prefetch_line<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint: it reads nothing architecturally and
+    // never faults, whatever the address.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = ptr;
+}
+/// Keys a task of [`TagIndex::get_batch_chunked`] and
+/// [`TagIndex::get_batch_ahead`] takes (the tree's `LEAF_CHUNK`).
 const GET_CHUNK: usize = 1024;
 const MAX_BITS: u32 = FP_BITS;
 
@@ -596,13 +630,108 @@ impl TagIndex {
     /// [`GET_CHUNK`]-key chunks of [`Self::get_into`] keep both the shard's
     /// table and the entry reads (each earlier block appended its keys in
     /// sorted order) local. Seeded shards spread a chunk over all 256
-    /// tables, so the seeded mode splits the lookup in two passes, each
-    /// with its own locality: the buckets probed shard by shard
-    /// ([`partition_by_shard`], [`Shard::first_candidate`]), then the
-    /// candidates confirmed against the entry store in the keys' order. A
-    /// candidate whose key differs (a 24-bit fingerprint collision) is
-    /// looked up again in full, so the answers are [`Self::get`]'s.
+    /// tables; the seeded mode walks the same chunks in the keys' order
+    /// (the entry reads' locality) and hides the scattered bucket reads
+    /// behind a software pipeline ([`Self::get_batch_ahead`], which the
+    /// tree calls with its entry store's read hints).
+    #[cfg(test)]
     pub(crate) fn get_batch<'k>(
+        &self,
+        out: &mut [Option<u64>],
+        key: impl Fn(usize) -> &'k Hash + Sync,
+        key_at: impl Fn(u64) -> Hash + Sync,
+    ) {
+        self.get_batch_ahead(out, key, key_at, |_, _| {});
+    }
+
+    /// [`Self::get_batch`], with `ahead(slot, stage)` asked to prefetch each
+    /// candidate's key read ([`KeyRead`]) before it is confirmed: in a file
+    /// store that read is two dependent cache misses a key (an offset, then
+    /// a record), and the hints let them overlap instead of being taken one
+    /// by one. `ahead` must only prefetch; the answers are [`Self::get`]'s
+    /// whatever it does. The key0 mode takes no hints.
+    ///
+    /// Seeded: one pass over the pool, [`GET_CHUNK`]-key chunks in the keys'
+    /// order, each key's three dependent reads started as a software
+    /// pipeline -- its bucket [`PIPE_BUCKET`] keys ahead, its candidate read
+    /// and the candidate's location asked for ([`KeyRead::Locate`])
+    /// [`PIPE_LOCATE`] ahead, its record ([`KeyRead::Record`])
+    /// [`PIPE_RECORD`] ahead -- then confirmed in place. A candidate whose
+    /// key differs (a 24-bit fingerprint collision) is looked up again in
+    /// full. It replaced a partition by shard, a probe pass shard by shard
+    /// and a confirming pass (four passes over the pool): on a leader whose
+    /// pool shares its cores with the next block's execution every pass ends
+    /// at its slowest task, and the four-pass lookup read 54-58 ms against
+    /// this pass's 21-22 ms with the cores shared (`shard_mode_bench`,
+    /// `IDXBENCH_NOISE`).
+    pub(crate) fn get_batch_ahead<'k>(
+        &self,
+        out: &mut [Option<u64>],
+        key: impl Fn(usize) -> &'k Hash + Sync,
+        key_at: impl Fn(u64) -> Hash + Sync,
+        ahead: impl Fn(u64, KeyRead) + Sync,
+    ) {
+        if self.key0 {
+            return self.get_batch_chunked(out, key, key_at);
+        }
+        let work = |(chunk, held): (usize, &mut [Option<u64>])| {
+            let base = chunk * GET_CHUNK;
+            let n = held.len();
+            let bucket = |i: usize| {
+                let k = key(base + i);
+                self.shards[self.shard(k)].prefetch(k);
+            };
+            // The candidate of key `i`, written to its own place ahead of its
+            // confirmation, and its location asked for.
+            let candidate = |held: &mut [Option<u64>], i: usize| {
+                let k = key(base + i);
+                let found = self.shards[self.shard(k)].first_candidate(fingerprint(k));
+                held[i] = found;
+                if let Some(slot) = found {
+                    ahead(slot, KeyRead::Locate);
+                }
+            };
+            for i in 0..PIPE_BUCKET.min(n) {
+                bucket(i);
+            }
+            for i in 0..PIPE_LOCATE.min(n) {
+                candidate(held, i);
+            }
+            for slot in held[..PIPE_RECORD.min(n)].iter().flatten() {
+                ahead(*slot, KeyRead::Record);
+            }
+            for i in 0..n {
+                if i + PIPE_BUCKET < n {
+                    bucket(i + PIPE_BUCKET);
+                }
+                if i + PIPE_LOCATE < n {
+                    candidate(held, i + PIPE_LOCATE);
+                }
+                if let Some(Some(slot)) = held.get(i + PIPE_RECORD) {
+                    ahead(*slot, KeyRead::Record);
+                }
+                if let Some(slot) = held[i] {
+                    let k = key(base + i);
+                    if key_at(slot) != *k {
+                        held[i] = self.get(k, &key_at);
+                    }
+                }
+            }
+        };
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+            out.par_chunks_mut(GET_CHUNK).enumerate().for_each(work);
+        }
+        #[cfg(not(feature = "rayon"))]
+        out.chunks_mut(GET_CHUNK).enumerate().for_each(work);
+    }
+
+    /// The seeded held-slot pass before the pipeline (bench reference):
+    /// the batch partitioned by shard, the buckets probed shard by shard,
+    /// the candidates confirmed in the keys' order. The same answers.
+    #[cfg(test)]
+    pub(crate) fn get_batch_partitioned<'k>(
         &self,
         out: &mut [Option<u64>],
         key: impl Fn(usize) -> &'k Hash + Sync,
@@ -1427,6 +1556,9 @@ mod tests {
                 let mut plain_held = vec![None; keys.len()];
                 plain.get_batch_chunked(&mut plain_held, |i| &keys[i], key_at);
                 assert_eq!(plain_held, want);
+                let mut partitioned = vec![Some(u64::MAX); keys.len()];
+                known.get_batch_partitioned(&mut partitioned, |i| &keys[i], key_at);
+                assert_eq!(partitioned, want);
                 let pairs: Vec<(Hash, u64)> = keys.iter().enumerate().map(|(i, key)| (*key, first + i as u64)).collect();
                 if round == 7 {
                     // A wrong `held` (every slot off by one): the fallback.
@@ -1444,6 +1576,45 @@ mod tests {
                 assert_eq!(known.get(&key, key_at), plain.get(&key, key_at));
             }
         }
+    }
+
+    /// Two keys in one seeded shard with one fingerprint: the pipelined
+    /// batch takes the first candidate on the probe path, finds the other
+    /// key there and looks the key up in full -- the same answers as `get`,
+    /// with the hints asked for and changing nothing.
+    #[test]
+    fn the_pipelined_batch_confirms_a_fingerprint_collision() {
+        let mut seen: HashMap<(usize, u64), Hash> = HashMap::new();
+        let (a, b) = (0u64..)
+            .find_map(|n| {
+                let key = key_of(n, None);
+                seen.insert((shard_of(&key), fingerprint(&key)), key).map(|other| (other, key))
+            })
+            .unwrap();
+        let mut sorted = [a, b];
+        sorted.sort_unstable();
+        // Store: slot 0 holds `a`, slot 1 `b`.
+        let store = [a, b];
+        let key_at = |slot: u64| store[slot as usize];
+        let hints = std::sync::atomic::AtomicUsize::new(0);
+        let ahead = |slot: u64, _: KeyRead| {
+            assert!(slot < 2);
+            hints.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let mut index = TagIndex::with_key0(false);
+        index.insert(a, 0, key_at).unwrap();
+        // `b` absent: its first candidate is `a`'s slot, refused.
+        let mut out = vec![Some(9); 2];
+        index.get_batch_ahead(&mut out, |i| &sorted[i], key_at, ahead);
+        let want: Vec<Option<u64>> = sorted.iter().map(|key| index.get(key, key_at)).collect();
+        assert_eq!(out, want);
+        assert_eq!(want.iter().flatten().count(), 1);
+        // Both held: whichever is second on the path is found in full.
+        index.insert(b, 1, key_at).unwrap();
+        index.get_batch_ahead(&mut out, |i| &sorted[i], key_at, ahead);
+        assert_eq!(out, sorted.iter().map(|key| index.get(key, key_at)).collect::<Vec<_>>());
+        assert_eq!(out.iter().flatten().count(), 2);
+        assert!(hints.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 
     #[test]
@@ -1478,10 +1649,15 @@ mod tests {
     /// (default 15) are timed. Before each timed step the caches are swept
     /// with 512 MB of other traffic (`IDXBENCH_SWEEP_MB`, 0 = off), as the
     /// block's execution sweeps them between root jobs. Per mode: the
-    /// held-slot pass as chunks of `get_into` and as `get_batch`, the tree's
-    /// `insert_sorted` and `insert_sorted_known` (alternate rounds), the read
-    /// view's `apply_sorted`; medians in microseconds, on a pool of
-    /// `IDXBENCH_THREADS` (default 16).
+    /// held-slot pass as chunks of `get_into`, as the partitioned pass, as
+    /// `get_batch` and as `get_batch_ahead` with the entry reads' hints (the
+    /// store reads a key through a slot -> offset table, as the file store
+    /// does), the tree's `insert_sorted` and `insert_sorted_known` (alternate
+    /// rounds), the read view's `apply_sorted`; medians in microseconds, on a
+    /// pool of `IDXBENCH_THREADS` (default 16). `IDXBENCH_NOISE=16` with the
+    /// process under `taskset -c 0-15` shares the pool's cores with random
+    /// memory readers, as the leader's root job shares them with the next
+    /// block's execution.
     #[cfg(feature = "rayon")]
     #[test]
     #[ignore = "timing; run by hand in release"]
@@ -1530,28 +1706,57 @@ mod tests {
         let mut sweep_now = |pool: &rayon::ThreadPool| {
             pool.install(|| sweep.par_chunks_mut(1 << 16).for_each(|chunk| chunk.iter_mut().for_each(|word| *word = word.wrapping_add(1))));
         };
+        // `IDXBENCH_NOISE` threads reading a 1 GB buffer at random the whole
+        // time: the leader's pool shares its cores (run under `taskset`)
+        // and memory with the next block's execution.
+        let noise = var("IDXBENCH_NOISE", 0);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let noisy: Vec<_> = (0..noise)
+            .map(|t| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let buffer = vec![1u64; 1 << 27];
+                    let (mut x, mut sum) = (t as u64 + 1, 0u64);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        for _ in 0..4096 {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            sum = sum.wrapping_add(buffer[(x as usize) & ((1 << 27) - 1)]);
+                        }
+                    }
+                    sum
+                })
+            })
+            .collect();
         for key0 in [true, false, true, false] {
             // The entry store: 40-byte records, on 4 KB pages like the
-            // mapped entry file.
-            let mut store: Vec<[u8; RECORD]> = Vec::with_capacity(total);
+            // mapped entry file, each found through a slot -> byte offset
+            // table as the file store's are (two dependent reads a key).
+            let mut store: Vec<u8> = Vec::with_capacity(total * RECORD);
+            let mut offsets: Vec<u64> = Vec::with_capacity(total);
             #[cfg(target_os = "linux")]
-            // SAFETY: advice on this vector's own (not yet touched) allocation.
+            // SAFETY: advice on these vectors' own (not yet touched) allocations.
             unsafe {
                 libc::madvise(store.as_mut_ptr().cast(), total * RECORD, libc::MADV_NOHUGEPAGE);
+                libc::madvise(offsets.as_mut_ptr().cast(), total * 8, libc::MADV_NOHUGEPAGE);
             }
             let mut tag = TagIndex::with_key0(key0);
             let shared = SharedOffsetIndex::with_key0(key0);
-            let (mut chunked_us, mut batch_us, mut insert_us, mut known_us, mut apply_us, mut sink) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0usize);
+            let (mut chunked_us, mut batch_us, mut ahead_us, mut piped_us, mut insert_us, mut known_us, mut apply_us, mut sink) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0usize);
             for (number, keys) in blocks.iter().enumerate() {
                 let timed = number >= first_timed;
-                let first = store.len() as u64;
-                store.extend(keys.iter().map(|key| {
-                    let mut record = [0u8; RECORD];
-                    record[..32].copy_from_slice(key);
-                    record
-                }));
-                let key_at = |slot: u64| -> Hash { store[slot as usize][..32].try_into().unwrap() };
+                let first = offsets.len() as u64;
+                for key in keys {
+                    offsets.push(store.len() as u64);
+                    store.extend_from_slice(key);
+                    store.extend_from_slice(&[0u8; RECORD - 32]);
+                }
+                let key_at = |slot: u64| -> Hash {
+                    let at = offsets[slot as usize] as usize;
+                    store[at..at + 32].try_into().unwrap()
+                };
                 let pairs: Vec<(Hash, u64)> = keys.iter().enumerate().map(|(i, key)| (*key, first + i as u64)).collect();
                 let changes: Vec<(Hash, Option<u64>)> = pairs.iter().map(|(key, slot)| (*key, Some(*slot))).collect();
                 let mut held = vec![None; keys.len()];
@@ -1567,8 +1772,29 @@ mod tests {
                 };
                 let mut chunked = vec![None; keys.len()];
                 time(&mut chunked_us, &mut || tag.get_batch_chunked(&mut chunked, |i| &keys[i], key_at));
-                time(&mut batch_us, &mut || tag.get_batch(&mut held, |i| &keys[i], key_at));
+                // The partitioned pass that came before, the pipelined one
+                // without and with the entry reads' hints, the order rotating
+                // by block.
+                let prefetch_at = |slot: u64, stage: KeyRead| match stage {
+                    KeyRead::Locate => prefetch_line(offsets.as_ptr().wrapping_add(slot as usize)),
+                    KeyRead::Record => {
+                        if let Some(at) = offsets.get(slot as usize) {
+                            prefetch_line(store.as_ptr().wrapping_add(*at as usize));
+                        }
+                    }
+                };
+                let mut hinted = vec![None; keys.len()];
+                let mut piped = vec![None; keys.len()];
+                for step in 0..3 {
+                    match (number + step) % 3 {
+                        0 => time(&mut batch_us, &mut || tag.get_batch_partitioned(&mut held, |i| &keys[i], key_at)),
+                        1 => time(&mut piped_us, &mut || tag.get_batch(&mut piped, |i| &keys[i], key_at)),
+                        _ => time(&mut ahead_us, &mut || tag.get_batch_ahead(&mut hinted, |i| &keys[i], key_at, prefetch_at)),
+                    }
+                }
                 assert_eq!(held, chunked);
+                assert_eq!(hinted, chunked);
+                assert_eq!(piped, chunked);
                 sink += held.iter().flatten().count();
                 if number % 2 == 0 {
                     time(&mut insert_us, &mut || tag.insert_sorted(&pairs, key_at).unwrap());
@@ -1579,18 +1805,24 @@ mod tests {
             }
             assert_eq!(tag.len(), shared.len());
             println!(
-                "{} live {} batch ~{} threads {}: held chunked {} us get_batch {} us, insert_sorted {} us insert_known {} us, apply_sorted {} us (index {} MB, sink {sink})",
+                "{} live {} batch ~{} threads {}: held chunked {} us partitioned {} us get_batch {} us hinted {} us, insert_sorted {} us insert_known {} us, apply_sorted {} us (index {} MB, sink {sink})",
                 if key0 { "key0  " } else { "seeded" },
                 tag.len(),
                 blocks[first_timed].len(),
                 threads,
                 median(chunked_us),
                 median(batch_us),
+                median(piped_us),
+                median(ahead_us),
                 median(insert_us),
                 median(known_us),
                 median(apply_us),
                 tag.memory_bytes() >> 20,
             );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for thread in noisy {
+            let _ = thread.join();
         }
     }
 

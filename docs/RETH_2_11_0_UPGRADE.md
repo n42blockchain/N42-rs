@@ -126,10 +126,36 @@ logs under `audit-notes/ci/`. check, clippy and the n42 / ported / main suites r
 | `cargo test -p reth-nippy-jar -p reth-node-core -p reth-provider -p reth-chainspec --lib --tests` | `r211-t-vendored3.log` | 0 | 522 passed, 4 ignored (incl. the new nippy-jar test and the restored dev fork id; `r211-t-vendored2.log` was the fork-id failure) |
 | `cargo test -p n42-clique-utils -p n42-tx-ingest -p n42-tx-types -p n42-clique` (the secp256k1 port) | `r211-t-touched.log` | 0 | 211 passed, 6 ignored |
 
+## Dependency advisories (2026-11-15)
+
+`cargo-audit` is not installed here. The check matched every lockfile in the repository
+(`Cargo.lock`, `ddn/Cargo.lock`, `docs/sigbench/Cargo.lock`) two ways:
+
+- against a fresh clone of `rustsec/advisory-db` (`02e2517`, at `/data/n42-build/rustsec`);
+- against OSV.dev, which also carries the GHSA ids GitHub reports.
+
+Only crates.io packages were checked; the git-sourced reth and evm2 crates are not. GitHub's
+count on main ("4 advisories, 1 moderate, 3 low") is consistent with the four rustls advisories in
+`ddn/Cargo.lock`. The root lock has no rustls hit.
+
+| Advisory | Crate (lock) | Kind | Status |
+|---|---|---|---|
+| RUSTSEC-2026-0346 / 0347 / 0348 / 0349 (GHSA-c8m5…, -h2v8…, -vp88…, -w44r…) | rustls 0.23.45 (ddn) | TLS secrets in `Debug`, ECH data leak, Brotli 1 GiB allocation, ServerHello downgrade | **fixed**: 0.23.46 (d7bba8f47) |
+| RUSTSEC-2026-0382 | rustls-webpki 0.103.15 (ddn) | distrusted intermediates accepted | **fixed**: 0.103.17 |
+| RUSTSEC-2026-0383 | webpki-root-certs 1.0.9 (ddn) | distrusted emSign roots | **fixed**: 1.0.12 |
+| RUSTSEC-2026-0386 | tokio 1.53.2 (ddn) | unsound `AsyncFd::new` | **fixed**: 1.54.1 |
+| RUSTSEC-2026-0486 | rustix 1.1.5 (ddn) | unsound xattr zero-length buffer | **fixed**: 1.1.6 |
+| RUSTSEC-2026-0387 | crypto-bigint 0.5.5 (all three) | timing variability in constant-time ops | **left**: fixed only in 0.7.6, a major bump. 0.5 comes from `elliptic-curve` 0.13 / `k256` 0.13, alloy's RustCrypto generation. The node recovers senders with libsecp256k1, and k256 signs only in tooling (`TX_FLOOD_K256_SIGN`, mobile-sdk) |
+| RUSTSEC-2024-0436 | paste 1.0.15 (root, ddn) | unmaintained | **left**: pulled in by evm2 / evm2-jit-builtins (upstream); the N42 repairs already use `pastey` |
+| RUSTSEC-2024-0388 | derivative 2.2.0 (ddn) | unmaintained | **left**: transitive, ddn only |
+| RUSTSEC-2026-0162 / 0163 / 0165 | pqcrypto-traits / -internals / -falcon (sigbench) | unmaintained | **left**: the signature benchmark only, not built with the node |
+
+The v2.11.0 upgrade itself clears none of these: the root lock carries the same two hits as main.
+The ddn bumps are lock-only. `cargo test --locked` in ddn passes (`ci/r211-ddn-test.log`, four
+test binaries).
+
 ## Left for the coordinator
 
-- `roll --kill`: the k90 and k20 runs, the second with a kill before the first persistence.
-  The static-file deferred truncation and the nippy-jar bulk-append fix are on the unwind path.
 - The X22 throughput pair against main. Two things there could show: `evm2::block` under the
   builder and follower, and evm2's interpreter changes (64-byte aligned dispatch, tco stack
   length in bytes).

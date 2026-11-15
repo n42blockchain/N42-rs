@@ -250,6 +250,9 @@ pub struct H2Service<E> {
     /// Our own blocks as the execution layer takes them, from the driver's
     /// spawned import; each one is the parent of the next build ahead.
     own_imports: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
+    /// Our own blocks whose import ended without a Valid answer: a commit
+    /// the driver held for one is sent then (`ExecutionDriver::own_import_ended`).
+    own_import_ends: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
     /// Verdicts of follower imports the driver ran on a task (bench only,
     /// `N42_VOTE_BEFORE_IMPORT=1`).
     foreign_imports: Option<tokio::sync::mpsc::UnboundedReceiver<n42_h2_execution::ImportReport>>,
@@ -1537,6 +1540,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             transport,
             engine,
             own_imports: driver.take_own_imports(),
+            own_import_ends: driver.take_own_import_ends(),
             foreign_imports: driver.take_foreign_imports(),
             commit_reports: driver.take_commit_reports(),
             driver,
@@ -2063,6 +2067,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                 () = std::future::ready(()) => {}
             }
             self.drain_commit_reports(&mut events).await?;
+            // The own imports' reports too: a leader that keeps advancing
+            // returns here every step and never reaches the select below,
+            // and a commit the driver holds for an own import runs only on
+            // that import's report.
+            self.drain_own_import_reports(&mut events).await?;
             self.drain_outputs(&mut events).await?;
             self.forward_inbound_transactions();
             self.flush_outbox(&mut events);
@@ -2089,6 +2098,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let mobile_outbound = self.mobile_outbound.as_mut();
         let body_rx = self.body_rx.as_mut();
         let own_imports = self.own_imports.as_mut();
+        let own_import_ends = self.own_import_ends.as_mut();
         let foreign_imports = self.foreign_imports.as_mut();
         let commit_reports = self.commit_reports.as_mut();
 
@@ -2195,23 +2205,18 @@ impl<E: ExecutionLayer> H2Service<E> {
                     None => std::future::pending().await,
                 }
             } => {
-                // Our own block is in the execution layer: the parent the
-                // next build ahead wants. Flushed at the end of this step.
                 if let Some(hash) = imported {
-                    self.prepare_on = Some(hash);
-                    // And it is a block the execution layer holds, which is
-                    // the two things a follower import would have moved: the
-                    // height the next block is judged against, and a commit
-                    // for it that was answered SYNCING while it was landing.
-                    // Without them the head stays at the block before this
-                    // node's own last one and every block after it is held
-                    // for ever (defect 12).
-                    if let Some(header) = self.block_headers.get(&hash) {
-                        self.note_imported(header.number);
-                    }
-                    if let Some(action) = self.driver.own_block_imported(hash).await {
-                        self.apply_driver_action(action, &mut events)?;
-                    }
+                    self.on_own_import(hash, &mut events).await?;
+                }
+            }
+            ended = async {
+                match own_import_ends {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(hash) = ended {
+                    self.on_own_import_end(hash, &mut events).await?;
                 }
             }
             () = &mut timeout => {
@@ -3111,6 +3116,45 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             self.halt_on_commit_refusal();
         }
+    }
+
+    /// Our own block is in the execution layer: the parent the next build
+    /// ahead wants (flushed by the next `flush_prepare`).
+    async fn on_own_import(&mut self, hash: B256, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+        self.prepare_on = Some(hash);
+        // And it is a block the execution layer holds, which is the two
+        // things a follower import would have moved: the height the next
+        // block is judged against, and a commit for it that was held or
+        // answered SYNCING while it was landing. Without them the head stays
+        // at the block before this node's own last one and every block after
+        // it is held for ever (defect 12).
+        if let Some(header) = self.block_headers.get(&hash) {
+            self.note_imported(header.number);
+        }
+        if let Some(action) = self.driver.own_block_imported(hash).await {
+            self.apply_driver_action(action, events)?;
+        }
+        Ok(())
+    }
+
+    /// Our own block's import ended without a Valid answer: a commit the
+    /// driver held for it is sent now (`ExecutionDriver::own_import_ended`).
+    async fn on_own_import_end(&mut self, hash: B256, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+        if let Some(action) = self.driver.own_import_ended(hash).await {
+            self.apply_driver_action(action, events)?;
+        }
+        Ok(())
+    }
+
+    /// The own imports' reports already in their channels, without waiting.
+    async fn drain_own_import_reports(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+        while let Some(hash) = self.own_imports.as_mut().and_then(|rx| rx.try_recv().ok()) {
+            self.on_own_import(hash, events).await?;
+        }
+        while let Some(hash) = self.own_import_ends.as_mut().and_then(|rx| rx.try_recv().ok()) {
+            self.on_own_import_end(hash, events).await?;
+        }
+        Ok(())
     }
 
     async fn handle_output(

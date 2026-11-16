@@ -609,6 +609,10 @@ pub enum NodeStateError {
         /// The root of the rebuilt tree.
         restored: B256,
     },
+    /// QMDB history (`N42_QMDB_HISTORY`) is misconfigured or could not be
+    /// opened: refused at start rather than run without it.
+    #[error("QMDB history: {0}")]
+    History(String),
 }
 
 /// The state roots of the last [`HeadRoots::SLOTS`] persisted heads, in a
@@ -856,6 +860,11 @@ struct Inner {
     /// ([`QmdbNodeState::expect_head_root`]): the check a restart falls back
     /// on when `forest.roots` has no record of that head.
     head_header_root: std::sync::OnceLock<((u64, B256), B256)>,
+    /// What `N42_QMDB_HISTORY` asked for (an unparsable value is refused at
+    /// initialisation); overridable before it ([`QmdbNodeState::set_history_mode`]).
+    history_mode: Mutex<Result<crate::history::HistoryMode, String>>,
+    /// The history, once opened by initialisation.
+    history: std::sync::OnceLock<Arc<crate::history::QmdbHistory>>,
 }
 
 /// A rename queued by [`QmdbNodeState::rename_or_defer`].
@@ -1323,6 +1332,8 @@ impl QmdbNodeState {
                 occupancy: Default::default(),
                 unchecked_restart: std::sync::OnceLock::new(),
                 head_header_root: std::sync::OnceLock::new(),
+                history_mode: Mutex::new(crate::history::HistoryMode::from_env()),
+                history: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -1746,6 +1757,9 @@ impl QmdbNodeState {
     /// back through its journals to it, and the forest keeps the records of
     /// the blocks after it for the view's next advances.
     pub fn on_unwound(&self, number: u64) {
+        if let Some(history) = self.inner.history.get() {
+            history.truncate_above(number);
+        }
         let Some(view) = self.inner.read_view.get() else { return };
         if view.head().0 <= number {
             return;
@@ -1810,6 +1824,60 @@ impl QmdbNodeState {
             forest.set_keep_from(None);
             Ok(())
         });
+    }
+
+    /// Overrides `N42_QMDB_HISTORY` for this node state; takes effect at
+    /// initialisation.
+    pub fn set_history_mode(&self, mode: crate::history::HistoryMode) {
+        *self.inner.history_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Ok(mode);
+    }
+
+    /// The history mode, refused when it cannot be honoured: an unparsable
+    /// value, heap-mode entries (history reads past records from
+    /// `entries.log`), or the entry compaction (it punches the dead records
+    /// a past height's proofs read).
+    fn checked_history_mode(&self) -> Result<crate::history::HistoryMode, NodeStateError> {
+        let mode = self
+            .inner
+            .history_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .map_err(NodeStateError::History)?;
+        if !mode.is_on() {
+            return Ok(mode);
+        }
+        if !self.inner.entry_file {
+            return Err(NodeStateError::History(format!(
+                "{}={mode:?} needs the entry file (N42_QMDB_ENTRY_FILE=1): past states are read from entries.log",
+                crate::history::HISTORY_ENV
+            )));
+        }
+        if self.inner.entry_compaction.config().enabled {
+            return Err(NodeStateError::History(format!(
+                "{}={mode:?} cannot run with N42_QMDB_COMPACT=1: compaction punches the dead records past heights are proved from",
+                crate::history::HISTORY_ENV
+            )));
+        }
+        Ok(mode)
+    }
+
+    /// The QMDB history, when the node keeps one.
+    pub fn history(&self) -> Option<Arc<crate::history::QmdbHistory>> {
+        self.inner.history.get().cloned()
+    }
+
+    /// Proves raw QMDB `keys` as the state stood after block `target`, against
+    /// `expected_root` (the root the header that commits that state carries).
+    /// See [`crate::history`].
+    pub fn prove_historical(
+        &self,
+        target: (u64, B256),
+        expected_root: B256,
+        keys: &[[u8; 32]],
+    ) -> Result<crate::history::HistoricalProof, crate::history::HistoryError> {
+        let history = self.inner.history.get().ok_or(crate::history::HistoryError::Disabled)?;
+        history.prove(target, expected_root, keys, self)
     }
 
     /// Whether the entries live in the file.
@@ -2677,8 +2745,16 @@ impl QmdbNodeState {
             return Ok(());
         }
         let (head_number, head_hash) = head;
+        let history_mode = self.checked_history_mode()?;
         if self.inner.entry_file {
             let mut forest = with_configured_retention(self.initialize_file_mode(head, &mut cursor)?);
+            if history_mode.is_on() {
+                let opened = crate::history::QmdbHistory::open(&self.inner.dir, history_mode, forest.head(), || {
+                    forest.checkpoint().map_err(|error| error.to_string())
+                })
+                .map_err(|error| NodeStateError::History(error.to_string()))?;
+                let _ = self.inner.history.set(Arc::new(opened));
+            }
             if self.inner.read_view_wanted.load(std::sync::atomic::Ordering::Relaxed) {
                 self.build_read_view(&mut forest, head);
             }
@@ -3584,6 +3660,9 @@ impl QmdbNodeState {
             }
             cursor.head = block_hash;
             self.record_head_roots(&roots);
+            if let Some(history) = self.inner.history.get() {
+                history.record(&deltas);
+            }
             if checkpoint_due(cursor) {
                 return self.rewrite_checkpoint(target.map(|_| block_hash), cursor);
             }
@@ -3623,6 +3702,9 @@ impl QmdbNodeState {
         cursor.log_len = written;
         self.inner.entry_compaction.note_logged(delta.head_number, delta.next_slot);
         self.record_head_roots(&[(delta.head_number, block_hash, root)]);
+        if let Some(history) = self.inner.history.get() {
+            history.record(core::slice::from_ref(&delta));
+        }
         debug!(
             target: "n42.qmdb",
             block = delta.head_number, %block_hash,
@@ -4062,6 +4144,9 @@ impl QmdbNodeState {
             let archive = self.archive_before_rewrite(&self.ckpt_path(), (ckpt.head_number, block_hash))?;
             let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
             self.record_head_roots(&[(ckpt.head_number, block_hash, root)]);
+            if let Some(history) = self.inner.history.get() {
+                history.note_checkpoint(&ckpt);
+            }
             self.retire_superseded_log(archive.as_deref())?;
             *cursor = PersistCursor {
                 head: block_hash,
@@ -4190,6 +4275,16 @@ const ARCHIVE_RETIRE_MARGIN: u64 = 64;
 fn checkpoint_due(cursor: &PersistCursor) -> bool {
     cursor.log_len >= cursor.checkpoint_len.saturating_mul(checkpoint_ratio())
         && cursor.log_len >= MIN_LOG_BEFORE_CHECKPOINT
+}
+
+impl crate::history::LiveTree for QmdbNodeState {
+    fn live_slot_of(&self, key: &[u8; 32]) -> Option<u64> {
+        self.lock_as("history_probe").as_ref()?.live_slot_of(key)
+    }
+
+    fn offsets_reader(&self) -> Option<n42_twig_core::offsets::OffsetsReader> {
+        self.lock_as("history_probe").as_ref()?.entry_offsets_reader()
+    }
 }
 
 impl StateProofProvider for QmdbNodeState {
@@ -6050,6 +6145,206 @@ mod tests {
         sync_parent_dir(&path).unwrap();
         sync_parent_dir(Path::new("no-directory-part")).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What one history test chain recorded at every height: the block, the
+    /// root after it, and the head proof of account 7 (account 1 at genesis)
+    /// then.
+    struct Recorded {
+        hash: B256,
+        root: B256,
+        proof7: n42_twig_core::qmdb_compat::QmdbProof,
+    }
+
+    fn history_key(number: u64) -> [u8; 32] {
+        use alloy_primitives::{Address, U256};
+        n42_twig_core::qmdb_compat::gov5_account_key(&Address::from_word(B256::from(U256::from(number))).0 .0)
+    }
+
+    fn history_grow(state: &QmdbNodeState, chain: &mut Vec<Recorded>, to: u64) {
+        use alloy_primitives::{Address, U256};
+        for number in chain.len() as u64..=to {
+            let (hash, root) = advance(state, number, chain.last().unwrap().hash);
+            let (proof7, head_root) =
+                state.prove_with_root(Address::from_word(B256::from(U256::from(7u64))), None).unwrap();
+            assert_eq!(head_root, root);
+            chain.push(Recorded { hash, root, proof7 });
+        }
+    }
+
+    fn history_chain(state: &QmdbNodeState, chain: &Arc<ChainSpec>, to: u64) -> Vec<Recorded> {
+        let mut out = vec![Recorded {
+            hash: chain.genesis_hash(),
+            root: chain.genesis_header.state_root,
+            proof7: state.prove_with_root(alloy_primitives::Address::with_last_byte(1), None).unwrap().0,
+        }];
+        history_grow(state, &mut out, to);
+        out
+    }
+
+    /// Every height history holds proves the keys it had, against that
+    /// height's root, byte-identical to the head proof cut then; absent keys
+    /// come back without a proof; a wrong root is refused.
+    fn check_heights(state: &QmdbNodeState, chain: &[Recorded], heights: impl IntoIterator<Item = u64>) {
+        for n in heights {
+            let at = &chain[n as usize];
+            let keys = [history_key(7), history_key(n.max(1)), history_key(n + 1), history_key(1)];
+            let proof = state.prove_historical((n, at.hash), at.root, &keys).unwrap_or_else(|e| panic!("block {n}: {e}"));
+            assert_eq!(proof.root, at.root);
+            // Account 7 is rewritten from block 1 on.
+            match &proof.keys[0].proof {
+                Some(p) => {
+                    assert!(n >= 1, "account 7 does not exist at genesis");
+                    assert!(p.verify_for_key(&at.root.0, &keys[0]));
+                    assert_eq!(p.encode().unwrap(), at.proof7.encode().unwrap(), "block {n}: the historical proof is the head proof of then");
+                }
+                None => assert_eq!(n, 0),
+            }
+            // The account block n created exists at n (block 0: genesis account 1).
+            let created = proof.keys[1].proof.as_ref().unwrap_or_else(|| panic!("block {n}: the account created at it"));
+            assert!(created.verify_for_key(&at.root.0, &keys[1]));
+            // The next block's account does not exist yet (7 aside).
+            if n + 1 != 7 && n != 0 {
+                assert!(proof.keys[2].proof.is_none(), "block {n}: the account of block {} is not there yet", n + 1);
+            }
+            // Account 1: the genesis alloc's, rewritten at block 1.
+            let one = proof.keys[3].proof.as_ref().expect("account 1 exists from genesis");
+            assert!(one.verify_for_key(&at.root.0, &keys[3]));
+            if n == 0 {
+                assert_eq!(one.encode().unwrap(), at.proof7.encode().unwrap(), "the genesis proof is the head proof at genesis");
+            }
+            let wrong = state.prove_historical((n, at.hash), B256::repeat_byte(0x5A), &keys[..1]);
+            assert!(matches!(wrong, Err(crate::history::HistoryError::RootMismatch { .. })), "block {n}: {wrong:?}");
+        }
+    }
+
+    fn copied(chain: &[Recorded]) -> Vec<Recorded> {
+        chain.iter().map(|r| Recorded { hash: r.hash, root: r.root, proof7: r.proof7.clone() }).collect()
+    }
+
+    #[test]
+    fn history_proves_every_kept_height_and_survives_a_restart_and_an_unwind() {
+        use crate::history::{HistoryError, HistoryMode};
+        let chain = qmdb_chain();
+        let dir = scratch("history-all");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        state.set_history_mode(HistoryMode::All);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let recorded = history_chain(&state, &chain, 40);
+        assert_eq!(state.history().unwrap().range(), (0, 40));
+        check_heights(&state, &recorded, [0, 1, 2, 6, 7, 8, 19, 33, 39, 40]);
+        assert!(matches!(
+            state.prove_historical((12, B256::repeat_byte(1)), recorded[12].root, &[history_key(7)]),
+            Err(HistoryError::NotRecorded { .. })
+        ));
+        state.wait_for_compaction();
+        drop(state);
+
+        // A restart keeps every height.
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        restarted.set_history_mode(HistoryMode::All);
+        restarted.initialize((40, recorded[40].hash)).unwrap();
+        assert_eq!(restarted.history().unwrap().range(), (0, 40));
+        check_heights(&restarted, &recorded, [0, 3, 21, 40]);
+        restarted.wait_for_compaction();
+        drop(restarted);
+
+        // The database restarts lower (an unwind): history is cut there and
+        // the heights above it come back as not recorded yet.
+        let unwound = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        unwound.set_history_mode(HistoryMode::All);
+        unwound.initialize((30, recorded[30].hash)).unwrap();
+        assert_eq!(unwound.history().unwrap().range(), (0, 30));
+        assert!(matches!(
+            unwound.prove_historical((35, recorded[35].hash), recorded[35].root, &[history_key(7)]),
+            Err(HistoryError::NotYet { requested: 35, latest: 30 })
+        ));
+        check_heights(&unwound, &recorded, [0, 15, 30]);
+        // The chain grows again from there, and the new heights are proved.
+        let mut regrown = copied(&recorded[..=30]);
+        history_grow(&unwound, &mut regrown, 36);
+        check_heights(&unwound, &regrown, [29, 31, 36]);
+        // And an unwind notified while running cuts it too.
+        unwound.on_unwound(33);
+        assert_eq!(unwound.history().unwrap().range(), (0, 33));
+        unwound.wait_for_compaction();
+        drop(unwound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_keeps_the_last_blocks_and_reports_the_rest_as_pruned() {
+        use crate::history::{HistoryError, HistoryMode};
+        let chain = qmdb_chain();
+        let dir = scratch("history-keep");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        state.set_history_mode(HistoryMode::Keep(8));
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let recorded = history_chain(&state, &chain, 40);
+        let (earliest, latest) = state.history().unwrap().range();
+        assert_eq!(latest, 40);
+        assert!((40 - 8 - 16..=40 - 8).contains(&earliest), "earliest {earliest}");
+        let below = earliest as usize - 1;
+        assert!(matches!(
+            state.prove_historical((below as u64, recorded[below].hash), recorded[below].root, &[history_key(7)]),
+            Err(HistoryError::Pruned { earliest: e, .. }) if e == earliest
+        ));
+        check_heights(&state, &recorded, [earliest, earliest + 1, 39, 40]);
+        state.wait_for_compaction();
+        drop(state);
+        // A restart keeps the pruned base.
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        restarted.set_history_mode(HistoryMode::Keep(8));
+        restarted.initialize((40, recorded[40].hash)).unwrap();
+        assert_eq!(restarted.history().unwrap().range(), (earliest, 40));
+        check_heights(&restarted, &recorded, [earliest, 40]);
+        restarted.wait_for_compaction();
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_enabled_late_starts_at_the_head_and_refuses_what_it_cannot_honour() {
+        use crate::history::{HistoryError, HistoryMode};
+        let chain = qmdb_chain();
+        let dir = scratch("history-late");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        state.set_history_mode(HistoryMode::Off);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        assert!(state.history().is_none());
+        assert!(matches!(state.prove_historical((0, chain.genesis_hash()), B256::ZERO, &[]), Err(HistoryError::Disabled)));
+        let recorded = history_chain(&state, &chain, 12);
+        state.wait_for_compaction();
+        drop(state);
+        assert!(!dir.join(crate::history::HISTORY_DIR).exists(), "history off writes nothing");
+
+        let late = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        late.set_history_mode(HistoryMode::All);
+        late.initialize((12, recorded[12].hash)).unwrap();
+        assert_eq!(late.history().unwrap().range(), (12, 12));
+        assert!(matches!(
+            late.prove_historical((5, recorded[5].hash), recorded[5].root, &[history_key(7)]),
+            Err(HistoryError::Pruned { requested: 5, earliest: 12 })
+        ));
+        // A base that is not genesis: keys untouched since are found through
+        // the live tree, keys changed since through their retirements.
+        let mut grown = copied(&recorded);
+        history_grow(&late, &mut grown, 20);
+        check_heights(&late, &grown, [12, 13, 17, 20]);
+        late.wait_for_compaction();
+        drop(late);
+
+        // Heap mode cannot keep history; neither can a bad value.
+        let heap_dir = scratch("history-heap");
+        let heap = QmdbNodeState::new_with_entry_file(chain.clone(), &heap_dir, false);
+        heap.set_history_mode(HistoryMode::All);
+        assert!(matches!(heap.initialize((0, chain.genesis_hash())), Err(NodeStateError::History(_))));
+        assert!(HistoryMode::parse("lots").is_err());
+        assert_eq!(HistoryMode::parse("all"), Ok(HistoryMode::All));
+        assert_eq!(HistoryMode::parse(" 128 "), Ok(HistoryMode::Keep(128)));
+        assert_eq!(HistoryMode::parse("off"), Ok(HistoryMode::Off));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&heap_dir);
     }
 }
 

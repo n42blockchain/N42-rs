@@ -26,6 +26,7 @@ pub mod entry_compaction;
 pub mod executed_fields;
 pub mod chainspec;
 pub mod changes;
+pub mod history;
 pub mod hotstuff;
 pub mod node_state;
 mod recovery_frontier;

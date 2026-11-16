@@ -2027,6 +2027,56 @@ impl QmdbForest {
         self.min_cursor = self.tree.next_slot();
     }
 
+    /// A historical prover's one read of the live tree, under one hold of
+    /// the forest's lock: each key's live slot, the entry log's offsets and,
+    /// with `retired_since = (ancestor, below, limit)`, the slots below
+    /// `below` that the blocks applied since `ancestor` (the pending one
+    /// included) deactivated. Never moves the tree; `None` while it is
+    /// leased out or poisoned.
+    pub fn history_probe(&self, keys: &[[u8; 32]], retired_since: Option<(B256, u64, usize)>) -> Option<LiveProbe> {
+        if self.is_leased() || self.poisoned.is_some() {
+            return None;
+        }
+        let offsets = self.tree.entry_offsets_reader()?;
+        let slots = keys.iter().map(|key| self.tree.slot_of(key)).collect();
+        let retired_since = retired_since.and_then(|(ancestor, below, limit)| self.retired_since(ancestor, below, limit));
+        Some(LiveProbe { slots, offsets, retired_since })
+    }
+
+    /// The slots below `below` the blocks applied on the tree since
+    /// `ancestor` deactivated, walking the applied records (their undo
+    /// records name what they retired) from the tree's position back to
+    /// `ancestor`; `None` when that walk leaves the window or meets a block
+    /// not applied, or past `limit` slots.
+    fn retired_since(&self, ancestor: B256, below: u64, limit: usize) -> Option<Vec<u64>> {
+        let mut out = Vec::new();
+        let mut take = |undo: &BlockUndo| -> bool {
+            for slot in undo.retired_slots() {
+                if slot < below {
+                    out.push(slot);
+                    if out.len() > limit {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+        if let Some((parent, undo)) = &self.pending {
+            if *parent != self.tip || !take(undo) {
+                return None;
+            }
+        }
+        let mut current = self.tip;
+        while current != ancestor {
+            let record = self.records.get(&current)?;
+            if !take(record.undo.as_ref()?) {
+                return None;
+            }
+            current = record.parent;
+        }
+        Some(out)
+    }
+
     /// The slot holding raw QMDB key `key`'s live entry on the tree as it
     /// stands now (which may be above or beside the canonical head), without
     /// moving it; `None` when the key has no live entry or the tree is leased
@@ -2359,6 +2409,21 @@ pub trait StateProofProvider: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the QMDB head moved while the proof was cut; retry")]
 pub struct ProofRootMismatch;
+
+/// What a historical prover reads from the live tree in one hold of its lock
+/// ([`QmdbForest::history_probe`]).
+#[derive(Debug, Clone)]
+pub struct LiveProbe {
+    /// Each key's live slot on the tree as it stands (`None`: no live entry).
+    pub slots: Vec<Option<u64>>,
+    /// The entry log's offsets, lock-free from here on.
+    pub offsets: n42_twig_core::offsets::OffsetsReader,
+    /// When asked: the slots below the given bound that the blocks applied
+    /// on the tree since the given ancestor deactivated; `None` when the
+    /// tree does not descend from it within the forest's window, or when
+    /// there are more than the limit.
+    pub retired_since: Option<Vec<u64>>,
+}
 
 impl QmdbForest {
     /// [`StateProofProvider::prove_with_root`] on a forest already held:

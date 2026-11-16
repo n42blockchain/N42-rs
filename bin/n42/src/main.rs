@@ -215,6 +215,7 @@ fn main() {
             };
             let qmdb_for_startup = qmdb.clone();
             let qmdb_before_launch = qmdb.clone();
+            let qmdb_for_rpc = qmdb.clone();
 
             let NodeHandle {
                 node,
@@ -486,6 +487,45 @@ fn main() {
                         in_memory_blocks: Some(in_memory_blocks),
                         persisted_block: Some(persisted_block),
                     };
+
+                    // A QMDB chain proves state from the forest: `n42_getProof`
+                    // (QMDB twig proofs at persisted blocks, from the history
+                    // `N42_QMDB_HISTORY` keeps), and `eth_getProof` -- whose
+                    // Merkle-Patricia proofs would not verify against a QMDB
+                    // header -- refused with a pointer to it.
+                    if let Some(qmdb) = qmdb_for_rpc {
+                        use reth_provider::ChainSpecProvider;
+                        let genesis = ctx.provider().chain_spec().genesis().clone();
+                        let root_offset: n42::qmdb_proof_ext::RootOffset = std::sync::Arc::new(move |timestamp| {
+                            if reth_chainspec::qmdb::deferred_execution_active_at(&genesis, timestamp) {
+                                reth_chainspec::qmdb::deferred_execution_depth_at(&genesis, timestamp)
+                            } else {
+                                0
+                            }
+                        });
+                        let finish_provider = ctx.provider().clone();
+                        let persisted: n42::qmdb_proof_ext::PersistedHead = std::sync::Arc::new(move || {
+                            use reth_db_api::transaction::DbTx;
+                            use reth_provider::DatabaseProviderFactory;
+                            let database = finish_provider.database_provider_ro().ok()?;
+                            database
+                                .tx_ref()
+                                .get::<reth_db_api::tables::StageCheckpoints>("Finish".to_owned())
+                                .ok()?
+                                .map(|checkpoint| checkpoint.block_number)
+                        });
+                        let proofs = n42::qmdb_proof_ext::QmdbProofExt {
+                            state: qmdb,
+                            provider: ctx.provider().clone(),
+                            root_offset,
+                            persisted,
+                        };
+                        use n42::qmdb_proof_ext::QmdbProofApiServer;
+                        ctx.modules.merge_configured(proofs.into_rpc())?;
+                        ctx.modules.replace_configured(n42::qmdb_proof_ext::eth_get_proof_refusal())?;
+                        ctx.auth_module.replace_auth_methods(n42::qmdb_proof_ext::eth_get_proof_refusal())?;
+                        info!(target: "reth::cli", "QMDB proof namespace enabled (n42_getProof); eth_getProof refused");
+                    }
 
                     // now we merge our extension namespace into all configured transports
                     ctx.auth_module.merge_auth_methods(ext.into_rpc())?;

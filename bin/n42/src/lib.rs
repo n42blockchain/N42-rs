@@ -47,6 +47,7 @@ pub mod engine_ext;
 pub mod follower_import;
 pub mod import_once;
 pub mod payload_serve;
+pub mod qmdb_proof_ext;
 pub mod queue_prune;
 pub mod queue_reorg;
 pub mod road_runtime;

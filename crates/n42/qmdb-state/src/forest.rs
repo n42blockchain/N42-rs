@@ -2027,6 +2027,28 @@ impl QmdbForest {
         self.min_cursor = self.tree.next_slot();
     }
 
+    /// The slot holding raw QMDB key `key`'s live entry on the tree as it
+    /// stands now (which may be above or beside the canonical head), without
+    /// moving it; `None` when the key has no live entry or the tree is leased
+    /// out. A historical prover's candidate, which it validates against the
+    /// active bits it reconstructs for its height.
+    pub fn live_slot_of(&self, key: &[u8; 32]) -> Option<u64> {
+        if self.is_leased() || self.poisoned.is_some() {
+            return None;
+        }
+        self.tree.slot_of(key)
+    }
+
+    /// A lock-free reader of the entry file's record offsets by slot
+    /// (`n42_twig_core::offsets`); `None` in the heap or while the tree is
+    /// leased out. It follows the tree from now on, not a copy of it.
+    pub fn entry_offsets_reader(&self) -> Option<n42_twig_core::offsets::OffsetsReader> {
+        if self.is_leased() {
+            return None;
+        }
+        self.tree.entry_offsets_reader()
+    }
+
     /// The value of raw QMDB key `key` at the canonical head, if it is live.
     pub fn value_at_head(&mut self, key: &[u8; 32]) -> Option<Vec<u8>> {
         self.move_to(self.head.1).ok()?;

@@ -89,6 +89,9 @@ past heights read).
   block. A multi-block persistence (rare: a branch switch or the delta fallback) makes the heights
   inside it unprovable; a rewind of persisted state makes the heights below it unprovable.
 - **Unwind / restart.** Records above the database head are cut at start, and on `on_unwound`.
+  An offline `n42 stage unwind` does not work on a QMDB chain independently of history (the stock
+  `MerkleUnwind` stage checks an MPT root; docs/BFT_RECOVERY_AUDIT.md) and leaves the database
+  refusing to start; an EL that loses unpersisted blocks to a crash resumes from its database head.
 - **Pruning.** `<blocks>` folds the oldest records into `base.ckpt` once a quarter more (at least
   16) has accumulated; `all` never prunes.
 - **Disk.** Per block: its delta (12 B frame + 41 B header + 9 B per retired slot), i.e. what

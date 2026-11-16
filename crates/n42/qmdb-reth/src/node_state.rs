@@ -865,6 +865,8 @@ struct Inner {
     history_mode: Mutex<Result<crate::history::HistoryMode, String>>,
     /// The history, once opened by initialisation.
     history: std::sync::OnceLock<Arc<crate::history::QmdbHistory>>,
+    /// History tuning set in code (tests); `None`: from the environment.
+    history_config: Mutex<Option<crate::history::HistoryConfig>>,
 }
 
 /// A rename queued by [`QmdbNodeState::rename_or_defer`].
@@ -1334,6 +1336,7 @@ impl QmdbNodeState {
                 head_header_root: std::sync::OnceLock::new(),
                 history_mode: Mutex::new(crate::history::HistoryMode::from_env()),
                 history: std::sync::OnceLock::new(),
+                history_config: Mutex::new(None),
             }),
         }
     }
@@ -1830,6 +1833,13 @@ impl QmdbNodeState {
     /// initialisation.
     pub fn set_history_mode(&self, mode: crate::history::HistoryMode) {
         *self.inner.history_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Ok(mode);
+    }
+
+    /// Overrides history's tuning (segment length, request budget) for this
+    /// node state; takes effect at initialisation. The mode stays the one
+    /// [`Self::set_history_mode`] or the environment sets.
+    pub fn set_history_config(&self, config: crate::history::HistoryConfig) {
+        *self.inner.history_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(config);
     }
 
     /// The history mode, refused when it cannot be honoured: an unparsable
@@ -2749,9 +2759,32 @@ impl QmdbNodeState {
         if self.inner.entry_file {
             let mut forest = with_configured_retention(self.initialize_file_mode(head, &mut cursor)?);
             if history_mode.is_on() {
-                let opened = crate::history::QmdbHistory::open(&self.inner.dir, history_mode, forest.head(), || {
-                    forest.checkpoint().map_err(|error| error.to_string())
-                })
+                // The worker reads the entry log's offsets through a weak
+                // handle: history never keeps the node state alive. At open
+                // (this thread holds the forest's lock) they come from the
+                // forest directly.
+                let weak = Arc::downgrade(&self.inner);
+                let offsets: crate::history::OffsetsSource = Arc::new(move || {
+                    let inner = weak.upgrade()?;
+                    QmdbNodeState { inner }.lock_as("history_probe").as_ref()?.entry_offsets_reader()
+                });
+                let at_open = forest.entry_offsets_reader();
+                let relocated_bytes = forest.entry_stats().relocated_bytes;
+                let config = self
+                    .inner
+                    .history_config
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(|| crate::history::HistoryConfig::new(history_mode));
+                let opened = crate::history::QmdbHistory::open(
+                    &self.inner.dir,
+                    crate::history::HistoryConfig { mode: history_mode, ..config },
+                    forest.head(),
+                    || forest.checkpoint().map_err(|error| error.to_string()),
+                    at_open,
+                    relocated_bytes,
+                    offsets,
+                )
                 .map_err(|error| NodeStateError::History(error.to_string()))?;
                 let _ = self.inner.history.set(Arc::new(opened));
             }
@@ -4278,12 +4311,9 @@ fn checkpoint_due(cursor: &PersistCursor) -> bool {
 }
 
 impl crate::history::LiveTree for QmdbNodeState {
-    fn live_slot_of(&self, key: &[u8; 32]) -> Option<u64> {
-        self.lock_as("history_probe").as_ref()?.live_slot_of(key)
-    }
-
-    fn offsets_reader(&self) -> Option<n42_twig_core::offsets::OffsetsReader> {
-        self.lock_as("history_probe").as_ref()?.entry_offsets_reader()
+    fn probe(&self, keys: &[[u8; 32]], retired_since: Option<(B256, u64, usize)>) -> Option<n42_qmdb_state::LiveProbe> {
+        // One acquisition for every key of a request.
+        self.lock_as("history_probe").as_ref()?.history_probe(keys, retired_since)
     }
 }
 
@@ -6288,6 +6318,8 @@ mod tests {
         state.set_history_mode(HistoryMode::Keep(8));
         state.initialize((0, chain.genesis_hash())).unwrap();
         let recorded = history_chain(&state, &chain, 40);
+        // Pruning runs in the background.
+        state.history().unwrap().sync();
         let (earliest, latest) = state.history().unwrap().range();
         assert_eq!(latest, 40);
         assert!((40 - 8 - 16..=40 - 8).contains(&earliest), "earliest {earliest}");
@@ -6303,10 +6335,189 @@ mod tests {
         let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
         restarted.set_history_mode(HistoryMode::Keep(8));
         restarted.initialize((40, recorded[40].hash)).unwrap();
+        restarted.history().unwrap().sync();
         assert_eq!(restarted.history().unwrap().range(), (earliest, 40));
         check_heights(&restarted, &recorded, [earliest, 40]);
         restarted.wait_for_compaction();
         drop(restarted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wide_addr(n: u64) -> alloy_primitives::Address {
+        alloy_primitives::Address::from_word(B256::from(alloy_primitives::U256::from(n)))
+    }
+
+    /// A block that creates 150 accounts, rewrites account 7 and ten of the
+    /// previous block's accounts and deletes one of them: blocks cross twig
+    /// boundaries and retire slots in older twigs. `salt` makes a sibling.
+    fn wide_block(state: &QmdbNodeState, number: u64, parent: B256, salt: u64, canonical: bool) -> (B256, B256) {
+        use alloy_primitives::U256;
+        use n42_qmdb_state::AccountState;
+        let mut changes = BlockChanges::new();
+        let account = |nonce: u64, balance: u64| AccountState { nonce, balance: U256::from(balance), code_hash: B256::ZERO };
+        for i in 0..150 {
+            changes.set_account(wide_addr(number * 1000 + i), account(number + salt, i));
+        }
+        changes.set_account(wide_addr(7), account(number, number * 3 + salt));
+        if number > 1 {
+            for i in 0..10 {
+                changes.set_account(wide_addr((number - 1) * 1000 + i), account(100 + number + salt, i));
+            }
+            changes.delete_account(wide_addr((number - 1) * 1000 + 20));
+        }
+        let hash = B256::from((U256::from(number) << 64) | U256::from(salt));
+        let prepared = state.compute(parent, &changes).unwrap();
+        let root = prepared.root;
+        state.insert(hash, number, prepared).unwrap();
+        if canonical {
+            state.on_canonical(hash).unwrap();
+        }
+        (hash, root)
+    }
+
+    fn wide_probe() -> Vec<alloy_primitives::Address> {
+        [1, 7, 3000, 3005, 3020, 10_001, 25_003, 38_020, 39_000, 41_002, 999_999_999]
+            .into_iter()
+            .map(|n| if n == 1 { alloy_primitives::Address::with_last_byte(1) } else { wide_addr(n) })
+            .collect()
+    }
+
+    /// One height: its block, root, and the head proof (encoded) of every
+    /// probed account then (`None`: no leaf).
+    struct Snap {
+        number: u64,
+        hash: B256,
+        root: B256,
+        proofs: Vec<Option<Vec<u8>>>,
+    }
+
+    fn snap(state: &QmdbNodeState, number: u64, hash: B256, root: B256) -> Snap {
+        let proofs = wide_probe()
+            .into_iter()
+            .map(|address| {
+                state.prove_with_root(address, None).unwrap().map(|(proof, at)| {
+                    assert_eq!(at, root);
+                    proof.encode().unwrap()
+                })
+            })
+            .collect();
+        Snap { number, hash, root, proofs }
+    }
+
+    /// Every probed account at each height is what the head said then: the
+    /// same proof bytes, or no proof.
+    fn check_snaps(state: &QmdbNodeState, snaps: &[Snap], heights: impl IntoIterator<Item = u64>) {
+        let keys: Vec<[u8; 32]> =
+            wide_probe().iter().map(|a| n42_twig_core::qmdb_compat::gov5_account_key(&a.0 .0)).collect();
+        for n in heights {
+            let at = snaps.iter().find(|s| s.number == n).unwrap();
+            let got = state.prove_historical((n, at.hash), at.root, &keys).unwrap_or_else(|e| panic!("block {n}: {e}"));
+            assert_eq!(got.root, at.root);
+            for (i, (answer, want)) in got.keys.iter().zip(&at.proofs).enumerate() {
+                assert_eq!(answer.proof.as_ref().map(|p| p.encode().unwrap()), *want, "block {n}, probe {i}");
+            }
+        }
+    }
+
+    fn grow_wide(state: &QmdbNodeState, snaps: &mut Vec<Snap>, to: u64, salt: u64) {
+        for number in snaps.last().unwrap().number + 1..=to {
+            let (hash, root) = wide_block(state, number, snaps.last().unwrap().hash, salt, true);
+            snaps.push(snap(state, number, hash, root));
+        }
+    }
+
+    fn wide_state(chain: &Arc<ChainSpec>, dir: &Path, config: crate::history::HistoryConfig) -> QmdbNodeState {
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), dir, true);
+        state.set_history_mode(config.mode);
+        state.set_history_config(config);
+        state
+    }
+
+    /// Snapshots every few blocks: every height is still proved byte-for-byte
+    /// as the head proved it then, across twig boundaries; a request reads at
+    /// most the deltas since the snapshot before it (and is refused past its
+    /// budget); records lost between `forest.log` and history (a kill between
+    /// the two appends) are caught up from `forest.log` at the next start; an
+    /// unwind cuts the records and the leaf-root cache, and the branch grown
+    /// on top is proved; a branch switch at the head keeps the heights below
+    /// it provable.
+    #[test]
+    fn history_snapshots_bound_requests_and_survive_twigs_lost_tails_unwinds_and_branch_switches() {
+        use crate::history::{HistoryConfig, HistoryError, HistoryMode};
+        let chain = qmdb_chain();
+        let dir = scratch("history-wide");
+        let config = HistoryConfig { snapshot_blocks: 5, ..HistoryConfig::new(HistoryMode::All) };
+        let state = wide_state(&chain, &dir, config);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let mut snaps = vec![snap(&state, 0, chain.genesis_hash(), chain.genesis_header.state_root)];
+        grow_wide(&state, &mut snaps, 42, 0);
+        let history = state.history().unwrap();
+        history.sync();
+        let (segments, with_snapshot) = history.segments();
+        assert_eq!(segments, 9, "a segment every five blocks, the last one open");
+        assert_eq!(with_snapshot, segments, "every segment's snapshot is written in the background");
+        let twigs = std::fs::metadata(dir.join(crate::history::HISTORY_DIR).join("twigs.idx")).unwrap().len();
+        assert!(twigs >= 3 * 32 && twigs % 32 == 0, "the leaf roots of the full twigs are cached: {twigs}");
+        check_snaps(&state, &snaps, [0, 1, 3, 4, 5, 6, 9, 10, 11, 20, 33, 39, 40, 41, 42]);
+        drop(history);
+        state.wait_for_compaction();
+        drop(state);
+
+        // A budget of one byte: only heights a snapshot stands at are served.
+        let tight = wide_state(&chain, &dir, HistoryConfig { budget_bytes: 1, ..config });
+        tight.initialize((42, snaps[42].hash)).unwrap();
+        check_snaps(&tight, &snaps, [0, 10, 35, 40]);
+        let keys = [history_key(7)];
+        assert!(matches!(
+            tight.prove_historical((12, snaps[12].hash), snaps[12].root, &keys),
+            Err(HistoryError::Budget { requested: 12, .. })
+        ));
+        tight.history().unwrap().sync();
+        tight.wait_for_compaction();
+        drop(tight);
+
+        // A kill after `forest.log` took blocks 41 and 42 but before history
+        // did: the open segment loses them; the next start catches up.
+        let history_dir = dir.join(crate::history::HISTORY_DIR);
+        for ext in ["log", "idx"] {
+            let path = history_dir.join(format!("seg-{:020}.{ext}", 40));
+            assert!(std::fs::metadata(&path).unwrap().len() > 0, "{}", path.display());
+            std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        }
+        let restarted = wide_state(&chain, &dir, config);
+        restarted.initialize((42, snaps[42].hash)).unwrap();
+        assert_eq!(restarted.history().unwrap().range(), (0, 42), "caught up from forest.log, nothing discarded");
+        check_snaps(&restarted, &snaps, [2, 40, 41, 42]);
+
+        // A branch switch at the head: 43 is replaced by a sibling; the
+        // heights below it stay provable, the replaced block is not recorded.
+        grow_wide(&restarted, &mut snaps, 43, 0);
+        let (hash, root) = wide_block(&restarted, 43, snaps[42].hash, 7, true);
+        let old = snaps.pop().unwrap();
+        snaps.push(snap(&restarted, 43, hash, root));
+        assert_eq!(restarted.history().unwrap().range(), (0, 43));
+        check_snaps(&restarted, &snaps, [0, 39, 41, 42, 43]);
+        assert!(matches!(
+            restarted.prove_historical((43, old.hash), old.root, &keys),
+            Err(HistoryError::NotRecorded { number: 43, .. })
+        ));
+        restarted.history().unwrap().sync();
+        restarted.wait_for_compaction();
+        drop(restarted);
+
+        // The database restarts lower (an unwind): the records above it and
+        // the leaf roots of the twigs re-appended from there are cut; a
+        // different branch grows on top and is proved.
+        let unwound = wide_state(&chain, &dir, config);
+        unwound.initialize((17, snaps[17].hash)).unwrap();
+        assert_eq!(unwound.history().unwrap().range(), (0, 17));
+        snaps.truncate(18);
+        grow_wide(&unwound, &mut snaps, 30, 1);
+        unwound.history().unwrap().sync();
+        check_snaps(&unwound, &snaps, [0, 16, 17, 18, 22, 25, 29, 30]);
+        unwound.wait_for_compaction();
+        drop(unwound);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6338,6 +6549,36 @@ mod tests {
         let mut grown = copied(&recorded);
         history_grow(&late, &mut grown, 20);
         check_heights(&late, &grown, [12, 13, 17, 20]);
+
+        // The live tree runs ahead of history: block 21, not persisted,
+        // rewrites account 1 (whose slot predates the base). Its slot at 13
+        // is retired only on the live tree; it is still found there.
+        let rewrite_one = |parent: B256, number: u64, nonce: u64| {
+            use n42_qmdb_state::AccountState;
+            let mut changes = BlockChanges::new();
+            changes.set_account(
+                alloy_primitives::Address::with_last_byte(1),
+                AccountState { nonce, balance: alloy_primitives::U256::from(5u64), code_hash: B256::ZERO },
+            );
+            let hash = B256::from((alloy_primitives::U256::from(number) << 64) | alloy_primitives::U256::from(nonce));
+            let prepared = late.compute(parent, &changes).unwrap();
+            late.insert(hash, number, prepared).unwrap();
+            hash
+        };
+        rewrite_one(grown[20].hash, 21, 77);
+        let one = history_key(1);
+        let live_slot = late.lock_as("test").as_ref().unwrap().live_slot_of(&one);
+        let at13 = late.prove_historical((13, grown[13].hash), grown[13].root, &[one]).unwrap();
+        let proof = at13.keys[0].proof.as_ref().expect("account 1 existed at 13: never reported absent");
+        assert!(proof.verify_for_key(&grown[13].root.0, &one));
+        assert_ne!(live_slot, Some(proof.slot), "the live tree moved account 1 past history's head");
+        // The live tree on a branch beside history's head (a sibling of 20):
+        // what it retired cannot be told apart, so the answer is to retry.
+        rewrite_one(grown[19].hash, 20, 78);
+        assert!(matches!(
+            late.prove_historical((13, grown[13].hash), grown[13].root, &[one]),
+            Err(HistoryError::Retry(_))
+        ));
         late.wait_for_compaction();
         drop(late);
 

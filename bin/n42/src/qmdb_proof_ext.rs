@@ -46,6 +46,9 @@ pub const NOT_YET_CODE: i32 = -32001;
 pub const UNSUPPORTED_CODE: i32 = -32004;
 /// The rebuilt root disagrees with the header, or a history file is unreadable.
 pub const INTERNAL_CODE: i32 = -32603;
+/// The request would read more QMDB history than one may
+/// (`N42_QMDB_HISTORY_BUDGET_MB`): EIP-1474 "limit exceeded".
+pub const LIMIT_EXCEEDED_CODE: i32 = -32005;
 /// The most storage keys one request may ask for.
 pub const MAX_STORAGE_KEYS: usize = 1024;
 
@@ -164,7 +167,8 @@ fn error(code: i32, message: impl Into<String>) -> ErrorObjectOwned {
 fn history_error(err: HistoryError) -> ErrorObjectOwned {
     let code = match &err {
         HistoryError::Pruned { .. } | HistoryError::Rewound { .. } => PRUNED_HISTORY_CODE,
-        HistoryError::NotYet { .. } | HistoryError::Retry(_) => NOT_YET_CODE,
+        HistoryError::NotYet { .. } | HistoryError::Retry(_) | HistoryError::Warming { .. } => NOT_YET_CODE,
+        HistoryError::Budget { .. } => LIMIT_EXCEEDED_CODE,
         HistoryError::Disabled | HistoryError::NotRecorded { .. } | HistoryError::LookupBudget(_) => UNSUPPORTED_CODE,
         HistoryError::RootMismatch { .. } | HistoryError::Io(_) => INTERNAL_CODE,
     };

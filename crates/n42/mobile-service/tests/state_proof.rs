@@ -54,7 +54,7 @@ fn node() -> (MobileService, B256) {
 fn a_phone_verifies_an_account_proof_against_the_state_root() {
     let (service, root) = node();
 
-    let report = service.prove(ALICE, None).expect("a proof");
+    let report = service.prove(ALICE, None).unwrap().expect("a proof");
     assert_eq!(report.root, root, "the proof names the root it was cut from");
 
     let proof = QmdbProof::decode(&report.proof).expect("gov5 v2 proof layout");
@@ -68,7 +68,7 @@ fn a_phone_verifies_an_account_proof_against_the_state_root() {
 fn a_phone_verifies_a_storage_proof_the_same_way() {
     let (service, root) = node();
 
-    let report = service.prove(ALICE, Some(SLOT)).expect("a proof");
+    let report = service.prove(ALICE, Some(SLOT)).unwrap().expect("a proof");
     let proof = QmdbProof::decode(&report.proof).expect("decode");
     assert!(proof.verify_for_key(&root.0, &gov5_storage_key(&ALICE.0 .0, &SLOT.0)));
     assert_eq!(
@@ -104,7 +104,7 @@ fn a_proof_from_another_tree_does_not_verify_against_this_root() {
         "a proof of a different state must not check out against this root",
     );
     // And the honest one still does.
-    let honest = service.prove(ALICE, None).expect("a proof");
+    let honest = service.prove(ALICE, None).unwrap().expect("a proof");
     let honest = QmdbProof::decode(&honest.proof).unwrap();
     assert!(honest.verify_for_key(&root.0, &gov5_account_key(&ALICE.0 .0)));
 }
@@ -142,7 +142,7 @@ fn a_key_with_no_leaf_yields_null_rather_than_an_empty_proof() {
     let (mut service, _) = node();
     let unknown = Address::with_last_byte(200);
 
-    assert!(service.prove(unknown, None).is_none());
+    assert_eq!(service.prove(unknown, None), Ok(None));
     assert_eq!(
         dispatch(&mut service, "mobile_getProof", &json!([unknown.to_string()])).unwrap(),
         serde_json::Value::Null,
@@ -169,7 +169,7 @@ fn finality_and_proofs_are_served_from_the_same_node() {
         .expect("record");
 
     assert!(service.finality().is_some());
-    let report = service.prove(ALICE, None).expect("a proof");
+    let report = service.prove(ALICE, None).unwrap().expect("a proof");
     assert_eq!(report.root, root);
 }
 
@@ -218,5 +218,12 @@ fn a_proof_and_a_root_that_disagree_are_not_served_as_a_pair() {
     assert_eq!(state.apply_block(1, &changes).unwrap(), root);
     let service = MobileService::new(identity(), 1)
         .with_state(Arc::new(MovingRoot { state: Mutex::new(state), stale_root: B256::repeat_byte(0xEE) }));
-    assert!(service.prove(ALICE, None).is_none(), "a proof that does not verify against the root served beside it is withheld");
+    assert_eq!(
+        service.prove(ALICE, None),
+        Err(n42_qmdb_state::ProofRootMismatch),
+        "a proof that does not verify against the root served beside it is withheld, and reported as such, not as absent",
+    );
+    let mut service = service;
+    let refused = dispatch(&mut service, "mobile_getProof", &json!([ALICE.to_string()])).unwrap_err();
+    assert_eq!(refused.code, n42_mobile_service::rpc::codes::STATE_MOVED, "{refused:?}");
 }

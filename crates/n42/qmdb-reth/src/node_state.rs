@@ -4300,8 +4300,15 @@ impl StateProofProvider for QmdbNodeState {
         self.lock_as("prove_storage").as_mut()?.prove_storage(address, slot)
     }
 
-    fn prove_with_root(&self, address: Address, slot: Option<B256>) -> Option<(QmdbProof, B256)> {
-        self.lock_as("prove_with_root").as_mut()?.prove_with_root(address, slot)
+    fn prove_with_root(
+        &self,
+        address: Address,
+        slot: Option<B256>,
+    ) -> Result<Option<(QmdbProof, B256)>, n42_qmdb_state::ProofRootMismatch> {
+        match self.lock_as("prove_with_root").as_mut() {
+            Some(forest) => forest.prove_with_root(address, slot),
+            None => Ok(None),
+        }
     }
 }
 
@@ -6166,7 +6173,7 @@ mod tests {
         for number in chain.len() as u64..=to {
             let (hash, root) = advance(state, number, chain.last().unwrap().hash);
             let (proof7, head_root) =
-                state.prove_with_root(Address::from_word(B256::from(U256::from(7u64))), None).unwrap();
+                state.prove_with_root(Address::from_word(B256::from(U256::from(7u64))), None).unwrap().unwrap();
             assert_eq!(head_root, root);
             chain.push(Recorded { hash, root, proof7 });
         }
@@ -6176,7 +6183,7 @@ mod tests {
         let mut out = vec![Recorded {
             hash: chain.genesis_hash(),
             root: chain.genesis_header.state_root,
-            proof7: state.prove_with_root(alloy_primitives::Address::with_last_byte(1), None).unwrap().0,
+            proof7: state.prove_with_root(alloy_primitives::Address::with_last_byte(1), None).unwrap().unwrap().0,
         }];
         history_grow(state, &mut out, to);
         out

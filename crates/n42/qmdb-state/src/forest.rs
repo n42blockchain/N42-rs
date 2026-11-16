@@ -2338,30 +2338,41 @@ pub trait StateProofProvider: Send + Sync {
     /// [`Self::state_root`] and the `prove_*` calls each read the head on
     /// their own, so a block applied between them pairs a proof with a root
     /// it does not verify against. The default reads both and returns the
-    /// pair only when the proof verifies against that root (`None` otherwise,
-    /// a caller retries); a provider that can read both under one hold
-    /// overrides it.
-    fn prove_with_root(&self, address: Address, slot: Option<B256>) -> Option<(QmdbProof, B256)> {
-        let proof = match slot {
+    /// pair only when the proof verifies against that root; a provider that
+    /// can read both under one hold overrides it. `Ok(None)`: the key has no
+    /// leaf. [`ProofRootMismatch`]: a proof was cut but does not verify
+    /// against the root read beside it (the head moved); the caller retries.
+    fn prove_with_root(&self, address: Address, slot: Option<B256>) -> Result<Option<(QmdbProof, B256)>, ProofRootMismatch> {
+        let Some(proof) = (match slot {
             Some(slot) => self.prove_storage(address, slot),
             None => self.prove_account(address),
-        }?;
+        }) else {
+            return Ok(None);
+        };
         let root = self.state_root();
-        proof.verify_for_key(&root.0, &proof.key).then_some((proof, root))
+        if proof.verify_for_key(&root.0, &proof.key) { Ok(Some((proof, root))) } else { Err(ProofRootMismatch) }
     }
 }
+
+/// A head proof that does not verify against the root read with it: the
+/// state moved under the reader. Not "absent": the caller retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the QMDB head moved while the proof was cut; retry")]
+pub struct ProofRootMismatch;
 
 impl QmdbForest {
     /// [`StateProofProvider::prove_with_root`] on a forest already held:
     /// the proof and the root of the head the tree stands at, checked
     /// against each other.
-    pub fn prove_with_root(&mut self, address: Address, slot: Option<B256>) -> Option<(QmdbProof, B256)> {
-        let proof = match slot {
+    pub fn prove_with_root(&mut self, address: Address, slot: Option<B256>) -> Result<Option<(QmdbProof, B256)>, ProofRootMismatch> {
+        let Some(proof) = (match slot {
             Some(slot) => self.prove_storage(address, slot),
             None => self.prove_account(address),
-        }?;
+        }) else {
+            return Ok(None);
+        };
         let root = B256::from(self.tree.root());
-        (root == self.root() && proof.verify_for_key(&root.0, &proof.key)).then_some((proof, root))
+        if root == self.root() && proof.verify_for_key(&root.0, &proof.key) { Ok(Some((proof, root))) } else { Err(ProofRootMismatch) }
     }
 }
 
@@ -2384,7 +2395,7 @@ impl StateProofProvider for std::sync::Mutex<QmdbForest> {
             .prove_storage(address, slot)
     }
 
-    fn prove_with_root(&self, address: Address, slot: Option<B256>) -> Option<(QmdbProof, B256)> {
+    fn prove_with_root(&self, address: Address, slot: Option<B256>) -> Result<Option<(QmdbProof, B256)>, ProofRootMismatch> {
         self.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .prove_with_root(address, slot)

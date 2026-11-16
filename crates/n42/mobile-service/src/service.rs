@@ -331,12 +331,11 @@ impl MobileService {
     /// as "the account does not exist".
     pub fn prove(&self, address: Address, slot: Option<B256>) -> Option<StateProofReport> {
         let state = self.state.as_ref()?;
-        let proof = match slot {
-            Some(slot) => state.prove_storage(address, slot),
-            None => state.prove_account(address),
-        }?;
+        // The proof and its root as one pair: read apart, a block applied
+        // between them paired a proof with a root it does not verify against.
+        let (proof, root) = state.prove_with_root(address, slot)?;
         Some(StateProofReport {
-            root: state.state_root(),
+            root,
             key: B256::from(proof.key),
             value: proof.value.clone(),
             proof: proof.encode().ok()?,

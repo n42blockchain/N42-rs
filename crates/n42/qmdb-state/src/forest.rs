@@ -2309,6 +2309,38 @@ pub trait StateProofProvider: Send + Sync {
     fn prove_account(&self, address: Address) -> Option<QmdbProof>;
     /// Proves a storage slot's leaf, if it has one.
     fn prove_storage(&self, address: Address, slot: B256) -> Option<QmdbProof>;
+
+    /// Proves an account (`slot` `None`) or one of its storage slots together
+    /// with the root the proof verifies against, read as one consistent pair.
+    ///
+    /// [`Self::state_root`] and the `prove_*` calls each read the head on
+    /// their own, so a block applied between them pairs a proof with a root
+    /// it does not verify against. The default reads both and returns the
+    /// pair only when the proof verifies against that root (`None` otherwise,
+    /// a caller retries); a provider that can read both under one hold
+    /// overrides it.
+    fn prove_with_root(&self, address: Address, slot: Option<B256>) -> Option<(QmdbProof, B256)> {
+        let proof = match slot {
+            Some(slot) => self.prove_storage(address, slot),
+            None => self.prove_account(address),
+        }?;
+        let root = self.state_root();
+        proof.verify_for_key(&root.0, &proof.key).then_some((proof, root))
+    }
+}
+
+impl QmdbForest {
+    /// [`StateProofProvider::prove_with_root`] on a forest already held:
+    /// the proof and the root of the head the tree stands at, checked
+    /// against each other.
+    pub fn prove_with_root(&mut self, address: Address, slot: Option<B256>) -> Option<(QmdbProof, B256)> {
+        let proof = match slot {
+            Some(slot) => self.prove_storage(address, slot),
+            None => self.prove_account(address),
+        }?;
+        let root = B256::from(self.tree.root());
+        (root == self.root() && proof.verify_for_key(&root.0, &proof.key)).then_some((proof, root))
+    }
 }
 
 impl StateProofProvider for std::sync::Mutex<QmdbForest> {
@@ -2328,6 +2360,12 @@ impl StateProofProvider for std::sync::Mutex<QmdbForest> {
         self.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .prove_storage(address, slot)
+    }
+
+    fn prove_with_root(&self, address: Address, slot: Option<B256>) -> Option<(QmdbProof, B256)> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prove_with_root(address, slot)
     }
 }
 

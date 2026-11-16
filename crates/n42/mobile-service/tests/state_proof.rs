@@ -172,3 +172,51 @@ fn finality_and_proofs_are_served_from_the_same_node() {
     let report = service.prove(ALICE, None).expect("a proof");
     assert_eq!(report.root, root);
 }
+
+/// A past block is not answered at the head: the request is refused with a
+/// code, and the head is still served for no block or `"latest"`.
+#[test]
+fn a_past_block_is_refused_rather_than_answered_at_the_head() {
+    let (mut service, root) = node();
+    for block in [json!("0x1"), json!(1), json!("earliest"), json!("finalized")] {
+        let err = dispatch(&mut service, "mobile_getProof", &json!([ALICE.to_string(), null, block]))
+            .expect_err("a block other than the head is refused");
+        assert_eq!(err.code, n42_mobile_service::rpc::codes::UNSUPPORTED_BLOCK, "{block}");
+        assert!(err.message.contains("n42_getProof"), "the refusal names the method that serves it");
+    }
+    let latest = dispatch(&mut service, "mobile_getProof", &json!([ALICE.to_string(), null, "latest"])).expect("the head");
+    let report: StateProofReport = serde_json::from_value(latest).expect("a proof report");
+    assert_eq!(report.root, root);
+}
+
+/// A provider whose root moves between the proof and the root read (a block
+/// applied in between): the pair must never be returned unverified.
+struct MovingRoot {
+    state: Mutex<QmdbState>,
+    stale_root: B256,
+}
+
+impl n42_qmdb_state::StateProofProvider for MovingRoot {
+    fn state_root(&self) -> B256 {
+        self.stale_root
+    }
+    fn prove_account(&self, address: Address) -> Option<QmdbProof> {
+        self.state.lock().unwrap().prove_account(address)
+    }
+    fn prove_storage(&self, address: Address, slot: B256) -> Option<QmdbProof> {
+        self.state.lock().unwrap().prove_storage(address, slot)
+    }
+}
+
+#[test]
+fn a_proof_and_a_root_that_disagree_are_not_served_as_a_pair() {
+    let (_, root) = node();
+    let mut state = QmdbState::new();
+    let mut changes = BlockChanges::new();
+    changes.set_account(ALICE, AccountState { nonce: 3, balance: U256::from(1_000u64), code_hash: B256::ZERO });
+    changes.set_storage(ALICE, SLOT, U256::from(42u64));
+    assert_eq!(state.apply_block(1, &changes).unwrap(), root);
+    let service = MobileService::new(identity(), 1)
+        .with_state(Arc::new(MovingRoot { state: Mutex::new(state), stale_root: B256::repeat_byte(0xEE) }));
+    assert!(service.prove(ALICE, None).is_none(), "a proof that does not verify against the root served beside it is withheld");
+}

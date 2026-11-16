@@ -4204,6 +4204,10 @@ impl StateProofProvider for QmdbNodeState {
     fn prove_storage(&self, address: Address, slot: B256) -> Option<QmdbProof> {
         self.lock_as("prove_storage").as_mut()?.prove_storage(address, slot)
     }
+
+    fn prove_with_root(&self, address: Address, slot: Option<B256>) -> Option<(QmdbProof, B256)> {
+        self.lock_as("prove_with_root").as_mut()?.prove_with_root(address, slot)
+    }
 }
 
 /// What a delta log replays onto: the full snapshot (heap mode) or the

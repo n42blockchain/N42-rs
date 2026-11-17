@@ -149,7 +149,7 @@ leader's own block reaches its execution layer as a sealed header (`request::OWN
 instead of 90-130).
 `MALLOC_CONF=thp:always` gives the execution layer's jemalloc heap 2 MB pages under the host's THP
 `madvise` (the builder's execution is 194-207 ms with them, 225-241 without); the third window is
-lost to direct compaction until the host runs `defrag=defer`. Host rules that matter: THP `madvise`
+lost to direct compaction until the host runs `defrag=defer`. Host rules that matter: **physical core 99 (CPUs 99 and 227) of this box computes wrongly a few times per 10^8 operations (one-bit flips in AVX2 output, a lost store; found 2026-11-16 behind intermittent refusals of valid transactions) -- `/data/blockchain/BAD-CPUS` lists it, `scripts/fleet7-env.sh` (`f7_keep_cpus`, `F7_EXCLUDE_CPUS`) and the build wrapper keep work off it, and an "impossible" one-off failure on this host is first checked against it**; THP `madvise`
 (not `always`: with it the fleet's reads faulted by the million), swap empty, and
 `/data/blockchain/wr-logs/BOX-CLAIM-PROTOCOL.md` for sharing the box. **The old "one warm-up leg"
 rule was the huge-page pool** (round 43, loop86-98): the seven `thp:always` heaps take every free

@@ -7548,3 +7548,28 @@ last own block never reaches `driver.handle_output`: the candidates in
 runs ahead of the execution layer; held until the pull reaches it",
 debug only, so invisible at the fleet's level) and `imported_tip`
 being stale for a leader that imported its own blocks by header.
+
+## Host note: physical core 99 is excluded (2026-11-17)
+
+An intermittent refusal of valid transactions (about one in 3-10 million `eth_sendRawTransaction`
+calls: "expected a valid hex string", "insufficient funds ... have 0", "invalid transaction
+signature", the same bytes accepted on a resend) was reproduced on one node with a 20-60M request
+hammer (`examples/rawtx_hammer`) and traced to the host, not the code:
+
+- every captured refusal is one bit, XOR 0x08 on output byte 15 or 31 of a 128-bit chunk of
+  const-hex's AVX2 decode; the request string the server held was intact and decodes correctly again;
+- 8 of 12 located flips ran on physical core 99 (CPUs 99 and 227); a node pinned to CPUs 96-111 and
+  224-239 flipped 3 of 3 on that core; nodes pinned to 0-63 or to 0-15 and 128-143: none;
+- a random-input decode pinned to CPU 99 alone lost a store (a byte the thread had just written
+  read back as zero) once in 68M runs; the neighbouring cores 98 and 100: none in 89M each;
+- scalar decode: none in 120M; the plain (not `target-cpu=native`) build flips too; a canary holding
+  vector registers across interrupts and preemption: none in 81M holds; no MCE or EDAC record.
+
+So anything on that core (blake3 roots, keccak, secp256k1, state) can be wrong silently, a few
+times per 10^8 operations. `/data/blockchain/BAD-CPUS` holds `99,227`; `scripts/fleet7-env.sh`
+drops those CPUs from every pin list (`f7_keep_cpus`; `F7_EXCLUDE_CPUS=` set and empty restores
+them), the node's core layout splits whatever mask it gets, and the build wrapper pins its commands
+off them. Legs before this date ran with the core in the layer's set; their replay checks read zero
+misses. The open same-parent rebuild mismatch (docs/RETH_2_10_0_UPGRADE.md) is compatible with this
+fault and not shown to be it. Taking the two CPUs offline, a firmware update or a replacement is
+the host owner's step.

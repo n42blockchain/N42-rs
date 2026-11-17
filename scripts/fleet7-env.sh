@@ -757,6 +757,31 @@ f7_smt_offset() {
   esac
 }
 
+# f7_keep_cpus <cpu list> -- the list without the host's excluded CPUs, in taskset syntax.
+#
+# F7_EXCLUDE_CPUS (default: the contents of /data/blockchain/BAD-CPUS, empty when the file is
+# missing) names logical CPUs no fleet process may run on. Written for this host's physical core 99
+# (CPUs 99 and 227), which returns silently wrong results a few times per 10^8 operations
+# (2026-11-16: one-bit flips in AVX2 output and a lost store; docs/NATIVE_FLEET7.md). The node's
+# own core layout splits whatever affinity mask it is given, so a hole in the range is safe.
+# F7_EXCLUDE_CPUS= (set and empty) keeps every CPU.
+f7_keep_cpus() {
+  local list=$1 ex=${F7_EXCLUDE_CPUS-$(cat /data/blockchain/BAD-CPUS 2>/dev/null)}
+  ex=$(echo "$ex" | tr -dc '0-9,')
+  [[ -n $ex ]] || { echo "$list"; return 0; }
+  awk -v list="$list" -v ex="$ex" 'BEGIN {
+    n = split(ex, e, ","); for (i = 1; i <= n; i++) if (e[i] != "") bad[e[i] + 0] = 1
+    n = split(list, r, ","); out = ""
+    for (i = 1; i <= n; i++) {
+      m = split(r[i], ab, "-"); lo = ab[1] + 0; hi = (m > 1 ? ab[2] : ab[1]) + 0; start = -1
+      for (c = lo; c <= hi + 1; c++) {
+        if (c <= hi && !(c in bad)) { if (start < 0) start = c; continue }
+        if (start >= 0) { out = out (out == "" ? "" : ",") (start == c - 1 ? start : start "-" (c - 1)); start = -1 }
+      }
+    }
+    print out }'
+}
+
 # f7_fleet_cpus -- the CPUs the nodes (layers and validators) share, flood excluded.
 #
 # F7_NODES x F7_CORES_PER_NODE (7 x 32 = 224) unless F7_FLEET_CPUS says otherwise. The many-key
@@ -813,12 +838,12 @@ f7_pin_validator() {
     off=$(f7_smt_offset)
     lo=$((F7_CORE_OFFSET + ($(f7_fleet_cpus) - v) / 2))
     hi=$((lo + v / 2 - 1))
-    echo "taskset -c $lo-$hi,$((lo + off))-$((hi + off))"
+    echo "taskset -c $(f7_keep_cpus "$lo-$hi,$((lo + off))-$((hi + off))")"
     return 0
   fi
   lo=$((F7_CORE_OFFSET + $(f7_fleet_cpus) - v))
   hi=$((lo + v - 1))
-  echo "taskset -c $lo-$hi"
+  echo "taskset -c $(f7_keep_cpus "$lo-$hi")"
 }
 
 # f7_pin <el index> -- echoes the taskset prefix for that execution layer, or nothing.
@@ -853,12 +878,12 @@ f7_pin() {
     off=$(f7_smt_offset)
     lo=$((F7_CORE_OFFSET + i * cpus / 2))
     hi=$((lo + cpus / 2 - 1))
-    echo "taskset -c $lo-$hi,$((lo + off))-$((hi + off))"
+    echo "taskset -c $(f7_keep_cpus "$lo-$hi,$((lo + off))-$((hi + off))")"
     return 0
   fi
   lo=$((F7_CORE_OFFSET + i * cpus))
   hi=$((lo + cpus - 1))
-  echo "taskset -c $lo-$hi"
+  echo "taskset -c $(f7_keep_cpus "$lo-$hi")"
 }
 
 # f7_flood_cores -- the CPUs left for the load generator, in taskset syntax.
@@ -876,10 +901,10 @@ f7_flood_cores() {
     off=$(f7_smt_offset)
     lo=$((F7_CORE_OFFSET + $(f7_fleet_cpus) / 2))
     hi=$((off - 1))
-    echo "${F7_FLOOD_CORES:-$lo-$hi,$((lo + off))-$((hi + off))}"
+    f7_keep_cpus "${F7_FLOOD_CORES:-$lo-$hi,$((lo + off))-$((hi + off))}"
     return 0
   fi
-  echo "${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + $(f7_fleet_cpus)))-$(($(nproc) - 1))}"
+  f7_keep_cpus "${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + $(f7_fleet_cpus)))-$(($(nproc) - 1))}"
 }
 
 # f7_check_shared_ready -- a layer shared by several keys must dedupe their imports.

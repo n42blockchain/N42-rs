@@ -416,7 +416,7 @@ impl CliqueTest {
                 .voted
                 .as_ref()
                 .map(|voted| (accounts.address(voted), vote.auth.unwrap_or(true)));
-            let eth_signer_key = hex::encode(accounts.secret_key(&vote.signer).secret_bytes());
+            let eth_signer_key = hex::encode(accounts.secret_key(&vote.signer).to_secret_bytes());
             println!("signer={} eth_signer_key={eth_signer_key:?}", vote.signer);
             new_block(&node, eth_signer_key, vote_cast, &capturing_consensus).await?;
         }
@@ -1454,7 +1454,7 @@ async fn test_qmdb_chain__read_view_verifies_against_the_hashed_tables() -> eyre
     assert!(qmdb.read_view().is_some(), "the read view is built in file mode");
     assert!(register_state_reader(&qmdb), "verify mode registers the view");
 
-    let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    let key = hex::encode(accounts.secret_key("A").to_secret_bytes());
     for (nonce, number) in (1..=8u64).enumerate() {
         let tx = alloy_consensus::TxEip1559 {
             chain_id: chainspec.chain().id(),
@@ -1627,7 +1627,7 @@ async fn test_qmdb_chain__headers_carry_the_forest_root_and_validate() -> eyre::
     qmdb.initialize((0, genesis_hash))?;
     assert_eq!(qmdb.root_of(&genesis_hash), Some(chainspec.genesis_header.state_root));
 
-    let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    let key = hex::encode(accounts.secret_key("A").to_secret_bytes());
     let mut previous_root = chainspec.genesis_header.state_root;
     for expected in 1..=3u64 {
         // Block 2 carries a transfer; the others are empty.
@@ -1717,7 +1717,7 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
     // depend on its address.
     accounts
         .accounts
-        .insert("A".to_string(), secp256k1::SecretKey::from_slice(&[0x11u8; 32])?);
+        .insert("A".to_string(), secp256k1::SecretKey::from_secret_bytes([0x11u8; 32])?);
     let base = CliqueTest {
         signers: vec!["A".to_string()],
         ..Default::default()
@@ -1817,7 +1817,7 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
         logs_bloom: h.logs_bloom,
         gas_used: h.gas_used,
     };
-    let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    let key = hex::encode(accounts.secret_key("A").to_secret_bytes());
     let mut nonce = 0u64;
     let mut previous_root = chainspec.genesis_header.state_root;
     // What the parent's execution produced: the genesis header's own fields.
@@ -2050,7 +2050,7 @@ async fn deferred_chain(run: DeferredChainRun) -> eyre::Result<serde_json::Value
     let mut accounts = TesterAccountPool::new();
     accounts
         .accounts
-        .insert("A".to_string(), secp256k1::SecretKey::from_slice(&[0x11u8; 32])?);
+        .insert("A".to_string(), secp256k1::SecretKey::from_secret_bytes([0x11u8; 32])?);
     let base = CliqueTest { signers: vec!["A".to_string()], ..Default::default() };
     let mut chainspec = base.gen_chainspec(&mut accounts);
     let sender = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42))?;
@@ -2137,7 +2137,7 @@ async fn deferred_chain(run: DeferredChainRun) -> eyre::Result<serde_json::Value
         let recovered = reth_primitives_traits::Recovered::new_unchecked(signed, signer.address());
         Ok(n42_engine_types::N42PooledTransaction::new(recovered, encoded_len))
     };
-    let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    let key = hex::encode(accounts.secret_key("A").to_secret_bytes());
     let genesis_sealed = chainspec.genesis_header.clone();
     // Every block's own result and sealed header, by hash, genesis included.
     let mut own: std::collections::HashMap<B256, ExecutedFields> = std::collections::HashMap::new();
@@ -2499,7 +2499,7 @@ async fn test_altsig_transfer__is_mined_and_typed_0x50() -> eyre::Result<()> {
     let status = reth_transaction_pool::TransactionPool::pool_size(&node.pool);
     assert_eq!(status.pending, 1, "the transaction is pending, not queued: {status:?}");
 
-    let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    let key = hex::encode(accounts.secret_key("A").to_secret_bytes());
     new_block(&node, key, None, &capturing_consensus).await?;
     let header = node.provider.latest_header()?.expect("a head");
     assert_eq!(header.number, 1);

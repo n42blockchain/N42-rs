@@ -10,7 +10,7 @@ use bytes::BufMut;
 use core::error::Error;
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId},
-    Error as SecpError, Message, PublicKey, SECP256K1,
+    Error as SecpError, Message, PublicKey,
 };
 
 /// recovery error
@@ -71,7 +71,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
     )?;
 
     Ok(public_key_to_address(
-        SECP256K1.recover_ecdsa(&message, &signature)?,
+        signature.recover_ecdsa(message)?,
     ))
 }
 
@@ -98,7 +98,7 @@ where
     )?;
 
     Ok(public_key_to_address(
-        SECP256K1.recover_ecdsa(&message, &signature)?,
+        signature.recover_ecdsa(message)?,
     ))
 }
 

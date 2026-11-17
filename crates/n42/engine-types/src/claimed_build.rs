@@ -409,7 +409,7 @@ mod tests {
     fn eth_sig(seed: u8, nonce: u64) -> (N42TxEnvelope, Address) {
         let mut bytes = keccak256([seed; 32]);
         let key = loop {
-            match secp256k1::SecretKey::from_slice(bytes.as_slice()) {
+            match secp256k1::SecretKey::from_secret_bytes(bytes.0) {
                 Ok(key) => break key,
                 Err(_) => bytes = keccak256(bytes),
             }
@@ -426,11 +426,11 @@ mod tests {
         };
         let message = secp256k1::Message::from_digest(tx.signature_hash().0);
         let (recovery_id, compact) =
-            secp256k1::SECP256K1.sign_ecdsa_recoverable(&message, &key).serialize_compact();
+            secp256k1::ecdsa::RecoverableSignature::sign_ecdsa_recoverable(message, &key).serialize_compact();
         let signature = Signature::new(
             U256::from_be_slice(&compact[..32]),
             U256::from_be_slice(&compact[32..]),
-            i32::from(recovery_id) != 0,
+            recovery_id.to_u8() != 0,
         );
         let signed: reth_ethereum_primitives::TransactionSigned = tx.into_signed(signature).into();
         let sender = signed.recover_signer().expect("the signature recovers");

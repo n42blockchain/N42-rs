@@ -7,10 +7,11 @@ use boa_engine::NativeFunction;
 use boa_gc::{Finalize, Trace};
 use evm2::{
     BaseEvmTypes, Precompiles, SpecId,
+    block::ethereum::execution::execute_transaction_without_commit,
     bytecode::Bytecode,
-    env::{BlockEnvExt, TxEnv},
-    ethereum::{TxEnvelope, ethereum_tx_registry},
-    evm::{AccountInfo, CacheDB, EmptyDB},
+    env::BlockEnvExt,
+    ethereum::{RecoveredTxEnvelope, TxEnvelope, ethereum_tx_registry},
+    evm::{AccountInfo, EmptyDB, InMemoryDB},
     registry::HandlerError,
 };
 
@@ -19,14 +20,14 @@ const TARGET: Address = Address::with_last_byte(0x42);
 
 #[test]
 fn unset_interrupt_preserves_results() {
-    for interrupt in [None, Some(JsInspectorInterrupt::default())] {
+    for interrupt in [None, Some(JsInspectorInterrupt::new())] {
         let mut inspector = JsInspector::new(TRACER.into(), serde_json::Value::Null).unwrap();
         if let Some(interrupt) = interrupt {
             inspector = inspector.with_interrupt(interrupt);
         }
         let (mut inspector, result) = run(inspector, &hex!("60015000"), TxKind::Call(TARGET));
         let result = result.unwrap();
-        assert!(result.result.status);
+        assert!(result.result.is_success());
         assert_eq!(
             inspector
                 .json_result(
@@ -66,9 +67,8 @@ fn interrupt_stops_steps_without_js_step_callback() {
     let mut inspector = JsInspector::new(TRACER.into(), serde_json::Value::Null)
         .unwrap()
         .with_interrupt(interrupt.clone());
-    let tx_env = TxEnv::<BaseEvmTypes>::default();
     let message = Message::<BaseEvmTypes>::default();
-    let mut interp = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+    let mut interp = Interpreter::<BaseEvmTypes>::new(&message);
     // Signal from another thread after the inspector has been created.
     std::thread::spawn(move || interrupt.interrupt()).join().unwrap();
     inspector.step(&mut interp);
@@ -106,8 +106,9 @@ fn interrupt_during_enter_and_exit_aborts() {
             // SELFDESTRUCT invokes enter/exit outside of step_end.
             &hex!("6043ff")[..],
         ] {
+            let other = if callback == "enter" { "exit" } else { "enter" };
             let script = format!(
-                "{{ {callback}: function() {{ interrupt(); }},
+                "{{ {callback}: function() {{ interrupt(); }}, {other}: function() {{}},
                     fault: function() {{}}, result: function() {{ return 42; }} }}"
             );
             let (_, result) = run(interruptible(&script), code, TxKind::Call(TARGET));
@@ -127,9 +128,8 @@ fn interrupt_before_step_end_skips_callback_and_preserves_error() {
         )
         .unwrap()
         .with_interrupt(interrupt.clone());
-        let tx_env = TxEnv::<BaseEvmTypes>::default();
         let message = Message::<BaseEvmTypes>::default();
-        let mut interp = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        let mut interp = Interpreter::<BaseEvmTypes>::new(&message);
         inspector.step(&mut interp);
         assert!(inspector.pending_steps[0].active);
         let error = if preserve_error {
@@ -248,7 +248,7 @@ fn run(
     code: &[u8],
     kind: TxKind,
 ) -> (JsInspector, Result<TxResultWithState, HandlerError>) {
-    let mut db = CacheDB::<EmptyDB>::default();
+    let mut db = InMemoryDB::default();
     db.insert_account_info(
         &TARGET,
         AccountInfo::default().with_code(Bytecode::new_raw(code.to_vec().into())),
@@ -261,7 +261,7 @@ fn run(
         Precompiles::base(SpecId::CANCUN),
     );
     evm.set_inspector(inspector);
-    let result = evm.transact(&transaction(kind)).map(|result| result.detach());
+    let result = execute_transaction_without_commit(&mut evm, &transaction(kind));
     (*evm.clear_inspector_as::<JsInspector>().unwrap(), result)
 }
 
@@ -272,7 +272,7 @@ fn assert_interrupted(result: Result<TxResultWithState, HandlerError>) {
     ));
 }
 
-fn transaction(kind: TxKind) -> Recovered<TxEnvelope> {
+pub(super) fn transaction(kind: TxKind) -> RecoveredTxEnvelope {
     Recovered::new_unchecked(
         TxEnvelope::Legacy(TxLegacy { gas_limit: 1_000_000, to: kind, ..Default::default() }),
         Address::ZERO,
@@ -285,7 +285,7 @@ fn hook_error_takes_precedence_over_a_later_interrupt() {
     let (mut inspector, result) =
         run(interruptible(script), &hex!("60015000"), TxKind::Call(TARGET));
     let result = result.unwrap();
-    assert!(result.result.status);
+    assert!(result.result.is_success());
     inspector.interrupt.as_ref().unwrap().interrupt();
     let error = inspector
         .json_result(

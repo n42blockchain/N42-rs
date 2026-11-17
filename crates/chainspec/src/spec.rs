@@ -2544,14 +2544,8 @@ Post-merge hard forks (timestamp based):
         test_fork_ids(
             &DEV,
             &[(
-                Head {
-                    number: 0,
-                    ..Default::default()
-                },
-                ForkId {
-                    hash: ForkHash([0x45, 0xb8, 0x36, 0x12]),
-                    next: 0,
-                },
+                Head { number: 0, ..Default::default() },
+                ForkId { hash: ForkHash(hex!("0x45b83612")), next: 0 },
             )],
         )
     }

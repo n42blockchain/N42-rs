@@ -89,20 +89,22 @@
   },
   {
     "package": "reth-nippy-jar",
-    "version": "2.10.0",
-    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.10.0#f5192ac72d92bc1e656a6939796421af76544af4",
+    "version": "2.11.0",
+    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.11.0#b9abbcc1b982755baa9021e6874e2e58936ca65f",
     "upstream_manifest_sha256": "f83d6dd5db47c4e6b88d26e331e7e049abda5010ddbbcd37768b32adeb451623",
-    "path": "vendor/dependency-repairs/reth-nippy-jar-2.10.0",
+    "path": "vendor/dependency-repairs/reth-nippy-jar-2.11.0",
     "modified_files": [
-      "Cargo.toml"
+      "Cargo.toml",
+      "src/lib.rs",
+      "src/writer.rs"
     ]
   },
   {
     "package": "reth-transaction-pool",
-    "version": "2.10.0",
-    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.10.0#f5192ac72d92bc1e656a6939796421af76544af4",
-    "upstream_manifest_sha256": "75cf765e7689cc5691181d4edea5df7ff7f2934925af25a79ef48e7e31003a59",
-    "path": "vendor/dependency-repairs/reth-transaction-pool-2.10.0",
+    "version": "2.11.0",
+    "source": "git+https://github.com/paradigmxyz/reth.git?tag=v2.11.0#b9abbcc1b982755baa9021e6874e2e58936ca65f",
+    "upstream_manifest_sha256": "48f4e784d61112d0028586075db000dd3414983dccc5ce57d1bab9598bfb0c0e",
+    "path": "vendor/dependency-repairs/reth-transaction-pool-2.11.0",
     "modified_files": [
       "Cargo.toml"
     ]

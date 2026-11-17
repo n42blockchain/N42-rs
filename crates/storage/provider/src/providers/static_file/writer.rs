@@ -674,10 +674,29 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             self.update_index()?;
         }
 
-        // N42: the files are synced, release their clean pages (`N42_SF_DROP_CACHE=1`).
+        // Pruned rows are cut from the files only now. Both the cached jar `update_index` just
+        // replaced and the one it installed may still map the uncut length: the replaced one waits
+        // for its readers, and the installed one never reads past its row count. Indexing again
+        // caches a jar that maps the cut length.
+        if self.apply_pending_truncation()? {
+            self.update_index()?;
+        }
+
+        // N42: the files are synced (and cut), release their clean pages (`N42_SF_DROP_CACHE=1`).
         super::n42_sf::drop_cache_after_commit(&self.data_path, &mut self.n42_dropped_upto);
 
         Ok(())
+    }
+
+    /// Applies the truncation deferred by pruning to the data and changeset offset files.
+    ///
+    /// Returns `false` if no truncation was pending.
+    fn apply_pending_truncation(&mut self) -> ProviderResult<bool> {
+        let mut truncated = self.writer.apply_pending_truncation().map_err(ProviderError::other)?;
+        if let Some(writer) = &mut self.changeset_offsets {
+            truncated |= writer.apply_pending_truncation().map_err(ProviderError::other)?;
+        }
+        Ok(truncated)
     }
 
     /// Commits configuration changes to disk and updates the reader index with the new changes.
@@ -985,7 +1004,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             self.writer.user_header_mut().prune(blocks_to_remove);
 
             // Prune the actual rows
-            self.writer.prune_rows(rows_to_delete as usize).map_err(ProviderError::other)?;
+            self.writer
+                .prune_rows_deferred(rows_to_delete as usize)
+                .map_err(ProviderError::other)?;
         }
 
         // Update the block range
@@ -996,7 +1017,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
         // Truncate the sidecar file to match the new block count
         if let Some(writer) = &mut self.changeset_offsets {
-            writer.truncate(blocks_to_keep).map_err(ProviderError::other)?;
+            writer.truncate_deferred(blocks_to_keep);
         }
 
         // Clear current changeset offset tracking since we've pruned
@@ -1045,7 +1066,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 } else {
                     // Update `SegmentHeader`
                     self.writer.user_header_mut().prune(len);
-                    self.writer.prune_rows(len as usize).map_err(ProviderError::other)?;
+                    self.writer.prune_rows_deferred(len as usize).map_err(ProviderError::other)?;
                     break
                 }
 
@@ -1055,7 +1076,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 self.writer.user_header_mut().prune(remaining_rows);
 
                 // Truncate data
-                self.writer.prune_rows(remaining_rows as usize).map_err(ProviderError::other)?;
+                self.writer
+                    .prune_rows_deferred(remaining_rows as usize)
+                    .map_err(ProviderError::other)?;
                 remaining_rows = 0;
             }
         }

@@ -70,11 +70,11 @@ fn alt(seed: u8, nonce: u64) -> N42PooledTxEnvelope {
 }
 
 fn secp_key(index: u8) -> secp256k1::SecretKey {
-    secp256k1::SecretKey::from_slice(&[index; 32]).expect("a valid key")
+    secp256k1::SecretKey::from_secret_bytes([index; 32]).expect("a valid key")
 }
 
 pub(crate) fn secp_address(index: u8) -> Address {
-    let public = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &secp_key(index));
+    let public = secp256k1::PublicKey::from_secret_key(&secp_key(index));
     Address::from_slice(&keccak256(&public.serialize_uncompressed()[1..])[12..])
 }
 
@@ -91,13 +91,12 @@ pub(crate) fn eth_tx(key_index: u8, nonce: u64) -> N42PooledTxEnvelope {
         ..Default::default()
     };
     let message = secp256k1::Message::from_digest(tx.signature_hash().0);
-    let (recovery_id, compact) = secp256k1::SECP256K1
-        .sign_ecdsa_recoverable(&message, &secp_key(key_index))
+    let (recovery_id, compact) = secp256k1::ecdsa::RecoverableSignature::sign_ecdsa_recoverable(message, &secp_key(key_index))
         .serialize_compact();
     let signature = Signature::new(
         U256::from_be_slice(&compact[..32]),
         U256::from_be_slice(&compact[32..]),
-        i32::from(recovery_id) != 0,
+        recovery_id.to_u8() != 0,
     );
     N42PooledTxEnvelope::Eth(PooledTransactionVariant::Eip1559(tx.into_signed(signature)))
 }

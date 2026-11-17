@@ -39,7 +39,10 @@ ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"]
 libc.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local.workspace = true
-secp256k1.workspace = true
+# tx_flood signs with libsecp256k1 0.30, the version alloy-consensus and reth-primitives-traits
+# recover with. 0.33 (reth v2.11.0's workspace version) rerandomises its global context on every
+# signature, which would change the flood's own supply ceiling between A/B legs.
+secp256k1 = { package = "secp256k1", version = "0.30", default-features = false, features = ["global-context", "recovery", "std"] }
 rayon.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 futures.workspace = true

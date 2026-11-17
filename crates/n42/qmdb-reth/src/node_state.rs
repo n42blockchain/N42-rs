@@ -2766,7 +2766,7 @@ impl QmdbNodeState {
                 let weak = Arc::downgrade(&self.inner);
                 let offsets: crate::history::OffsetsSource = Arc::new(move || {
                     let inner = weak.upgrade()?;
-                    QmdbNodeState { inner }.lock_as("history_probe").as_ref()?.entry_offsets_reader()
+                    Self { inner }.lock_as("history_probe").as_ref()?.entry_offsets_reader()
                 });
                 let at_open = forest.entry_offsets_reader();
                 let relocated_bytes = forest.entry_stats().relocated_bytes;

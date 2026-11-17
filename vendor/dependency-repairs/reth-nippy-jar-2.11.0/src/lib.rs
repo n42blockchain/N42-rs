@@ -1308,6 +1308,48 @@ mod tests {
         }
     }
 
+    /// N42: after a deferred prune (reth v2.11.0), `append_encoded_rows` cuts the files first and
+    /// leaves the same files as one `append_column` per row.
+    #[test]
+    fn append_encoded_rows_after_a_deferred_prune_matches_per_row_append() {
+        let rows: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i; 1 + i as usize]).collect();
+        let more: Vec<Vec<u8>> = (0..4u8).map(|i| vec![0xa0 + i; 3]).collect();
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for (which, dir) in dirs.iter().enumerate() {
+            let path = dir.path().join("jar");
+            let nippy = NippyJar::new_without_header(1, &path);
+            nippy.freeze_config().unwrap();
+            let mut writer = NippyJarWriter::new(nippy).unwrap();
+            for row in &rows {
+                writer.append_column(Some(Ok(row))).unwrap();
+            }
+            writer.commit().unwrap();
+            writer.prune_rows_deferred(3).unwrap();
+            if which == 0 {
+                for row in &more {
+                    writer.append_column(Some(Ok(row))).unwrap();
+                }
+            } else {
+                let bytes: Vec<u8> = more.iter().flatten().copied().collect();
+                let lens: Vec<u32> = more.iter().map(|r| r.len() as u32).collect();
+                writer.append_encoded_rows(&bytes, &lens).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+
+        let read = |dir: &Path| {
+            let mut out = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let p = entry.unwrap().path();
+                out.insert(p.file_name().unwrap().to_owned(), std::fs::read(&p).unwrap());
+            }
+            out
+        };
+        assert_eq!(read(dirs[0].path()), read(dirs[1].path()));
+        let jar = NippyJar::load_without_header(&dirs[1].path().join("jar")).unwrap();
+        assert_eq!(jar.rows, rows.len() - 3 + more.len());
+    }
+
     #[test]
     fn append_encoded_rows_rejects_other_shapes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1342,5 +1384,41 @@ mod tests {
             assert_eq!((values[0], values[1]), (col1[row].as_slice(), col2[row].as_slice()));
         }
         assert!(cursor.row_by_number(rows).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_zstd_013_compatibility() {
+        // These jars and the dictionary-compressed block were written with zstd 0.13.3.
+        let col1 = (0..100u8).map(|i| vec![i; 32]).collect::<Vec<_>>();
+        let col2 = (0..100u8)
+            .map(|i| (0..32u8).map(|j| i.wrapping_add(j)).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zstd-0.13");
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["dictionary", "plain"] {
+            let path = directory.path().join(name);
+            for extension in ["", CONFIG_FILE_EXTENSION, OFFSETS_FILE_EXTENSION] {
+                reth_fs_util::write(
+                    path.with_extension(extension),
+                    reth_fs_util::read(fixtures.join(name).with_extension(extension)).unwrap(),
+                )
+                .unwrap();
+            }
+            assert_jar_rows(&path, &col1, &col2, 100);
+        }
+
+        let jar = NippyJar::load_without_header(&directory.path().join("dictionary")).unwrap();
+        let Some(Compressors::Zstd(zstd)) = jar.compressor() else {
+            panic!("Expected Zstd compressor")
+        };
+        let encoded = include_bytes!("../tests/fixtures/zstd-0.13/dictionary.block");
+        let mut output = Vec::with_capacity(32);
+        compression::Zstd::decompress_with_dictionary(
+            encoded,
+            &mut output,
+            &mut zstd.decompressors().unwrap()[0],
+        )
+        .unwrap();
+        assert_eq!(output, col1[5]);
     }
 }

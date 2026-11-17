@@ -2061,10 +2061,10 @@ impl QmdbForest {
             }
             true
         };
-        if let Some((parent, undo)) = &self.pending {
-            if *parent != self.tip || !take(undo) {
-                return None;
-            }
+        if let Some((parent, undo)) = &self.pending
+            && (*parent != self.tip || !take(undo))
+        {
+            return None;
         }
         let mut current = self.tip;
         while current != ancestor {

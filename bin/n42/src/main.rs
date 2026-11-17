@@ -28,6 +28,21 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
+/// N42's own `node` flags, beside reth's.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+struct N42Args {
+    /// Keep QMDB state history so `n42_getProof` proves past blocks: a
+    /// block count (`N`, the last N persisted blocks), `all`, or `off`.
+    /// Overrides `N42_QMDB_HISTORY`; an invalid value refuses to start.
+    /// Needs a QMDB chain with the entry file (docs/QMDB_HISTORY.md).
+    #[arg(long = "qmdb.history", value_name = "N|all|off", value_parser = parse_history_mode)]
+    qmdb_history: Option<n42_qmdb_reth::history::HistoryMode>,
+}
+
+fn parse_history_mode(raw: &str) -> Result<n42_qmdb_reth::history::HistoryMode, String> {
+    n42_qmdb_reth::history::HistoryMode::parse(raw)
+}
+
 #[allow(clippy::iter_with_drain)] // the batch buffer is reused, so it is drained rather than consumed
 fn main() {
     // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
@@ -53,7 +68,7 @@ fn main() {
     // withdrawn again, so the profile never forces a chain feature. A
     // command without a chain withdraws them too. An operator's own
     // `N42_FRAME_BLOCKS=1` is left for `frame_blocks::init` to refuse.
-    let cli = Cli::<N42ChainSpecParser>::parse();
+    let cli = Cli::<N42ChainSpecParser, N42Args>::parse();
     let features = n42_env::profile::ChainFeatures {
         frame_blocks: cli
             .command
@@ -137,7 +152,7 @@ fn main() {
     let consensus_holder_clone = consensus_holder.clone();
 
     if let Err(err) =
-        cli.run(async move |builder, _extra_args| {
+        cli.run(async move |builder, n42_args: N42Args| {
             info!(target: "reth::cli", "Launching node");
             for knob in &trusting_knobs {
                 warn!(target: "reth::cli", knob = *knob, "trusting ingest mode accepted: this node admits transactions on a frame's word (benchmark only)");
@@ -209,12 +224,25 @@ fn main() {
                 StateScheme::Qmdb => {
                     let dir = builder.config().datadir().data_dir().join("qmdb");
                     info!(target: "reth::cli", dir = %dir.display(), "chain declares the QMDB state commitment");
-                    Some(QmdbNodeState::new(chain, dir))
+                    let state = QmdbNodeState::new(chain, dir);
+                    // `--qmdb.history` overrides `N42_QMDB_HISTORY` (an
+                    // invalid value of either refuses to start).
+                    if let Some(mode) = n42_args.qmdb_history {
+                        info!(target: "reth::cli", %mode, "QMDB history set on the command line");
+                        state.set_history_mode(mode);
+                    }
+                    Some(state)
                 }
-                StateScheme::Mpt => None,
+                StateScheme::Mpt => {
+                    if n42_args.qmdb_history.is_some_and(|mode| mode.is_on()) {
+                        return Err(eyre::eyre!("--qmdb.history needs a QMDB chain; this chain's genesis declares the MPT state commitment"));
+                    }
+                    None
+                }
             };
             let qmdb_for_startup = qmdb.clone();
             let qmdb_before_launch = qmdb.clone();
+            let qmdb_for_rpc = qmdb.clone();
 
             let NodeHandle {
                 node,
@@ -486,6 +514,45 @@ fn main() {
                         in_memory_blocks: Some(in_memory_blocks),
                         persisted_block: Some(persisted_block),
                     };
+
+                    // A QMDB chain proves state from the forest: `n42_getProof`
+                    // (QMDB twig proofs at persisted blocks, from the history
+                    // `N42_QMDB_HISTORY` keeps), and `eth_getProof` -- whose
+                    // Merkle-Patricia proofs would not verify against a QMDB
+                    // header -- refused with a pointer to it.
+                    if let Some(qmdb) = qmdb_for_rpc {
+                        use reth_provider::ChainSpecProvider;
+                        let genesis = ctx.provider().chain_spec().genesis().clone();
+                        let root_offset: n42::qmdb_proof_ext::RootOffset = std::sync::Arc::new(move |timestamp| {
+                            if reth_chainspec::qmdb::deferred_execution_active_at(&genesis, timestamp) {
+                                reth_chainspec::qmdb::deferred_execution_depth_at(&genesis, timestamp)
+                            } else {
+                                0
+                            }
+                        });
+                        let finish_provider = ctx.provider().clone();
+                        let persisted: n42::qmdb_proof_ext::PersistedHead = std::sync::Arc::new(move || {
+                            use reth_db_api::transaction::DbTx;
+                            use reth_provider::DatabaseProviderFactory;
+                            let database = finish_provider.database_provider_ro().ok()?;
+                            database
+                                .tx_ref()
+                                .get::<reth_db_api::tables::StageCheckpoints>("Finish".to_owned())
+                                .ok()?
+                                .map(|checkpoint| checkpoint.block_number)
+                        });
+                        let proofs = n42::qmdb_proof_ext::QmdbProofExt {
+                            state: qmdb,
+                            provider: ctx.provider().clone(),
+                            root_offset,
+                            persisted,
+                        };
+                        use n42::qmdb_proof_ext::QmdbProofApiServer;
+                        ctx.modules.merge_configured(proofs.into_rpc())?;
+                        ctx.modules.replace_configured(n42::qmdb_proof_ext::eth_get_proof_refusal())?;
+                        ctx.auth_module.replace_auth_methods(n42::qmdb_proof_ext::eth_get_proof_refusal())?;
+                        info!(target: "reth::cli", "QMDB proof namespace enabled (n42_getProof); eth_getProof refused");
+                    }
 
                     // now we merge our extension namespace into all configured transports
                     ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
@@ -1185,5 +1252,28 @@ fn main() {
     {
         error!(target: "reth::cli", "Error: {err:?}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::N42Args;
+    use clap::Parser;
+    use n42_qmdb_reth::history::HistoryMode;
+
+    #[derive(Debug, Parser)]
+    struct Line {
+        #[command(flatten)]
+        n42: N42Args,
+    }
+
+    #[test]
+    fn the_qmdb_history_flag_parses_a_count_all_or_off_and_refuses_anything_else() {
+        let parse = |args: &[&str]| Line::try_parse_from(std::iter::once("n42").chain(args.iter().copied())).map(|l| l.n42.qmdb_history);
+        assert_eq!(parse(&[]).unwrap(), None, "absent: N42_QMDB_HISTORY decides");
+        assert_eq!(parse(&["--qmdb.history", "all"]).unwrap(), Some(HistoryMode::All));
+        assert_eq!(parse(&["--qmdb.history", "50000"]).unwrap(), Some(HistoryMode::Keep(50_000)));
+        assert_eq!(parse(&["--qmdb.history=off"]).unwrap(), Some(HistoryMode::Off));
+        assert!(parse(&["--qmdb.history", "lots"]).is_err());
     }
 }

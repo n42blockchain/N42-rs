@@ -30,7 +30,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
-use n42_qmdb_state::StateProofProvider;
+use n42_qmdb_state::{ProofRootMismatch, StateProofProvider};
 use n42_h2_consensus::wire_bridge::{self, BridgeError};
 use n42_h2_primitives::consensus::{
     ConsensusMessage, Decide, H2V4ChainIdentity, QuorumCertificate,
@@ -325,22 +325,23 @@ impl MobileService {
     /// Proves what the state tree holds for an account, or for one of its
     /// storage slots when `slot` is given.
     ///
-    /// `None` means either that this node keeps no state tree, or that the key
-    /// has no live leaf. Those are deliberately not distinguished: QMDB
+    /// `Ok(None)` means either that this node keeps no state tree, or that the
+    /// key has no live leaf. Those are deliberately not distinguished: QMDB
     /// membership proofs do not prove absence, so a caller must not read either
-    /// as "the account does not exist".
-    pub fn prove(&self, address: Address, slot: Option<B256>) -> Option<StateProofReport> {
-        let state = self.state.as_ref()?;
-        let proof = match slot {
-            Some(slot) => state.prove_storage(address, slot),
-            None => state.prove_account(address),
-        }?;
-        Some(StateProofReport {
-            root: state.state_root(),
+    /// as "the account does not exist". [`ProofRootMismatch`]: a proof was cut
+    /// but did not verify against the root read with it (the head moved); it
+    /// is withheld, and the caller retries.
+    pub fn prove(&self, address: Address, slot: Option<B256>) -> Result<Option<StateProofReport>, ProofRootMismatch> {
+        let Some(state) = self.state.as_ref() else { return Ok(None) };
+        // The proof and its root as one pair: read apart, a block applied
+        // between them paired a proof with a root it does not verify against.
+        let Some((proof, root)) = state.prove_with_root(address, slot)? else { return Ok(None) };
+        Ok(proof.encode().ok().map(|encoded| StateProofReport {
+            root,
             key: B256::from(proof.key),
             value: proof.value.clone(),
-            proof: proof.encode().ok()?,
-        })
+            proof: encoded,
+        }))
     }
 
     /// Whether this node can serve state proofs at all.

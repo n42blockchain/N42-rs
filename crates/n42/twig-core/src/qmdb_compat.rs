@@ -1494,6 +1494,35 @@ fn hash_twig_parents(nodes: &mut [Hash; 2 * TWIG_SIZE]) {
     }
 }
 
+/// Bytes of a twig's active-bit set (one bit per slot, slot `i` at
+/// `bits[i / 8] >> (i % 8)`), the `active_bits` of a [`QmdbProof`].
+pub const TWIG_BITS_BYTES: usize = BITS_BYTES;
+
+/// The hash a twig commits its active-bit set under: `blake3(0x03 || bits)`,
+/// exactly what the live tree and [`QmdbProof::verify_for_key`] use. Public
+/// for a historical prover that rebuilds a twig root at a past height.
+pub fn twig_bits_hash(bits: &[u8; BITS_BYTES]) -> Hash {
+    hash_bits(bits)
+}
+
+/// A twig's committed root, `hash_node(leaf_root, bits_hash)`.
+pub fn twig_root_of(leaf_root: &Hash, bits: &[u8; BITS_BYTES]) -> Hash {
+    hash_node(leaf_root, &hash_bits(bits))
+}
+
+/// A twig's leaf merkle tree over its first `leaves.len()` leaf hashes (at
+/// most [`TWIG_SIZE`]; the rest null), every level above them: what the live
+/// tree holds for a twig with that many slots appended (`twig_leaf_nodes`).
+/// `nodes[1]` is the leaf root and `nodes[TWIG_SIZE + i]` leaf `i`, so a
+/// membership path is read from it the way [`QmdbCompatTree::prove`] reads it.
+pub fn twig_leaf_tree(leaves: &[Hash]) -> TwigNodes {
+    assert!(leaves.len() <= TWIG_SIZE, "a twig holds at most {TWIG_SIZE} leaves");
+    let mut nodes = Box::new([NULL_HASH; 2 * TWIG_SIZE]);
+    nodes[TWIG_SIZE..TWIG_SIZE + leaves.len()].copy_from_slice(leaves);
+    hash_twig_parents(&mut nodes);
+    nodes
+}
+
 /// The leaf root of a full twig whose leaves are `leaves`.
 fn twig_leaf_root(leaves: &[Hash]) -> Hash {
     let mut nodes = Box::new([NULL_HASH; 2 * TWIG_SIZE]);
@@ -2260,6 +2289,13 @@ impl QmdbCompatTree {
             slots_only: self.entries.file_path().is_some(),
             slots: Vec::new(),
         });
+    }
+
+    /// The slot that holds `key`'s live entry, if any: a probe of the key
+    /// index and nothing else (no tree move, no record read beyond the key
+    /// comparisons the index makes).
+    pub fn slot_of(&self, key: &Hash) -> Option<u64> {
+        self.index.get(key, |slot| self.entries.key(slot as usize))
     }
 
     /// Whether `slot` is live, `None` past the cursor.

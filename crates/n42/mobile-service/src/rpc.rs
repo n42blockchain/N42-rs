@@ -22,7 +22,7 @@
 //! | `mobile_registerVerifier` | `[pubkey_hex, pop_hex]` | the verifier's registry index (a known key needs no `pop_hex`) |
 //! | `mobile_submitReceipt` | `[receipt_hex]` | [`SubmitOutcome`] |
 //! | `mobile_attestation` | `[block_hash]` | the aggregate, or `null` |
-//! | `mobile_getProof` | `[address]` or `[address, slot]` | [`crate::StateProofReport`], or `null` |
+//! | `mobile_getProof` | `[address]`, `[address, slot]` or `[address, slot, "latest"]` | [`crate::StateProofReport`] at the head, or `null`; any other block is refused with -32005 (`n42_getProof` serves past blocks); a proof that does not verify against the root read with it is -32006 (retry), never `null` |
 
 use alloy_primitives::{Address, B256};
 use n42_mobile_verify::receipt::decode_receipt;
@@ -46,6 +46,11 @@ pub mod codes {
     pub const INTERNAL: i64 = -32603;
     /// The verifier registry holds as many keys as it may.
     pub const REGISTRY_FULL: i64 = -32004;
+    /// A block other than the head was asked for a state proof.
+    pub const UNSUPPORTED_BLOCK: i64 = -32005;
+    /// A head proof did not verify against the root read with it (the head
+    /// moved while it was cut); retry.
+    pub const STATE_MOVED: i64 = -32006;
 }
 
 /// A JSON-RPC error: a code the caller can branch on and a message for a person.
@@ -165,13 +170,30 @@ pub fn dispatch(
                         .map_err(|e| RpcError::new(codes::INVALID_PARAMS, e))?,
                 ),
             };
+            // A third param names a block. This method proves only at the
+            // head the tree stands at; a past height is served by
+            // `n42_getProof` on a node keeping QMDB history, and a request
+            // for one here is refused rather than answered at the head.
+            match params.get(2) {
+                None | Some(Value::Null) => {}
+                Some(Value::String(tag)) if tag == "latest" => {}
+                Some(_) => {
+                    return Err(RpcError::new(
+                        codes::UNSUPPORTED_BLOCK,
+                        "mobile_getProof proves only at the head (\"latest\"); use n42_getProof for a past block",
+                    ))
+                }
+            }
             Ok(match service.prove(address, slot) {
                 // Null, not an error: a node with no state tree and a key with
                 // no leaf are both "nothing to prove", and QMDB membership
                 // proofs cannot tell a caller which.
-                None => Value::Null,
-                Some(report) => serde_json::to_value(report)
+                Ok(None) => Value::Null,
+                Ok(Some(report)) => serde_json::to_value(report)
                     .map_err(|e| RpcError::new(codes::INTERNAL, e))?,
+                // Not null: a proof exists but did not verify against the
+                // root read beside it, which is no statement about the key.
+                Err(moved) => return Err(RpcError::new(codes::STATE_MOVED, moved)),
             })
         }
 

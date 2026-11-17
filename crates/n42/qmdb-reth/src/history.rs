@@ -553,7 +553,7 @@ struct Seg {
 }
 
 impl Seg {
-    fn empty(start: u64, start_hash: B256, start_next_slot: u64, ckpt: bool) -> Self {
+    const fn empty(start: u64, start_hash: B256, start_next_slot: u64, ckpt: bool) -> Self {
         Self { start, start_hash, start_next_slot, ckpt, sealed: false, count: 0, log_len: 0, last: None }
     }
 
@@ -575,7 +575,7 @@ fn read_recs(dir: &Path, start: u64, from: u64, to: u64) -> Result<Vec<Rec>, His
     let file = File::open(&path).map_err(|e| io_at(&path, e))?;
     let mut bytes = vec![0u8; ((to - from) as usize) * IDX_ENTRY];
     read_exact_at(&file, &mut bytes, from * IDX_ENTRY as u64).map_err(|e| io_at(&path, e))?;
-    Ok(bytes.chunks_exact(IDX_ENTRY).map(Rec::decode).collect())
+    Ok(bytes.as_chunks::<IDX_ENTRY>().0.iter().map(|c| Rec::decode(c)).collect())
 }
 
 /// The position of block `number` in a segment's index (binary search: the
@@ -705,7 +705,7 @@ struct Leaves {
 impl Leaves {
     fn open(path: PathBuf, max_twigs: usize) -> Self {
         let mut roots: Vec<Hash> = std::fs::read(&path)
-            .map(|bytes| bytes.chunks_exact(32).map(|c| c.try_into().expect("32 bytes")).collect())
+            .map(|bytes| bytes.as_chunks::<32>().0.to_vec())
             .unwrap_or_default();
         if roots.len() > max_twigs {
             roots.truncate(max_twigs);
@@ -915,7 +915,7 @@ fn build_heap(roots: &[Hash]) -> (usize, Vec<Hash>) {
 
 fn words_to_bits(words: &[u64; WORDS]) -> [u8; TWIG_BITS_BYTES] {
     let mut bits = [0u8; TWIG_BITS_BYTES];
-    for (chunk, word) in bits.chunks_exact_mut(8).zip(words) {
+    for (chunk, word) in bits.as_chunks_mut::<8>().0.iter_mut().zip(words) {
         chunk.copy_from_slice(&word.to_le_bytes());
     }
     bits
@@ -1375,7 +1375,14 @@ impl QmdbHistory {
                     });
                     end = shared.meta().head();
                 }
-                if (end.0, end.1) != head {
+                if (end.0, end.1) == head {
+                    let meta = shared.meta();
+                    info!(
+                        target: "n42.qmdb.history",
+                        earliest = meta.base().start, latest = end.0, segments = meta.segs.len(), backfilled,
+                        "opened the QMDB history",
+                    );
+                } else {
                     error!(
                         target: "n42.qmdb.history",
                         history_ends = end.0, history_hash = %end.1, head = head.0, head_hash = %head.1,
@@ -1383,13 +1390,6 @@ impl QmdbHistory {
                          or lost records the log no longer holds); it restarts at the head and the blocks before it are no longer provable",
                     );
                     fresh(&shared, "history did not reach the database head")?;
-                } else {
-                    let meta = shared.meta();
-                    info!(
-                        target: "n42.qmdb.history",
-                        earliest = meta.base().start, latest = end.0, segments = meta.segs.len(), backfilled,
-                        "opened the QMDB history",
-                    );
                 }
             }
         }
@@ -1803,7 +1803,7 @@ impl Shared {
             next_slot: delta.next_slot,
             offset: current.log_len,
             len,
-            flags: if delta.head_number != head.0 + 1 { SPAN } else { 0 } | if rewind { REWIND } else { 0 },
+            flags: if delta.head_number == head.0 + 1 { 0 } else { SPAN } | if rewind { REWIND } else { 0 },
         };
         // The index need not be durable: a start rebuilds it from the log.
         let idx_path = seg_path(&self.dir, current.start, "idx");

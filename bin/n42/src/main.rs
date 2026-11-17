@@ -34,7 +34,7 @@ struct N42Args {
     /// Keep QMDB state history so `n42_getProof` proves past blocks: a
     /// block count (`N`, the last N persisted blocks), `all`, or `off`.
     /// Overrides `N42_QMDB_HISTORY`; an invalid value refuses to start.
-    /// Needs a QMDB chain with the entry file (docs/QMDB_HISTORY.md).
+    /// Needs a QMDB chain with the entry file (`docs/QMDB_HISTORY.md`).
     #[arg(long = "qmdb.history", value_name = "N|all|off", value_parser = parse_history_mode)]
     qmdb_history: Option<n42_qmdb_reth::history::HistoryMode>,
 }

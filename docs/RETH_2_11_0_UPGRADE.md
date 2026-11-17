@@ -154,6 +154,35 @@ The v2.11.0 upgrade itself clears none of these: the root lock carries the same 
 The ddn bumps are lock-only. `cargo test --locked` in ddn passes (`ci/r211-ddn-test.log`, four
 test binaries).
 
+## SIGKILL recovery (`roll --kill`, 2026-11-17)
+
+The recovery rounds ran on the upgrade natives (`target/native/release`, built from 6df0139bc
+by the coordinator's chain). The runner was `audit-notes/scripts/rollkill-check.sh`: seven-node
+`fleet7.sh up --fresh`, 200 tx/s offered, then `roll 1/2/3 --kill` 45 s apart and a 360 s watch.
+It held the box through box-gate and ran under `flock devnet/.round.lock`, after `CEIL-CHAIN DONE`.
+There were four shapes; the driver is `ci/r211-rollkill.out` and each shape's outputs are
+`ci/r211<shape>-rollkill-{up,roll,watch,status}.out` and `ci/r211<shape>-node<i>-el-recovery.txt`:
+
+| Shape | First kill | QMDB | Kills (height → restored from) | After 360 s | Fault lines |
+|---|---|---|---|---|---|
+| k20 | 20 s, before the first MDBX persistence | heap | node1 at 7 → genesis checkpoint (block 0); node2 at 24, node3 at 41 → their persisted forests | 117 blocks (0.325/s); all 7 at 118, one head `0x266ff56d…` | 0 |
+| k90 | 90 s, after several persistence rounds | heap | node1 at 31 → block 21; node2 at 48, node3 at 65 | 118 blocks (0.328/s); all 7 at 119, one head `0x8aaad771…` | 0 |
+| k20f | 20 s | entry file (`N42_QMDB_ENTRY_FILE=1`) | node1 at 7 → entry file at block 0; node2 at 24, node3 at 41 | 117 blocks; all 7 at 118, one head `0x233e23d9…` | 0 |
+| k90f | 90 s | entry file | node1 at 31 → entry file at block 21; node2 at 48, node3 at 65 | 118 blocks; all 7 at 119, one head `0xe13c49bf…` | 0 |
+
+In every round, each killed member did four things:
+
+- logged `restored the QMDB forest`;
+- ran reth's `check_consistency: Healing static file inconsistencies` on start-up, the
+  static-file unwind that now goes through `prune_rows_deferred`;
+- appended to the cut files again, covering the nippy-jar bulk-append fix;
+- committed again within a minute ("commits since restart" 1-2).
+
+No el.log carried a fault line (`SnapshotMismatch`, `PersistUnsettled`, `cannot follow the
+canonical chain`, `not settled through`, an exit), an ERROR or an invalid block. No `n42` or
+`h2_validator` process was left after `down`. The same fleet shape on v2.10.0 (gk90 / gk20)
+read 118 / 117 blocks in the watch; this round matches it.
+
 ## Left for the coordinator
 
 - The X22 throughput pair against main. Two things there could show: `evm2::block` under the

@@ -29,6 +29,8 @@ pub mod primitives;
 pub mod rpc;
 pub mod sender_cache;
 
+#[doc(hidden)]
+pub use alt_sig::{verify_batch_linear, verify_batch_with, BatchFallback};
 pub use alt_sig::{
     verify_batch, AltSigError, AltSigTx, TxAltSig, ALG_ED25519, ALT_SIG_TX_TYPE_ID,
     ED25519_PUBKEY_LEN, ED25519_SIGNATURE_LEN,

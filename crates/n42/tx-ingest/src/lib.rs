@@ -1007,6 +1007,7 @@ fn spawn_stats_reporter() {
                     dropped_decode = STATS.dropped_decode.load(Ordering::Relaxed),
                     dropped_signature = STATS.dropped_signature.load(Ordering::Relaxed),
                     dropped_altsig = STATS.dropped_altsig.load(Ordering::Relaxed),
+                    altsig_batches_failed = STATS.altsig_batches_failed.load(Ordering::Relaxed),
                     dropped_altsig_disabled = STATS.dropped_altsig_disabled.load(Ordering::Relaxed),
                     dropped_altsig_claim = STATS.dropped_altsig_claim.load(Ordering::Relaxed),
                     // Cumulative: frames noted in the queue's frame index,
@@ -1695,6 +1696,11 @@ struct IngestStats {
     dropped_decode: AtomicU64,
     dropped_signature: AtomicU64,
     dropped_altsig: AtomicU64,
+    /// 0x50 chunks with a signature the curve check refused (not a shape
+    /// error): each one paid the batch equation and then the fallback, the
+    /// unauthenticated cost of an invalid signature
+    /// (`docs/SIGNATURE_AND_BATCH_TX_SURVEY.md` section 5).
+    altsig_batches_failed: AtomicU64,
     dropped_altsig_disabled: AtomicU64,
     /// 0x50 transactions in a claiming frame whose claim was not the sender
     /// their key derives.
@@ -1732,6 +1738,7 @@ static STATS: IngestStats = IngestStats {
     dropped_decode: AtomicU64::new(0),
     dropped_signature: AtomicU64::new(0),
     dropped_altsig: AtomicU64::new(0),
+    altsig_batches_failed: AtomicU64::new(0),
     dropped_altsig_disabled: AtomicU64::new(0),
     dropped_altsig_claim: AtomicU64::new(0),
     frames_admitted: AtomicU64::new(0),
@@ -2330,8 +2337,12 @@ where
                 N42PooledTxEnvelope::Eth(_) => None,
             })
             .collect();
+        let start = verdicts.len();
         verdicts.extend(n42_tx_types::verify_batch(&refs));
         STATS.altsig_batches.fetch_add(1, Ordering::Relaxed);
+        if verdicts[start..].iter().any(|v| matches!(v, Err(n42_tx_types::AltSigError::Invalid))) {
+            STATS.altsig_batches_failed.fetch_add(1, Ordering::Relaxed);
+        }
     }
     STATS.altsig_txs.fetch_add(todo.len() as u64, Ordering::Relaxed);
     // One verdict per transaction, or the zip below would silently drop the

@@ -435,4 +435,25 @@ mod tests {
         assert!(other.import_committed(&snap).is_err());
         assert!(Registry::new().import_committed(&snap[..20]).is_err());
     }
+
+    /// The snapshot's magic and version byte are its only markers
+    /// (`docs/PROOF_TRUST_INVENTORY.md`): another version is refused before
+    /// any entry is read, and nothing is imported.
+    #[test]
+    fn snapshot_of_another_version_is_refused() {
+        let reg = Registry::new();
+        let k = key(1);
+        reg.register(&k.pubkey(), &k.proof_of_possession()).unwrap();
+        reg.commit_epoch_at(1000);
+        let snap = reg.export_committed();
+        for version in [0u8, SNAPSHOT_VERSION + 1, u8::MAX] {
+            let mut other = snap.clone();
+            other[4] = version;
+            let fresh = Registry::new();
+            let err = fresh.import_committed(&other).unwrap_err();
+            assert!(err.to_string().contains("bad snapshot header"), "{err}");
+            assert_eq!(fresh.count(), 0);
+        }
+        assert_eq!(Registry::new().import_committed(&snap).unwrap(), reg.root());
+    }
 }

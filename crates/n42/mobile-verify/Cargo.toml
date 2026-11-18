@@ -25,3 +25,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# examples/proof_budget.rs: the finality proof a phone checks before it trusts a root.
+n42-h2-wire.workspace = true
+n42-h2-consensus.workspace = true

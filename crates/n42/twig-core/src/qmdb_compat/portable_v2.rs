@@ -550,6 +550,27 @@ mod tests {
         bytes.windows(needle.len()).position(|window| window == needle.as_slice()).expect("the record")
     }
 
+    /// A snapshot is versioned by its eight-byte magic only; any other version
+    /// (or anything else) is refused by the streaming verifier and both
+    /// decoders before a record is read (`docs/PROOF_TRUST_INVENTORY.md`).
+    #[test]
+    fn an_unknown_magic_is_refused_by_every_reader() {
+        let (plain, _) = trees();
+        let v2 = plain.encode(PortableFormat::V2).unwrap();
+        // v1 is `\x01`, v2 `\x03`; anything else in the version byte is unknown.
+        for version in [0x00, 0x02, 0x04, 0xFF] {
+            let mut other = v2.clone();
+            other[7] = version;
+            // A fresh trailer, so the v1 decoder (digest first) reaches the magic.
+            let other = reseal(other);
+            assert_eq!(PortableFormat::detect(&other), None);
+            assert_eq!(verify(&other).err(), Some(QmdbPortableError::UnsupportedVersion));
+            assert_eq!(QmdbPortableTree::decode(&other).err(), Some(QmdbPortableError::UnsupportedVersion));
+            assert_eq!(QmdbPortableSnapshot::decode(&other).err(), Some(QmdbPortableError::UnsupportedVersion));
+        }
+        assert!(verify(&v2).is_ok());
+    }
+
     #[test]
     fn the_fixture_tree_has_every_slot_kind() {
         let (plain, compacted) = trees();

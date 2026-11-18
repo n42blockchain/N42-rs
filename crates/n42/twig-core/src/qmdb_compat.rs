@@ -4482,6 +4482,22 @@ mod tests {
         assert_eq!(QmdbProof::decode(&encoded).unwrap(), proof);
         assert!(tree.prove(&indexed_key(u64::MAX)).is_none());
     }
+
+    /// The version byte is the only marker a v2 proof carries
+    /// (`docs/PROOF_TRUST_INVENTORY.md`): every other value is refused before
+    /// any field is read, including the v1 layout this one replaced.
+    #[test]
+    fn proof_codec_refuses_every_other_version_byte() {
+        let mut tree = QmdbCompatTree::new();
+        tree.set(key(7), b"proof-value".to_vec()).unwrap();
+        let encoded = tree.prove(&key(7)).unwrap().encode().unwrap();
+        assert_eq!(encoded[0], PROOF_CODEC_VERSION);
+        for version in (0..=u8::MAX).filter(|v| *v != PROOF_CODEC_VERSION) {
+            let mut other = encoded.clone();
+            other[0] = version;
+            assert_eq!(QmdbProof::decode(&other), Err(QmdbProofCodecError::UnsupportedVersion(version)));
+        }
+    }
 }
 
 #[cfg(test)]

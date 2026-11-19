@@ -548,4 +548,43 @@ mod tests {
         assert!(!in_precompile_range(&Address::left_padding_from(&[0x02, 0x00])));
         assert!(!in_precompile_range(&Address::left_padding_from(&[0x01, 0x00, 0x01])));
     }
+
+    /// EIP-7825: a transfer over the transaction gas cap (2^24 from Osaka,
+    /// 2^32 - 1 on Amsterdam) is not applied directly; evm2's stock
+    /// `prepare`, which the batch then runs, refuses it
+    /// (`fast_handler::tests::the_transaction_gas_caps_bind_on_both_handlers`).
+    #[test]
+    fn a_transfer_over_the_gas_cap_falls_back_to_evm2() {
+        use evm2::evm::{CacheDB, EmptyDB};
+        let (sender, recipient, beneficiary) =
+            (Address::repeat_byte(0xa1), Address::repeat_byte(0xa2), Address::repeat_byte(0xbe));
+        let mut parent = CacheDB::new(EmptyDB::default());
+        for address in [sender, recipient, beneficiary] {
+            parent.insert_account_info(&address, AccountInfo { balance: U256::from(10u128.pow(24)), ..Default::default() });
+        }
+        let shape = |gas_limit| TxShape {
+            caller: sender,
+            to: recipient,
+            value: U256::from(1),
+            nonce: 0,
+            gas_limit,
+            max_fee: U256::from(100),
+            priority: Some(U256::from(1)),
+            chain_id: Some(1),
+        };
+        let block_gas_limit = U256::from(u64::MAX);
+        for (spec, cap) in [(SpecId::OSAKA, 1u64 << 24), (SpecId::AMSTERDAM, u64::from(u32::MAX))] {
+            let mut version = Version::new(spec);
+            version.chain_id = 1;
+            let direct = DirectTransfers::<TxEnvelope>::new(spec, &version, beneficiary, U256::from(7), block_gas_limit, shape_of)
+                .expect("the path models the block");
+            let mut state = BatchState::with_capacity(4);
+            assert_eq!(direct.apply(&shape(cap + 1), &mut parent, &mut state, |_| true), Step::Fallback, "{spec:?}");
+            assert!(state.is_empty(), "nothing written");
+            assert!(
+                matches!(direct.apply(&shape(cap), &mut parent, &mut state, |_| true), Step::Applied { .. }),
+                "{spec:?} at the cap"
+            );
+        }
+    }
 }

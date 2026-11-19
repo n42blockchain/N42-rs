@@ -7012,6 +7012,7 @@ dependencies = [
  "reth-rpc-api",
  "reth-rpc-builder",
  "reth-rpc-convert",
+ "reth-rpc-eth-api",
  "reth-rpc-eth-types",
  "reth-rpc-server-types",
  "reth-static-file-types",

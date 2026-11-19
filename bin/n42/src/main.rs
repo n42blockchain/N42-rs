@@ -552,6 +552,27 @@ fn main() {
                         ctx.modules.replace_configured(n42::qmdb_proof_ext::eth_get_proof_refusal())?;
                         ctx.auth_module.replace_auth_methods(n42::qmdb_proof_ext::eth_get_proof_refusal())?;
                         info!(target: "reth::cli", "QMDB proof namespace enabled (n42_getProof); eth_getProof refused");
+                        // The execution witness is the same trie's nodes:
+                        // refused too (`docs/RPC_SURFACE_NATIVE.md`).
+                        if ctx.modules.module_config().contains_any(&reth_rpc_server_types::RethRpcModule::Debug) {
+                            ctx.modules.replace_configured(n42::native_rpc::execution_witness_refusal())?;
+                        }
+                    }
+
+                    // EIP-7910 `eth_config`: reth's handler on an Ethereum
+                    // chain (upstream's node merges it, ours did not); gov5's
+                    // refusal on a native one, whose fork schedule the EIP
+                    // cannot express (`n42::native_rpc`).
+                    {
+                        use reth_provider::ChainSpecProvider;
+                        use reth_rpc_server_types::RethRpcModule;
+                        if reth_chainspec::qmdb::is_n42_native(ctx.provider().chain_spec().genesis()) {
+                            ctx.modules.merge_if_module_configured(RethRpcModule::Eth, n42::native_rpc::eth_config_refusal())?;
+                        } else {
+                            use reth_rpc_eth_api::helpers::config::{EthConfigApiServer, EthConfigHandler};
+                            let handler = EthConfigHandler::new(ctx.provider().clone(), ctx.node().evm_config().clone());
+                            ctx.modules.merge_if_module_configured(RethRpcModule::Eth, handler.into_rpc())?;
+                        }
                     }
 
                     // now we merge our extension namespace into all configured transports

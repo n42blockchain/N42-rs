@@ -840,15 +840,26 @@ fn delta_of_applied(tree: &QmdbCompatTree, undo: &BlockUndo) -> ForestDelta {
     // revival is a move, not a block), so no read: the flag is false.
     // Sized up front: grown by doubling it copied into fresh pages on
     // every block, under the forest's lock.
-    let mut slots: Vec<u64> = Vec::with_capacity(undo.retired_len());
-    slots.extend(undo.retired_slots().filter(|slot| *slot < base_next_slot));
-    // Sorted on the worker pool: one thread sorting a full block's
-    // ~190,000 retired slots was 2.4 ms of the leader's root, under the
-    // forest's lock (`docs/SHARED_EXECUTION_SCOPE.md` 13). The same
-    // order either way.
-    slots.par_sort_unstable();
-    slots.dedup();
-    let changed: Vec<(u64, bool)> = slots.into_par_iter().map(|slot| (slot, false)).collect();
+    // The apply's own sorted list when it made one for these slots (the
+    // parallel retirement): the same slots, ascending and distinct, all
+    // below the block's base, as the sort below gives them.
+    let presorted = tree
+        .retired_sorted(base_next_slot)
+        .filter(|sorted| sorted.len() == undo.retired_len() && sorted.last().is_none_or(|last| *last < base_next_slot));
+    let changed: Vec<(u64, bool)> = match presorted {
+        Some(sorted) => sorted.par_iter().with_min_len(4096).map(|slot| (*slot, false)).collect(),
+        None => {
+            let mut slots: Vec<u64> = Vec::with_capacity(undo.retired_len());
+            slots.extend(undo.retired_slots().filter(|slot| *slot < base_next_slot));
+            // Sorted on the worker pool: one thread sorting a full block's
+            // ~190,000 retired slots was 2.4 ms of the leader's root, under the
+            // forest's lock (`docs/SHARED_EXECUTION_SCOPE.md` 13). The same
+            // order either way.
+            slots.par_sort_unstable();
+            slots.dedup();
+            slots.into_par_iter().map(|slot| (slot, false)).collect()
+        }
+    };
     ForestDelta {
         version: ForestDelta::VERSION,
         head_number: 0,
@@ -3252,6 +3263,86 @@ mod tests {
         let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_entry_file(&path).unwrap();
         forest.apply(GENESIS, h(1), 1, &accounts(1, 8)).unwrap();
         (dir, path, forest)
+    }
+
+    /// The parallel apply on an entry file sorts its retired slots once and
+    /// the delta takes that list (no second sort): every block's root, delta
+    /// and appended offsets equal the serial apply's, over random blocks that
+    /// update, delete, re-create and touch keys again across many twig
+    /// groups, an empty block, and a revert and re-apply; and the deltas
+    /// replay a checkpoint to the same tree.
+    #[test]
+    fn the_presorted_delta_equals_the_sorted_one() {
+        use n42_twig_core::qmdb_compat::{set_parallel_apply_on_this_thread, QmdbOperation};
+        let (dir_s, _, mut serial) = entry_file_forest("presorted-serial");
+        let (dir_p, _, mut parallel) = entry_file_forest("presorted-parallel");
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let key_of = |n: u64| {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&n.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+            key[24..].copy_from_slice(&n.to_be_bytes());
+            key
+        };
+        let mut block_ops = |count: usize, first: bool| {
+            let mut seen = std::collections::HashSet::new();
+            let mut operations = Vec::new();
+            while operations.len() < count {
+                let r = next();
+                let key = key_of(r % 120_000);
+                if !seen.insert(key) {
+                    continue;
+                }
+                let value = (r % 11 != 0 || first).then(|| (0..(3 + (r % 60) as usize)).map(|i| (r as u8) ^ (i as u8)).collect());
+                operations.push(QmdbOperation { key, value });
+            }
+            QmdbOps::from(operations)
+        };
+        let mut parent = h(1);
+        for block in 2..14u8 {
+            let count = match block {
+                2 => 90_000,
+                7 => 0,
+                _ => 25_000,
+            };
+            // Block 9 first has a sibling computed and filed on the same
+            // parent, so its own computation stands the tree back first.
+            let sibling = (block == 9).then(|| block_ops(30_000, false));
+            let ops = block_ops(count, block == 2);
+            let mut computed = Vec::new();
+            for (forest, on) in [(&mut serial, false), (&mut parallel, true)] {
+                set_parallel_apply_on_this_thread(Some(on));
+                if let Some(sibling) = &sibling {
+                    let mut lease = forest.lease_tree(parent).unwrap();
+                    let result = lease.compute(sibling.clone());
+                    let (prepared, _) = forest.return_tree(lease, result).unwrap();
+                    forest.insert(h(100 + block), u64::from(block), prepared).unwrap();
+                }
+                let mut lease = forest.lease_tree(parent).unwrap();
+                let result = lease.compute(ops.clone());
+                let (prepared, _) = forest.return_tree(lease, result).unwrap();
+                set_parallel_apply_on_this_thread(None);
+                let delta = prepared.delta.as_ref().map(|delta| {
+                    (delta.version, delta.base_next_slot, delta.next_slot, delta.appended.clone(), delta.changed.clone())
+                });
+                computed.push((prepared.root, delta, prepared.offsets.clone()));
+                forest.insert(h(block), u64::from(block), prepared).unwrap();
+                forest.set_canonical(h(block)).unwrap();
+            }
+            assert_eq!(computed[0].0, computed[1].0, "root at block {block}");
+            assert!(computed[1].1.as_ref().is_some_and(|delta| delta.4.len() > 1_000 || block == 2 || count == 0), "block {block} retired slots");
+            assert_eq!(computed[0].1, computed[1].1, "delta at block {block}");
+            assert_eq!(computed[0].2, computed[1].2, "offsets at block {block}");
+            parent = h(block);
+        }
+        assert_eq!(serial.root(), parallel.root());
+        let _ = std::fs::remove_dir_all(&dir_s);
+        let _ = std::fs::remove_dir_all(&dir_p);
     }
 
     /// An entry-file write that fails part way through a block's apply

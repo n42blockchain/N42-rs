@@ -146,6 +146,9 @@ pub(crate) struct ApplyScratch {
     pub(crate) held: Vec<Option<u64>>,
     /// The appends' key and slot pairs.
     pub(crate) pairs: Vec<(Hash, u64)>,
+    /// Where in its index shard each held key's bucket was found
+    /// (`TagIndex::get_batch_ahead_at`), for the inserts to write in place.
+    pub(crate) at: Vec<u32>,
 }
 
 static APPLY_SCRATCH: Mutex<Option<ApplyScratch>> = Mutex::new(None);
@@ -177,6 +180,9 @@ pub(crate) fn take_apply_scratch(ops: usize) -> ApplyScratch {
     if scratch.pairs.capacity() < ops {
         scratch.pairs = Vec::with_capacity(room);
     }
+    if scratch.at.capacity() < ops {
+        scratch.at = Vec::with_capacity(room);
+    }
     scratch
 }
 
@@ -189,6 +195,7 @@ pub(crate) fn recycle_apply_scratch(mut scratch: ApplyScratch) {
     scratch.leaves.clear();
     scratch.held.clear();
     scratch.pairs.clear();
+    scratch.at.clear();
     let mut kept = APPLY_SCRATCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if kept.as_ref().is_none_or(|kept| kept.pairs.capacity() < scratch.pairs.capacity()) {
         *kept = Some(scratch);

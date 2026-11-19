@@ -302,6 +302,10 @@ pub struct PreparedBuild<T: reth_transaction_pool::PoolTransaction> {
     pub hashes: Vec<B256>,
     /// The partition of `keys` at this beneficiary, when one was known.
     pub groups: Option<(alloy_primitives::Address, Vec<Vec<usize>>)>,
+    /// The candidates' bytes in the block, as the builder's byte budget
+    /// counts them ([`crate::byte_budget::payload_size`]), summed with the
+    /// plan off the build's path.
+    pub bytes: usize,
     /// The hook's time.
     pub made_us: u64,
     /// `N42_PLAN_AHEAD_PARTS=1`: the transactions root of `hashes` laid out

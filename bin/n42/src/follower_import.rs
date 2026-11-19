@@ -1041,6 +1041,12 @@ fn scan_transactions(
         .collect()
 }
 
+/// The includability refusal of a blob transaction, gov5's words
+/// (`internal/deferred_includable.go`).
+fn blob_not_includable(index: usize) -> String {
+    format!("transaction {index}: blob transactions are not includable under deferred execution")
+}
+
 /// One stretch of the block's transactions, `base` its first index: what
 /// [`scan_transactions`] computes per chunk.
 fn scan_range(
@@ -1060,6 +1066,13 @@ fn scan_range(
         {
             scan.refused =
                 Some(Fault { index, message: format!("transaction {index}: chain id {id}, the chain's is {chain_id}") });
+            break;
+        }
+        // gov5's `deferredTxPlan`: blob fees and their balance charge are not
+        // modelled, so a blob transaction is not includable under deferred
+        // execution (and on a native chain it is invalid anyway, D4).
+        if alloy_consensus::Typed2718::is_eip4844(tx) {
+            scan.refused = Some(Fault { index, message: blob_not_includable(index) });
             break;
         }
         let cap = tx.max_fee_per_gas();
@@ -3587,6 +3600,9 @@ mod tests {
                     return Err(format!("transaction {index}: chain id {id}, the chain's is {chain_id}"));
                 }
             }
+            if alloy_consensus::Typed2718::is_eip4844(tx) {
+                return Err(blob_not_includable(index));
+            }
             let cap = tx.max_fee_per_gas();
             if cap < base_fee {
                 return Err(format!("transaction {index}: fee cap {cap} under the base fee {base_fee}"));
@@ -4272,6 +4288,38 @@ mod tests {
         let refused = check_includable(&provider(&accounts), B256::random(), None, &block, CHAIN_ID + 1, SpecId::OSAKA)
             .expect_err("foreign chain");
         assert!(refused.starts_with("transaction 0: chain id 1,"), "{refused}");
+    }
+
+    /// A blob transaction is not includable under deferred execution, as in
+    /// gov5's `deferredTxPlan` (whose words the refusal carries), with or
+    /// without blob hashes: the fused scan and the oracle agree.
+    #[test]
+    fn refuses_a_blob_transaction() {
+        let (block, accounts) = bench_fixture(4, 3, 64, 2);
+        for hashes in [Vec::new(), vec![B256::with_last_byte(1)]] {
+            let blob = alloy_consensus::TxEip4844 {
+                chain_id: CHAIN_ID,
+                gas_limit: 21_000,
+                max_fee_per_gas: FEE_CAP,
+                max_fee_per_blob_gas: 1,
+                to: addr(9),
+                blob_versioned_hashes: hashes,
+                ..Default::default()
+            };
+            let blob = Signed::new_unchecked(blob, Signature::test_signature(), B256::random());
+            let mut txs = block.body().transactions.clone();
+            let mut senders = block.senders().to_vec();
+            txs.insert(5, TransactionSigned::from(reth_ethereum_primitives::TransactionSigned::from(blob)));
+            senders.insert(5, addr(100));
+            let with_blob = seal(txs, senders, addr(1));
+            let mock = provider(&accounts);
+            let refused = check_includable(&mock, B256::random(), None, &with_blob, CHAIN_ID, SpecId::OSAKA)
+                .expect_err("a blob transaction");
+            assert_eq!(refused, "transaction 5: blob transactions are not includable under deferred execution");
+            let oracle = check_includable_oracle(&mock, B256::random(), None, &with_blob, CHAIN_ID, SpecId::OSAKA)
+                .expect_err("a blob transaction");
+            assert_eq!(oracle, refused);
+        }
     }
 
     /// The senders of a block, to keep the fixtures readable.

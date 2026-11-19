@@ -1009,6 +1009,7 @@ fn spawn_stats_reporter() {
                     dropped_altsig = STATS.dropped_altsig.load(Ordering::Relaxed),
                     altsig_batches_failed = STATS.altsig_batches_failed.load(Ordering::Relaxed),
                     dropped_altsig_disabled = STATS.dropped_altsig_disabled.load(Ordering::Relaxed),
+                    dropped_blob_native = STATS.dropped_blob_native.load(Ordering::Relaxed),
                     dropped_altsig_claim = STATS.dropped_altsig_claim.load(Ordering::Relaxed),
                     // Cumulative: frames noted in the queue's frame index,
                     // and frames with a dropped transaction (never whole).
@@ -1702,6 +1703,8 @@ struct IngestStats {
     /// (`docs/SIGNATURE_AND_BATCH_TX_SURVEY.md` section 5).
     altsig_batches_failed: AtomicU64,
     dropped_altsig_disabled: AtomicU64,
+    /// Blob (type-3) transactions refused on an N42-native chain.
+    dropped_blob_native: AtomicU64,
     /// 0x50 transactions in a claiming frame whose claim was not the sender
     /// their key derives.
     dropped_altsig_claim: AtomicU64,
@@ -1740,6 +1743,7 @@ static STATS: IngestStats = IngestStats {
     dropped_altsig: AtomicU64::new(0),
     altsig_batches_failed: AtomicU64::new(0),
     dropped_altsig_disabled: AtomicU64::new(0),
+    dropped_blob_native: AtomicU64::new(0),
     dropped_altsig_claim: AtomicU64::new(0),
     frames_admitted: AtomicU64::new(0),
     frames_unaligned: AtomicU64::new(0),
@@ -1966,6 +1970,15 @@ where
     let mut kept = if claimed { Vec::with_capacity(raws.len()) } else { Vec::new() };
     for (at, raw) in raws.into_iter().enumerate() {
         match <PooledOf<P> as alloy_eips::Decodable2718>::decode_2718_exact(raw.as_ref()) {
+            // A blob transaction is invalid at every fork on an N42-native
+            // chain (`docs/PROTOCOL_CONFORMANCE_2026_11.md` D4): refused
+            // here as the pool refuses it, before it can reach the queue.
+            Ok(pooled) if n42_tx_types::n42_native() && alloy_eips::Typed2718::is_eip4844(&pooled) => {
+                let dropped = STATS.dropped_blob_native.fetch_add(1, Ordering::Relaxed) + 1;
+                if drop_warn_allowed() {
+                    warn!(target: "n42.tx_ingest", dropped, "{}", n42_tx_types::BLOB_TX_ON_NATIVE_CHAIN);
+                }
+            }
             Ok(pooled) => {
                 decoded.push(pooled);
                 if claimed {

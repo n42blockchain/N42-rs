@@ -65,7 +65,7 @@ Effects are for N42's shapes:
 | 7708 transfer logs | LOG3 from `0xff…fe`, topic `Transfer(address,address,uint256)`, data = amount. Emitted on CALL with value (depth 0 included) when caller ≠ callee, on CREATE with endowment, and on a SELFDESTRUCT sweep. Not for fees, rewards, withdrawals or system calls; no burn log. (`vm/eips_amsterdam.go:204-223`, `evm.go:324,565`) | `journal/inner.rs:503,597,709,732,1122`: same emitter, topic and data. Skipped for a self-transfer and a zero value. `BURN_LOG_TOPIC` is defined but never emitted. | same | T, TC, A: one log each (the mv4f receipts root). W: none (an `increment_balances`, gov5 `AddBalance`). |
 | 7778 pre-refund block gas | Part of the 8037 settlement above. | Same. | same | — |
 | 3529 refund cap | `min(usedBeforeRefund/5, refunds)`; the base includes state gas. | `inner_refunded` capped at `total_gas_spent/5`, state included. | same | C (slot clears). |
-| 7954 code / initcode size | Max code 65,536; max initcode 131,072, enforced on native chains too at Amsterdam (`state_transition_amsterdam.go:116`, `evm.go:587`). | `eip7954::MAX_CODE_SIZE`/`MAX_INITCODE_SIZE` = 0x10000/0x20000 (`cfg.rs:462-488`). | same | CR. Before Amsterdam gov5 exempts native chains from the initcode cap and reth does not (G6, not part of this item). |
+| 7954 code / initcode size | Max code 65,536; max initcode 131,072, enforced on native chains too at Amsterdam (`state_transition_amsterdam.go:116`, `evm.go:587`). | `eip7954::MAX_CODE_SIZE`/`MAX_INITCODE_SIZE` = 0x10000/0x20000 (`cfg.rs:462-488`). | same | CR. Before Amsterdam both clients exempt native chains from the transaction-level initcode cap (G6, closed 2026-11-19). |
 | 7825 tx gas cap | 2^24 only at `IsOsaka && !IsGlamsterdam`. | Skipped when 8037 is on (`validation.rs:150`). | same | — |
 | 8246 SELFDESTRUCT | To self: no burn, no log. A destroyed account with a balance is kept as balance-only at the end of the transaction (`intra_block_state.go:1934-1963`). | `eip8246_clear_selfdestructed_accounts` (`journal/inner.rs:285`). To self keeps the balance. | same | No N42 shape self-destructs. |
 | 7843 SLOTNUM | Pushes `header.SlotNumber` on a Glamsterdam header, else 0 (`internal/evm.go:84`). With the header-parity branch a native header carries slot = number. | `block_env.slot_num` from the header (import) or the payload V4 (Engine API). The builder used to read 0 (`NextBlockEnvAttributes.slot_number: None`). | **different (fixed)** | Only for a contract that reads SLOTNUM. Gap G3, fixed in `next_evm_env`. |
@@ -141,9 +141,19 @@ implemented.
 `by_ref_road`) fall back to the serial executor on an Amsterdam-execution block, as
 gov5 does. The fast transfer path already refused Amsterdam (`fast_transfer.rs:469`).
 
-**G6 — pre-Amsterdam initcode cap on native chains (pre-existing, out of scope).**
-gov5 skips the EIP-3860 cap on native chains before Amsterdam; revm enforces it. At
-Amsterdam both enforce EIP-7954.
+**G6 — pre-Amsterdam initcode cap on native chains: closed 2026-11-19 (decision D5 of
+`PROTOCOL_CONFORMANCE_2026_11.md`).** gov5 skips the transaction-level EIP-3860 cap on
+native chains before Amsterdam (`internal/state_transition.go`, `TransitionDb`); evm2
+enforced it. The Rust node now matches gov5 exactly: on a native chain from Shanghai until
+`glamsterdamTime`, a creation transaction (types 0, 1, 2) whose initcode is over 49,152
+bytes is run by `crates/n42/engine-types/src/native_tx_rules.rs` (evm2's stock `prepare`
+without `validate_create_initcode`, then the stock execution). The initcode word gas, the
+CREATE / CREATE2 opcode cap of 49,152 bytes (gov5's `gasCreateEip3860`) and EIP-170 stay.
+The pool applies no initcode cap on a native chain, as gov5's pool applies none (the 128 KiB
+size cap remains). From `glamsterdamTime` both enforce EIP-7954's 131,072 bytes. Tests:
+`native_tx_rules` `a_native_chain_runs_oversized_initcode_until_amsterdam`,
+`an_ethereum_chain_keeps_the_eip3860_cap`, `the_create_opcode_keeps_its_cap_on_a_native_chain`;
+`pool` `the_pool_caps_initcode_on_an_ethereum_chain_only`. gov5 is unchanged.
 
 **G7 — pool admission intrinsic: closed by reth v2.11.0 (2026-11).** The pool now resolves its gas rules from the EVM environment of the tip, `N42EvmConfig`'s, so it prices EIP-2780 from `glamsterdamTime` as gov5's pool does from `IsGlamsterdam` (both read the tip's time). One difference is left: reth's pool still refuses a gas limit under the calldata floor, which gov5's admits; the executor refuses such a transaction anyway. The text below is the 2026-11-03 state. **(Was: no consensus effect.)** reth's vendored pool takes its
 Amsterdam intrinsic from the chain spec. Making it follow the EVM configuration needs a

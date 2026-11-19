@@ -76,6 +76,28 @@ pub fn set_alt_sig_enabled(enabled: bool) {
     ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+static NATIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this node runs an N42-native chain (gov5's `IsN42Native`:
+/// consensus `hotstuff` or `apos`). Off until the node reads its genesis and
+/// says so with [`set_n42_native`]. On, a blob (type-3) transaction is invalid
+/// at every fork: the pool and the ingest refuse it and block validation
+/// rejects a block carrying one (`docs/PROTOCOL_CONFORMANCE_2026_11.md` D4);
+/// and the pool, like gov5's, applies no EIP-3860 initcode cap of its own
+/// (D5).
+pub fn n42_native() -> bool {
+    NATIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Records whether the chain is N42-native.
+pub fn set_n42_native(native: bool) {
+    NATIVE.store(native, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The refusal of a blob transaction on an N42-native chain, word for word
+/// in every place that refuses one.
+pub const BLOB_TX_ON_NATIVE_CHAIN: &str = "blob (EIP-4844, type 3) transactions are not supported on an N42-native chain";
+
 /// Whether this node takes an ingested transaction's sender from the frame
 /// that carried it instead of recovering it from the signature:
 /// `N42_INGEST_VERIFY=leader`, against the default `all`.

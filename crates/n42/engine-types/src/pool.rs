@@ -130,6 +130,20 @@ impl PoolTransaction for N42PooledTransaction {
     fn encoded_length(&self) -> usize {
         self.encoded_length
     }
+
+    /// On an N42-native chain the pool applies no EIP-3860 initcode cap, as
+    /// gov5's does not (`internal/txspool`: the 128 KiB transaction size cap
+    /// only, as here): gov5's state transition exempts a native chain's
+    /// creation transactions from the cap before Amsterdam and applies
+    /// EIP-7954's 131,072 bytes from Amsterdam, which the size cap already
+    /// keeps out of the pool (`docs/PROTOCOL_CONFORMANCE_2026_11.md` D5,
+    /// `crate::native_tx_rules`). Elsewhere reth's check.
+    fn ensure_max_init_code_size(
+        &self,
+        max_init_code_size: usize,
+    ) -> Result<(), reth_transaction_pool::error::InvalidPoolTransactionError> {
+        init_code_check(n42_tx_types::n42_native(), self.is_create(), self.input().len(), max_init_code_size)
+    }
 }
 
 impl Typed2718 for N42PooledTransaction {
@@ -231,5 +245,34 @@ impl EthPoolTransaction for N42PooledTransaction {
             Some(tx) => tx.tx().validate_blob(sidecar, settings),
             _ => Err(BlobTransactionValidationError::NotBlobTransaction(self.ty())),
         }
+    }
+}
+
+/// [`PoolTransaction::ensure_max_init_code_size`] on a chain that is native
+/// or not: no cap on a native one, reth's elsewhere.
+fn init_code_check(
+    native: bool,
+    is_create: bool,
+    input_len: usize,
+    max_init_code_size: usize,
+) -> Result<(), reth_transaction_pool::error::InvalidPoolTransactionError> {
+    if !native && is_create && input_len > max_init_code_size {
+        Err(reth_transaction_pool::error::InvalidPoolTransactionError::ExceedsMaxInitCodeSize(input_len, max_init_code_size))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod init_code_tests {
+    use super::init_code_check;
+
+    /// D5: the pool caps a creation's initcode on an Ethereum chain only.
+    #[test]
+    fn the_pool_caps_initcode_on_an_ethereum_chain_only() {
+        assert!(init_code_check(false, true, 49_152, 49_152).is_ok());
+        assert!(init_code_check(false, true, 49_153, 49_152).is_err());
+        assert!(init_code_check(false, false, 49_153, 49_152).is_ok(), "a call's input is not initcode");
+        assert!(init_code_check(true, true, 49_153, 49_152).is_ok());
     }
 }

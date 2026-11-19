@@ -938,6 +938,15 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     #[allow(clippy::type_complexity)]
     let (transactions, (senders, hashes)): (Vec<TransactionSigned>, (Vec<alloy_primitives::Address>, Vec<B256>)) = pool
         .install(|| cands.par_iter().with_min_len(1024).map(|tx| (pooled_consensus(tx).clone(), (tx.sender(), *tx.hash()))).unzip());
+    // The candidates' block bytes for the byte budget, on the plan body's
+    // pool beside the rest: the build then checks one sum, not each one.
+    let bytes = pool.install(|| {
+        cands
+            .par_iter()
+            .with_min_len(1024)
+            .map(|tx| crate::byte_budget::payload_size(PoolTransaction::encoded_length(&tx.transaction)))
+            .sum::<usize>()
+    });
     let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
@@ -954,6 +963,7 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         senders,
         hashes,
         groups,
+        bytes,
         made_us: at.elapsed().as_micros() as u64,
         root_ahead,
     })
@@ -1762,6 +1772,20 @@ where
         header.beneficiary = coinbase;
     }
     let start_prepare_ms = start_prepare_at.elapsed().as_millis() as u64;
+    // Decision D1 (`docs/PROTOCOL_CONFORMANCE_2026_11.md`): on an N42-native
+    // chain the block stays inside gov5's byte budget, 9/10 of the gossip cap
+    // less 32 KiB and the header (`crate::byte_budget`), so the network can
+    // carry every block this node seals. Builder policy, not a rule. Its
+    // counts are the pool's encoded lengths; a chain that is not native has
+    // no budget and nothing is counted.
+    let native = reth_chainspec::qmdb::is_n42_native(chain_spec.genesis());
+    let mut byte_budget = if native {
+        crate::byte_budget::ByteBudget::new(crate::byte_budget::wire_cap(), alloy_rlp::Encodable::length(&header))
+    } else {
+        crate::byte_budget::ByteBudget::unlimited()
+    };
+    // Whether the budget cut this block: it is then full, as at the gas limit.
+    let mut bytes_full = false;
 
     // `N42_STATE_AFTER_PULL=1`: the parent's state opened and the
     // pre-execution changes applied once, just before the parallel step's
@@ -2177,6 +2201,35 @@ where
                 }
             }
         }
+        // The byte budget (D1): the prefix that fits, the rest handed back
+        // for the next block like a block's worth over the gas budget. With
+        // the plan's body made for exactly these candidates its sum is
+        // checked; otherwise each candidate's pooled length is read (only on
+        // a native chain: elsewhere the budget is unlimited and nothing is).
+        // Counted into the budget once the step has executed them.
+        let mut par_bytes = 0usize;
+        if native {
+            let plan_bytes = prepared_build
+                .as_deref()
+                .filter(|made| prepared_miss_of(Some(made), from_bulk, bulk_len, cands.len()).is_none())
+                .map(|made| made.bytes);
+            match plan_bytes {
+                Some(bytes) if byte_budget.fits(bytes) => par_bytes = bytes,
+                _ => {
+                    let mut trial = byte_budget;
+                    let take = trial.take_prefix(
+                        cands.iter().map(|tx| crate::byte_budget::payload_size(tx.transaction.encoded_length())),
+                    );
+                    par_bytes = trial.used() - byte_budget.used();
+                    if take < cands.len() {
+                        bytes_full = true;
+                        for tx in cands.split_off(take).into_iter().rev() {
+                            lookahead.push_front(tx);
+                        }
+                    }
+                }
+            }
+        }
         par_pull_ms = par_at.elapsed().as_millis() as u64;
         // `N42_PULLER_STOP_AT_PULL` (default on, F5g item 5): a full pull
         // on a block that can seal at the execution's end gives the
@@ -2217,18 +2270,7 @@ where
         // empty then): the take is the plan's when the bulk vector came with
         // it and was not cut (F5g8: E13 missed on every block on the
         // `made.cands` length).
-        let prepared_miss = match prepared_build.as_ref() {
-            None => Some(String::from("no_plan")),
-            Some(made) if made.keys.len() != cands.len() => Some(format!("keys_len {}!={}", made.keys.len(), cands.len())),
-            Some(made) if !made.cands.is_empty() && made.cands.len() != cands.len() => {
-                Some(format!("cands_len {}!={}", made.cands.len(), cands.len()))
-            }
-            Some(_) if made_cands_cut(from_bulk, bulk_len, cands.len()) => Some(format!("bulk_cut {}!={}", bulk_len, cands.len())),
-            Some(made) if made.transactions.len() != cands.len() => {
-                Some(format!("transactions_len {}!={}", made.transactions.len(), cands.len()))
-            }
-            Some(_) => None,
-        };
+        let prepared_miss = prepared_miss_of(prepared_build.as_deref(), from_bulk, bulk_len, cands.len());
         let prepared = if prepared_miss.is_none() { prepared_build.take() } else { None };
         prep_from_plan = prepared.is_some();
         evm2_prepared_miss = prepared_miss.unwrap_or_else(|| String::from("none"));
@@ -2378,6 +2420,7 @@ where
                     let gas_left_after = block_gas_limit.saturating_sub(cumulative_gas_used + gas);
                     let full_after = gas_left_after < MIN_TRANSACTION_GAS
                         || par_drained
+                        || bytes_full
                         || (executed_len != 0 && gas_left_after <= seal_shortfall(block_gas_limit));
                     let seal_here = seal_at_exec()
                         && seal_early_possible
@@ -2619,6 +2662,7 @@ where
                             cumulative_gas_used += committed_gas;
                             tx_count += executed_len as u64;
                             par_txs = executed_len as u64;
+                            byte_budget.add(par_bytes);
                             par_groups = groups.len();
                             par_batches = batches;
                             par_skipped = skipped.len();
@@ -2697,6 +2741,7 @@ where
     let gas_left = block_gas_limit.saturating_sub(cumulative_gas_used);
     let block_full = gas_left < MIN_TRANSACTION_GAS
         || par_drained
+        || (par_txs > 0 && bytes_full)
         || (par_txs > 0 && gas_left <= seal_shortfall(block_gas_limit));
     // Why this build will not seal early, decided from the same inputs as
     // the gate below and said once a second. Until loop207 nothing named
@@ -4162,6 +4207,11 @@ where
         if serial_closed || gas_budget.left(cumulative_gas_used) < MIN_TRANSACTION_GAS {
             break;
         }
+        // The byte budget's end (D1): too little left for any transaction, or
+        // eight candidates in a row did not fit (gov5's `packStop`).
+        if byte_budget.full() {
+            break;
+        }
         // The pool/execution split is timed with the cycle counter, not the
         // clock: round 37's clock-count shim found 99.9% of the builder
         // thread's clock reads were this loop's own per-transaction timers
@@ -4218,6 +4268,25 @@ where
             );
             continue;
         }
+        // The byte budget (D1): a transaction that does not fit goes back
+        // with its sender's later ones for the next block (gov5's
+        // `packSkipAccount`); one that cannot fit any more ends the loop and
+        // goes back with the rest of what was taken (`packStop`).
+        let tx_bytes = crate::byte_budget::payload_size(pool_tx.transaction.encoded_length());
+        match byte_budget.admit(tx_bytes) {
+            crate::byte_budget::Pack::Accept => {}
+            crate::byte_budget::Pack::SkipSender => {
+                refuse!(
+                    &pool_tx,
+                    InvalidPoolTransactionError::OversizedData { size: tx_bytes, limit: byte_budget.remaining() }
+                );
+                continue;
+            }
+            crate::byte_budget::Pack::Stop => {
+                lookahead.push_front(pool_tx);
+                break;
+            }
+        }
 
         // check if the job was cancelled, if so we can exit early
         if cancel.is_cancelled() {
@@ -4247,6 +4316,14 @@ where
 
         // convert tx to a signed transaction
         let tx = pool_tx.to_consensus();
+
+        // A blob transaction is invalid on an N42-native chain (D4): the pool
+        // and the ingest refuse it, and so does the builder, whatever reached
+        // it. (The chain's EVM refuses it too, `crate::native_tx_rules`.)
+        if native && tx.is_eip4844() {
+            refuse!(&pool_tx, InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported));
+            continue;
+        }
 
         // There's only limited amount of blob space available per block, so we need to check if
         // the EIP-4844 can still fit in the block
@@ -4402,6 +4479,7 @@ where
         total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
         cumulative_gas_used += tx_gas_used;
         gas_budget.admit(pool_tx.gas_limit());
+        byte_budget.add(tx_bytes);
         if let Some(admitted) = admitted {
             admitted.commit();
         }
@@ -5084,6 +5162,30 @@ fn puller_stop_at_pull() -> bool {
 /// not come as the selection's bulk vector, or it was cut to the budget.
 const fn made_cands_cut(from_bulk: bool, bulk_len: usize, cands: usize) -> bool {
     !from_bulk || bulk_len != cands
+}
+
+/// Why the plan's prepared body is not for exactly the parallel step's
+/// candidates (`cands` of them), or `None` when it is: its keys, its
+/// candidates and its transactions are as many, and the candidates came as
+/// the plan's uncut bulk vector.
+fn prepared_miss_of<P: PoolTransaction>(
+    made: Option<&crate::frame_blocks::PreparedBuild<P>>,
+    from_bulk: bool,
+    bulk_len: usize,
+    cands: usize,
+) -> Option<String> {
+    match made {
+        None => Some(String::from("no_plan")),
+        Some(made) if made.keys.len() != cands => Some(format!("keys_len {}!={}", made.keys.len(), cands)),
+        Some(made) if !made.cands.is_empty() && made.cands.len() != cands => {
+            Some(format!("cands_len {}!={}", made.cands.len(), cands))
+        }
+        Some(_) if made_cands_cut(from_bulk, bulk_len, cands) => Some(format!("bulk_cut {bulk_len}!={cands}")),
+        Some(made) if made.transactions.len() != cands => {
+            Some(format!("transactions_len {}!={}", made.transactions.len(), cands))
+        }
+        Some(_) => None,
+    }
 }
 
 /// `N42_EVM2_RECEIPTS_LATE` (default on; `0` commits the receipts before the

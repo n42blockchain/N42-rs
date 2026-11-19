@@ -66,3 +66,17 @@ Rust branch `fix/conformance-decisions`; gov5 branch `fix/native-conformance-202
   - `internal/api/eth_config.go:86-126`
   - `internal/state_transition.go:577-581`
   - `common/transaction/transaction.go:236-275`
+
+## Verification of the decisions (2026-11-19)
+
+- **Mixed devnet** (three Rust validators and one gov5 member built from `fix/native-conformance-2026-11`,
+  Rust natives from `fix/conformance-decisions`): round cd2a, 240 s, height 107, the gov5 member sealed 27
+  blocks, head hash equal in both clients, 0 errors; round cd2b with `GOV5_DELAY=120`, 360 s, height 160,
+  gov5 sealed 40, head hash equal, 0 errors. Ordinary traffic only: no blob transaction and no oversized
+  initcode was submitted end to end; those rules rest on each client's unit tests.
+- **Fleet pair CDN** against the root-job natives: 5.09M / 5.21M against 5.21M, par_exec 30.0 / 29.2
+  against 28.9 ms, sealed_at 37.5 / 36.5 against 36.6 ms: inside leg noise (three legs; the fourth
+  yielded the box).
+- **Open before the gov5 branch is merged into gov5 main:** the history of chains 94 and 95 has not
+  been scanned for type-3 transactions or for type-4 transactions without a recipient or with an empty
+  authorization list (D3, D4). Until then gov5 main still accepts what the Rust node refuses.

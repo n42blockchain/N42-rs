@@ -46,6 +46,7 @@ pub mod consensus_ext;
 pub mod engine_ext;
 pub mod follower_import;
 pub mod import_once;
+pub mod native_rpc;
 pub mod payload_serve;
 pub mod qmdb_proof_ext;
 pub mod queue_prune;

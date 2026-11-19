@@ -45,6 +45,7 @@ pub mod engine_validator;
 pub mod claimed_build;
 pub mod fast_handler;
 pub mod native_tx_rules;
+pub mod byte_budget;
 pub mod direct_transfer;
 pub mod frame_blocks;
 pub mod frame_scan;

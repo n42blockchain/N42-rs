@@ -152,6 +152,11 @@ pub fn summarize<'a>(txs: impl IntoIterator<Item = (&'a TransactionSigned, Addre
         if tx.authorization_list().is_some_and(|list| list.is_empty()) {
             return None;
         }
+        // Not includable under deferred execution (gov5's rule): the check
+        // refuses it transaction by transaction.
+        if alloy_consensus::Typed2718::is_eip4844(tx) {
+            return None;
+        }
         if intrinsic_gas_shortfall(tx, SUMMARY_SPEC).is_some() {
             return None;
         }

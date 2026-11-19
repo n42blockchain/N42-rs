@@ -216,18 +216,26 @@ pub struct N42BlockExecutorFactory<C = ChainSpec, F = RethEvmFactory> {
     receipt_builder: N42ReceiptBuilder,
     chain_spec: Arc<C>,
     evm_factory: F,
+    /// Whether the chain is N42-native (gov5's `IsN42Native`), read from its
+    /// genesis once: its EVMs then carry [`crate::native_tx_rules`].
+    native: std::sync::OnceLock<bool>,
 }
 
 impl<C, F: Clone> Clone for N42BlockExecutorFactory<C, F> {
     fn clone(&self) -> Self {
-        Self { receipt_builder: self.receipt_builder, chain_spec: self.chain_spec.clone(), evm_factory: self.evm_factory.clone() }
+        Self {
+            receipt_builder: self.receipt_builder,
+            chain_spec: self.chain_spec.clone(),
+            evm_factory: self.evm_factory.clone(),
+            native: self.native.clone(),
+        }
     }
 }
 
 impl<C, F> N42BlockExecutorFactory<C, F> {
     /// The factory for `chain_spec` with `evm_factory`.
     pub const fn new(chain_spec: Arc<C>, evm_factory: F) -> Self {
-        Self { receipt_builder: N42ReceiptBuilder, chain_spec, evm_factory }
+        Self { receipt_builder: N42ReceiptBuilder, chain_spec, evm_factory, native: std::sync::OnceLock::new() }
     }
 
     /// The chain spec.
@@ -280,7 +288,10 @@ where
         // reth's `EthBlockExecutorFactory::build_evm`, which is crate-private.
         let spec = env.spec;
         let config = self.evm_factory.execution_config(spec, env.version);
-        let registry = self.evm_factory.n42_tx_registry(spec);
+        let mut registry = self.evm_factory.n42_tx_registry(spec);
+        if *self.native.get_or_init(|| reth_chainspec::qmdb::is_n42_native(self.chain_spec.genesis())) {
+            registry = self.evm_factory.n42_native_tx_registry(spec, registry);
+        }
         let precompiles = self.evm_factory.precompiles(spec);
         let mut evm =
             evm2::Evm::<F::Types>::new_with_execution_config(config, spec, env.block, registry, db, precompiles);
@@ -297,6 +308,17 @@ pub trait TxRegistrySource: EvmFactory {
     fn n42_tx_registry(&self, spec: Self::SpecId) -> evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>> {
         self.tx_registry(spec)
     }
+
+    /// `base` with an N42-native chain's transaction rules
+    /// ([`crate::native_tx_rules`]); `base` unchanged by default.
+    fn n42_native_tx_registry(
+        &self,
+        spec: Self::SpecId,
+        base: evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>>,
+    ) -> evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>> {
+        let _ = spec;
+        base
+    }
 }
 
 impl TxRegistrySource for RethEvmFactory {
@@ -307,6 +329,14 @@ impl TxRegistrySource for RethEvmFactory {
         } else {
             base
         }
+    }
+
+    fn n42_native_tx_registry(
+        &self,
+        spec: Self::SpecId,
+        base: evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>>,
+    ) -> evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>> {
+        crate::native_tx_rules::registry(spec, base)
     }
 }
 

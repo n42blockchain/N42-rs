@@ -74,6 +74,9 @@ pub(crate) fn prefetch_line<T>(ptr: *const T) {
 /// Keys a task of [`TagIndex::get_batch_chunked`] and
 /// [`TagIndex::get_batch_ahead`] takes (the tree's `LEAF_CHUNK`).
 const GET_CHUNK: usize = 1024;
+
+/// `TagIndex::get_batch_ahead_at`'s place for a key it did not find.
+pub(crate) const NOT_FOUND_AT: u32 = u32::MAX;
 const MAX_BITS: u32 = FP_BITS;
 
 /// A random seed per process, taken from std's randomly keyed hasher.
@@ -375,10 +378,11 @@ impl Shard {
         let _ = fp;
     }
 
-    /// The slot of the first bucket on `fp`'s probe path that carries `fp`,
-    /// unconfirmed: [`Self::get`]'s first candidate, before it reads a key.
-    /// `None` when the path reaches an empty bucket first (the key is absent).
-    fn first_candidate(&self, fp: u64) -> Option<u64> {
+    /// The first bucket on `fp`'s probe path that carries `fp` and the slot
+    /// in it, unconfirmed: [`Self::get`]'s first candidate, before it reads a
+    /// key. `None` when the path reaches an empty bucket first (the key is
+    /// absent).
+    fn first_candidate_at(&self, fp: u64) -> Option<(usize, u64)> {
         if self.len == 0 {
             return None;
         }
@@ -390,7 +394,7 @@ impl Shard {
                 return None;
             }
             if bucket >> SLOT_BITS == fp {
-                return Some((bucket & SLOT_MASK) - 1);
+                return Some((at, (bucket & SLOT_MASK) - 1));
             }
             at = (at + 1) & mask;
         }
@@ -671,10 +675,29 @@ impl TagIndex {
         key_at: impl Fn(u64) -> Hash + Sync,
         ahead: impl Fn(u64, KeyRead) + Sync,
     ) {
+        self.get_batch_ahead_at(out, None, key, key_at, ahead);
+    }
+
+    /// [`Self::get_batch_ahead`], also writing into `at[i]` the bucket
+    /// within its shard where `key(i)`'s answer was found ([`NOT_FOUND_AT`]
+    /// when absent, or in the key0 mode), for
+    /// [`Self::insert_sorted_known_at`] to write it in place. The answers
+    /// are the same.
+    pub(crate) fn get_batch_ahead_at<'k>(
+        &self,
+        out: &mut [Option<u64>],
+        at: Option<&mut [u32]>,
+        key: impl Fn(usize) -> &'k Hash + Sync,
+        key_at: impl Fn(u64) -> Hash + Sync,
+        ahead: impl Fn(u64, KeyRead) + Sync,
+    ) {
         if self.key0 {
+            if let Some(at) = at {
+                at.fill(NOT_FOUND_AT);
+            }
             return self.get_batch_chunked(out, key, key_at);
         }
-        let work = |(chunk, held): (usize, &mut [Option<u64>])| {
+        let work = |chunk: usize, held: &mut [Option<u64>], mut place: Option<&mut [u32]>| {
             let base = chunk * GET_CHUNK;
             let n = held.len();
             let bucket = |i: usize| {
@@ -683,11 +706,14 @@ impl TagIndex {
             };
             // The candidate of key `i`, written to its own place ahead of its
             // confirmation, and its location asked for.
-            let candidate = |held: &mut [Option<u64>], i: usize| {
+            let candidate = |held: &mut [Option<u64>], place: &mut Option<&mut [u32]>, i: usize| {
                 let k = key(base + i);
-                let found = self.shards[self.shard(k)].first_candidate(fingerprint(k));
-                held[i] = found;
-                if let Some(slot) = found {
+                let found = self.shards[self.shard(k)].first_candidate_at(fingerprint(k));
+                held[i] = found.map(|(_, slot)| slot);
+                if let Some(place) = place.as_deref_mut() {
+                    place[i] = found.map_or(NOT_FOUND_AT, |(bucket, _)| bucket as u32);
+                }
+                if let Some((_, slot)) = found {
                     ahead(slot, KeyRead::Locate);
                 }
             };
@@ -695,7 +721,7 @@ impl TagIndex {
                 bucket(i);
             }
             for i in 0..PIPE_LOCATE.min(n) {
-                candidate(held, i);
+                candidate(held, &mut place, i);
             }
             for slot in held[..PIPE_RECORD.min(n)].iter().flatten() {
                 ahead(*slot, KeyRead::Record);
@@ -705,7 +731,7 @@ impl TagIndex {
                     bucket(i + PIPE_BUCKET);
                 }
                 if i + PIPE_LOCATE < n {
-                    candidate(held, i + PIPE_LOCATE);
+                    candidate(held, &mut place, i + PIPE_LOCATE);
                 }
                 if let Some(Some(slot)) = held.get(i + PIPE_RECORD) {
                     ahead(*slot, KeyRead::Record);
@@ -713,7 +739,11 @@ impl TagIndex {
                 if let Some(slot) = held[i] {
                     let k = key(base + i);
                     if key_at(slot) != *k {
-                        held[i] = self.get(k, &key_at);
+                        let found = self.shards[self.shard(k)].get(k, &key_at);
+                        held[i] = found.map(|(_, slot)| slot);
+                        if let Some(place) = place.as_deref_mut() {
+                            place[i] = found.map_or(NOT_FOUND_AT, |(bucket, _)| bucket as u32);
+                        }
                     }
                 }
             }
@@ -721,10 +751,24 @@ impl TagIndex {
         #[cfg(feature = "rayon")]
         {
             use rayon::prelude::*;
-            out.par_chunks_mut(GET_CHUNK).enumerate().for_each(work);
+            match at {
+                Some(at) => out
+                    .par_chunks_mut(GET_CHUNK)
+                    .zip(at.par_chunks_mut(GET_CHUNK))
+                    .enumerate()
+                    .for_each(|(chunk, (held, place))| work(chunk, held, Some(place))),
+                None => out.par_chunks_mut(GET_CHUNK).enumerate().for_each(|(chunk, held)| work(chunk, held, None)),
+            }
         }
         #[cfg(not(feature = "rayon"))]
-        out.chunks_mut(GET_CHUNK).enumerate().for_each(work);
+        match at {
+            Some(at) => out
+                .chunks_mut(GET_CHUNK)
+                .zip(at.chunks_mut(GET_CHUNK))
+                .enumerate()
+                .for_each(|(chunk, (held, place))| work(chunk, held, Some(place))),
+            None => out.chunks_mut(GET_CHUNK).enumerate().for_each(|(chunk, held)| work(chunk, held, None)),
+        }
     }
 
     /// The seeded held-slot pass before the pipeline (bench reference):
@@ -756,7 +800,7 @@ impl TagIndex {
                 }
                 // SAFETY: `position < out.len()`, and the partition names
                 // every position exactly once, so no two tasks write one.
-                unsafe { *dst.at(*position as usize) = shard.first_candidate(*fp) };
+                unsafe { *dst.at(*position as usize) = shard.first_candidate_at(*fp).map(|(_, slot)| slot) };
             }
         };
         let confirm = |(chunk, held): (usize, &mut [Option<u64>])| {
@@ -803,6 +847,71 @@ impl TagIndex {
         }
         #[cfg(not(feature = "rayon"))]
         out.chunks_mut(GET_CHUNK).enumerate().for_each(work);
+    }
+
+    /// [`Self::insert_sorted_known`] with `at[i]`, the bucket within its
+    /// shard where the block's own lookup ([`Self::get_batch_ahead_at`])
+    /// found `pairs[i]`'s key: every held key whose bucket still holds its
+    /// fingerprint and `held` slot there -- a (fingerprint, slot) pair names
+    /// one key, so that bucket is the one `insert_sorted_known` would find
+    /// on the key's probe path -- is rewritten in place on the pool, with no
+    /// partition and no probe; the rest (absent keys, buckets moved since by
+    /// a removal or a growth) go through [`Self::insert_sorted_known`] in
+    /// their order. Rewriting a bucket in place changes no bucket's
+    /// emptiness, so the rest land where they would have: the same table
+    /// either way (`known_places_insert_like_the_probes`).
+    pub(crate) fn insert_sorted_known_at(
+        &mut self,
+        pairs: &[(Hash, u64)],
+        held: &[Option<u64>],
+        at: &[u32],
+        key_at: impl Fn(u64) -> Hash + Sync,
+    ) -> Result<(), IndexError> {
+        if self.key0 || held.len() != pairs.len() || at.len() != pairs.len() {
+            return self.insert_sorted_known(pairs, held, key_at);
+        }
+        let tables: Vec<(SyncPtr<u64>, usize)> =
+            self.shards.iter_mut().map(|shard| (SyncPtr(shard.buckets.as_mut_ptr()), shard.buckets.len())).collect();
+        let in_place = |i: usize| -> bool {
+            let (Some(old), place) = (held[i], at[i] as usize) else { return false };
+            let (key, slot) = &pairs[i];
+            if place == NOT_FOUND_AT as usize || old > MAX_SLOT || *slot > MAX_SLOT {
+                return false;
+            }
+            let (table, len) = tables[shard_of(key)];
+            if place >= len {
+                return false;
+            }
+            let fp = fingerprint(key);
+            // SAFETY: `place < len`, the shard's bucket count, and the
+            // shards' tables are not resized while `tables` lives (`self` is
+            // borrowed mutably and only these writes touch them). Two tasks
+            // never touch one bucket: a bucket is rewritten only when it
+            // holds `(fp, old)`, and a slot names one key, so each bucket
+            // matches at most one `i`.
+            unsafe {
+                let bucket = table.at(place);
+                if *bucket != (fp << SLOT_BITS) | (old + 1) {
+                    return false;
+                }
+                *bucket = (fp << SLOT_BITS) | (slot + 1);
+            }
+            true
+        };
+        #[cfg(feature = "rayon")]
+        let rest: Vec<usize> = {
+            use rayon::prelude::*;
+            (0..pairs.len()).into_par_iter().with_min_len(4096).filter(|&i| !in_place(i)).collect()
+        };
+        #[cfg(not(feature = "rayon"))]
+        let rest: Vec<usize> = (0..pairs.len()).filter(|&i| !in_place(i)).collect();
+        drop(tables);
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let rest_pairs: Vec<(Hash, u64)> = rest.iter().map(|&i| pairs[i]).collect();
+        let rest_held: Vec<Option<u64>> = rest.iter().map(|&i| held[i]).collect();
+        self.insert_sorted_known(&rest_pairs, &rest_held, key_at)
     }
 
     /// [`Self::insert_sorted`] for a block whose pairs' current slots are
@@ -1157,6 +1266,78 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
             z ^ (z >> 31)
+        }
+    }
+
+    /// The block path's in-place inserts (`get_batch_ahead_at` places,
+    /// `insert_sorted_known_at`) leave every shard's table -- each bucket,
+    /// the lengths, the sizes -- as the probing inserts leave it, over
+    /// blocks of held keys with fresh ones among them (absent places), with
+    /// the shards growing between the lookup and the insert (stale places),
+    /// with a removal shifting buckets in between, and in the key0 mode.
+    #[test]
+    fn known_places_insert_like_the_probes() {
+        for key0 in [false, true] {
+            let mut stream = Stream(7);
+            let mut store: Vec<Hash> = Vec::new();
+            let mut probed = TagIndex::with_key0(key0);
+            for n in 0..40_000u64 {
+                store.push(key_of(n, None));
+            }
+            let mut pairs: Vec<(Hash, u64)> = store.iter().enumerate().map(|(i, k)| (*k, i as u64)).collect();
+            pairs.sort_unstable();
+            probed.insert_sorted(&pairs, |slot| store[slot as usize]).unwrap();
+            let mut placed = probed.clone();
+            let mut next_new = 40_000u64;
+            for block in 0..12 {
+                let size = if block % 4 == 3 { 30_000 } else { 9_000 };
+                let mut keys: Vec<Hash> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                while keys.len() < size {
+                    let key = if stream.next() % 10 == 0 {
+                        next_new += 1;
+                        key_of(next_new, None)
+                    } else {
+                        key_of(stream.next() % next_new, None)
+                    };
+                    if seen.insert(key) {
+                        keys.push(key);
+                    }
+                }
+                keys.sort_unstable();
+                let mut held = vec![None; keys.len()];
+                let mut places = vec![0u32; keys.len()];
+                let key_at = |slot: u64| store[slot as usize];
+                placed.get_batch_ahead_at(&mut held, Some(&mut places), |i| &keys[i], key_at, |_, _| {});
+                let mut expected = vec![None; keys.len()];
+                probed.get_batch_ahead(&mut expected, |i| &keys[i], key_at, |_, _| {});
+                assert_eq!(held, expected, "lookups at block {block} (key0 {key0})");
+                for (i, place) in places.iter().enumerate() {
+                    assert_eq!(*place == NOT_FOUND_AT, held[i].is_none() || key0, "place {i} at block {block}");
+                }
+                // Growth between the lookup and the inserts on some blocks
+                // (every place stale), a removal on others.
+                if block % 3 == 1 {
+                    placed.reserve(200_000 * (block + 1));
+                    probed.reserve(200_000 * (block + 1));
+                }
+                if block % 3 == 2 {
+                    let gone = key_of(3, None);
+                    let _ = placed.remove(&gone, key_at);
+                    let _ = probed.remove(&gone, key_at);
+                }
+                let first = store.len() as u64;
+                store.extend(keys.iter().copied());
+                let appended: Vec<(Hash, u64)> = keys.iter().enumerate().map(|(i, k)| (*k, first + i as u64)).collect();
+                let key_at = |slot: u64| store[slot as usize];
+                placed.insert_sorted_known_at(&appended, &held, &places, key_at).unwrap();
+                probed.insert_sorted_known(&appended, &held, key_at).unwrap();
+                assert_eq!(placed.len(), probed.len(), "len at block {block} (key0 {key0})");
+                for (a, b) in placed.shards.iter().zip(&probed.shards) {
+                    assert_eq!((a.bits, a.len), (b.bits, b.len), "shard shape at block {block} (key0 {key0})");
+                    assert!(a.buckets == b.buckets, "buckets at block {block} (key0 {key0})");
+                }
+            }
         }
     }
 

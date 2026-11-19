@@ -2914,7 +2914,8 @@ where
                         n42_core_layout::enter(n42_core_layout::Set::Critical);
                         let empty = reth_trie::bundle_state::BundleState::default();
                         let accounts = shards.view(&empty, &[]);
-                        (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
+                        let ahead = crate::parallel_common::on_leader_root_pool(|| n42_qmdb_reth::operations_ahead(&accounts, prague));
+                        (ahead, std::time::Instant::now())
                     });
                     match spawned {
                         Ok(handle) => ops_ahead = Some((handle, prague)),
@@ -3265,7 +3266,7 @@ where
                             concat_us: 0,
                             sort_us: ahead.sort_us,
                         };
-                        let ops = ahead.finish(&replaced, &newer, prague);
+                        let ops = crate::parallel_common::on_leader_root_pool(|| ahead.finish(&replaced, &newer, prague));
                         Some((
                             ops,
                             split,
@@ -3275,7 +3276,9 @@ where
                     let (ops, split, mut ahead_use) = match finished {
                         Some(finished) => finished,
                         None => {
-                            let (ops, split) = n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague);
+                            let (ops, split) = crate::parallel_common::on_leader_root_pool(|| {
+                                n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague)
+                            });
                             (ops, split, OpsAheadUse::default())
                         }
                     };
@@ -3287,7 +3290,7 @@ where
                     // of it reads the parent's tree or fields.
                     let (ops, leaves) = if before_gate {
                         let mut ops = ops;
-                        let leaves = n42_qmdb_reth::sort_and_hash_leaves(&mut ops);
+                        let leaves = crate::parallel_common::on_leader_root_pool(|| n42_qmdb_reth::sort_and_hash_leaves(&mut ops));
                         (ops, leaves)
                     } else {
                         (ops, None)
@@ -3303,7 +3306,9 @@ where
                     } else {
                         spawned
                     };
-                    let prepared = qmdb_job.compute_operations_with_leaves(parent_sealed, ops, leaves);
+                    let prepared = crate::parallel_common::on_leader_root_pool(|| {
+                        qmdb_job.compute_operations_with_leaves(parent_sealed, ops, leaves)
+                    });
                     let ended = std::time::Instant::now();
                     // The operations' phase is its own length whichever side
                     // of the gate it ran; the compute is the apply after it.

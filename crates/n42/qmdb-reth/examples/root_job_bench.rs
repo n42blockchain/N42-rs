@@ -73,7 +73,7 @@ fn pin(cpus: &[usize]) {
         for cpu in cpus {
             libc::CPU_SET(*cpu, &mut set);
         }
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set);
     }
 }
 
@@ -190,7 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut forest = QmdbForest::from_tree(0, B256::with_last_byte(1), tree);
     let entry_path = args.entry_dir.as_ref().map(|dir| dir.join(format!("root-job-bench-{}.entries", std::process::id())));
     if let Some(path) = &entry_path {
-        std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))?;
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new(".")))?;
         forest = forest.with_entry_file(path)?;
     }
     eprintln!("seeded in {} ms", built_at.elapsed().as_millis());
@@ -282,7 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let compute_us = compute_at.elapsed().as_micros() as u64;
         let job_us = job_at.elapsed().as_micros() as u64;
         let (_, p) = forest.last_compute();
-        let (note_us, delta_us, apply_us) = forest.last_compute_tail();
+        let (_note_us, delta_us, apply_us) = forest.last_compute_tail();
         let hash = B256::from(U256::from(block + 1));
         forest.insert(hash, block, prepared)?;
         forest.set_canonical(hash)?;

@@ -166,8 +166,11 @@ async fn an_inserted_block_is_the_same_with_or_without_its_new_payload() -> eyre
         }
     }
 
-    // Fallback: no insert landed. Forkchoice alone does not make the block
-    // canonical; the newPayload executes it.
+    // Fallback: no insert landed -- as for an insert the tree dropped or
+    // evicted before the block's newPayload (N42_OWN_PAYLOAD_PRECOPY keeps
+    // that newPayload, carrying the full block). Forkchoice alone does not
+    // make the block canonical; the newPayload executes it, and the node
+    // ends up where the reference is.
     producer.rpc.inject_tx(next_tx(&wallet, &mut nonce).await).await?;
     let payload = producer.advance_block().await?;
     let hash = payload.block().hash();

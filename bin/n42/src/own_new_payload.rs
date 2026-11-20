@@ -88,6 +88,20 @@ use tracing::info;
 /// The switch's name.
 pub const SKIP_ENV: &str = "N42_SKIP_OWN_NEW_PAYLOAD";
 
+/// The precopy switch's name: the own block's `newPayload` is still sent,
+/// but the sealed store gets its own copy of the body first, made here, so
+/// the engine's conversion moves it instead of copying it on the engine
+/// thread (`built_executions::precopy_sealed`). reth sees the same payload
+/// and gets the same block, so it changes nothing toward reth and needs no
+/// acknowledgement.
+pub const PRECOPY_ENV: &str = "N42_OWN_PAYLOAD_PRECOPY";
+
+/// Whether the precopy is on (`1`), read once.
+pub fn precopy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(PRECOPY_ENV).ok().as_deref() == Some("1"))
+}
+
 /// How long the hand-off waits for the tree's word that it kept the insert
 /// before sending the `newPayload` after all.
 pub const ACCEPT_BOUND: Duration = Duration::from_millis(250);
@@ -122,6 +136,8 @@ pub struct Settled {
     pub skipped: bool,
     /// The wait for the tree's word, microseconds (0 without the switch).
     pub accept_wait_us: u64,
+    /// The precopy of the body, microseconds (`None`: not made).
+    pub precopy_us: Option<u64>,
     /// When the `newPayload` was sent.
     pub sent_at: Option<Instant>,
     /// When its reply came back.
@@ -143,7 +159,8 @@ pub async fn settle<T>(
 where
     T: PayloadTypes<ExecutionData = ExecutionData>,
 {
-    let (status, settled) = settle_quiet(engine, data, sealed_hash, inserted, skip, ACCEPT_BOUND).await;
+    let (status, settled) =
+        settle_quiet(engine, data, sealed_hash, inserted, skip, precopy_enabled(), ACCEPT_BOUND).await;
     log_steps(number, sealed_hash, insert_sent_at, &settled, engine_steps::take(sealed_hash));
     status
 }
@@ -155,6 +172,7 @@ pub(crate) async fn settle_quiet<T>(
     sealed_hash: B256,
     inserted: bool,
     skip: bool,
+    precopy: bool,
     bound: Duration,
 ) -> (Result<PayloadStatus, BeaconOnNewPayloadError>, Settled)
 where
@@ -174,6 +192,17 @@ where
             drop(data);
             return (Ok(PayloadStatus::new(PayloadStatusEnum::Valid, Some(sealed_hash))), settled);
         }
+    }
+    if precopy && inserted {
+        // On a blocking thread, behind the answer: off the engine thread and
+        // off the seal path. The insert shares the body with the store; the
+        // copy is the store's own, for the conversion to move.
+        settled.precopy_us = tokio::task::spawn_blocking(move || {
+            n42_engine_types::built_executions::precopy_sealed(sealed_hash)
+        })
+        .await
+        .ok()
+        .flatten();
     }
     settled.sent_at = Some(Instant::now());
     let status = engine.new_payload(data).await;
@@ -196,6 +225,7 @@ fn log_steps(number: u64, sealed_hash: B256, insert_sent_at: Instant, settled: &
         hash = %sealed_hash,
         np_skipped = settled.skipped,
         accept_wait_us = settled.accept_wait_us,
+        np_precopy_us = settled.precopy_us,
         insert_accepted = steps.accepted_at.is_some(),
         insert_queue_us = since(steps.accepted_at, Some(insert_sent_at)),
         insert_hook_us = steps.insert_hook_us,
@@ -264,27 +294,44 @@ mod tests {
 
         let kept = B256::with_last_byte(0xD1);
         engine_steps::note_accepted(kept, engine_steps::Span::start());
-        let (status, settled) = settle_quiet(&engine, data(kept), kept, true, true, bound).await;
+        let (status, settled) = settle_quiet(&engine, data(kept), kept, true, true, false, bound).await;
         assert_eq!(status.expect("status"), PayloadStatus::new(PayloadStatusEnum::Valid, Some(kept)));
         assert!(settled.skipped);
         assert_eq!(seen.load(SeqCst), 0, "no newPayload for a kept insert");
 
         let dropped = B256::with_last_byte(0xD2);
-        let (status, settled) = settle_quiet(&engine, data(dropped), dropped, true, true, bound).await;
+        let (status, settled) = settle_quiet(&engine, data(dropped), dropped, true, true, false, bound).await;
         assert!(status.expect("status").status.is_valid());
         assert!(!settled.skipped && settled.accept_wait_us >= 40_000, "waited the bound, then sent");
         assert_eq!(seen.load(SeqCst), 1);
 
         let not_forwarded = B256::with_last_byte(0xD3);
         engine_steps::note_accepted(not_forwarded, engine_steps::Span::start());
-        let (_, settled) = settle_quiet(&engine, data(not_forwarded), not_forwarded, false, true, bound).await;
+        let (_, settled) = settle_quiet(&engine, data(not_forwarded), not_forwarded, false, true, false, bound).await;
         assert!(!settled.skipped, "an insert not forwarded is never skipped");
         assert_eq!(seen.load(SeqCst), 2);
 
         let off = B256::with_last_byte(0xD4);
         engine_steps::note_accepted(off, engine_steps::Span::start());
-        let (_, settled) = settle_quiet(&engine, data(off), off, true, false, bound).await;
+        let (_, settled) = settle_quiet(&engine, data(off), off, true, false, false, bound).await;
         assert!(!settled.skipped && settled.accept_wait_us == 0, "switch off: sent at once");
         assert_eq!(seen.load(SeqCst), 3);
+    }
+
+    /// The precopy keeps the `newPayload`: it is sent whether or not the
+    /// tree kept the insert, and it is sent after the copy was made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_precopy_still_sends_the_payload() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (engine, seen) = counting_engine();
+        let bound = Duration::from_millis(40);
+        let kept = B256::with_last_byte(0xE1);
+        engine_steps::note_accepted(kept, engine_steps::Span::start());
+        let (status, settled) = settle_quiet(&engine, data(kept), kept, true, false, true, bound).await;
+        assert!(status.expect("status").status.is_valid());
+        assert!(!settled.skipped && settled.sent_at.is_some());
+        // Nothing kept under this hash in the sealed store: no copy made.
+        assert_eq!(settled.precopy_us, None);
+        assert_eq!(seen.load(SeqCst), 1);
     }
 }

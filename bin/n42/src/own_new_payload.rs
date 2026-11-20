@@ -41,13 +41,40 @@
 //! that call (`n42_qmdb_reth::engine_steps`). After it, the block is in the
 //! tree's state, and a `newPayload` for it takes `insert_block_or_payload`'s
 //! first branch -- `AlreadySeen(Valid)`, nothing executed, nothing stored --
-//! after `find_invalid_ancestor` on its parent. So with the insert kept the
-//! `newPayload` changes nothing and its answer is VALID; skipping it is the
-//! only thing the switch does, and it does it only for this node's own block
-//! with the tree's word that it holds it. Without that word within
-//! [`ACCEPT_BOUND`] the `newPayload` goes as before (and executes the block
-//! if the insert was dropped). Because the skipped pass is a check, however
-//! empty, the switch is a benchmark setting: the node refuses it without
+//! after `find_invalid_ancestor`. So with the insert kept the `newPayload`
+//! changes nothing, and its answer is VALID unless that check finds an
+//! invalid entry. Without the tree's word within [`ACCEPT_BOUND`] the
+//! `newPayload` goes as before (and executes the block if the insert was
+//! dropped).
+//!
+//! ## Why the switch stays behind `N42_BENCH_UNSAFE`
+//!
+//! The one answer the skip can change is reth's invalid-ancestor verdict
+//! (reth v2.11.0, `crates/engine/tree/src/tree/mod.rs`):
+//!
+//! - `on_new_payload` (mod.rs:739) calls `find_invalid_ancestor` (mod.rs:2616)
+//!   before anything else: INVALID when the block's own hash, or its lowest
+//!   buffered ancestor (the parent when nothing is buffered), is in the
+//!   invalid-header cache.
+//! - `InsertExecutedBlock` (mod.rs:1604-1641) checks only "outdated" and
+//!   "already held"; it never looks at that cache. Entries come from
+//!   execution failures of payloads and downloaded blocks (mod.rs:3355),
+//!   descendants of those (mod.rs:2594) and backfill (mod.rs:1855), none of
+//!   which removes or refuses an executed insert. So a block can be held and
+//!   still have its parent recorded invalid -- e.g. a parent this node's
+//!   direct import inserted as executed after reth's own execution of it
+//!   failed. `crates/ethereum/node/tests/own_block_insert.rs` builds exactly
+//!   that: the held child's `newPayload` is INVALID, a skip would say VALID.
+//! - The cache is private (`EngineApiTreeState::invalid_headers`, mod.rs:116).
+//!   Its one public reader, `has_invalid_header(&mut self)` (mod.rs:179),
+//!   needs the tree state mutably, and no validator hook gets that per block:
+//!   `on_canonical_head_changed` gets `&` (mod.rs:1267, 2929) and
+//!   `payload_builder_resources` only runs for a forkchoice with attributes
+//!   (mod.rs:3600). The engine-tree crate is upstream, not vendored here.
+//!
+//! So the check cannot be made before the skip without a hook in reth's
+//! engine tree, and no argument from reth's code rules the entry out. The
+//! switch therefore skips a check, and the node refuses it without
 //! `N42_BENCH_UNSAFE=1` ([`skip_refusal`]).
 
 use alloy_primitives::B256;

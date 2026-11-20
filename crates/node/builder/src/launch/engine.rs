@@ -313,7 +313,10 @@ impl<B> EngineNodeLauncher<B> {
             (network_client.clone(), ctx.provider_factory().clone());
         let mut orchestrator = EngineOrchestratorBuilder {
             engine_kind,
-            consensus,
+            consensus: Arc::new(super::invalid_latch::LatchingConsensus::new(
+                consensus,
+                super::invalid_latch::global(),
+            )),
             client: network_client,
             incoming_requests: Box::pin(consensus_engine_stream),
             pipeline,
@@ -322,7 +325,13 @@ impl<B> EngineNodeLauncher<B> {
             blockchain_db: ctx.blockchain_db().clone(),
             pruner,
             payload_builder: ctx.components().payload_builder_handle().clone(),
-            payload_validator: engine_validator,
+            // N42: the tree's validator and consensus set the invalid-header
+            // latch before any first write to the tree's invalid-header cache
+            // (`invalid_latch`); the backfill sets it when one is started.
+            payload_validator: super::invalid_latch::LatchingValidator::new(
+                engine_validator,
+                super::invalid_latch::global(),
+            ),
             overlay_manager,
             tree_config: engine_tree_config,
             sync_metrics_tx: ctx.sync_metrics_tx(),
@@ -330,12 +339,14 @@ impl<B> EngineNodeLauncher<B> {
             runtime: ctx.task_executor().clone(),
         }
         .build_with_backfill(|pipeline, runtime| {
-            backfill.build(BackfillContext::new(
-                pipeline,
-                backfill_client,
-                backfill_factory,
-                runtime,
-            ))
+            backfill
+                .build(BackfillContext::new(pipeline, backfill_client, backfill_factory, runtime))
+                .map(|backfill| {
+                    super::invalid_latch::LatchingBackfill::new(
+                        backfill,
+                        super::invalid_latch::global(),
+                    )
+                })
         })?;
 
         info!(target: "reth::cli", "Consensus engine initialized");

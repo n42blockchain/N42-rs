@@ -34,8 +34,9 @@ mod builder;
 pub use builder::{add_ons::AddOns, *};
 
 mod launch;
-/// N42: hand the engine a block the node has already executed.
-pub use launch::executed_inserts;
+/// N42: hand the engine a block the node has already executed, and the
+/// latch set before the engine first records a block invalid.
+pub use launch::{executed_inserts, invalid_latch};
 pub use launch::{
     debug::{DebugNode, DebugNodeLauncher, DebugNodeLauncherFuture, DefaultDebugBlockProvider},
     engine::EngineNodeLauncher,

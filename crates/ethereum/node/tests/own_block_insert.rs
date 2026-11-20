@@ -17,7 +17,10 @@ use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use reth_chainspec::EthereumHardfork;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, E2ETestSetupExt};
 use reth_ethereum_primitives::EthPrimitives;
-use reth_node_builder::executed_inserts::{sender, ExecutedInsert};
+use reth_node_builder::{
+    executed_inserts::{sender, ExecutedInsert},
+    invalid_latch,
+};
 use reth_node_ethereum::{EthEngineTypes, EthereumNode};
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadTypes};
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
@@ -99,8 +102,11 @@ fn same(hash: B256) -> ForkchoiceState {
 /// node that imported it the ordinary way. Then the fallbacks: a block whose
 /// insert never landed needs its `newPayload` (forkchoice alone is not
 /// VALID), and a held block whose parent the engine recorded invalid is
-/// answered INVALID by `newPayload` -- the answer a skip would not give,
-/// which is why `N42_SKIP_OWN_NEW_PAYLOAD` stays behind `N42_BENCH_UNSAFE`.
+/// answered INVALID by `newPayload` -- the answer a skip would not give. The
+/// invalid-header latch (`reth_node_builder::invalid_latch`) stays clear
+/// through the ordinary blocks and is set by the parent's rejection before
+/// the child is held, so the skip's rule (skip only with the latch clear)
+/// sends the child's `newPayload`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_inserted_block_is_the_same_with_or_without_its_new_payload() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -166,6 +172,8 @@ async fn an_inserted_block_is_the_same_with_or_without_its_new_payload() -> eyre
         }
     }
 
+    assert!(!invalid_latch::is_latched(), "valid blocks leave the latch clear: {:?}", invalid_latch::global().reason());
+
     // Fallback: no insert landed -- as for an insert the tree dropped or
     // evicted before the block's newPayload (N42_OWN_PAYLOAD_PRECOPY keeps
     // that newPayload, carrying the full block). Forkchoice alone does not
@@ -183,6 +191,8 @@ async fn an_inserted_block_is_the_same_with_or_without_its_new_payload() -> eyre
     assert!(reference.update_forkchoice(hash, hash).await?.payload_status.is_valid());
     assert_eq!(view(&skip.inner.provider, &accounts).await, view(&reference.inner.provider, &accounts).await);
 
+    assert!(!invalid_latch::is_latched(), "the fallback leaves the latch clear: {:?}", invalid_latch::global().reason());
+
     // A held block whose parent the engine recorded invalid. The parent: the
     // next block with a wrong state root, resealed, so it executes and fails.
     producer.rpc.inject_tx(next_tx(&wallet, &mut nonce).await).await?;
@@ -197,6 +207,13 @@ async fn an_inserted_block_is_the_same_with_or_without_its_new_payload() -> eyre
         .new_payload(<EthEngineTypes as PayloadTypes>::block_to_payload(bad.clone(), None))
         .await?;
     assert!(matches!(bad_status.status, PayloadStatusEnum::Invalid { .. }), "{:?}", bad_status.status);
+    // Set by the validator's rejection, before the tree recorded the block.
+    assert!(invalid_latch::is_latched(), "the rejection sets the latch");
+    assert!(
+        invalid_latch::global().reason().is_some_and(|why| why.contains("validator")),
+        "{:?}",
+        invalid_latch::global().reason()
+    );
     // The child, inserted as executed: the insert does not look at the parent.
     let template = executed_from(&reference.inner.provider, next_hash);
     let mut child = template.recovered_block.sealed_block().clone().into_block();
@@ -212,6 +229,9 @@ async fn an_inserted_block_is_the_same_with_or_without_its_new_payload() -> eyre
         })
         .await
     );
+    // The skip's rule with the insert kept: skip only while the latch is
+    // clear. It is set, so the newPayload goes.
+    assert!(invalid_latch::is_latched(), "the child's newPayload is sent");
     let answer = skip.inner.add_ons_handle.beacon_engine_handle
         .new_payload(<EthEngineTypes as PayloadTypes>::block_to_payload(child, None))
         .await?;

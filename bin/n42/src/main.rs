@@ -101,12 +101,6 @@ fn main() {
     if let Some(refusal) = n42_tx_types::trusting_mode_refusal(ingest_mode, bench_unsafe.as_deref())
         .or_else(|| n42_tx_types::frame_gateways_refusal(gateways, bench_unsafe.as_deref()))
         .or_else(|| n42_tx_types::ingest_direct_refusal(direct, bench_unsafe.as_deref()))
-        .or_else(|| {
-            n42::own_new_payload::skip_refusal(
-                std::env::var(n42::own_new_payload::SKIP_ENV).ok().as_deref(),
-                bench_unsafe.as_deref(),
-            )
-        })
     {
         eprintln!("error: {refusal}");
         std::process::exit(2);

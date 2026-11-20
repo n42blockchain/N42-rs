@@ -16,8 +16,9 @@
 //! there too. That was the ~30 ms of engine-thread CPU per full own block.
 //!
 //! [`settle`] sends that `newPayload` (or, under `N42_SKIP_OWN_NEW_PAYLOAD=1`,
-//! does not, once the tree has said it kept the insert) and prints one line
-//! per block with the engine-thread steps, waits and work apart:
+//! does not, once the tree has said it kept the insert and the invalid-header
+//! latch is clear) and prints one line per block with the engine-thread
+//! steps, waits and work apart:
 //!
 //! - `insert_queue_us`: the executed insert sent until the tree's hook ran
 //!   (the engine's queue and the orchestrator in front of it);
@@ -32,6 +33,7 @@
 //! - `np_us`: the whole `newPayload` round trip;
 //! - `np_skipped`, `accept_wait_us`: the skip and how long it waited to learn
 //!   the insert was kept.
+//! - `np_latched`: sent although the insert was kept, the latch being set.
 //!
 //! ## The skip
 //!
@@ -47,9 +49,9 @@
 //! `newPayload` goes as before (and executes the block if the insert was
 //! dropped).
 //!
-//! ## Why the switch stays behind `N42_BENCH_UNSAFE`
+//! ## The invalid-header latch
 //!
-//! The one answer the skip can change is reth's invalid-ancestor verdict
+//! The one answer the skip could change is reth's invalid-ancestor verdict
 //! (reth v2.11.0, `crates/engine/tree/src/tree/mod.rs`):
 //!
 //! - `on_new_payload` (mod.rs:739) calls `find_invalid_ancestor` (mod.rs:2616)
@@ -57,25 +59,30 @@
 //!   buffered ancestor (the parent when nothing is buffered), is in the
 //!   invalid-header cache.
 //! - `InsertExecutedBlock` (mod.rs:1604-1641) checks only "outdated" and
-//!   "already held"; it never looks at that cache. Entries come from
-//!   execution failures of payloads and downloaded blocks (mod.rs:3355),
-//!   descendants of those (mod.rs:2594) and backfill (mod.rs:1855), none of
-//!   which removes or refuses an executed insert. So a block can be held and
-//!   still have its parent recorded invalid -- e.g. a parent this node's
-//!   direct import inserted as executed after reth's own execution of it
-//!   failed. `crates/ethereum/node/tests/own_block_insert.rs` builds exactly
-//!   that: the held child's `newPayload` is INVALID, a skip would say VALID.
-//! - The cache is private (`EngineApiTreeState::invalid_headers`, mod.rs:116).
-//!   Its one public reader, `has_invalid_header(&mut self)` (mod.rs:179),
-//!   needs the tree state mutably, and no validator hook gets that per block:
-//!   `on_canonical_head_changed` gets `&` (mod.rs:1267, 2929) and
-//!   `payload_builder_resources` only runs for a forkchoice with attributes
-//!   (mod.rs:3600). The engine-tree crate is upstream, not vendored here.
+//!   "already held"; it never looks at that cache, so a block can be held
+//!   with its parent recorded invalid
+//!   (`crates/ethereum/node/tests/own_block_insert.rs` builds that case).
 //!
-//! So the check cannot be made before the skip without a hook in reth's
-//! engine tree, and no argument from reth's code rules the entry out. The
-//! switch therefore skips a check, and the node refuses it without
-//! `N42_BENCH_UNSAFE=1` ([`skip_refusal`]).
+//! The cache is private, but it starts empty, and the launcher sets a
+//! process-wide latch before its first write
+//! (`reth_node_builder::launch::invalid_latch`, which lists every write site:
+//! mod.rs:3355 through the tree's validator or consensus, both wrapped;
+//! mod.rs:1855 only after a backfill start, wrapped; mod.rs:2594 only over an
+//! existing entry). The latch is never cleared, and the skip requires it
+//! clear, read after the tree's word that it kept the insert:
+//!
+//! - engine thread: latch set (in the wrapper, before the failure returns)
+//!   -> cache write -> ... -> our insert's hook -> `note_accepted`;
+//! - here: `wait_accepted` (the same mutex as `note_accepted`) -> latch read.
+//!
+//! So a cache write anywhere before the hook is seen as a set latch, and the
+//! `newPayload` is sent (and answered INVALID if it should be). A clear latch
+//! means the cache was empty when the tree kept the insert and stayed empty
+//! until the read: a `newPayload` taken next by the engine would have found
+//! no entry and changed nothing, and taking it next is a schedule the engine
+//! could always have run. A write after the read is unordered against the
+//! `newPayload` today as well. Once the latch is set, every later own block's
+//! `newPayload` is sent for the rest of the process (`np_latched`).
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionData, PayloadStatus, PayloadStatusEnum};
@@ -117,18 +124,6 @@ pub fn skip_enabled() -> bool {
     *ON.get_or_init(|| skip_from(std::env::var(SKIP_ENV).ok().as_deref()))
 }
 
-/// Why the node must not start with the switch as given, or `None`.
-pub fn skip_refusal(raw: Option<&str>, bench_unsafe: Option<&str>) -> Option<String> {
-    if !skip_from(raw) || bench_unsafe == Some("1") {
-        return None;
-    }
-    Some(format!(
-        "{SKIP_ENV}=1 skips the engine's newPayload for an own block the tree already holds \
-         (its invalid-ancestor check included); it is a benchmark setting. Set N42_BENCH_UNSAFE=1 \
-         to run it anyway"
-    ))
-}
-
 /// The `newPayload` round trip as the hand-off saw it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Settled {
@@ -136,6 +131,8 @@ pub struct Settled {
     pub skipped: bool,
     /// The wait for the tree's word, microseconds (0 without the switch).
     pub accept_wait_us: u64,
+    /// Sent although the insert was kept: the invalid-header latch was set.
+    pub latched: bool,
     /// The precopy of the body, microseconds (`None`: not made).
     pub precopy_us: Option<u64>,
     /// When the `newPayload` was sent.
@@ -146,7 +143,8 @@ pub struct Settled {
 
 /// The own block's `newPayload` after its executed insert (sent at
 /// `insert_sent_at`, `inserted` when it was forwarded): sent, or skipped when
-/// `skip` and the tree kept the insert. Then the block's engine-thread line.
+/// `skip`, the tree kept the insert and the invalid-header latch is clear.
+/// Then the block's engine-thread line.
 pub async fn settle<T>(
     engine: &ConsensusEngineHandle<T>,
     data: ExecutionData,
@@ -160,12 +158,16 @@ where
     T: PayloadTypes<ExecutionData = ExecutionData>,
 {
     let (status, settled) =
-        settle_quiet(engine, data, sealed_hash, inserted, skip, precopy_enabled(), ACCEPT_BOUND).await;
+        settle_quiet(engine, data, sealed_hash, inserted, skip, precopy_enabled(), ACCEPT_BOUND, || {
+            reth_node_builder::invalid_latch::is_latched()
+        })
+        .await;
     log_steps(number, sealed_hash, insert_sent_at, &settled, engine_steps::take(sealed_hash));
     status
 }
 
-/// [`settle`] without the line, with the bound given (tests).
+/// [`settle`] without the line, with the bound and the latch given (tests).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn settle_quiet<T>(
     engine: &ConsensusEngineHandle<T>,
     data: ExecutionData,
@@ -174,6 +176,7 @@ pub(crate) async fn settle_quiet<T>(
     skip: bool,
     precopy: bool,
     bound: Duration,
+    latched: impl Fn() -> bool,
 ) -> (Result<PayloadStatus, BeaconOnNewPayloadError>, Settled)
 where
     T: PayloadTypes<ExecutionData = ExecutionData>,
@@ -186,7 +189,10 @@ where
             .ok()
             .flatten();
         settled.accept_wait_us = waited_at.elapsed().as_micros() as u64;
-        if accepted.is_some() {
+        // Read after the tree's word (module docs, "The invalid-header latch").
+        if accepted.is_some() && latched() {
+            settled.latched = true;
+        } else if accepted.is_some() {
             settled.skipped = true;
             // Dropped here, not on the engine thread.
             drop(data);
@@ -225,6 +231,7 @@ fn log_steps(number: u64, sealed_hash: B256, insert_sent_at: Instant, settled: &
         hash = %sealed_hash,
         np_skipped = settled.skipped,
         accept_wait_us = settled.accept_wait_us,
+        np_latched = settled.latched,
         np_precopy_us = settled.precopy_us,
         insert_accepted = steps.accepted_at.is_some(),
         insert_queue_us = since(steps.accepted_at, Some(insert_sent_at)),
@@ -251,15 +258,11 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
-    fn the_switch_reads_one_and_is_refused_without_the_acknowledgement() {
+    fn the_switch_reads_one() {
         assert!(skip_from(Some("1")));
         for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
             assert!(!skip_from(raw), "{raw:?}");
-            assert_eq!(skip_refusal(raw, None), None);
         }
-        assert!(skip_refusal(Some("1"), None).is_some_and(|why| why.contains("N42_BENCH_UNSAFE=1")));
-        assert!(skip_refusal(Some("1"), Some("true")).is_some());
-        assert_eq!(skip_refusal(Some("1"), Some("1")), None);
     }
 
     fn data(hash: B256) -> ExecutionData {
@@ -294,26 +297,26 @@ mod tests {
 
         let kept = B256::with_last_byte(0xD1);
         engine_steps::note_accepted(kept, engine_steps::Span::start());
-        let (status, settled) = settle_quiet(&engine, data(kept), kept, true, true, false, bound).await;
+        let (status, settled) = settle_quiet(&engine, data(kept), kept, true, true, false, bound, || false).await;
         assert_eq!(status.expect("status"), PayloadStatus::new(PayloadStatusEnum::Valid, Some(kept)));
         assert!(settled.skipped);
         assert_eq!(seen.load(SeqCst), 0, "no newPayload for a kept insert");
 
         let dropped = B256::with_last_byte(0xD2);
-        let (status, settled) = settle_quiet(&engine, data(dropped), dropped, true, true, false, bound).await;
+        let (status, settled) = settle_quiet(&engine, data(dropped), dropped, true, true, false, bound, || false).await;
         assert!(status.expect("status").status.is_valid());
         assert!(!settled.skipped && settled.accept_wait_us >= 40_000, "waited the bound, then sent");
         assert_eq!(seen.load(SeqCst), 1);
 
         let not_forwarded = B256::with_last_byte(0xD3);
         engine_steps::note_accepted(not_forwarded, engine_steps::Span::start());
-        let (_, settled) = settle_quiet(&engine, data(not_forwarded), not_forwarded, false, true, false, bound).await;
+        let (_, settled) = settle_quiet(&engine, data(not_forwarded), not_forwarded, false, true, false, bound, || false).await;
         assert!(!settled.skipped, "an insert not forwarded is never skipped");
         assert_eq!(seen.load(SeqCst), 2);
 
         let off = B256::with_last_byte(0xD4);
         engine_steps::note_accepted(off, engine_steps::Span::start());
-        let (_, settled) = settle_quiet(&engine, data(off), off, true, false, false, bound).await;
+        let (_, settled) = settle_quiet(&engine, data(off), off, true, false, false, bound, || false).await;
         assert!(!settled.skipped && settled.accept_wait_us == 0, "switch off: sent at once");
         assert_eq!(seen.load(SeqCst), 3);
     }
@@ -327,11 +330,45 @@ mod tests {
         let bound = Duration::from_millis(40);
         let kept = B256::with_last_byte(0xE1);
         engine_steps::note_accepted(kept, engine_steps::Span::start());
-        let (status, settled) = settle_quiet(&engine, data(kept), kept, true, false, true, bound).await;
+        let (status, settled) = settle_quiet(&engine, data(kept), kept, true, false, true, bound, || false).await;
         assert!(status.expect("status").status.is_valid());
         assert!(!settled.skipped && settled.sent_at.is_some());
         // Nothing kept under this hash in the sealed store: no copy made.
         assert_eq!(settled.precopy_us, None);
         assert_eq!(seen.load(SeqCst), 1);
+    }
+
+    /// A set latch sends the `newPayload` for a kept insert; the latch is
+    /// read only once the tree has kept it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_set_latch_sends_the_payload_for_a_kept_insert() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (engine, seen) = counting_engine();
+        let bound = Duration::from_millis(40);
+
+        let kept = B256::with_last_byte(0xF1);
+        engine_steps::note_accepted(kept, engine_steps::Span::start());
+        let reads = AtomicUsize::new(0);
+        let (status, settled) = settle_quiet(&engine, data(kept), kept, true, true, false, bound, || {
+            reads.fetch_add(1, SeqCst);
+            true
+        })
+        .await;
+        assert!(status.expect("status").status.is_valid(), "the engine's answer, not ours");
+        assert!(!settled.skipped && settled.latched && settled.sent_at.is_some());
+        assert_eq!(seen.load(SeqCst), 1);
+        assert_eq!(reads.load(SeqCst), 1);
+
+        // Not kept: sent without reading the latch.
+        let dropped = B256::with_last_byte(0xF2);
+        let reads = AtomicUsize::new(0);
+        let (_, settled) = settle_quiet(&engine, data(dropped), dropped, true, true, false, bound, || {
+            reads.fetch_add(1, SeqCst);
+            false
+        })
+        .await;
+        assert!(!settled.skipped && !settled.latched);
+        assert_eq!(reads.load(SeqCst), 0);
+        assert_eq!(seen.load(SeqCst), 2);
     }
 }

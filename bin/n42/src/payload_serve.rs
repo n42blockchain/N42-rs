@@ -1143,6 +1143,7 @@ where
         // The parent's insert first, if it is still to come: the tree gets
         // the chain in order.
         let parent_wait_us = pending::wait_for_insert(parent_hash).await.map_or(0, |w| w.as_micros() as u64);
+        let insert_sent_at = std::time::Instant::now();
         let inserted = match built {
             Some((built_hash, built)) => {
                 let clone_at = std::time::Instant::now();
@@ -1205,7 +1206,19 @@ where
         if !inserted {
             warn!(target: "n42.payload_serve", number, %sealed_hash, "own block answered before its merge was not inserted as executed; its newPayload executes it");
         }
-        let status = engine.new_payload(data).await;
+        // Sent, or skipped once the tree has said it kept the insert
+        // (`N42_SKIP_OWN_NEW_PAYLOAD`); either way the engine thread's steps
+        // for this block are printed (`crate::own_new_payload`).
+        let status = crate::own_new_payload::settle(
+            &engine,
+            data,
+            number,
+            sealed_hash,
+            inserted,
+            insert_sent_at,
+            crate::own_new_payload::skip_enabled(),
+        )
+        .await;
         drop(sealed_hold);
         status
     };

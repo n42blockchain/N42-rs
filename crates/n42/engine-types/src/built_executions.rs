@@ -1149,15 +1149,34 @@ pub fn find_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
 /// list (the header-only own block) or a different count gets the copy, as
 /// before; so does every caller with the flag off.
 pub fn find_or_take_sealed(sealed_hash: B256, transactions: usize) -> Option<SealedBlock<Block>> {
-    if !take_sealed_enabled() || transactions == 0 {
-        return find_sealed(sealed_hash);
-    }
+    use n42_qmdb_reth::engine_steps::{note_convert_road, ConvertRoad};
+    let lock_at = std::time::Instant::now();
     let mut store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
+    let lock_us = lock_at.elapsed().as_micros() as u64;
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
-    if store[at].1.block().body().transactions.len() != transactions {
-        return Some(store[at].1.block().clone());
-    }
-    store.remove(at).map(|(_, block)| block.into_block())
+    let kept = &store[at].1;
+    let kept_transactions = kept.block().body().transactions.len();
+    let take = take_sealed_enabled() && transactions != 0 && kept_transactions == transactions;
+    // The road the engine thread took, for the hand-off's line
+    // (`n42_qmdb_reth::engine_steps`): a move, or a copy of the body -- of a
+    // block shared with the engine's own executed insert when the hand-off
+    // shared it (`N42_HANDOFF_NO_CLONE`), which is the case on every own
+    // block the tree already holds.
+    let copy_at = std::time::Instant::now();
+    let (block, road) = if take {
+        let shared = matches!(kept, SealedKept::Shared(recovered) if Arc::strong_count(recovered) > 1);
+        let block = store.remove(at).map(|(_, block)| block.into_block())?;
+        (block, if shared { ConvertRoad::CopiedShared } else { ConvertRoad::Taken })
+    } else {
+        let road = match kept {
+            SealedKept::Shared(_) => ConvertRoad::CopiedShared,
+            SealedKept::Owned(_) => ConvertRoad::CopiedOwned,
+        };
+        (kept.block().clone(), road)
+    };
+    drop(store);
+    note_convert_road(sealed_hash, road, lock_us, copy_at.elapsed().as_micros() as u64, kept_transactions);
+    Some(block)
 }
 
 /// Whether `N42_ENGINE_TAKE_SEALED=1` is set; see [`find_or_take_sealed`].

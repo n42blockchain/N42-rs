@@ -22,17 +22,40 @@
 //!   already in the cache (both callers, mod.rs:2581 and mod.rs:2660, first
 //!   find that entry): never the first write.
 //!
+//! The latch also covers the tree leaving its idle backfill state. While
+//! not idle, `on_new_payload` (mod.rs:791) buffers every payload and answers
+//! SYNCING (`try_buffer_payload`), where a held block would otherwise have
+//! been VALID. The tree starts idle (mod.rs:401) and leaves it only to:
+//!
+//! - `Active` (mod.rs:1588), on the orchestrator's `BackfillSyncStarted`,
+//!   which follows `BackfillSync::on_action(Start)`;
+//! - `Pending` (mod.rs:2200) or `PendingRevalidation` (mod.rs:2182), both
+//!   only in `emit_event` for a `BackfillAction`. Those come from a backfill
+//!   that just finished (mod.rs:1951, after a start) or from
+//!   `on_disconnected_downloaded_block` (mod.rs:2995), for a block the
+//!   downloader delivered (`on_downloaded`, mod.rs:689, fed only by
+//!   `FromEngine::DownloadedBlocks`). The downloader is built with the
+//!   tree's consensus (`launch.rs:152`), and every block it delivers has
+//!   passed `validate_body_against_header` on it first
+//!   (`net/p2p/src/full_block.rs:243`, `:258`, `:776`).
+//!
 //! The launcher wraps the three objects those roots go through:
 //! [`LatchingValidator`] around the tree's validator, [`LatchingConsensus`]
 //! around the tree's consensus, and [`LatchingBackfill`] around the
-//! backfill. Each sets the latch before the call returns the failure (or,
-//! for the backfill, before the start is acted on), so the latch is set
-//! before the cache write on the engine thread, and so before anything the
-//! engine thread does after that write. It may also be set where no write
-//! follows (a transient consensus error, the downloader's checks, a backfill
-//! that unwinds nothing): it only ever errs toward set.
+//! backfill. The validator and consensus set the latch before a failure
+//! returns; the consensus also on any downloaded body or header range,
+//! whatever the outcome; the backfill before a start is acted on. So the
+//! latch is set before the first cache write and before the tree first
+//! leaves idle, on the engine thread or (downloader, orchestrator) strictly
+//! before the message that leads there reaches it. It may also be set where
+//! neither follows (a transient consensus error, a download that ends in an
+//! ordinary insert, a backfill that unwinds nothing): it only ever errs
+//! toward set.
 
-use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderConsensusError, HeaderValidator, ReceiptRootBloom, TransactionRoot};
+use reth_consensus::{
+    Consensus, ConsensusError, FullConsensus, HeaderConsensusError, HeaderValidator,
+    ReceiptRootBloom, TransactionRoot,
+};
 use reth_engine_tree::{
     backfill::{BackfillAction, BackfillEvent, BackfillSync},
     tree::{
@@ -249,11 +272,10 @@ where
     where
         H: Clone,
     {
-        let result = self.inner.validate_header_range(headers);
-        if result.is_err() {
-            self.latch.set(|| "the engine's consensus failed validate_header_range".to_owned());
-        }
-        result
+        // Only the block downloader checks ranges: a range download, whatever
+        // the outcome, may be what takes the tree out of idle.
+        self.latch.set(|| "the engine's block downloader checked a header range".to_owned());
+        self.inner.validate_header_range(headers)
     }
 }
 
@@ -267,7 +289,11 @@ where
         body: &B::Body,
         header: &SealedHeader<B::Header>,
     ) -> Result<(), ConsensusError> {
-        self.note("validate_body_against_header", self.inner.validate_body_against_header(body, header))
+        // Only the block downloader checks bodies alone, once for every block
+        // it delivers: a downloaded block, valid or not, may be what takes
+        // the tree out of idle (module docs).
+        self.latch.set(|| "the engine's block downloader checked a downloaded body".to_owned());
+        self.inner.validate_body_against_header(body, header)
     }
 
     fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), ConsensusError> {
@@ -454,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn the_consensus_latches_on_a_failure_and_not_on_a_pass() {
+    fn the_consensus_latches_on_a_failure_or_a_download() {
         let block = SealedBlock::<EthBlock>::seal_slow(EthBlock::default());
 
         let passing_latch = leaked();
@@ -474,6 +500,22 @@ mod tests {
         let refusing = LatchingConsensus::new(Refusing, body_latch);
         assert!(Consensus::<EthBlock>::validate_block_pre_execution(&refusing, &block).is_err());
         assert!(body_latch.is_set());
+
+        // The downloader's body check latches even when the body passes: a
+        // delivered block is how the tree first leaves idle.
+        let download_latch = leaked();
+        let downloading = LatchingConsensus::new(NoopConsensus::default(), download_latch);
+        assert!(Consensus::<EthBlock>::validate_body_against_header(
+            &downloading,
+            block.body(),
+            block.sealed_header()
+        )
+        .is_ok());
+        assert!(download_latch.reason().is_some_and(|why| why.contains("downloaded body")));
+        let range_latch = leaked();
+        let downloading = LatchingConsensus::new(NoopConsensus::default(), range_latch);
+        assert!(HeaderValidator::<alloy_consensus::Header>::validate_header_range(&downloading, &[]).is_ok());
+        assert!(range_latch.is_set());
 
         // Whatever is forwarded unchanged stays unchanged.
         let forwarded = LatchingConsensus::new(NoopConsensus::default(), leaked());

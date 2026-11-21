@@ -129,6 +129,7 @@
 - `crates/node/builder/src/launch/executed_inserts.rs`（N42 新增）
 - `crates/node/builder/src/launch/engine.rs`（引擎循环多一个 select 分支）
 - `crates/node/builder/src/lib.rs`（`pub use launch::executed_inserts`）
+- `crates/node/builder/src/launch/invalid_latch.rs`（N42 新增，2026-11-20）：单向闩锁加三个包装层（引擎树的 payload validator、共识、回填同步），在 reth 首次把块记为无效或引擎树离开空闲回填状态之前置位；`N42_SKIP_OWN_NEW_PAYLOAD=1`（默认关闭）仅在闩锁未置位时跳过自己块的 `newPayload`。包装层转发全部方法，开关关闭时行为不变。在 `launch/engine.rs` 接线
 ### 定制内容:
 - 一条进入引擎循环的通道：节点把自己已经执行过的块（`BuiltPayloadExecutedBlock`）交给引擎，
   循环转成 `EngineApiRequest::InsertExecutedBlock` 并回执。reth 只对 payload 事件流里带执行结果的

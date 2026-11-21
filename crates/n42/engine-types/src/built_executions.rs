@@ -1149,15 +1149,73 @@ pub fn find_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
 /// list (the header-only own block) or a different count gets the copy, as
 /// before; so does every caller with the flag off.
 pub fn find_or_take_sealed(sealed_hash: B256, transactions: usize) -> Option<SealedBlock<Block>> {
-    if !take_sealed_enabled() || transactions == 0 {
-        return find_sealed(sealed_hash);
-    }
+    use n42_qmdb_reth::engine_steps::{note_convert_road, ConvertRoad};
+    let lock_at = std::time::Instant::now();
     let mut store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
+    let lock_us = lock_at.elapsed().as_micros() as u64;
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
-    if store[at].1.block().body().transactions.len() != transactions {
-        return Some(store[at].1.block().clone());
-    }
-    store.remove(at).map(|(_, block)| block.into_block())
+    let kept = &store[at].1;
+    let kept_transactions = kept.block().body().transactions.len();
+    let take = take_sealed_enabled() && transactions != 0 && kept_transactions == transactions;
+    // The road the engine thread took, for the hand-off's line
+    // (`n42_qmdb_reth::engine_steps`): a move, or a copy of the body -- of a
+    // block shared with the engine's own executed insert when the hand-off
+    // shared it (`N42_HANDOFF_NO_CLONE`), which is the case on every own
+    // block the tree already holds.
+    let copy_at = std::time::Instant::now();
+    let (block, road) = if take {
+        let shared = matches!(kept, SealedKept::Shared(recovered) if Arc::strong_count(recovered) > 1);
+        let block = store.remove(at).map(|(_, block)| block.into_block())?;
+        (block, if shared { ConvertRoad::CopiedShared } else { ConvertRoad::Taken })
+    } else {
+        let road = match kept {
+            SealedKept::Shared(_) => ConvertRoad::CopiedShared,
+            SealedKept::Owned(_) => ConvertRoad::CopiedOwned,
+        };
+        (kept.block().clone(), road)
+    };
+    drop(store);
+    note_convert_road(sealed_hash, road, lock_us, copy_at.elapsed().as_micros() as u64, kept_transactions);
+    Some(block)
+}
+
+/// Gives the sealed store its own copy of a block it shares with the
+/// engine's executed insert (`N42_OWN_PAYLOAD_PRECOPY`), so the engine's
+/// conversion of the block's `newPayload` moves it out
+/// ([`find_or_take_sealed`], `N42_ENGINE_TAKE_SEALED`) instead of copying it
+/// on the engine thread. The copy is made by the caller's thread, outside the
+/// store's lock; the shared entry is replaced only if it is still the one
+/// copied. Returns the copy's length in microseconds, `Some(0)` when the
+/// store already holds its own copy, `None` when it holds nothing for the
+/// hash.
+pub fn precopy_sealed(sealed_hash: B256) -> Option<u64> {
+    let shared = {
+        let store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
+        match &store.iter().find(|(hash, _)| *hash == sealed_hash)?.1 {
+            SealedKept::Owned(_) => return Some(0),
+            SealedKept::Shared(recovered) => Arc::clone(recovered),
+        }
+    };
+    let at = std::time::Instant::now();
+    let copy = shared.sealed_block().clone();
+    let copy_us = at.elapsed().as_micros() as u64;
+    let mut store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
+    let entry = store
+        .iter_mut()
+        .find(|(hash, kept)| *hash == sealed_hash && matches!(kept, SealedKept::Shared(r) if Arc::ptr_eq(r, &shared)));
+    let Some((_, kept)) = entry else {
+        // Taken or replaced meanwhile: the copy is not needed.
+        drop(store);
+        free_boxed_off_path(Box::new(copy));
+        return Some(copy_us);
+    };
+    let replaced = std::mem::replace(kept, SealedKept::Owned(copy));
+    drop(store);
+    // The store's reference to the shared block: a count decrement, the
+    // engine's insert still holds the block.
+    drop(replaced);
+    drop(shared);
+    Some(copy_us)
 }
 
 /// Whether `N42_ENGINE_TAKE_SEALED=1` is set; see [`find_or_take_sealed`].
@@ -1355,6 +1413,42 @@ mod tests {
         drop(shared);
         assert_eq!(take_sealed(hash).map(|block| block.hash()), Some(hash));
         assert!(find_sealed(hash).is_none());
+    }
+
+    /// `N42_OWN_PAYLOAD_PRECOPY`: after the precopy the engine's conversion
+    /// moves the store's own copy out (no copy on its thread), the block it
+    /// gets is the shared block transaction for transaction, and the shared
+    /// block the engine's insert holds is untouched. A second conversion of
+    /// the same payload still finds a block (the shared one is gone from the
+    /// store, so it is decoded by the caller -- here: none kept, `None`).
+    #[test]
+    fn a_precopied_block_is_moved_to_the_engine_and_is_the_same_block() {
+        let _guard = lock();
+        let tx = |nonce: u64| {
+            let tx = alloy_consensus::TxLegacy { nonce, gas_limit: 21_000, ..Default::default() };
+            n42_tx_types::N42TxEnvelope::Eth(reth_ethereum_primitives::TransactionSigned::new_unhashed(
+                reth_ethereum_primitives::Transaction::Legacy(tx),
+                alloy_primitives::Signature::test_signature(),
+            ))
+        };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 991, ..Default::default() });
+        let body = BlockBody { transactions: (0..64).map(tx).collect(), ..Default::default() };
+        let sealed = SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(header, body));
+        let hash = sealed.hash();
+        let shared = Arc::new(RecoveredBlock::new_sealed(sealed, Vec::new()));
+        remember_sealed_shared(hash, Arc::clone(&shared));
+        assert_eq!(Arc::strong_count(&shared), 2, "the store shares the insert's block");
+        assert!(precopy_sealed(hash).is_some());
+        assert_eq!(Arc::strong_count(&shared), 1, "the store now holds its own copy");
+        assert_eq!(precopy_sealed(hash), Some(0), "a second precopy finds the copy");
+        let converted = if take_sealed_enabled() {
+            find_or_take_sealed(hash, 64).expect("kept")
+        } else {
+            take_sealed(hash).expect("kept")
+        };
+        assert_eq!(converted.hash(), hash);
+        assert_eq!(converted.body(), shared.sealed_block().body(), "the same block");
+        assert!(precopy_sealed(B256::repeat_byte(0x99)).is_none(), "nothing kept: nothing copied");
     }
 
     /// A sealed block evicted from the store is freed off the caller's

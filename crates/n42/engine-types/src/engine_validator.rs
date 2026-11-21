@@ -840,6 +840,13 @@ where
         .map_err(|err| NewPayloadError::Other(err.into()))?;
 
         let sealed = SealedBlock::seal_slow(block);
+        n42_qmdb_reth::engine_steps::note_convert_road(
+            expected_hash,
+            n42_qmdb_reth::engine_steps::ConvertRoad::Decoded,
+            0,
+            started.elapsed().as_micros() as u64,
+            tx_count,
+        );
         if tx_count >= 10_000 {
             tracing::info!(
                 target: "n42::engine_validator",

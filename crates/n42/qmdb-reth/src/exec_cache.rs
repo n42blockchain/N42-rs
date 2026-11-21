@@ -194,7 +194,15 @@ where
         &self,
         payload: Types::ExecutionData,
     ) -> Result<SealedBlock<N::Block>, NewPayloadError> {
-        self.inner.convert_payload_to_block(payload)
+        // Reached from the tree directly (a block it already holds, one it
+        // buffers, an error report), never from its execution path, which
+        // converts through the inner validator: timed for the hand-off's line
+        // (`engine_steps`).
+        let hash = reth_payload_primitives::ExecutionPayload::block_hash(&payload);
+        let span = crate::engine_steps::Span::start();
+        let converted = self.inner.convert_payload_to_block(payload);
+        crate::engine_steps::note_converted(hash, span);
+        converted
     }
 
     fn validate_payload(
@@ -218,7 +226,11 @@ where
         block: BuiltPayloadExecutedBlock<N>,
     ) -> ProviderResult<ExecutedBlock<N>> {
         use std::sync::atomic::Ordering::Relaxed;
-        match self.mode {
+        // The tree calls this only for an insert it keeps (not one dropped as
+        // outdated or already held): recorded as accepted (`engine_steps`).
+        let hash = block.recovered_block.hash();
+        let span = crate::engine_steps::Span::start();
+        let executed = match self.mode {
             ExecCacheOnInsert::Update => {
                 CACHE_UPDATES.fetch_add(1, Relaxed);
                 self.inner.on_inserted_executed_block(block)
@@ -227,7 +239,11 @@ where
                 CACHE_SKIPS.fetch_add(1, Relaxed);
                 Ok(executed_block_without_cache(block, &self.runtime))
             }
+        };
+        if executed.is_ok() {
+            crate::engine_steps::note_accepted(hash, span);
         }
+        executed
     }
 
     fn on_canonical_head_changed(&self, hash: B256, state: &EngineApiTreeState<N>) {

@@ -924,3 +924,62 @@ async fn own_block_files_its_root_for_the_fallback_conversion() {
     own_block_by_header_with(Some(&reuse), &engine, &alloy_rlp::encode(&sealed), None, None).await.expect("imported by header");
     assert_eq!(n42_engine_types::frame_blocks::root_of_block(&sealed.hash_slow()), Some(root));
 }
+
+/// A builder that records which parent build it was asked to build on.
+struct RecordingBuilder(Mutex<Vec<B256>>);
+
+impl n42_engine_types::direct_build::DirectBuilder for RecordingBuilder {
+    fn build_on_own(&self, request: n42_engine_types::direct_build::BuildOnOwnRequest) -> Result<N42BuiltPayload, String> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(request.parent_execution.built_hash());
+        Err("recorded".to_owned())
+    }
+}
+
+/// `N42_BUILD_ON_OUTPUT`: the build on a sealed own block opens on the
+/// sealed build's output, never a sibling's with the same fields (another
+/// key's build, or this node's rebuild for another view). Before the fix the
+/// field search named the newer sibling: the next block would have built on
+/// its post-state and its tree been filed under the sealed hash.
+async fn build_on_output_names(sibling_of: impl Fn(&Header) -> Header) {
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reuse = instant_reuse();
+    let sealed = header(560, 0x5F);
+    let sibling = sibling_of(&sealed);
+    let sealed_hash = file_build(&sealed);
+    let sibling_hash = file_build(&sibling);
+    assert_ne!(sealed_hash, sibling_hash);
+    let builder = Arc::new(RecordingBuilder(Mutex::new(Vec::new())));
+    let result = build_on_sealed_output(
+        &reuse,
+        builder.clone(),
+        sealed.clone(),
+        alloy_rpc_types_engine::PayloadAttributes {
+            timestamp: sealed.timestamp + 1,
+            suggested_fee_recipient: sealed.beneficiary,
+            ..Default::default()
+        },
+        None,
+        false,
+        BuildOnOwnTimes::default(),
+    )
+    .await;
+    assert!(result.is_err(), "the recording builder builds nothing");
+    let asked = builder.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    assert_eq!(asked, vec![sealed_hash], "built on the sealed build, not its sibling");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn build_on_output_opens_the_sealed_build_not_another_keys_sibling() {
+    build_on_output_names(|sealed| {
+        n42_header::N42Header::from(alloy_consensus::Header { beneficiary: Address::repeat_byte(5), ..sealed.inner.clone() })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn build_on_output_opens_the_sealed_build_not_a_rebuild_for_another_view() {
+    build_on_output_names(|sealed| {
+        n42_header::N42Header::from(alloy_consensus::Header { timestamp: sealed.timestamp + 2, ..sealed.inner.clone() })
+    })
+    .await;
+}

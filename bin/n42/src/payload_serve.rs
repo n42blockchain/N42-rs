@@ -1591,18 +1591,14 @@ async fn build_on_sealed_output(
     want_hashes: bool,
     mut times: BuildOnOwnTimes,
 ) -> Result<(N42BuiltPayload, BuildOnOwnTimes, Option<raw_engine::ChainHint>, bool), String> {
-    use n42_engine_types::built_executions::{find_kept_sealed, stage_of, Stage};
+    use n42_engine_types::built_executions::{find_kept_sealed_key, stage_of, BuildKey, Stage};
     times.on_output = true;
     let at = std::time::Instant::now();
-    let (built_hash, block, _) = find_kept_sealed(
-        header.parent_hash,
-        header.number,
-        header.state_root,
-        header.receipts_root,
-        header.gas_used,
-        Some(header.transactions_root),
-    )
-    .ok_or("unknown build")?;
+    // By the sealed header's seal-invariant fields too: the build found here
+    // is the parent the next block builds on, whose tree is filed under the
+    // sealed hash and whose take the queue forgets -- a sibling with the
+    // same fields would put its post-state under this block.
+    let (built_hash, block, _) = find_kept_sealed_key(BuildKey::of_sealed(&header)).ok_or("unknown build")?;
     times.find_ms = at.elapsed().as_millis() as u64;
     let sealed_hash = header.hash_slow();
     let parent = reth_primitives_traits::SealedHeader::new(header, sealed_hash);

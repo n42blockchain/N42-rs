@@ -939,6 +939,12 @@ where
     .await
     .map_err(|err| format!("build lookup: {err}"))?
     .ok_or("unknown build")?;
+    // The key holds what tells siblings apart; the rest of what the block
+    // executes with (gas limit, base fee, blob fields, withdrawals) must
+    // match too, or the block is imported the ordinary way.
+    if !block_is_sealed_as(&built.block, &header) {
+        return Err("the kept build does not execute as the sealed header".to_owned());
+    }
     let waits = AnswerWaits::after_take(built_hash, lookup_at);
     let sealed_hash = header.hash_slow();
     // What the engine's conversion of this block's payload needs when the
@@ -1090,6 +1096,11 @@ where
     .await
     .map_err(|err| format!("build lookup: {err}"))?
     .ok_or("unknown build")?;
+    // As on the ordinary road: checked before the answer, so a mismatch is
+    // imported the ordinary way and never answered VALID.
+    if !block_is_sealed_as(&block, &header) {
+        return Err("the kept build does not execute as the sealed header".to_owned());
+    }
     let answer_wait_merge_us = merge_wait_us(built_hash, lookup_at);
     let sealed_hash = header.hash_slow();
     // What the engine's conversion of this block's payload needs when the
@@ -2838,13 +2849,31 @@ fn is_own_build(header: &n42_header::N42Header) -> bool {
     let Some((_, built, built_withdrawals)) = n42_engine_types::built_executions::find_kept_sealed_header_key(n42_engine_types::built_executions::BuildKey::of_sealed(header)) else {
         return false;
     };
-    let withdrawals_match = built.withdrawals_root == header.withdrawals_root
+    build_is_sealed_as(&built, built_withdrawals.as_deref(), header)
+}
+
+/// Whether `built` (with its withdrawals) is the build `sealed` was sealed
+/// from, beyond the fields the store's key compares: the withdrawals root in
+/// either shape the seal gives it (raw, or gov5's rewards commitment), then
+/// every execution input [`build_executes_as_sealed`] compares (gas limit,
+/// base fee, blob fields among them).
+fn build_is_sealed_as(
+    built: &n42_header::N42Header,
+    built_withdrawals: Option<&[alloy_eips::eip4895::Withdrawal]>,
+    sealed: &n42_header::N42Header,
+) -> bool {
+    let withdrawals_match = built.withdrawals_root == sealed.withdrawals_root
         || built.withdrawals_root.is_some() && {
-            let withdrawals = built_withdrawals.as_deref().unwrap_or_default();
-            header.withdrawals_root
+            let withdrawals = built_withdrawals.unwrap_or_default();
+            sealed.withdrawals_root
                 == Some(n42_h2_consensus::gov5_rewards_root(n42_h2_consensus::withdrawals_to_rewards(withdrawals)))
         };
-    withdrawals_match && build_executes_as_sealed(&built, None, header, None)
+    withdrawals_match && build_executes_as_sealed(built, None, sealed, None)
+}
+
+/// [`build_is_sealed_as`] for a kept build's block.
+fn block_is_sealed_as(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>, sealed: &n42_header::N42Header) -> bool {
+    build_is_sealed_as(block.header(), block.body().withdrawals.as_ref().map(|w| w.as_slice()), sealed)
 }
 
 /// The fields of a payload that tell an own build from a sibling on the same

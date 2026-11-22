@@ -983,3 +983,33 @@ async fn build_on_output_opens_the_sealed_build_not_a_rebuild_for_another_view()
     })
     .await;
 }
+
+/// A kept build that matches the sealed header's key but not the rest of
+/// what the block executes with (here the gas limit) is not handed off on
+/// either own-block road: the import is refused, so the block is imported
+/// the ordinary way, and the before-merge road never answers it VALID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_block_refuses_a_build_that_does_not_execute_as_sealed() {
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reuse, inserted) = recording_reuse();
+    let (engine, new_payloads) = valid_engine();
+    let deferred = Arc::new(crate::answer_at_insert::Deferred::default());
+
+    for (number, before_merge) in [(570u64, false), (571, true)] {
+        let sealed = header(number, 0x60 + number as u8);
+        let kept = n42_header::N42Header::from(alloy_consensus::Header { gas_limit: sealed.gas_limit - 1, ..sealed.inner.clone() });
+        file_build(&kept);
+        let result = if before_merge {
+            own_block_before_merge::<N42EngineTypes>(&reuse, &engine, sealed.clone(), &deferred, crate::follower_import::HandoffStage(number))
+                .await
+        } else {
+            own_block_by_header_with(Some(&reuse), &engine, &alloy_rlp::encode(&sealed), None, None).await
+        };
+        let err = result.expect_err("a build that does not execute as sealed is refused");
+        assert!(err.contains("does not execute as the sealed header"), "{err}");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(inserted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(), "nothing handed off");
+    assert_eq!(new_payloads.load(Ordering::SeqCst), 0, "no newPayload for a refused block");
+    assert!(deferred.failure().is_none());
+}

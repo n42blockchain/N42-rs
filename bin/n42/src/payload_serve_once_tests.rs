@@ -754,3 +754,121 @@ async fn own_block_answered_at_insert() {
     let (status, _, _, _) = call.await.expect("task").expect("answered");
     assert_eq!(status.status, PayloadStatusEnum::Valid);
 }
+
+/// What a [`recording_reuse`] was handed: per executed insert, the block's
+/// hash and the execution's `gas_used` (the tests' marker for which build's
+/// execution it carries).
+type Inserted = Arc<Mutex<Vec<(B256, u64)>>>;
+
+/// A reuse whose executed inserts are taken at once and recorded.
+fn recording_reuse() -> (OwnBlockReuse, Inserted) {
+    let inserted: Inserted = Arc::default();
+    let (inserts_tx, mut inserts_rx) = mpsc::unbounded_channel::<reth_node_builder::executed_inserts::ExecutedInsert>();
+    {
+        let inserted = Arc::clone(&inserted);
+        tokio::spawn(async move {
+            while let Some(insert) = inserts_rx.recv().await {
+                if let Some(executed) =
+                    insert.block.downcast_ref::<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>()
+                {
+                    inserted
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((executed.recovered_block.hash(), executed.execution_output.result.gas_used));
+                }
+                let _ = insert.done.send(true);
+            }
+        });
+    }
+    let reuse = OwnBlockReuse { inserts: inserts_tx, ..instant_reuse() };
+    (reuse, inserted)
+}
+
+/// An engine that answers every `newPayload` VALID and counts them.
+fn valid_engine() -> (ConsensusEngineHandle<N42EngineTypes>, Arc<AtomicUsize>) {
+    let (engine, mut engine_rx) = parked_engine();
+    let new_payloads = Arc::new(AtomicUsize::new(0));
+    {
+        let new_payloads = Arc::clone(&new_payloads);
+        tokio::spawn(async move {
+            while let Some(message) = engine_rx.recv().await {
+                if let BeaconEngineMessage::NewPayload { tx, .. } = message {
+                    new_payloads.fetch_add(1, Ordering::SeqCst);
+                    let _ = tx.send(Ok(PayloadStatus::from_status(PayloadStatusEnum::Valid)));
+                }
+            }
+        });
+    }
+    (engine, new_payloads)
+}
+
+/// A build of `header` whose execution carries `marker` as its `gas_used`.
+fn marked_build(header: &Header, marker: u64) -> n42_engine_types::built_executions::BuiltExecution {
+    let execution = executed(header);
+    let mut output = (*execution.execution_output).clone();
+    output.result.gas_used = marker;
+    n42_engine_types::built_executions::BuiltExecution {
+        block: Arc::clone(&execution.recovered_block),
+        execution_output: Arc::new(output),
+        hashed_state: Arc::clone(&execution.hashed_state),
+        trie_updates: Arc::clone(&execution.trie_updates),
+    }
+}
+
+/// `N42_STATE_READY_WITHOUT_MERGE`: the own block is answered on its build's
+/// published fields, and a sibling -- same parent, number, roots, gas and
+/// transactions root, another beneficiary (another key's build on a shared
+/// layer, holding the transactions the queue gave back) -- is filed after
+/// the answer and never finishes. The deferred insert still hands the
+/// engine the answered build, as soon as it completes. Before the fix it
+/// searched by the fields, found the newer sibling, waited for it until the
+/// store's deadline and dropped the insert (loop351 FVAa: block 1023, the
+/// deferred newPayload then failed and latched the stall).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_block_before_merge_inserts_the_answered_build_not_its_sibling() {
+    use n42_engine_types::built_executions as builds;
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reuse, inserted) = recording_reuse();
+    let (engine, new_payloads) = valid_engine();
+    let deferred = Arc::new(crate::answer_at_insert::Deferred::default());
+
+    let answered = header(530, 0x5A);
+    let sibling = n42_header::N42Header::from(alloy_consensus::Header {
+        beneficiary: Address::repeat_byte(5),
+        ..answered.inner.clone()
+    });
+    let answered_build = marked_build(&answered, 1);
+    let sibling_build = marked_build(&sibling, 2);
+    let (answered_hash, sibling_hash) = (answered_build.block.hash(), sibling_build.block.hash());
+    assert_ne!(answered_hash, sibling_hash);
+
+    builds::remember_pending(answered_hash, Arc::clone(&answered_build.block));
+    builds::answerable(answered_hash);
+    let (status, number, _, _) = own_block_before_merge::<N42EngineTypes>(
+        &reuse,
+        &engine,
+        answered.clone(),
+        &deferred,
+        crate::follower_import::HandoffStage(530),
+    )
+    .await
+    .expect("answered on the published fields");
+    assert_eq!((status.status, number), (PayloadStatusEnum::Valid, 530));
+
+    // The sibling is filed behind the answer, then the answered build lands.
+    builds::remember_pending(sibling_hash, Arc::clone(&sibling_build.block));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    builds::complete(answered_hash, answered_build);
+
+    let started = std::time::Instant::now();
+    while inserted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+        && started.elapsed() < std::time::Duration::from_secs(2)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let got = inserted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    builds::fail(sibling_hash);
+    assert_eq!(got, vec![(answered.hash_slow(), 1)], "the answered build's execution, under the sealed header, at once");
+    assert!(deferred.failure().is_none());
+    let _ = new_payloads;
+}

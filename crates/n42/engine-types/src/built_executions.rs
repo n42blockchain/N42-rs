@@ -710,9 +710,33 @@ pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256,
 /// [`find`], taking the build out of the store: the caller becomes the
 /// block's only holder and can move it instead of cloning its body.
 pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+    // Complete first (waiting for a finish behind the seal), then out.
+    let (hash, built) = find(parent, number, state_root, receipts_root, gas_used, transactions_root)?;
+    Some(take_found(hash, built))
+}
+
+/// The build under `built_hash` once `Complete` (waited for up to [`WAIT`]),
+/// or as the handed list keeps it: the build a caller already identified,
+/// never a sibling found by fields. Two builds on one parent can share every
+/// field [`find`] compares -- the queue offers the first one's transactions
+/// to the second, and under deferred execution the roots and gas are the
+/// parent's -- and the newer of the two is what a field search returns
+/// (loop351 FVAa: the own block's insert waited for its sibling, dropped it
+/// as the wrong build, and the chain stalled).
+pub fn find_by_hash(built_hash: B256) -> Option<(B256, BuiltExecution)> {
+    wait_for(built_hash, Stage::Complete).map(|built| (built_hash, built))
+}
+
+/// [`find_by_hash`], taking the build out of the store as [`take`] does.
+pub fn take_by_hash(built_hash: B256) -> Option<(B256, BuiltExecution)> {
+    let built = wait_for(built_hash, Stage::Complete)?;
+    Some(take_found(built_hash, built))
+}
+
+/// [`take`]'s second half: the found build leaves the store for the handed
+/// list.
+fn take_found(hash: B256, built: BuiltExecution) -> (B256, BuiltExecution) {
     let taken = {
-        // Complete first (waiting for a finish behind the seal), then out.
-        let (hash, built) = find(parent, number, state_root, receipts_root, gas_used, transactions_root)?;
         let (store, _) = store();
         let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
         if let Some(at) = store.iter().rposition(|(h, _)| *h == hash) {
@@ -739,7 +763,7 @@ pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
     if !evicted.is_empty() {
         free_boxed_off_path(Box::new(evicted));
     }
-    Some(taken)
+    taken
 }
 
 /// Builds [`take`] handed to the engine, still findable by [`find_kept`].

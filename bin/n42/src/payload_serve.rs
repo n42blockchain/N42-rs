@@ -1127,11 +1127,16 @@ where
         // retire it first (`built_executions::hold_sealed`).
         let sealed_hold = n42_engine_types::built_executions::hold_sealed(sealed_hash);
         let waited_at = std::time::Instant::now();
+        // By the build hash the answer was given for, never by the fields
+        // again: a sibling on the same parent with the same transactions
+        // (the queue's give-back) shares them all, and a field search returns
+        // the newer one -- the insert then waited for the sibling's finish
+        // and was dropped as the wrong build (loop351 FVAa stall).
         let built = tokio::task::spawn_blocking(move || {
             if build_on_seal() {
-                n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+                n42_engine_types::built_executions::find_by_hash(built_hash)
             } else {
-                n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+                n42_engine_types::built_executions::take_by_hash(built_hash)
             }
         })
         .await

@@ -382,7 +382,8 @@ pub fn release_pins_through(canonical: u64) {
 /// is skipped: with empty blocks the hand-off of block N lands before the
 /// build request for N+1 brings the sealed header (loop351 stage ak), and a
 /// pin placed then would never be released.
-pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
+#[cfg(test)]
+pub(crate) fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
     pin_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
 }
 
@@ -515,7 +516,8 @@ pub fn state_ready_without_merge() -> bool {
 /// its fields published ([`answerable`]) or `Complete`, waited for up to
 /// [`WAIT`]. Gives its builder hash and its block; the build stays in the
 /// store for the insert that follows when its map lands.
-pub fn find_answerable(
+#[cfg(test)]
+pub(crate) fn find_answerable(
     parent: B256,
     number: u64,
     state_root: B256,
@@ -690,7 +692,8 @@ pub fn wait_for_state(built_hash: B256) -> Option<ParentState> {
 /// the transactions and the state they produced. The caller still proves the
 /// sealed header hashes to the hash it was given before trusting this. A
 /// build still finishing behind its seal is waited for, up to [`WAIT`].
-pub fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
     find_at(parent, number, state_root, receipts_root, gas_used, transactions_root, Stage::Complete)
 }
 
@@ -700,7 +703,8 @@ pub fn find_key(key: BuildKey) -> Option<(B256, BuiltExecution)> {
 }
 
 /// [`find`] at a given stage.
-pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
     find_at_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root), stage)
 }
 
@@ -731,7 +735,8 @@ pub fn find_at_key(key: BuildKey, stage: Stage) -> Option<(B256, BuiltExecution)
 
 /// [`find`], taking the build out of the store: the caller becomes the
 /// block's only holder and can move it instead of cloning its body.
-pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
     // Complete first (waiting for a finish behind the seal), then out.
     take_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
 }
@@ -805,7 +810,8 @@ fn handed() -> &'static Mutex<VecDeque<(B256, BuiltExecution)>> {
 /// (`remember_pending`), so a request naming the sealed header always finds
 /// it here -- what a build started at the parent's seal needs
 /// (`N42_BUILD_ON_OUTPUT`), which waits for the state only when it opens it.
-pub fn find_kept_sealed(
+#[cfg(test)]
+pub(crate) fn find_kept_sealed(
     parent: B256,
     number: u64,
     state_root: B256,
@@ -821,24 +827,12 @@ pub fn find_kept_sealed_key(key: BuildKey) -> Option<(B256, Arc<RecoveredBlock<B
     find_kept_sealed_with(key, |hash, block, execution| (hash, Arc::clone(block), execution.cloned()))
 }
 
-/// [`find_kept_sealed`] keeping no reference to the block: the builder hash,
-/// a copy of the block's header and of its withdrawals (a few hundred bytes).
-/// For a caller that only asks whether a header is one of this layer's
-/// builds -- every follower key's request on a shared layer asks it, as the
-/// own-block hand-off is about to move the block's body, which a reference
-/// held by such a lookup at that moment would make it copy instead.
-pub fn find_kept_sealed_header(
-    parent: B256,
-    number: u64,
-    state_root: B256,
-    receipts_root: B256,
-    gas_used: u64,
-    transactions_root: Option<B256>,
-) -> Option<(B256, n42_header::N42Header, Option<Vec<alloy_eips::eip4895::Withdrawal>>)> {
-    find_kept_sealed_header_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
-}
-
-/// [`find_kept_sealed_header`] by a [`BuildKey`].
+/// [`find_kept_sealed_key`] keeping no reference to the block: the builder
+/// hash, a copy of the block's header and of its withdrawals (a few hundred
+/// bytes). For a caller that only asks whether a header is one of this
+/// layer's builds -- every follower key's request on a shared layer asks it,
+/// as the own-block hand-off is about to move the block's body, which a
+/// reference held by such a lookup at that moment would make it copy instead.
 pub fn find_kept_sealed_header_key(
     key: BuildKey,
 ) -> Option<(B256, n42_header::N42Header, Option<Vec<alloy_eips::eip4895::Withdrawal>>)> {
@@ -871,13 +865,15 @@ fn find_kept_sealed_with<R>(
 /// [`find`], also among the builds already taken by the engine's import --
 /// what a build on the sealed block wants, whichever of the two requests the
 /// execution layer served first.
-pub fn find_kept(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn find_kept(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
     find_kept_at(parent, number, state_root, receipts_root, gas_used, transactions_root, Stage::Complete)
 }
 
 /// [`find_kept`] at a given stage: the build on the sealed block needs the
 /// parent's post-state (`StateReady`), not its receipts.
-pub fn find_kept_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn find_kept_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
     find_kept_at_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root), stage)
 }
 
@@ -937,24 +933,24 @@ impl AsSealed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildKey {
     /// The parent's hash.
-    pub parent: B256,
+    pub(crate) parent: B256,
     /// The block number.
-    pub number: u64,
+    pub(crate) number: u64,
     /// The header's state root (the parent's under deferred execution).
-    pub state_root: B256,
+    pub(crate) state_root: B256,
     /// The header's receipts root.
-    pub receipts_root: B256,
+    pub(crate) receipts_root: B256,
     /// The header's gas used.
-    pub gas_used: u64,
+    pub(crate) gas_used: u64,
     /// The transactions root, when the caller has it.
-    pub transactions_root: Option<B256>,
+    pub(crate) transactions_root: Option<B256>,
     /// The sibling-separating fields, when the caller has them.
-    pub as_sealed: Option<AsSealed>,
+    pub(crate) as_sealed: Option<AsSealed>,
 }
 
 impl BuildKey {
     /// The fields alone: a sibling with the same fields matches too.
-    pub const fn fields(
+    pub(crate) const fn fields(
         parent: B256,
         number: u64,
         state_root: B256,
@@ -981,8 +977,21 @@ impl BuildKey {
         }
     }
 
+    /// A payload's key: the fields it carries (no transactions root) and the
+    /// sibling-separating ones, which are required.
+    pub const fn of_payload(
+        parent: B256,
+        number: u64,
+        state_root: B256,
+        receipts_root: B256,
+        gas_used: u64,
+        as_sealed: AsSealed,
+    ) -> Self {
+        Self::fields(parent, number, state_root, receipts_root, gas_used, None).with_as_sealed(as_sealed)
+    }
+
     /// This key, telling siblings apart by `as_sealed`.
-    pub const fn with_as_sealed(self, as_sealed: AsSealed) -> Self {
+    pub(crate) const fn with_as_sealed(self, as_sealed: AsSealed) -> Self {
         Self { as_sealed: Some(as_sealed), ..self }
     }
 

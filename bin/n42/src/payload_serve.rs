@@ -352,8 +352,14 @@ where
     let keep = shared && build_on_seal();
     // The payload carries no transactions root; the fields that tell a
     // sibling on the same parent apart it does carry.
-    let key = n42_engine_types::built_executions::BuildKey::fields(parent_hash, number, state_root, receipts_root, gas_used, None)
-        .with_as_sealed(as_sealed_of_payload(data));
+    let key = n42_engine_types::built_executions::BuildKey::of_payload(
+        parent_hash,
+        number,
+        state_root,
+        receipts_root,
+        gas_used,
+        as_sealed_of_payload(data),
+    );
     let lookup_at = std::time::Instant::now();
     // On a thread: a build sealed before its finish is waited for.
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
@@ -1161,8 +1167,7 @@ where
         })
         .await
         .ok()
-        .flatten()
-        .filter(|(hash, _)| *hash == built_hash);
+        .flatten();
         let insert_wait_merge_us = waited_at.elapsed().as_micros() as u64;
         let merge_behind_answer_us = answered_at.elapsed().as_micros() as u64;
         // The parent's insert first, if it is still to come: the tree gets
@@ -2894,8 +2899,14 @@ fn as_sealed_of_payload(data: &alloy_rpc_types_engine::ExecutionData) -> n42_eng
 fn own_sealed_header_of_payload(data: &alloy_rpc_types_engine::ExecutionData) -> Option<n42_header::N42Header> {
     let v1 = data.payload.as_v1();
     let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed_header_key(
-        n42_engine_types::built_executions::BuildKey::fields(v1.parent_hash, v1.block_number, v1.state_root, v1.receipts_root, v1.gas_used, None)
-            .with_as_sealed(as_sealed_of_payload(data)),
+        n42_engine_types::built_executions::BuildKey::of_payload(
+            v1.parent_hash,
+            v1.block_number,
+            v1.state_root,
+            v1.receipts_root,
+            v1.gas_used,
+            as_sealed_of_payload(data),
+        ),
     )?;
     let sealed = sealed_header_from_fields(data, &built)?;
     (sealed.hash() == data.payload.block_hash() && is_own_build(sealed.header())).then(|| sealed.header().clone())
@@ -3980,15 +3991,9 @@ mod tests {
         };
         let built_hash = execution.block.hash();
         n42_engine_types::built_executions::remember(built_hash, execution);
-        let (taken_hash, taken) = n42_engine_types::built_executions::take(
-            header.parent_hash,
-            number,
-            header.state_root,
-            header.receipts_root,
-            header.gas_used,
-            None,
-        )
-        .expect("taken");
+        let (taken_hash, taken) =
+            n42_engine_types::built_executions::take_key(n42_engine_types::built_executions::BuildKey::of_sealed(&header))
+                .expect("taken");
         assert_eq!(taken_hash, built_hash);
         let sealed = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"view".as_slice().into(), ..header.inner }));
         (built_hash, taken, sealed)

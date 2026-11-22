@@ -381,13 +381,8 @@ async fn a_handover_on_one_execution_layer_keeps_the_build_chain() {
     // The incoming leader's first build on the last block finds it (what
     // `BUILD_ON_OWN` on a sealed parent looks up), as the outgoing leader's
     // next build would have.
-    let found = n42_engine_types::built_executions::find_kept_at(
-        last.parent_hash,
-        last.number,
-        last.state_root,
-        last.receipts_root,
-        last.gas_used,
-        Some(last.transactions_root),
+    let found = n42_engine_types::built_executions::find_kept_at_key(
+        n42_engine_types::built_executions::BuildKey::of_sealed(&last),
         n42_engine_types::built_executions::Stage::StateReady,
     );
     assert_eq!(found.map(|(hash, _)| hash), Some(last.hash_slow()), "the build chain goes on across the handover");

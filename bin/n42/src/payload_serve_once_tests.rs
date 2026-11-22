@@ -1013,3 +1013,84 @@ async fn own_block_refuses_a_build_that_does_not_execute_as_sealed() {
     assert_eq!(new_payloads.load(Ordering::SeqCst), 0, "no newPayload for a refused block");
     assert!(deferred.failure().is_none());
 }
+
+/// A rebuild of the sealed block for another view: same parent, number,
+/// roots, gas, transactions and beneficiary, another timestamp -- what a
+/// single node with its own execution layer files when it builds again on
+/// the same parent after a view change (the queue gives the first build's
+/// take to the second).
+fn rebuild_for_another_view(sealed: &Header) -> Header {
+    n42_header::N42Header::from(alloy_consensus::Header { timestamp: sealed.timestamp + 2, ..sealed.inner.clone() })
+}
+
+/// The ordinary road with a timestamp-only sibling filed after the build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_block_hands_off_the_sealed_build_not_a_rebuild_for_another_view() {
+    use n42_engine_types::built_executions as builds;
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reuse, inserted) = recording_reuse();
+    let (engine, _new_payloads) = valid_engine();
+    let sealed = header(580, 0x6A);
+    let sealed_build = marked_build(&sealed, 1);
+    let rebuild = marked_build(&rebuild_for_another_view(&sealed), 2);
+    builds::remember(sealed_build.block.hash(), sealed_build);
+    builds::remember(rebuild.block.hash(), rebuild);
+    own_block_by_header_with(Some(&reuse), &engine, &alloy_rlp::encode(&sealed), None, None).await.expect("imported by header");
+    let got = inserted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    assert_eq!(got, vec![(sealed.hash_slow(), 1)]);
+}
+
+/// The before-merge road: answered on the sealed build, a timestamp-only
+/// rebuild filed after it and never finishing; the deferred insert is the
+/// answered build's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_block_before_merge_answers_and_inserts_the_sealed_build_not_a_rebuild() {
+    use n42_engine_types::built_executions as builds;
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reuse, inserted) = recording_reuse();
+    let (engine, _new_payloads) = valid_engine();
+    let deferred = Arc::new(crate::answer_at_insert::Deferred::default());
+    let sealed = header(581, 0x6B);
+    let sealed_build = marked_build(&sealed, 1);
+    let rebuild = marked_build(&rebuild_for_another_view(&sealed), 2);
+    let (sealed_hash, rebuild_hash) = (sealed_build.block.hash(), rebuild.block.hash());
+    // The rebuild is filed after the sealed build and published too: a
+    // field search answers the newer one.
+    builds::remember_pending(sealed_hash, Arc::clone(&sealed_build.block));
+    builds::answerable(sealed_hash);
+    builds::remember_pending(rebuild_hash, Arc::clone(&rebuild.block));
+    builds::answerable(rebuild_hash);
+    let call = own_block_before_merge::<N42EngineTypes>(&reuse, &engine, sealed.clone(), &deferred, crate::follower_import::HandoffStage(581));
+    let (status, _, _, _) = call.await.expect("answered");
+    assert_eq!(status.status, PayloadStatusEnum::Valid);
+    builds::complete(sealed_hash, sealed_build);
+    let started = std::time::Instant::now();
+    while inserted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+        && started.elapsed() < std::time::Duration::from_secs(2)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let got = inserted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    builds::fail(rebuild_hash);
+    assert_eq!(got, vec![(sealed.hash_slow(), 1)]);
+}
+
+/// The payload road (`reuse_own_build`): keyed by the payload's own fee
+/// recipient, timestamp, prevRandao and beacon root, it takes the sealed
+/// build, not a timestamp-only rebuild filed after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reuse_own_build_takes_the_sealed_build_not_a_rebuild_for_another_view() {
+    use n42_engine_types::built_executions as builds;
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reuse, inserted) = recording_reuse();
+    let sealed = header(582, 0x6C);
+    let sealed_build = marked_build(&sealed, 1);
+    let sealed_hash = sealed_build.block.hash();
+    let rebuild = marked_build(&rebuild_for_another_view(&sealed), 2);
+    builds::remember(sealed_hash, sealed_build);
+    builds::remember(rebuild.block.hash(), rebuild);
+    let reused = reuse_own_build::<N42EngineTypes>(&reuse, &payload(&sealed), false).await;
+    assert_eq!(reused, Some(sealed_hash), "the sealed build went in");
+    let got = inserted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    assert_eq!(got, vec![(sealed.hash_slow(), 1)]);
+}

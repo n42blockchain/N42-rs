@@ -383,6 +383,13 @@ pub fn release_pins_through(canonical: u64) {
 /// build request for N+1 brings the sealed header (loop351 stage ak), and a
 /// pin placed then would never be released.
 pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
+    pin_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
+}
+
+/// [`pin_sealed`] by a [`BuildKey`]: under [`BuildKey::of_sealed`] a sibling
+/// with the same fields is never the build pinned.
+pub fn pin_key(key: BuildKey) -> bool {
+    let number = key.number;
     let (store, _) = store();
     let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     if number <= crate::canonical_head::number() {
@@ -391,7 +398,7 @@ pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B2
     match store
         .iter_mut()
         .rev()
-        .find(|(_, entry)| !entry.handed_off && matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+        .find(|(_, entry)| !entry.handed_off && key.matches(&entry.block))
     {
         Some((_, entry)) => {
             entry.pinned = true;
@@ -516,6 +523,11 @@ pub fn find_answerable(
     gas_used: u64,
     transactions_root: Option<B256>,
 ) -> Option<(B256, Arc<RecoveredBlock<Block>>)> {
+    find_answerable_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
+}
+
+/// [`find_answerable`] by a [`BuildKey`].
+pub fn find_answerable_key(key: BuildKey) -> Option<(B256, Arc<RecoveredBlock<Block>>)> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
     let mut guard = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
@@ -523,7 +535,7 @@ pub fn find_answerable(
         let found = guard
             .iter()
             .rev()
-            .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+            .find(|(_, entry)| key.matches(&entry.block))
             .map(|(hash, entry)| (*hash, entry.stage, Arc::clone(&entry.block)));
         match found {
             Some((hash, stage, block)) if stage == Stage::Complete || answerable_at(hash).is_some() => {
@@ -536,7 +548,7 @@ pub fn find_answerable(
                 return handed
                     .iter()
                     .rev()
-                    .find(|(_, built)| matches_block(&built.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+                    .find(|(_, built)| key.matches(&built.block))
                     .map(|(hash, built)| (*hash, Arc::clone(&built.block)));
             }
         }
@@ -682,8 +694,18 @@ pub fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
     find_at(parent, number, state_root, receipts_root, gas_used, transactions_root, Stage::Complete)
 }
 
+/// [`find`] by a [`BuildKey`].
+pub fn find_key(key: BuildKey) -> Option<(B256, BuiltExecution)> {
+    find_at_key(key, Stage::Complete)
+}
+
 /// [`find`] at a given stage.
 pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
+    find_at_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root), stage)
+}
+
+/// [`find_at`] by a [`BuildKey`].
+pub fn find_at_key(key: BuildKey, stage: Stage) -> Option<(B256, BuiltExecution)> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
     let mut guard = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
@@ -691,7 +713,7 @@ pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256,
         let found = guard
             .iter()
             .rev()
-            .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+            .find(|(_, entry)| key.matches(&entry.block))
             .map(|(hash, entry)| (*hash, entry.stage, entry.execution.clone()));
         match found {
             Some((hash, at, Some(built))) if at >= stage => return Some((hash, built)),
@@ -711,7 +733,12 @@ pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256,
 /// block's only holder and can move it instead of cloning its body.
 pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
     // Complete first (waiting for a finish behind the seal), then out.
-    let (hash, built) = find(parent, number, state_root, receipts_root, gas_used, transactions_root)?;
+    take_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
+}
+
+/// [`take`] by a [`BuildKey`].
+pub fn take_key(key: BuildKey) -> Option<(B256, BuiltExecution)> {
+    let (hash, built) = find_key(key)?;
     Some(take_found(hash, built))
 }
 
@@ -786,9 +813,12 @@ pub fn find_kept_sealed(
     gas_used: u64,
     transactions_root: Option<B256>,
 ) -> Option<(B256, Arc<RecoveredBlock<Block>>, Option<BuiltExecution>)> {
-    find_kept_sealed_with(parent, number, state_root, receipts_root, gas_used, transactions_root, |hash, block, execution| {
-        (hash, Arc::clone(block), execution.cloned())
-    })
+    find_kept_sealed_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
+}
+
+/// [`find_kept_sealed`] by a [`BuildKey`].
+pub fn find_kept_sealed_key(key: BuildKey) -> Option<(B256, Arc<RecoveredBlock<Block>>, Option<BuiltExecution>)> {
+    find_kept_sealed_with(key, |hash, block, execution| (hash, Arc::clone(block), execution.cloned()))
 }
 
 /// [`find_kept_sealed`] keeping no reference to the block: the builder hash,
@@ -805,7 +835,14 @@ pub fn find_kept_sealed_header(
     gas_used: u64,
     transactions_root: Option<B256>,
 ) -> Option<(B256, n42_header::N42Header, Option<Vec<alloy_eips::eip4895::Withdrawal>>)> {
-    find_kept_sealed_with(parent, number, state_root, receipts_root, gas_used, transactions_root, |hash, block, _| {
+    find_kept_sealed_header_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
+}
+
+/// [`find_kept_sealed_header`] by a [`BuildKey`].
+pub fn find_kept_sealed_header_key(
+    key: BuildKey,
+) -> Option<(B256, n42_header::N42Header, Option<Vec<alloy_eips::eip4895::Withdrawal>>)> {
+    find_kept_sealed_with(key, |hash, block, _| {
         (hash, block.header().clone(), block.body().withdrawals.as_ref().map(|w| w.to_vec()))
     })
 }
@@ -813,17 +850,12 @@ pub fn find_kept_sealed_header(
 /// The kept build matching these fields, `found` applied to it under the
 /// stores' lock (it must be cheap).
 fn find_kept_sealed_with<R>(
-    parent: B256,
-    number: u64,
-    state_root: B256,
-    receipts_root: B256,
-    gas_used: u64,
-    transactions_root: Option<B256>,
+    key: BuildKey,
     found: impl FnOnce(B256, &Arc<RecoveredBlock<Block>>, Option<&BuiltExecution>) -> R,
 ) -> Option<R> {
     {
         let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
-        if let Some((hash, built)) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used, transactions_root)) {
+        if let Some((hash, built)) = handed.iter().rev().find(|(_, built)| key.matches(&built.block)) {
             return Some(found(*hash, &built.block, Some(built)));
         }
     }
@@ -832,7 +864,7 @@ fn find_kept_sealed_with<R>(
     store
         .iter()
         .rev()
-        .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+        .find(|(_, entry)| key.matches(&entry.block))
         .map(|(hash, entry)| found(*hash, &entry.block, entry.execution.as_ref()))
 }
 
@@ -846,19 +878,118 @@ pub fn find_kept(parent: B256, number: u64, state_root: B256, receipts_root: B25
 /// [`find_kept`] at a given stage: the build on the sealed block needs the
 /// parent's post-state (`StateReady`), not its receipts.
 pub fn find_kept_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
+    find_kept_at_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root), stage)
+}
+
+/// [`find_kept_at`] by a [`BuildKey`].
+pub fn find_kept_at_key(key: BuildKey, stage: Stage) -> Option<(B256, BuiltExecution)> {
     // The handed list first: a build the engine already took is complete,
     // and looking there costs nothing where a wait on the store would.
     {
         let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
-        if let Some(found) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used, transactions_root)) {
+        if let Some(found) = handed.iter().rev().find(|(_, built)| key.matches(&built.block)) {
             return Some(found.clone());
         }
     }
-    find_at(parent, number, state_root, receipts_root, gas_used, transactions_root, stage)
+    find_at_key(key, stage)
 }
 
-fn matches_build(built: &BuiltExecution, parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
-    matches_block(&built.block, parent, number, state_root, receipts_root, gas_used, transactions_root)
+/// The seal-invariant fields that tell an own build from a sibling built
+/// on the same parent with the same transactions: the queue offers one
+/// build's take to the next build on that parent, and under deferred
+/// execution the roots and gas are the parent's, so a sibling built by
+/// another key (another beneficiary) or for another view (another timestamp)
+/// matches every field [`find`] compares (loop351 FVAa). These are inputs of
+/// the block's execution, which a seal cannot change without changing what
+/// the block executes to (`bin/n42` `build_executes_as_sealed` compares the
+/// same ones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsSealed {
+    /// The fee recipient.
+    pub beneficiary: alloy_primitives::Address,
+    /// The block's timestamp.
+    pub timestamp: u64,
+    /// `prevRandao`.
+    pub mix_hash: B256,
+    /// EIP-4788's root.
+    pub parent_beacon_block_root: Option<B256>,
+}
+
+impl AsSealed {
+    /// The fields of `header`.
+    pub fn of(header: &n42_header::N42Header) -> Self {
+        Self {
+            beneficiary: header.beneficiary,
+            timestamp: header.timestamp,
+            mix_hash: header.mix_hash,
+            parent_beacon_block_root: header.parent_beacon_block_root,
+        }
+    }
+
+    fn admits(&self, built: &n42_header::N42Header) -> bool {
+        *self == Self::of(built)
+    }
+}
+
+/// What a lookup in the stores matches a kept build by: the fields a seal
+/// cannot change that [`find`] has always compared, and, under
+/// [`Self::of_sealed`], the [`AsSealed`] fields that tell siblings apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildKey {
+    /// The parent's hash.
+    pub parent: B256,
+    /// The block number.
+    pub number: u64,
+    /// The header's state root (the parent's under deferred execution).
+    pub state_root: B256,
+    /// The header's receipts root.
+    pub receipts_root: B256,
+    /// The header's gas used.
+    pub gas_used: u64,
+    /// The transactions root, when the caller has it.
+    pub transactions_root: Option<B256>,
+    /// The sibling-separating fields, when the caller has them.
+    pub as_sealed: Option<AsSealed>,
+}
+
+impl BuildKey {
+    /// The fields alone: a sibling with the same fields matches too.
+    pub const fn fields(
+        parent: B256,
+        number: u64,
+        state_root: B256,
+        receipts_root: B256,
+        gas_used: u64,
+        transactions_root: Option<B256>,
+    ) -> Self {
+        Self { parent, number, state_root, receipts_root, gas_used, transactions_root, as_sealed: None }
+    }
+
+    /// Everything a sealed header pins its build by: a sibling never
+    /// matches.
+    pub fn of_sealed(header: &n42_header::N42Header) -> Self {
+        Self {
+            as_sealed: Some(AsSealed::of(header)),
+            ..Self::fields(
+                header.parent_hash,
+                header.number,
+                header.state_root,
+                header.receipts_root,
+                header.gas_used,
+                Some(header.transactions_root),
+            )
+        }
+    }
+
+    /// This key, telling siblings apart by `as_sealed`.
+    pub const fn with_as_sealed(self, as_sealed: AsSealed) -> Self {
+        Self { as_sealed: Some(as_sealed), ..self }
+    }
+
+    fn matches(&self, block: &RecoveredBlock<Block>) -> bool {
+        matches_block(block, self.parent, self.number, self.state_root, self.receipts_root, self.gas_used, self.transactions_root)
+            && self.as_sealed.is_none_or(|as_sealed| as_sealed.admits(block.header()))
+    }
 }
 
 /// Under deferred execution the state root, receipts root and gas are the
@@ -1541,6 +1672,49 @@ mod tests {
 
     fn find_by(h: &Header) -> Option<(B256, BuiltExecution)> {
         find(h.parent_hash, h.number, h.state_root, h.receipts_root, h.gas_used, None)
+    }
+
+    /// A sibling of a finished build -- same parent, number, roots, gas and
+    /// transactions root, another beneficiary (another key's build of the
+    /// same transactions, loop351 FVAa) -- filed after it and still
+    /// finishing: the field search returns the sibling, a lookup by the
+    /// sealed header (or by the build hash) returns the build at once, and
+    /// the sealed header pins the build, not its sibling.
+    #[test]
+    fn a_sibling_with_the_same_fields_is_never_the_sealed_build() {
+        let _guard = lock();
+        let sealed = header(0x71, 710);
+        let execution = built(&sealed);
+        let hash = execution.block.hash();
+        remember(hash, execution);
+        let sibling = Header::from(alloy_consensus::Header {
+            beneficiary: alloy_primitives::Address::repeat_byte(5),
+            ..sealed.inner.clone()
+        });
+        let sibling_hash = built(&sibling).block.hash();
+        remember_pending(sibling_hash, Arc::clone(&built(&sibling).block));
+        assert_ne!(hash, sibling_hash);
+
+        // The ambiguity: by the fields alone the newer entry, the sibling.
+        let by_fields = find_kept_sealed(sealed.parent_hash, 710, sealed.state_root, sealed.receipts_root, sealed.gas_used, Some(sealed.transactions_root));
+        assert_eq!(by_fields.map(|(found, _, _)| found), Some(sibling_hash));
+
+        let key = BuildKey::of_sealed(&sealed);
+        let started = Instant::now();
+        assert_eq!(find_key(key).map(|(found, _)| found), Some(hash));
+        assert_eq!(find_answerable_key(key).map(|(found, _)| found), Some(hash));
+        assert_eq!(find_kept_sealed_header_key(key).map(|(found, _, _)| found), Some(hash));
+        assert_eq!(find_kept_at_key(key, Stage::StateReady).map(|(found, _)| found), Some(hash));
+        assert_eq!(find_by_hash(hash).map(|(found, _)| found), Some(hash));
+        assert!(started.elapsed() < Duration::from_millis(500), "nothing waited for the sibling: {:?}", started.elapsed());
+
+        assert!(pin_key(key));
+        assert!(is_pinned(hash), "the sealed build is pinned");
+        assert!(!is_pinned(sibling_hash), "its sibling is not");
+
+        let (taken, _) = take_key(key).expect("taken");
+        assert_eq!(taken, hash);
+        fail(sibling_hash);
     }
 
     #[test]

@@ -872,3 +872,34 @@ async fn own_block_before_merge_inserts_the_answered_build_not_its_sibling() {
     assert!(deferred.failure().is_none());
     let _ = new_payloads;
 }
+
+/// The ordinary own-block road (merge first): a sibling of the sealed build
+/// with the same fields (another beneficiary, the queue's give-back of the
+/// same transactions), filed and finished after it, is not what is handed
+/// to the engine under the sealed header. Before the fix the field search
+/// returned the newer sibling and its execution was inserted as the sealed
+/// block's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_block_hands_off_the_sealed_build_not_its_sibling() {
+    use n42_engine_types::built_executions as builds;
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reuse, inserted) = recording_reuse();
+    let (engine, _new_payloads) = valid_engine();
+
+    let sealed = header(540, 0x5C);
+    let sibling = n42_header::N42Header::from(alloy_consensus::Header {
+        beneficiary: Address::repeat_byte(5),
+        ..sealed.inner.clone()
+    });
+    let sealed_build = marked_build(&sealed, 1);
+    let sibling_build = marked_build(&sibling, 2);
+    builds::remember(sealed_build.block.hash(), sealed_build);
+    builds::remember(sibling_build.block.hash(), sibling_build);
+
+    let (status, number, _, _) = own_block_by_header_with(Some(&reuse), &engine, &alloy_rlp::encode(&sealed), None, None)
+        .await
+        .expect("imported by header");
+    assert_eq!((status.status, number), (PayloadStatusEnum::Valid, 540));
+    let got = inserted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    assert_eq!(got, vec![(sealed.hash_slow(), 1)], "the sealed build's execution, not its sibling's");
+}

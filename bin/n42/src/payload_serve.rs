@@ -941,6 +941,11 @@ where
     .ok_or("unknown build")?;
     let waits = AnswerWaits::after_take(built_hash, lookup_at);
     let sealed_hash = header.hash_slow();
+    // What the engine's conversion of this block's payload needs when the
+    // executed insert does not land: the transactions root by the layout the
+    // seal filed, not the queue's frame index, which may have let go of the
+    // block's frames by then (loop351 FVAa: "no gov5 header variant").
+    n42_engine_types::frame_blocks::file_own_block_root(sealed_hash, header.transactions_root);
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
     let withdrawals = built.block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
     // The transactions travel with the `newPayload` below. reth executes a
@@ -1087,6 +1092,11 @@ where
     .ok_or("unknown build")?;
     let answer_wait_merge_us = merge_wait_us(built_hash, lookup_at);
     let sealed_hash = header.hash_slow();
+    // What the engine's conversion of this block's payload needs when the
+    // executed insert does not land: the transactions root by the layout the
+    // seal filed, not the queue's frame index, which may have let go of the
+    // block's frames by then (loop351 FVAa: "no gov5 header variant").
+    n42_engine_types::frame_blocks::file_own_block_root(sealed_hash, header.transactions_root);
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
     let withdrawals = block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
     // The transactions travel with the deferred `newPayload`, for the same

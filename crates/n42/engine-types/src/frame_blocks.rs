@@ -746,6 +746,23 @@ pub fn remember_verified(block: B256, root: B256, layout: &[(B256, u32)]) {
     remember_block_root(block, root);
 }
 
+/// Files `root` as the transactions root of the own block `block` (its
+/// sealed hash) when this node holds its own frame layout for `root`, the
+/// one it sealed the block from: an own block's `newPayload` then converts
+/// by that layout, checked over the body's hashes as any claim is, without
+/// the queue's frame index. Without it, an own block whose executed insert
+/// did not land had its payload rooted by the queue's index, which had let
+/// go of the block's frames, fell back to the MPT root and failed as "no
+/// gov5 header variant hashes to the payload's block hash" (loop351 FVAa,
+/// block 1023). Returns whether a root was filed.
+pub fn file_own_block_root(block: B256, root: B256) -> bool {
+    if layout_by_root(&root).is_none() {
+        return false;
+    }
+    remember_block_root(block, root);
+    true
+}
+
 /// Records `root` as block `block`'s transactions root, keeping the first.
 fn remember_block_root(block: B256, root: B256) {
     let mut kept = BLOCK_ROOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1292,6 +1309,27 @@ mod claimed_root_tests {
         let bare = B256::repeat_byte(0x79);
         remember_claimed(bare, root, &[]);
         assert_eq!(root_of_block(&bare), None);
+    }
+
+    /// An own block's payload, which does not carry the header's root, is
+    /// rooted by the layout this node sealed it from once its sealed hash is
+    /// filed -- with the queue's frame index no help (loop351 FVAa: the
+    /// fallback `newPayload` of block 1023 fell back to the MPT root).
+    #[test]
+    fn an_own_block_payload_is_rooted_by_the_sealed_layout() {
+        // Bytes no other test of the process-wide tables uses.
+        let hashes: Vec<B256> = (0..5u8).map(|i| B256::repeat_byte(0x30 + i)).collect();
+        let counts = [2usize, 3];
+        let root = root_of_hashes(&hashes, &counts).expect("the layout covers the body");
+        let mpt = B256::repeat_byte(0x12);
+        let sealed = B256::repeat_byte(0x3F);
+        // No own layout for the root: nothing is filed.
+        assert!(!file_own_block_root(sealed, root));
+        assert_eq!(root_for_body(root_of_block(&sealed), &hashes, || mpt), (mpt, false));
+        // The seal filed its layout under the root.
+        remember_layout(root, counts.iter().zip(0u8..).map(|(count, k)| (B256::repeat_byte(0xb0 + k), *count as u32)).collect());
+        assert!(file_own_block_root(sealed, root));
+        assert_eq!(root_for_body(root_of_block(&sealed), &hashes, || mpt), (root, true));
     }
 
     /// Audit 2026-10 round 2 (R2-X4): the layout is not in the header, so a

@@ -903,3 +903,24 @@ async fn own_block_hands_off_the_sealed_build_not_its_sibling() {
     let got = inserted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     assert_eq!(got, vec![(sealed.hash_slow(), 1)], "the sealed build's execution, not its sibling's");
 }
+
+/// The own-block roads file the block's transactions root under its sealed
+/// hash from the layout the seal filed, so the engine's conversion of the
+/// block's payload -- the fallback when the executed insert does not land
+/// -- roots the body by that layout rather than the queue's frame index
+/// (loop351 FVAa: the index had let go of block 1023's frames, the MPT root
+/// came out, "no gov5 header variant hashes to the payload's block hash").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_block_files_its_root_for_the_fallback_conversion() {
+    let _builds = BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reuse, _inserted) = recording_reuse();
+    let (engine, _new_payloads) = valid_engine();
+    let root = B256::repeat_byte(0x9C);
+    let sealed = n42_header::N42Header::from(alloy_consensus::Header { transactions_root: root, ..header(550, 0x5E).inner });
+    // The seal's layout for the root, as `frame_blocks` files it.
+    n42_engine_types::frame_blocks::remember_verified(B256::repeat_byte(0x9D), root, &[(B256::repeat_byte(0x9E), 1)]);
+    file_build(&sealed);
+    assert_eq!(n42_engine_types::frame_blocks::root_of_block(&sealed.hash_slow()), None);
+    own_block_by_header_with(Some(&reuse), &engine, &alloy_rlp::encode(&sealed), None, None).await.expect("imported by header");
+    assert_eq!(n42_engine_types::frame_blocks::root_of_block(&sealed.hash_slow()), Some(root));
+}

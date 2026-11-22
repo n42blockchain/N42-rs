@@ -350,13 +350,23 @@ where
     let (parent_hash, number, state_root, receipts_root, gas_used) =
         (v1.parent_hash, v1.block_number, v1.state_root, v1.receipts_root, v1.gas_used);
     let keep = shared && build_on_seal();
+    // The payload carries no transactions root; the fields that tell a
+    // sibling on the same parent apart it does carry.
+    let key = n42_engine_types::built_executions::BuildKey::of_payload(
+        parent_hash,
+        number,
+        state_root,
+        receipts_root,
+        gas_used,
+        as_sealed_of_payload(data),
+    );
     let lookup_at = std::time::Instant::now();
     // On a thread: a build sealed before its finish is waited for.
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
         if keep {
-            n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, None)
+            n42_engine_types::built_executions::find_key(key)
         } else {
-            n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used, None)
+            n42_engine_types::built_executions::take_key(key)
         }
     })
     .await
@@ -901,8 +911,7 @@ where
     // On a thread: a build that sealed before its finish is waited for
     // (docs/PHASE_D_DEFERRED_EXECUTION.md section 13), and that wait must
     // not hold a runtime worker.
-    let (parent_hash, number, state_root, receipts_root, gas_used, transactions_root) =
-        (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used, Some(header.transactions_root));
+    let number = header.number;
     let stage = crate::follower_import::HandoffStage(number);
     stage.at(1);
     // Other keys on this execution layer vote on this block once it is
@@ -912,15 +921,7 @@ where
     // result: the check a follower's import makes holds by construction,
     // without waiting for a build sealed before its finish.
     if let Some(once) = once
-        && n42_engine_types::built_executions::find_kept_sealed_header(
-            parent_hash,
-            number,
-            state_root,
-            receipts_root,
-            gas_used,
-            transactions_root,
-        )
-        .is_some()
+        && n42_engine_types::built_executions::find_kept_sealed_header_key(n42_engine_types::built_executions::BuildKey::of_sealed(&header)).is_some()
     {
         once.checked();
     }
@@ -930,18 +931,33 @@ where
         return own_block_before_merge::<T>(reuse, engine, header, deferred, stage).await;
     }
     let lookup_at = std::time::Instant::now();
+    // By every field the seal leaves, the sibling-separating ones included:
+    // a sibling on the same parent with the same transactions matches the
+    // rest, and its execution would be handed off under this header.
+    let key = n42_engine_types::built_executions::BuildKey::of_sealed(&header);
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
         if build_on_seal() {
-            n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+            n42_engine_types::built_executions::find_key(key)
         } else {
-            n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+            n42_engine_types::built_executions::take_key(key)
         }
     })
     .await
     .map_err(|err| format!("build lookup: {err}"))?
     .ok_or("unknown build")?;
+    // The key holds what tells siblings apart; the rest of what the block
+    // executes with (gas limit, base fee, blob fields, withdrawals) must
+    // match too, or the block is imported the ordinary way.
+    if !block_is_sealed_as(&built.block, &header) {
+        return Err("the kept build does not execute as the sealed header".to_owned());
+    }
     let waits = AnswerWaits::after_take(built_hash, lookup_at);
     let sealed_hash = header.hash_slow();
+    // What the engine's conversion of this block's payload needs when the
+    // executed insert does not land: the transactions root by the layout the
+    // seal filed, not the queue's frame index, which may have let go of the
+    // block's frames by then (loop351 FVAa: "no gov5 header variant").
+    n42_engine_types::frame_blocks::file_own_block_root(sealed_hash, header.transactions_root);
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
     let withdrawals = built.block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
     // The transactions travel with the `newPayload` below. reth executes a
@@ -1077,17 +1093,27 @@ where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     use reth_node_builder::executed_inserts::pending;
-    let (parent_hash, number, state_root, receipts_root, gas_used, transactions_root) =
-        (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used, Some(header.transactions_root));
+    let (parent_hash, number) = (header.parent_hash, header.number);
+    let key = n42_engine_types::built_executions::BuildKey::of_sealed(&header);
     let lookup_at = std::time::Instant::now();
     let (built_hash, block) = tokio::task::spawn_blocking(move || {
-        n42_engine_types::built_executions::find_answerable(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+        n42_engine_types::built_executions::find_answerable_key(key)
     })
     .await
     .map_err(|err| format!("build lookup: {err}"))?
     .ok_or("unknown build")?;
+    // As on the ordinary road: checked before the answer, so a mismatch is
+    // imported the ordinary way and never answered VALID.
+    if !block_is_sealed_as(&block, &header) {
+        return Err("the kept build does not execute as the sealed header".to_owned());
+    }
     let answer_wait_merge_us = merge_wait_us(built_hash, lookup_at);
     let sealed_hash = header.hash_slow();
+    // What the engine's conversion of this block's payload needs when the
+    // executed insert does not land: the transactions root by the layout the
+    // seal filed, not the queue's frame index, which may have let go of the
+    // block's frames by then (loop351 FVAa: "no gov5 header variant").
+    n42_engine_types::frame_blocks::file_own_block_root(sealed_hash, header.transactions_root);
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
     let withdrawals = block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
     // The transactions travel with the deferred `newPayload`, for the same
@@ -1127,17 +1153,21 @@ where
         // retire it first (`built_executions::hold_sealed`).
         let sealed_hold = n42_engine_types::built_executions::hold_sealed(sealed_hash);
         let waited_at = std::time::Instant::now();
+        // By the build hash the answer was given for, never by the fields
+        // again: a sibling on the same parent with the same transactions
+        // (the queue's give-back) shares them all, and a field search returns
+        // the newer one -- the insert then waited for the sibling's finish
+        // and was dropped as the wrong build (loop351 FVAa stall).
         let built = tokio::task::spawn_blocking(move || {
             if build_on_seal() {
-                n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+                n42_engine_types::built_executions::find_by_hash(built_hash)
             } else {
-                n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
+                n42_engine_types::built_executions::take_by_hash(built_hash)
             }
         })
         .await
         .ok()
-        .flatten()
-        .filter(|(hash, _)| *hash == built_hash);
+        .flatten();
         let insert_wait_merge_us = waited_at.elapsed().as_micros() as u64;
         let merge_behind_answer_us = answered_at.elapsed().as_micros() as u64;
         // The parent's insert first, if it is still to come: the tree gets
@@ -1297,29 +1327,14 @@ async fn build_on_own_block(
     // Consensus has sealed the parent: if it is one of this layer's builds it
     // is pinned in the build store until its own import hands it off, so the
     // builds that follow cannot evict it first (loop351 stage aj).
-    n42_engine_types::built_executions::pin_sealed(
-        header.parent_hash,
-        header.number,
-        header.state_root,
-        header.receipts_root,
-        header.gas_used,
-        Some(header.transactions_root),
-    );
+    n42_engine_types::built_executions::pin_key(n42_engine_types::built_executions::BuildKey::of_sealed(&header));
     // A parent this node did not build -- the previous leader's last block,
     // at a tenure's first build -- is not in the build registry; with the
     // flag it is built on the output this node's follower execution of it
     // published, instead of the request being refused and the leader going
     // through the forkchoice and the payload job.
     if tenure_first_on_output()
-        && n42_engine_types::built_executions::find_kept_sealed_header(
-            header.parent_hash,
-            header.number,
-            header.state_root,
-            header.receipts_root,
-            header.gas_used,
-            Some(header.transactions_root),
-        )
-        .is_none()
+        && n42_engine_types::built_executions::find_kept_sealed_header_key(n42_engine_types::built_executions::BuildKey::of_sealed(&header)).is_none()
     {
         return build_on_published_output(builder, header, attributes, chain, want_hashes, times).await;
     }
@@ -1329,19 +1344,9 @@ async fn build_on_own_block(
     let at = std::time::Instant::now();
     // The parent's post-state is what the build needs (`StateReady`); a
     // parent sealed before its finish is waited for, on a thread.
-    let (parent_hash, number, state_root, receipts_root, gas_used) =
-        (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used);
-    let transactions_root = Some(header.transactions_root);
+    let key = n42_engine_types::built_executions::BuildKey::of_sealed(&header);
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
-        n42_engine_types::built_executions::find_kept_at(
-            parent_hash,
-            number,
-            state_root,
-            receipts_root,
-            gas_used,
-            transactions_root,
-            n42_engine_types::built_executions::Stage::StateReady,
-        )
+        n42_engine_types::built_executions::find_kept_at_key(key, n42_engine_types::built_executions::Stage::StateReady)
     })
     .await
     .map_err(|err| format!("build lookup: {err}"))?
@@ -1602,18 +1607,14 @@ async fn build_on_sealed_output(
     want_hashes: bool,
     mut times: BuildOnOwnTimes,
 ) -> Result<(N42BuiltPayload, BuildOnOwnTimes, Option<raw_engine::ChainHint>, bool), String> {
-    use n42_engine_types::built_executions::{find_kept_sealed, stage_of, Stage};
+    use n42_engine_types::built_executions::{find_kept_sealed_key, stage_of, BuildKey, Stage};
     times.on_output = true;
     let at = std::time::Instant::now();
-    let (built_hash, block, _) = find_kept_sealed(
-        header.parent_hash,
-        header.number,
-        header.state_root,
-        header.receipts_root,
-        header.gas_used,
-        Some(header.transactions_root),
-    )
-    .ok_or("unknown build")?;
+    // By the sealed header's seal-invariant fields too: the build found here
+    // is the parent the next block builds on, whose tree is filed under the
+    // sealed hash and whose take the queue forgets -- a sibling with the
+    // same fields would put its post-state under this block.
+    let (built_hash, block, _) = find_kept_sealed_key(BuildKey::of_sealed(&header)).ok_or("unknown build")?;
     times.find_ms = at.elapsed().as_millis() as u64;
     let sealed_hash = header.hash_slow();
     let parent = reth_primitives_traits::SealedHeader::new(header, sealed_hash);
@@ -1805,14 +1806,7 @@ async fn own_block_body(frame: &[u8]) -> Result<Vec<u8>, String> {
     }
     let sealed_hash = header.hash_slow();
     tokio::task::spawn_blocking(move || {
-        if let Some((_, block, _)) = n42_engine_types::built_executions::find_kept_sealed(
-            header.parent_hash,
-            header.number,
-            header.state_root,
-            header.receipts_root,
-            header.gas_used,
-            Some(header.transactions_root),
-        ) {
+        if let Some((_, block, _)) = n42_engine_types::built_executions::find_kept_sealed_key(n42_engine_types::built_executions::BuildKey::of_sealed(&header)) {
             return Ok(encode_block_parallel(block.sealed_block()));
         }
         n42_engine_types::built_executions::find_sealed(sealed_hash)
@@ -2857,23 +2851,46 @@ async fn refuse_held(stream: &mut TcpStream, out: &mut Vec<u8>) -> std::io::Resu
 /// every own block on a shared layer miss and be executed a second time
 /// (loop328/330: 1,175 of 1,179 built blocks).
 fn is_own_build(header: &n42_header::N42Header) -> bool {
-    let Some((_, built, built_withdrawals)) = n42_engine_types::built_executions::find_kept_sealed_header(
-        header.parent_hash,
-        header.number,
-        header.state_root,
-        header.receipts_root,
-        header.gas_used,
-        Some(header.transactions_root),
-    ) else {
+    let Some((_, built, built_withdrawals)) = n42_engine_types::built_executions::find_kept_sealed_header_key(n42_engine_types::built_executions::BuildKey::of_sealed(header)) else {
         return false;
     };
-    let withdrawals_match = built.withdrawals_root == header.withdrawals_root
+    build_is_sealed_as(&built, built_withdrawals.as_deref(), header)
+}
+
+/// Whether `built` (with its withdrawals) is the build `sealed` was sealed
+/// from, beyond the fields the store's key compares: the withdrawals root in
+/// either shape the seal gives it (raw, or gov5's rewards commitment), then
+/// every execution input [`build_executes_as_sealed`] compares (gas limit,
+/// base fee, blob fields among them).
+fn build_is_sealed_as(
+    built: &n42_header::N42Header,
+    built_withdrawals: Option<&[alloy_eips::eip4895::Withdrawal]>,
+    sealed: &n42_header::N42Header,
+) -> bool {
+    let withdrawals_match = built.withdrawals_root == sealed.withdrawals_root
         || built.withdrawals_root.is_some() && {
-            let withdrawals = built_withdrawals.as_deref().unwrap_or_default();
-            header.withdrawals_root
+            let withdrawals = built_withdrawals.unwrap_or_default();
+            sealed.withdrawals_root
                 == Some(n42_h2_consensus::gov5_rewards_root(n42_h2_consensus::withdrawals_to_rewards(withdrawals)))
         };
-    withdrawals_match && build_executes_as_sealed(&built, None, header, None)
+    withdrawals_match && build_executes_as_sealed(built, None, sealed, None)
+}
+
+/// [`build_is_sealed_as`] for a kept build's block.
+fn block_is_sealed_as(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>, sealed: &n42_header::N42Header) -> bool {
+    build_is_sealed_as(block.header(), block.body().withdrawals.as_ref().map(|w| w.as_slice()), sealed)
+}
+
+/// The fields of a payload that tell an own build from a sibling on the same
+/// parent with the same transactions ([`n42_engine_types::built_executions::AsSealed`]).
+fn as_sealed_of_payload(data: &alloy_rpc_types_engine::ExecutionData) -> n42_engine_types::built_executions::AsSealed {
+    let v1 = data.payload.as_v1();
+    n42_engine_types::built_executions::AsSealed {
+        beneficiary: v1.fee_recipient,
+        timestamp: v1.timestamp,
+        mix_hash: v1.prev_randao,
+        parent_beacon_block_root: data.sidecar.parent_beacon_block_root(),
+    }
 }
 
 /// The sealed header a follower's payload describes when it is one of this
@@ -2881,13 +2898,15 @@ fn is_own_build(header: &n42_header::N42Header) -> bool {
 /// shape the seal may have given it, and proved by the payload's hash.
 fn own_sealed_header_of_payload(data: &alloy_rpc_types_engine::ExecutionData) -> Option<n42_header::N42Header> {
     let v1 = data.payload.as_v1();
-    let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed_header(
-        v1.parent_hash,
-        v1.block_number,
-        v1.state_root,
-        v1.receipts_root,
-        v1.gas_used,
-        None,
+    let (_, built, _) = n42_engine_types::built_executions::find_kept_sealed_header_key(
+        n42_engine_types::built_executions::BuildKey::of_payload(
+            v1.parent_hash,
+            v1.block_number,
+            v1.state_root,
+            v1.receipts_root,
+            v1.gas_used,
+            as_sealed_of_payload(data),
+        ),
     )?;
     let sealed = sealed_header_from_fields(data, &built)?;
     (sealed.hash() == data.payload.block_hash() && is_own_build(sealed.header())).then(|| sealed.header().clone())
@@ -3972,15 +3991,9 @@ mod tests {
         };
         let built_hash = execution.block.hash();
         n42_engine_types::built_executions::remember(built_hash, execution);
-        let (taken_hash, taken) = n42_engine_types::built_executions::take(
-            header.parent_hash,
-            number,
-            header.state_root,
-            header.receipts_root,
-            header.gas_used,
-            None,
-        )
-        .expect("taken");
+        let (taken_hash, taken) =
+            n42_engine_types::built_executions::take_key(n42_engine_types::built_executions::BuildKey::of_sealed(&header))
+                .expect("taken");
         assert_eq!(taken_hash, built_hash);
         let sealed = reth_primitives_traits::SealedHeader::seal_slow(n42_header::N42Header::from(alloy_consensus::Header { extra_data: b"view".as_slice().into(), ..header.inner }));
         (built_hash, taken, sealed)

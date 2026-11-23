@@ -154,6 +154,10 @@ pub struct TransportConfig {
     pub bootstrap_peers: Vec<Multiaddr>,
     /// Idle connection timeout. gov5 keeps fleet connections long-lived.
     pub idle_connection_timeout: Duration,
+    /// How often a `bootstrap_peers` member that is not connected is dialled
+    /// again. A fleet is a static mesh: without this a member that was not up
+    /// at start, or whose connection closed, stays gone until a restart.
+    pub redial_interval: Duration,
     /// Joins gov5's two mobile-verification topics,
     /// `/n42/<fork digest>/mobileverify_{packet,registration}/ssz_snappy`
     /// (raw payloads despite the suffix). Off by default: a node that serves
@@ -169,6 +173,7 @@ impl TransportConfig {
             listen_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
             idle_connection_timeout: Duration::from_secs(300),
+            redial_interval: Duration::from_secs(10),
             mobileverify: false,
         }
     }
@@ -182,6 +187,12 @@ impl TransportConfig {
     /// Adds a peer to dial on startup.
     pub fn with_peer(mut self, addr: Multiaddr) -> Self {
         self.bootstrap_peers.push(addr);
+        self
+    }
+
+    /// Sets how often an unconnected fleet member is dialled again.
+    pub const fn with_redial_interval(mut self, interval: Duration) -> Self {
+        self.redial_interval = interval;
         self
     }
 
@@ -504,6 +515,11 @@ pub(crate) struct TransportCore {
     mobile_topics: Option<(IdentTopic, IdentTopic)>,
     identity: H2V4ChainIdentity,
     mesh_peers: HashSet<PeerId>,
+    /// The configured fleet members, dialled again while not connected.
+    fleet: Vec<(PeerId, Multiaddr)>,
+    redial_interval: Duration,
+    /// Made on the first poll: a transport may be built outside a runtime.
+    redial: Option<tokio::time::Interval>,
     /// Events produced before the loop starts (dials that failed immediately).
     pending_events: Vec<TransportEvent>,
     /// Block requests this node sent, by request id, so the answer can be
@@ -664,6 +680,16 @@ impl TransportCore {
             mobile_topics,
             identity: config.identity,
             mesh_peers: HashSet::new(),
+            fleet: config
+                .bootstrap_peers
+                .iter()
+                .filter_map(|addr| match addr.iter().last() {
+                    Some(libp2p::multiaddr::Protocol::P2p(peer)) => Some((peer, addr.clone())),
+                    _ => None,
+                })
+                .collect(),
+            redial_interval: config.redial_interval,
+            redial: None,
             pending_events: dial_errors,
             block_requests: HashMap::new(),
             range_requests: HashMap::new(),
@@ -674,6 +700,22 @@ impl TransportCore {
             block_guards: HashMap::new(),
             txns_guards: HashMap::new(),
         })
+    }
+
+    /// Dials every configured fleet member this node is neither connected to
+    /// nor already dialling. The condition is explicit because a bare
+    /// multiaddr dial has none: a second connection to a connected member
+    /// would let gossip arrive out of order across the two.
+    fn redial_fleet(&mut self) {
+        use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+        for (peer, addr) in &self.fleet {
+            let dial = DialOpts::peer_id(*peer)
+                .condition(PeerCondition::DisconnectedAndNotDialing)
+                .addresses(vec![addr.clone()])
+                .build();
+            // Refused by the condition, or failed outright: the next tick tries again.
+            let _ = self.swarm.dial(dial);
+        }
     }
 
     /// This node's peer id — hand it to the fleet if it gates inbound peers.
@@ -989,8 +1031,24 @@ impl TransportCore {
         if !self.pending_events.is_empty() {
             return Some(self.pending_events.remove(0));
         }
+        if self.redial.is_none() {
+            // The first tick one interval from now: the start-up dials are
+            // already in flight.
+            let mut redial = tokio::time::interval_at(
+                tokio::time::Instant::now() + self.redial_interval,
+                self.redial_interval,
+            );
+            redial.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            self.redial = Some(redial);
+        }
         loop {
-            let event = self.swarm.select_next_some().await;
+            let event = tokio::select! {
+                event = self.swarm.select_next_some() => event,
+                _ = self.redial.as_mut().expect("made above").tick() => {
+                    self.redial_fleet();
+                    continue;
+                }
+            };
             match event {
                 SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source,

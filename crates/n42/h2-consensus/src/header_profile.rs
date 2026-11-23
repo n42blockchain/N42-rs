@@ -71,10 +71,10 @@ pub const MAX_HEADER_EXTRA_LEN: usize = 4096;
 pub const GOV5_NIL_HASH: B256 =
     b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
 
-/// What gov5 writes in `requestsHash` when a Prague block carried no
-/// EIP-7685 requests: `keccak256(RLP([]))`, the empty trie root — not the
-/// EIP's `sha256("")`, which gov5 uses only at genesis
-/// (`hotstuff/adapter.go` `FinalizeAndAssemble`).
+/// What gov5 wrote in `requestsHash` when a Prague block carried no
+/// EIP-7685 requests, before it followed the EIP: `keccak256(RLP([]))`, the
+/// empty trie root, where the EIP says `sha256("")`. Still read as "no
+/// requests" ([`is_empty_requests_hash`]); never written here.
 pub const GOV5_EMPTY_REQUESTS_HASH: B256 = alloy_consensus::EMPTY_ROOT_HASH;
 
 /// gov5's `withdrawalsRoot`: not a withdrawals commitment at all but
@@ -801,8 +801,9 @@ pub fn gov5_h2_header_for_view_with_qc(
     if header.withdrawals_root.is_some() {
         header.withdrawals_root = Some(gov5_rewards_root(withdrawals_to_rewards(withdrawals)));
     }
+    // "No requests" is sealed as EIP-7685 spells it, sha256 of nothing.
     if header.requests_hash.is_some_and(is_empty_requests_hash) {
-        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        header.requests_hash = Some(EMPTY_REQUESTS_HASH);
     }
     if let Some(key) = sealer {
         seal_header(&mut header, key)?;
@@ -894,8 +895,9 @@ pub fn normalize_to_gov5_h2_with_header_with_qc(
         let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
         block.header.withdrawals_root = Some(gov5_rewards_root(rewards));
     }
+    // "No requests" is sealed as EIP-7685 spells it, sha256 of nothing.
     if block.header.requests_hash.is_some_and(is_empty_requests_hash) {
-        block.header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        block.header.requests_hash = Some(EMPTY_REQUESTS_HASH);
     }
     // The access-list hash is *not* recomputed here. An earlier version of this
     // function did, on the reading that `try_into_block` fills the field with
@@ -1385,11 +1387,13 @@ mod tests {
         assert_eq!(header_view(&reconstructed.header).unwrap(), 42);
         verify_seal(&reconstructed.header, &key.public_key()).unwrap();
         // Execution outputs survived, and the two roots gov5 spells its own
-        // way took gov5's spelling.
+        // way took gov5's spelling. "No requests" is the EIP's sha256 of
+        // nothing, which gov5 checks from its `pragueTime`, not the empty
+        // trie root it used to write.
         assert_eq!(reconstructed.header.state_root, B256::repeat_byte(2));
         assert_eq!(reconstructed.header.receipts_root, GOV5_NIL_HASH);
         assert_eq!(reconstructed.header.withdrawals_root, Some(GOV5_NIL_HASH));
-        assert_eq!(reconstructed.header.requests_hash, Some(GOV5_EMPTY_REQUESTS_HASH));
+        assert_eq!(reconstructed.header.requests_hash, Some(EMPTY_REQUESTS_HASH));
         assert!(proposed.sidecar.requests().is_some());
     }
 

@@ -157,6 +157,8 @@ pub struct TransportConfig {
     /// How often a `bootstrap_peers` member that is not connected is dialled
     /// again. A fleet is a static mesh: without this a member that was not up
     /// at start, or whose connection closed, stays gone until a restart.
+    /// The default is gov5's: `ensurePeerConnections` runs every 10 s over
+    /// its static peers (`internal/p2p/watch_peers.go`).
     pub redial_interval: Duration,
     /// Joins gov5's two mobile-verification topics,
     /// `/n42/<fork digest>/mobileverify_{packet,registration}/ssz_snappy`
@@ -489,6 +491,10 @@ pub(crate) struct H2Behaviour {
 /// inbound slot (audit 2026-10 round 3, R3-N1).
 pub const MAX_CONNECTIONS_PER_PEER: u32 = 4;
 
+/// How long one dial may take: gov5's `maxDialTimeout` (`internal/p2p/service.go`).
+/// It is libp2p's default as well; set explicitly so the two cannot drift apart.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Inbound connections this node accepts at most: `N42_H2_MAX_INBOUND`,
 /// default 128 (a seven-member fleet holds six, gov5 caps its peers near 50).
 pub fn max_inbound_connections() -> u32 {
@@ -588,6 +594,7 @@ impl TransportCore {
             .with_behaviour(|_| behaviour)
             .map_err(|e| TransportError::Behaviour(e.to_string()))?
             .with_swarm_config(|c| c.with_idle_connection_timeout(config.idle_connection_timeout))
+            .with_connection_timeout(DIAL_TIMEOUT)
             .build();
 
         let topic = h2_v4_topic();
@@ -703,18 +710,29 @@ impl TransportCore {
     }
 
     /// Dials every configured fleet member this node is neither connected to
-    /// nor already dialling. The condition is explicit because a bare
-    /// multiaddr dial has none: a second connection to a connected member
-    /// would let gossip arrive out of order across the two.
+    /// nor already dialling, as gov5's `ensurePeerConnections` does for its
+    /// static peers. The condition is explicit because a bare multiaddr dial
+    /// has none: a second connection to a connected member would let gossip
+    /// arrive out of order across the two.
+    ///
+    /// A dial that fails later arrives as [`TransportEvent::DialFailed`] like
+    /// any other, so a member that stays unreachable is reported every tick
+    /// (gov5 logs "Failed to reconnect to peer" the same way).
     fn redial_fleet(&mut self) {
         use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+        use libp2p::swarm::DialError;
         for (peer, addr) in &self.fleet {
             let dial = DialOpts::peer_id(*peer)
                 .condition(PeerCondition::DisconnectedAndNotDialing)
                 .addresses(vec![addr.clone()])
                 .build();
-            // Refused by the condition, or failed outright: the next tick tries again.
-            let _ = self.swarm.dial(dial);
+            match self.swarm.dial(dial) {
+                // Connected, or a dial is in flight: nothing to do.
+                Ok(()) | Err(DialError::DialPeerConditionFalse(_)) => {}
+                Err(error) => {
+                    tracing::warn!(target: "n42.h2.net", %peer, %addr, %error, "could not redial a fleet member");
+                }
+            }
         }
     }
 

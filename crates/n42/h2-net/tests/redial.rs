@@ -45,8 +45,20 @@ async fn a_member_that_starts_later_is_dialled_again() {
         TransportConfig::new(IDENTITY).with_peer(member_addr).with_redial_interval(Duration::from_millis(200)),
     )
     .unwrap();
-    let early = tokio::time::timeout(Duration::from_secs(1), until_connected(&mut node, member_id)).await;
+    // While it is down every attempt is reported, the first and the redials.
+    let mut failed_dials = 0;
+    let early = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match node.next_event().await {
+                Some(TransportEvent::PeerConnected(peer)) if peer == member_id => return,
+                Some(TransportEvent::DialFailed { .. }) => failed_dials += 1,
+                _ => {}
+            }
+        }
+    })
+    .await;
     assert!(early.is_err(), "nothing listens yet");
+    assert!(failed_dials >= 2, "the start-up dial and at least one redial are reported, got {failed_dials}");
 
     // The member comes up and dials nobody; only a redial can connect the two.
     let mut member =

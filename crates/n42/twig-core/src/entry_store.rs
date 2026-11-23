@@ -2133,6 +2133,14 @@ impl Entries {
     /// Clears the active flag of every slot `held` names: one write a slot,
     /// in the heap as in the file, so the cost is the block's and not the
     /// state's (the heap used to scan a bitmap over every slot).
+    /// The live bits, 64 slots a word, of a file store; `None` for the heap.
+    pub(crate) fn active_words_mut(&mut self) -> Option<&mut [u64]> {
+        match self {
+            Self::Heap(_) => None,
+            Self::File(file) => Some(file.active.as_mut_slice()),
+        }
+    }
+
     pub(crate) fn retire(&mut self, held: &[Option<u64>]) {
         match self {
             Self::Heap(entries) => {

@@ -2,6 +2,7 @@
 
 pub mod common;
 pub mod executed_inserts;
+pub mod invalid_latch;
 mod exex;
 pub mod invalid_block_hook;
 

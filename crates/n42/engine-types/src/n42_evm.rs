@@ -216,18 +216,26 @@ pub struct N42BlockExecutorFactory<C = ChainSpec, F = RethEvmFactory> {
     receipt_builder: N42ReceiptBuilder,
     chain_spec: Arc<C>,
     evm_factory: F,
+    /// Whether the chain is N42-native (gov5's `IsN42Native`), read from its
+    /// genesis once: its EVMs then carry [`crate::native_tx_rules`].
+    native: std::sync::OnceLock<bool>,
 }
 
 impl<C, F: Clone> Clone for N42BlockExecutorFactory<C, F> {
     fn clone(&self) -> Self {
-        Self { receipt_builder: self.receipt_builder, chain_spec: self.chain_spec.clone(), evm_factory: self.evm_factory.clone() }
+        Self {
+            receipt_builder: self.receipt_builder,
+            chain_spec: self.chain_spec.clone(),
+            evm_factory: self.evm_factory.clone(),
+            native: self.native.clone(),
+        }
     }
 }
 
 impl<C, F> N42BlockExecutorFactory<C, F> {
     /// The factory for `chain_spec` with `evm_factory`.
     pub const fn new(chain_spec: Arc<C>, evm_factory: F) -> Self {
-        Self { receipt_builder: N42ReceiptBuilder, chain_spec, evm_factory }
+        Self { receipt_builder: N42ReceiptBuilder, chain_spec, evm_factory, native: std::sync::OnceLock::new() }
     }
 
     /// The chain spec.
@@ -280,7 +288,10 @@ where
         // reth's `EthBlockExecutorFactory::build_evm`, which is crate-private.
         let spec = env.spec;
         let config = self.evm_factory.execution_config(spec, env.version);
-        let registry = self.evm_factory.n42_tx_registry(spec);
+        let mut registry = self.evm_factory.n42_tx_registry(spec);
+        if *self.native.get_or_init(|| reth_chainspec::qmdb::is_n42_native(self.chain_spec.genesis())) {
+            registry = self.evm_factory.n42_native_tx_registry(spec, registry);
+        }
         let precompiles = self.evm_factory.precompiles(spec);
         let mut evm =
             evm2::Evm::<F::Types>::new_with_execution_config(config, spec, env.block, registry, db, precompiles);
@@ -297,6 +308,17 @@ pub trait TxRegistrySource: EvmFactory {
     fn n42_tx_registry(&self, spec: Self::SpecId) -> evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>> {
         self.tx_registry(spec)
     }
+
+    /// `base` with an N42-native chain's transaction rules
+    /// ([`crate::native_tx_rules`]); `base` unchanged by default.
+    fn n42_native_tx_registry(
+        &self,
+        spec: Self::SpecId,
+        base: evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>>,
+    ) -> evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>> {
+        let _ = spec;
+        base
+    }
 }
 
 impl TxRegistrySource for RethEvmFactory {
@@ -307,6 +329,14 @@ impl TxRegistrySource for RethEvmFactory {
         } else {
             base
         }
+    }
+
+    fn n42_native_tx_registry(
+        &self,
+        spec: Self::SpecId,
+        base: evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>>,
+    ) -> evm2::registry::TxRegistry<Self::Types, evm2::TxResult<Self::Types>> {
+        crate::native_tx_rules::registry(spec, base)
     }
 }
 
@@ -804,6 +834,51 @@ mod glamsterdam_execution_tests {
             assert_eq!(got.block, want.block);
             assert_eq!(got.spec, SpecId::OSAKA);
         }
+    }
+
+    /// The pool's rules come from this configuration: reth's validator
+    /// resolves them as `evm_env(tip).transaction_validation_limits()` and
+    /// `transaction_validation_gas_rules()` on every new head
+    /// (`reth-transaction-pool` `transaction_validation_rules`). So on a
+    /// native chain the pool follows the Amsterdam execution from
+    /// `glamsterdamTime` as gov5's pool follows `IsGlamsterdam`
+    /// (`txs_pool.go` `validateTx`): EIP-7825's 2^24 cap at Osaka, EIP-8037's
+    /// total cap 2^32 - 1 (gap G4) and EIP-2780's intrinsic gas (gap G7) at
+    /// Amsterdam.
+    #[test]
+    fn the_pool_rules_follow_the_amsterdam_execution() {
+        use alloy_consensus::{Signed, TxEip1559};
+        use alloy_primitives::{Signature, TxKind};
+        use reth_primitives_traits::Recovered;
+        use reth_transaction_pool::validate::ensure_intrinsic_gas;
+        let c = config_with(r#","consensus":"hotstuff","glamsterdamTime":100"#);
+        let osaka = c.evm_env(&header_at(99)).expect("env");
+        let amsterdam = c.evm_env(&header_at(100)).expect("env");
+        assert_eq!(osaka.transaction_validation_limits().tx_gas_limit_cap, 1 << 24, "EIP-7825");
+        assert_eq!(amsterdam.transaction_validation_limits().tx_gas_limit_cap, u64::from(u32::MAX), "EIP-8037 total cap");
+        let call = |value: u64, gas_limit: u64| {
+            let tx = TxEip1559 {
+                chain_id: 1143,
+                gas_limit,
+                max_fee_per_gas: 100,
+                to: TxKind::Call(Address::repeat_byte(0x22)),
+                value: U256::from(value),
+                ..Default::default()
+            };
+            let signed = Signed::new_unchecked(tx, Signature::test_signature(), B256::ZERO);
+            let envelope = N42TxEnvelope::Eth(signed.into());
+            let len = alloy_eips::eip2718::Encodable2718::encode_2718_len(&envelope);
+            crate::N42PooledTransaction::new(Recovered::new_unchecked(envelope, Address::repeat_byte(0x11)), len)
+        };
+        let (osaka_gas, amsterdam_gas) = (osaka.transaction_validation_gas_rules(), amsterdam.transaction_validation_gas_rules());
+        // A zero-value call at EIP-2780's 15,000: Amsterdam only.
+        assert!(ensure_intrinsic_gas(&call(0, 15_000), &osaka_gas).is_err());
+        assert!(ensure_intrinsic_gas(&call(0, 15_000), &amsterdam_gas).is_ok());
+        assert!(ensure_intrinsic_gas(&call(0, 14_999), &amsterdam_gas).is_err());
+        // A transfer with a value: 21,000 under both.
+        assert!(ensure_intrinsic_gas(&call(1, 21_000), &osaka_gas).is_ok());
+        assert!(ensure_intrinsic_gas(&call(1, 21_000), &amsterdam_gas).is_ok());
+        assert!(ensure_intrinsic_gas(&call(1, 20_999), &amsterdam_gas).is_err());
     }
 
     /// gov5's fixture (`internal/glamsterdam_native_fixture_test.go` on gov5

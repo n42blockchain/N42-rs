@@ -446,6 +446,39 @@ pub fn behind_pool() -> &'static rayon::ThreadPool {
     own.as_ref().unwrap_or_else(|| build_pool())
 }
 
+/// `N42_LEADER_ROOT_POOL=<threads>` (default off): the leader's QMDB root
+/// job -- the operations encoded ahead (`N42_ROOT_OPS_AHEAD`), their finish,
+/// sort and leaf hashes, and the tree's apply -- runs its parallel work on a
+/// pool of its own, pinned to the layout's critical set, instead of rayon's
+/// global pool. The global pool's threads were started before the layout
+/// split the node's mask (the chain parser computes the genesis root), so
+/// they run on the background set beside persistence, the merges, the
+/// pruner and tokio; the root job's own thread waits on them. The same
+/// computation either way: only where its tasks run moves. `None` when off
+/// or when the pool cannot be built (the global pool then takes the work).
+pub fn leader_root_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("N42_LEADER_ROOT_POOL").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0)?;
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-root-{i}"))
+            .start_handler(|_| n42_core_layout::enter(n42_core_layout::Set::Critical))
+            .build()
+            .inspect_err(|err| tracing::warn!(target: "payload_builder", %err, "no pool for the leader's root job; the global pool takes it"))
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Runs `f` on [`leader_root_pool`] when it is on, else here.
+pub fn on_leader_root_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match leader_root_pool() {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
 /// The pool the plan-ahead body is made on (`N42_PLAN_AHEAD_BODY=1`): its own
 /// `N42_PLAN_AHEAD_BODY_THREADS` threads (8 by default, `n42-plan-body-*`),
 /// so the next block's preparation does not take the build pool's workers

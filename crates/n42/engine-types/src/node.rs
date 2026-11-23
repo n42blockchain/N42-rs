@@ -391,9 +391,18 @@ where
         // genesis enables it; elsewhere the pool refuses the type.
         let alt_sig = reth_chainspec::qmdb::alt_sig_tx_enabled(ctx.chain_spec().genesis());
         n42_tx_types::set_alt_sig_enabled(alt_sig);
+        // An N42-native chain admits no blob transaction at any fork, and
+        // its pool, like gov5's, has no EIP-3860 initcode cap of its own
+        // (`docs/PROTOCOL_CONFORMANCE_2026_11.md` D4, D5;
+        // `N42PooledTransaction::ensure_max_init_code_size`).
+        let native = reth_chainspec::qmdb::is_n42_native(ctx.chain_spec().genesis());
+        n42_tx_types::set_n42_native(native);
         let mut validator = TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config);
         if alt_sig {
             validator = validator.with_custom_tx_type(n42_tx_types::ALT_SIG_TX_TYPE_ID);
+        }
+        if native {
+            validator = validator.no_eip4844();
         }
         let validator = validator
             .kzg_settings(ctx.kzg_settings()?)

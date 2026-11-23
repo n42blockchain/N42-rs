@@ -29,6 +29,8 @@ pub mod primitives;
 pub mod rpc;
 pub mod sender_cache;
 
+#[doc(hidden)]
+pub use alt_sig::{verify_batch_linear, verify_batch_with, BatchFallback};
 pub use alt_sig::{
     verify_batch, AltSigError, AltSigTx, TxAltSig, ALG_ED25519, ALT_SIG_TX_TYPE_ID,
     ED25519_PUBKEY_LEN, ED25519_SIGNATURE_LEN,
@@ -44,7 +46,8 @@ pub use primitives::{Block, BlockBody, N42Primitives, Receipt};
 pub use rpc::{AltSigRpcReceipt, N42RpcReceipt};
 pub use sender_cache::{
     alt_sig_enabled, bench_unsafe_acknowledged, ed25519_batch_size, ingest_shard, ingest_verify_mode,
-    parse_ingest_verify, senders_claimed_at_ingest, set_alt_sig_enabled, shard_owner,
+    parse_ingest_verify, senders_claimed_at_ingest, set_alt_sig_enabled, shard_owner, n42_native, set_n42_native,
+    BLOB_TX_ON_NATIVE_CHAIN,
     frame_gateways_refusal, ingest_direct_refusal, trusting_ingest_knobs, trusting_mode_refusal, AltSigSenderCache, IngestVerify,
 };
 

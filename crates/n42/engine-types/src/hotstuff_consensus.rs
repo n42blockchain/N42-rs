@@ -1514,6 +1514,39 @@ mod tests {
         assert!(c.validate_block_pre_execution_with_tx_root(&block, None).is_err());
     }
 
+    /// EIP-7934 (Osaka's 8 MiB RLP block bound) is not a rule of a native
+    /// chain: gov5 applies it only in its Engine API `newPayload` handlers,
+    /// never on HotStuff import, and the fleet7 bench chain seals blocks of
+    /// 20 MB and more with `osakaTime` 0. What bounds a native block's bytes
+    /// is the gossip size cap (`N42_MAX_GOSSIP_MB`, `n42_h2_net::max_gossip_size`)
+    /// and the gas limit (`docs/PROTOCOL_CONFORMANCE_2026_11.md`, item 1).
+    /// This pins it: a block past the bound passes the pre-execution checks.
+    #[test]
+    fn a_block_past_the_eip7934_bound_is_not_refused_on_a_native_chain() {
+        use alloy_consensus::{Signed, TxEip1559};
+        use alloy_primitives::{Signature, TxKind};
+        use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+        let c = consensus();
+        assert!(c.chain_spec().is_osaka_active_at_timestamp(TS_PRAGUE), "the block is an Osaka block");
+        // One transaction carrying 9 MiB of calldata.
+        let tx = TxEip1559 {
+            chain_id: 1,
+            gas_limit: 30_000_000,
+            to: TxKind::Call(Address::repeat_byte(1)),
+            input: vec![0x42; 9 << 20].into(),
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(tx, Signature::test_signature(), B256::ZERO);
+        let envelope = n42_tx_types::N42TxEnvelope::Eth(signed.into());
+        let body = EthBlockBody { transactions: vec![envelope], ommers: vec![], withdrawals: Some(Withdrawals::new(vec![])) };
+        let mut header = good_header(5, TS_PRAGUE);
+        header.transactions_root = body.calculate_tx_root();
+        let block = block_of(header, body);
+        let size = block.rlp_length();
+        assert!(size > MAX_RLP_BLOCK_SIZE, "{size} bytes, the bound is {MAX_RLP_BLOCK_SIZE}");
+        assert!(c.validate_block_pre_execution(&block).is_ok());
+    }
+
     #[test]
     fn prepare_and_seal_leave_the_view_and_seal_to_the_validator() {
         let c = consensus();

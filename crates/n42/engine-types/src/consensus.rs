@@ -135,6 +135,7 @@ where
 
     fn validate_block_pre_execution(&self, block: &SealedBlock<EthBlock>) -> Result<(), ConsensusError> {
         alt_sig_allowed(block)?;
+        no_blob_tx_on_native_chain(block)?;
         delegate!(self, c => Consensus::<EthBlock>::validate_block_pre_execution(c, block))
     }
 
@@ -148,6 +149,7 @@ where
         transaction_root: Option<TransactionRoot>,
     ) -> Result<(), ConsensusError> {
         alt_sig_allowed(block)?;
+        no_blob_tx_on_native_chain(block)?;
         delegate!(self, c => Consensus::<EthBlock>::validate_block_pre_execution_with_tx_root(c, block, transaction_root))
     }
 
@@ -220,6 +222,21 @@ fn alt_sig_allowed(block: &SealedBlock<EthBlock>) -> Result<(), ConsensusError> 
     Ok(())
 }
 
+/// A block carrying a blob (type-3) transaction is invalid on an N42-native
+/// chain (`docs/PROTOCOL_CONFORMANCE_2026_11.md` D4; gov5 refuses it in
+/// execution and, under deferred execution, in its includability check).
+fn no_blob_tx_on_native_chain(block: &SealedBlock<EthBlock>) -> Result<(), ConsensusError> {
+    refuse_blob_txs(n42_tx_types::n42_native(), block)
+}
+
+/// [`no_blob_tx_on_native_chain`] on a chain that is native or not.
+fn refuse_blob_txs(native: bool, block: &SealedBlock<EthBlock>) -> Result<(), ConsensusError> {
+    if native && block.body().transactions().any(alloy_eips::Typed2718::is_eip4844) {
+        return Err(ConsensusError::Other(Arc::new(std::io::Error::other(n42_tx_types::BLOB_TX_ON_NATIVE_CHAIN))));
+    }
+    Ok(())
+}
+
 impl<Provider> FullConsensus<EthPrimitives> for N42Consensus<Provider>
 where
     Provider: ConsensusProvider,
@@ -263,6 +280,7 @@ where
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         let chain_spec = ctx.chain_spec();
         n42_tx_types::set_alt_sig_enabled(reth_chainspec::qmdb::alt_sig_tx_enabled(chain_spec.genesis()));
+        n42_tx_types::set_n42_native(reth_chainspec::qmdb::is_n42_native(chain_spec.genesis()));
         let consensus = if is_hotstuff_chain(&chain_spec) {
             let consensus = HotStuffConsensus::new(chain_spec);
             if let Some(key) = ctx.config().dev.consensus_signer_private_key.clone() {
@@ -277,5 +295,32 @@ where
             )))
         };
         Ok(Arc::new(consensus))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{Signed, TxEip1559, TxEip4844};
+    use alloy_primitives::{Signature, B256};
+
+    fn block_with(txs: Vec<n42_tx_types::N42TxEnvelope>) -> SealedBlock<EthBlock> {
+        let body = n42_tx_types::BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: None };
+        SealedBlock::seal_slow(n42_tx_types::Block { header: N42Header::default(), body })
+    }
+
+    /// D4: a block with a type-3 transaction is invalid on a native chain,
+    /// and only there.
+    #[test]
+    fn a_block_with_a_blob_transaction_is_invalid_on_a_native_chain() {
+        let blob = Signed::new_unchecked(TxEip4844 { chain_id: 1143, ..Default::default() }, Signature::test_signature(), B256::ZERO);
+        let plain = Signed::new_unchecked(TxEip1559 { chain_id: 1143, ..Default::default() }, Signature::test_signature(), B256::ZERO);
+        let eth = |tx: reth_ethereum_primitives::TransactionSigned| n42_tx_types::N42TxEnvelope::from(tx);
+        let with_blob = block_with(vec![eth(plain.clone().into()), eth(blob.into())]);
+        let without = block_with(vec![eth(plain.into())]);
+        let refused = refuse_blob_txs(true, &with_blob).expect_err("refused");
+        assert!(refused.to_string().contains(n42_tx_types::BLOB_TX_ON_NATIVE_CHAIN), "{refused}");
+        assert!(refuse_blob_txs(true, &without).is_ok());
+        assert!(refuse_blob_txs(false, &with_blob).is_ok(), "an Ethereum chain keeps EIP-4844");
     }
 }

@@ -177,6 +177,10 @@ pub const X22: &[Knob] = &[
     k("N42_STATE_AFTER_PULL", "1"),
     k("N42_TENURE_FIRST_ON_OUTPUT", "1"),
     k("N42_ENGINE_TAKE_SEALED", "1"),
+    // Adopted 2026-11-21 (docs/PLAN_6M_2026_11.md, pairs FTB / FTI / FTL):
+    // the own block's newPayload is not sent once its executed insert is
+    // kept and the invalid-header latch is clear.
+    k("N42_SKIP_OWN_NEW_PAYLOAD", "1"),
     k("N42_FIELDS_AT_SEAL", "1"),
     // X22 base: the parallel build (build batches: SHARED_EXECUTION_SCOPE.md
     // 16.4 item 4).

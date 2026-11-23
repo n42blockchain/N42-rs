@@ -382,7 +382,15 @@ pub fn release_pins_through(canonical: u64) {
 /// is skipped: with empty blocks the hand-off of block N lands before the
 /// build request for N+1 brings the sealed header (loop351 stage ak), and a
 /// pin placed then would never be released.
-pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
+#[cfg(test)]
+pub(crate) fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
+    pin_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
+}
+
+/// [`pin_sealed`] by a [`BuildKey`]: under [`BuildKey::of_sealed`] a sibling
+/// with the same fields is never the build pinned.
+pub fn pin_key(key: BuildKey) -> bool {
+    let number = key.number;
     let (store, _) = store();
     let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
     if number <= crate::canonical_head::number() {
@@ -391,7 +399,7 @@ pub fn pin_sealed(parent: B256, number: u64, state_root: B256, receipts_root: B2
     match store
         .iter_mut()
         .rev()
-        .find(|(_, entry)| !entry.handed_off && matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+        .find(|(_, entry)| !entry.handed_off && key.matches(&entry.block))
     {
         Some((_, entry)) => {
             entry.pinned = true;
@@ -508,7 +516,8 @@ pub fn state_ready_without_merge() -> bool {
 /// its fields published ([`answerable`]) or `Complete`, waited for up to
 /// [`WAIT`]. Gives its builder hash and its block; the build stays in the
 /// store for the insert that follows when its map lands.
-pub fn find_answerable(
+#[cfg(test)]
+pub(crate) fn find_answerable(
     parent: B256,
     number: u64,
     state_root: B256,
@@ -516,6 +525,11 @@ pub fn find_answerable(
     gas_used: u64,
     transactions_root: Option<B256>,
 ) -> Option<(B256, Arc<RecoveredBlock<Block>>)> {
+    find_answerable_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
+}
+
+/// [`find_answerable`] by a [`BuildKey`].
+pub fn find_answerable_key(key: BuildKey) -> Option<(B256, Arc<RecoveredBlock<Block>>)> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
     let mut guard = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
@@ -523,7 +537,7 @@ pub fn find_answerable(
         let found = guard
             .iter()
             .rev()
-            .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+            .find(|(_, entry)| key.matches(&entry.block))
             .map(|(hash, entry)| (*hash, entry.stage, Arc::clone(&entry.block)));
         match found {
             Some((hash, stage, block)) if stage == Stage::Complete || answerable_at(hash).is_some() => {
@@ -536,7 +550,7 @@ pub fn find_answerable(
                 return handed
                     .iter()
                     .rev()
-                    .find(|(_, built)| matches_block(&built.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+                    .find(|(_, built)| key.matches(&built.block))
                     .map(|(hash, built)| (*hash, Arc::clone(&built.block)));
             }
         }
@@ -678,12 +692,24 @@ pub fn wait_for_state(built_hash: B256) -> Option<ParentState> {
 /// the transactions and the state they produced. The caller still proves the
 /// sealed header hashes to the hash it was given before trusting this. A
 /// build still finishing behind its seal is waited for, up to [`WAIT`].
-pub fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
     find_at(parent, number, state_root, receipts_root, gas_used, transactions_root, Stage::Complete)
 }
 
+/// [`find`] by a [`BuildKey`].
+pub fn find_key(key: BuildKey) -> Option<(B256, BuiltExecution)> {
+    find_at_key(key, Stage::Complete)
+}
+
 /// [`find`] at a given stage.
-pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
+    find_at_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root), stage)
+}
+
+/// [`find_at`] by a [`BuildKey`].
+pub fn find_at_key(key: BuildKey, stage: Stage) -> Option<(B256, BuiltExecution)> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
     let mut guard = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
@@ -691,7 +717,7 @@ pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256,
         let found = guard
             .iter()
             .rev()
-            .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+            .find(|(_, entry)| key.matches(&entry.block))
             .map(|(hash, entry)| (*hash, entry.stage, entry.execution.clone()));
         match found {
             Some((hash, at, Some(built))) if at >= stage => return Some((hash, built)),
@@ -709,10 +735,40 @@ pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256,
 
 /// [`find`], taking the build out of the store: the caller becomes the
 /// block's only holder and can move it instead of cloning its body.
-pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+    // Complete first (waiting for a finish behind the seal), then out.
+    take_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
+}
+
+/// [`take`] by a [`BuildKey`].
+pub fn take_key(key: BuildKey) -> Option<(B256, BuiltExecution)> {
+    let (hash, built) = find_key(key)?;
+    Some(take_found(hash, built))
+}
+
+/// The build under `built_hash` once `Complete` (waited for up to [`WAIT`]),
+/// or as the handed list keeps it: the build a caller already identified,
+/// never a sibling found by fields. Two builds on one parent can share every
+/// field [`find`] compares -- the queue offers the first one's transactions
+/// to the second, and under deferred execution the roots and gas are the
+/// parent's -- and the newer of the two is what a field search returns
+/// (loop351 FVAa: the own block's insert waited for its sibling, dropped it
+/// as the wrong build, and the chain stalled).
+pub fn find_by_hash(built_hash: B256) -> Option<(B256, BuiltExecution)> {
+    wait_for(built_hash, Stage::Complete).map(|built| (built_hash, built))
+}
+
+/// [`find_by_hash`], taking the build out of the store as [`take`] does.
+pub fn take_by_hash(built_hash: B256) -> Option<(B256, BuiltExecution)> {
+    let built = wait_for(built_hash, Stage::Complete)?;
+    Some(take_found(built_hash, built))
+}
+
+/// [`take`]'s second half: the found build leaves the store for the handed
+/// list.
+fn take_found(hash: B256, built: BuiltExecution) -> (B256, BuiltExecution) {
     let taken = {
-        // Complete first (waiting for a finish behind the seal), then out.
-        let (hash, built) = find(parent, number, state_root, receipts_root, gas_used, transactions_root)?;
         let (store, _) = store();
         let mut store = store.lock().unwrap_or_else(|p| recover_poisoned("built_executions", p));
         if let Some(at) = store.iter().rposition(|(h, _)| *h == hash) {
@@ -739,7 +795,7 @@ pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
     if !evicted.is_empty() {
         free_boxed_off_path(Box::new(evicted));
     }
-    Some(taken)
+    taken
 }
 
 /// Builds [`take`] handed to the engine, still findable by [`find_kept`].
@@ -754,7 +810,8 @@ fn handed() -> &'static Mutex<VecDeque<(B256, BuiltExecution)>> {
 /// (`remember_pending`), so a request naming the sealed header always finds
 /// it here -- what a build started at the parent's seal needs
 /// (`N42_BUILD_ON_OUTPUT`), which waits for the state only when it opens it.
-pub fn find_kept_sealed(
+#[cfg(test)]
+pub(crate) fn find_kept_sealed(
     parent: B256,
     number: u64,
     state_root: B256,
@@ -762,26 +819,24 @@ pub fn find_kept_sealed(
     gas_used: u64,
     transactions_root: Option<B256>,
 ) -> Option<(B256, Arc<RecoveredBlock<Block>>, Option<BuiltExecution>)> {
-    find_kept_sealed_with(parent, number, state_root, receipts_root, gas_used, transactions_root, |hash, block, execution| {
-        (hash, Arc::clone(block), execution.cloned())
-    })
+    find_kept_sealed_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root))
 }
 
-/// [`find_kept_sealed`] keeping no reference to the block: the builder hash,
-/// a copy of the block's header and of its withdrawals (a few hundred bytes).
-/// For a caller that only asks whether a header is one of this layer's
-/// builds -- every follower key's request on a shared layer asks it, as the
-/// own-block hand-off is about to move the block's body, which a reference
-/// held by such a lookup at that moment would make it copy instead.
-pub fn find_kept_sealed_header(
-    parent: B256,
-    number: u64,
-    state_root: B256,
-    receipts_root: B256,
-    gas_used: u64,
-    transactions_root: Option<B256>,
+/// [`find_kept_sealed`] by a [`BuildKey`].
+pub fn find_kept_sealed_key(key: BuildKey) -> Option<(B256, Arc<RecoveredBlock<Block>>, Option<BuiltExecution>)> {
+    find_kept_sealed_with(key, |hash, block, execution| (hash, Arc::clone(block), execution.cloned()))
+}
+
+/// [`find_kept_sealed_key`] keeping no reference to the block: the builder
+/// hash, a copy of the block's header and of its withdrawals (a few hundred
+/// bytes). For a caller that only asks whether a header is one of this
+/// layer's builds -- every follower key's request on a shared layer asks it,
+/// as the own-block hand-off is about to move the block's body, which a
+/// reference held by such a lookup at that moment would make it copy instead.
+pub fn find_kept_sealed_header_key(
+    key: BuildKey,
 ) -> Option<(B256, n42_header::N42Header, Option<Vec<alloy_eips::eip4895::Withdrawal>>)> {
-    find_kept_sealed_with(parent, number, state_root, receipts_root, gas_used, transactions_root, |hash, block, _| {
+    find_kept_sealed_with(key, |hash, block, _| {
         (hash, block.header().clone(), block.body().withdrawals.as_ref().map(|w| w.to_vec()))
     })
 }
@@ -789,17 +844,12 @@ pub fn find_kept_sealed_header(
 /// The kept build matching these fields, `found` applied to it under the
 /// stores' lock (it must be cheap).
 fn find_kept_sealed_with<R>(
-    parent: B256,
-    number: u64,
-    state_root: B256,
-    receipts_root: B256,
-    gas_used: u64,
-    transactions_root: Option<B256>,
+    key: BuildKey,
     found: impl FnOnce(B256, &Arc<RecoveredBlock<Block>>, Option<&BuiltExecution>) -> R,
 ) -> Option<R> {
     {
         let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
-        if let Some((hash, built)) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used, transactions_root)) {
+        if let Some((hash, built)) = handed.iter().rev().find(|(_, built)| key.matches(&built.block)) {
             return Some(found(*hash, &built.block, Some(built)));
         }
     }
@@ -808,33 +858,147 @@ fn find_kept_sealed_with<R>(
     store
         .iter()
         .rev()
-        .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+        .find(|(_, entry)| key.matches(&entry.block))
         .map(|(hash, entry)| found(*hash, &entry.block, entry.execution.as_ref()))
 }
 
 /// [`find`], also among the builds already taken by the engine's import --
 /// what a build on the sealed block wants, whichever of the two requests the
 /// execution layer served first.
-pub fn find_kept(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn find_kept(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
     find_kept_at(parent, number, state_root, receipts_root, gas_used, transactions_root, Stage::Complete)
 }
 
 /// [`find_kept`] at a given stage: the build on the sealed block needs the
 /// parent's post-state (`StateReady`), not its receipts.
-pub fn find_kept_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
+#[cfg(test)]
+pub(crate) fn find_kept_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
+    find_kept_at_key(BuildKey::fields(parent, number, state_root, receipts_root, gas_used, transactions_root), stage)
+}
+
+/// [`find_kept_at`] by a [`BuildKey`].
+pub fn find_kept_at_key(key: BuildKey, stage: Stage) -> Option<(B256, BuiltExecution)> {
     // The handed list first: a build the engine already took is complete,
     // and looking there costs nothing where a wait on the store would.
     {
         let handed = handed().lock().unwrap_or_else(|p| recover_poisoned("built_executions.handed", p));
-        if let Some(found) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used, transactions_root)) {
+        if let Some(found) = handed.iter().rev().find(|(_, built)| key.matches(&built.block)) {
             return Some(found.clone());
         }
     }
-    find_at(parent, number, state_root, receipts_root, gas_used, transactions_root, stage)
+    find_at_key(key, stage)
 }
 
-fn matches_build(built: &BuiltExecution, parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
-    matches_block(&built.block, parent, number, state_root, receipts_root, gas_used, transactions_root)
+/// The seal-invariant fields that tell an own build from a sibling built
+/// on the same parent with the same transactions: the queue offers one
+/// build's take to the next build on that parent, and under deferred
+/// execution the roots and gas are the parent's, so a sibling built by
+/// another key (another beneficiary) or for another view (another timestamp)
+/// matches every field [`find`] compares (loop351 FVAa). These are inputs of
+/// the block's execution, which a seal cannot change without changing what
+/// the block executes to (`bin/n42` `build_executes_as_sealed` compares the
+/// same ones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsSealed {
+    /// The fee recipient.
+    pub beneficiary: alloy_primitives::Address,
+    /// The block's timestamp.
+    pub timestamp: u64,
+    /// `prevRandao`.
+    pub mix_hash: B256,
+    /// EIP-4788's root.
+    pub parent_beacon_block_root: Option<B256>,
+}
+
+impl AsSealed {
+    /// The fields of `header`.
+    pub fn of(header: &n42_header::N42Header) -> Self {
+        Self {
+            beneficiary: header.beneficiary,
+            timestamp: header.timestamp,
+            mix_hash: header.mix_hash,
+            parent_beacon_block_root: header.parent_beacon_block_root,
+        }
+    }
+
+    fn admits(&self, built: &n42_header::N42Header) -> bool {
+        *self == Self::of(built)
+    }
+}
+
+/// What a lookup in the stores matches a kept build by: the fields a seal
+/// cannot change that [`find`] has always compared, and, under
+/// [`Self::of_sealed`], the [`AsSealed`] fields that tell siblings apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildKey {
+    /// The parent's hash.
+    pub(crate) parent: B256,
+    /// The block number.
+    pub(crate) number: u64,
+    /// The header's state root (the parent's under deferred execution).
+    pub(crate) state_root: B256,
+    /// The header's receipts root.
+    pub(crate) receipts_root: B256,
+    /// The header's gas used.
+    pub(crate) gas_used: u64,
+    /// The transactions root, when the caller has it.
+    pub(crate) transactions_root: Option<B256>,
+    /// The sibling-separating fields, when the caller has them.
+    pub(crate) as_sealed: Option<AsSealed>,
+}
+
+impl BuildKey {
+    /// The fields alone: a sibling with the same fields matches too.
+    pub(crate) const fn fields(
+        parent: B256,
+        number: u64,
+        state_root: B256,
+        receipts_root: B256,
+        gas_used: u64,
+        transactions_root: Option<B256>,
+    ) -> Self {
+        Self { parent, number, state_root, receipts_root, gas_used, transactions_root, as_sealed: None }
+    }
+
+    /// Everything a sealed header pins its build by: a sibling never
+    /// matches.
+    pub fn of_sealed(header: &n42_header::N42Header) -> Self {
+        Self {
+            as_sealed: Some(AsSealed::of(header)),
+            ..Self::fields(
+                header.parent_hash,
+                header.number,
+                header.state_root,
+                header.receipts_root,
+                header.gas_used,
+                Some(header.transactions_root),
+            )
+        }
+    }
+
+    /// A payload's key: the fields it carries (no transactions root) and the
+    /// sibling-separating ones, which are required.
+    pub const fn of_payload(
+        parent: B256,
+        number: u64,
+        state_root: B256,
+        receipts_root: B256,
+        gas_used: u64,
+        as_sealed: AsSealed,
+    ) -> Self {
+        Self::fields(parent, number, state_root, receipts_root, gas_used, None).with_as_sealed(as_sealed)
+    }
+
+    /// This key, telling siblings apart by `as_sealed`.
+    pub(crate) const fn with_as_sealed(self, as_sealed: AsSealed) -> Self {
+        Self { as_sealed: Some(as_sealed), ..self }
+    }
+
+    fn matches(&self, block: &RecoveredBlock<Block>) -> bool {
+        matches_block(block, self.parent, self.number, self.state_root, self.receipts_root, self.gas_used, self.transactions_root)
+            && self.as_sealed.is_none_or(|as_sealed| as_sealed.admits(block.header()))
+    }
 }
 
 /// Under deferred execution the state root, receipts root and gas are the
@@ -1149,15 +1313,73 @@ pub fn find_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
 /// list (the header-only own block) or a different count gets the copy, as
 /// before; so does every caller with the flag off.
 pub fn find_or_take_sealed(sealed_hash: B256, transactions: usize) -> Option<SealedBlock<Block>> {
-    if !take_sealed_enabled() || transactions == 0 {
-        return find_sealed(sealed_hash);
-    }
+    use n42_qmdb_reth::engine_steps::{note_convert_road, ConvertRoad};
+    let lock_at = std::time::Instant::now();
     let mut store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
+    let lock_us = lock_at.elapsed().as_micros() as u64;
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
-    if store[at].1.block().body().transactions.len() != transactions {
-        return Some(store[at].1.block().clone());
-    }
-    store.remove(at).map(|(_, block)| block.into_block())
+    let kept = &store[at].1;
+    let kept_transactions = kept.block().body().transactions.len();
+    let take = take_sealed_enabled() && transactions != 0 && kept_transactions == transactions;
+    // The road the engine thread took, for the hand-off's line
+    // (`n42_qmdb_reth::engine_steps`): a move, or a copy of the body -- of a
+    // block shared with the engine's own executed insert when the hand-off
+    // shared it (`N42_HANDOFF_NO_CLONE`), which is the case on every own
+    // block the tree already holds.
+    let copy_at = std::time::Instant::now();
+    let (block, road) = if take {
+        let shared = matches!(kept, SealedKept::Shared(recovered) if Arc::strong_count(recovered) > 1);
+        let block = store.remove(at).map(|(_, block)| block.into_block())?;
+        (block, if shared { ConvertRoad::CopiedShared } else { ConvertRoad::Taken })
+    } else {
+        let road = match kept {
+            SealedKept::Shared(_) => ConvertRoad::CopiedShared,
+            SealedKept::Owned(_) => ConvertRoad::CopiedOwned,
+        };
+        (kept.block().clone(), road)
+    };
+    drop(store);
+    note_convert_road(sealed_hash, road, lock_us, copy_at.elapsed().as_micros() as u64, kept_transactions);
+    Some(block)
+}
+
+/// Gives the sealed store its own copy of a block it shares with the
+/// engine's executed insert (`N42_OWN_PAYLOAD_PRECOPY`), so the engine's
+/// conversion of the block's `newPayload` moves it out
+/// ([`find_or_take_sealed`], `N42_ENGINE_TAKE_SEALED`) instead of copying it
+/// on the engine thread. The copy is made by the caller's thread, outside the
+/// store's lock; the shared entry is replaced only if it is still the one
+/// copied. Returns the copy's length in microseconds, `Some(0)` when the
+/// store already holds its own copy, `None` when it holds nothing for the
+/// hash.
+pub fn precopy_sealed(sealed_hash: B256) -> Option<u64> {
+    let shared = {
+        let store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
+        match &store.iter().find(|(hash, _)| *hash == sealed_hash)?.1 {
+            SealedKept::Owned(_) => return Some(0),
+            SealedKept::Shared(recovered) => Arc::clone(recovered),
+        }
+    };
+    let at = std::time::Instant::now();
+    let copy = shared.sealed_block().clone();
+    let copy_us = at.elapsed().as_micros() as u64;
+    let mut store = sealed_store().lock().unwrap_or_else(|p| recover_poisoned("built_executions.sealed", p));
+    let entry = store
+        .iter_mut()
+        .find(|(hash, kept)| *hash == sealed_hash && matches!(kept, SealedKept::Shared(r) if Arc::ptr_eq(r, &shared)));
+    let Some((_, kept)) = entry else {
+        // Taken or replaced meanwhile: the copy is not needed.
+        drop(store);
+        free_boxed_off_path(Box::new(copy));
+        return Some(copy_us);
+    };
+    let replaced = std::mem::replace(kept, SealedKept::Owned(copy));
+    drop(store);
+    // The store's reference to the shared block: a count decrement, the
+    // engine's insert still holds the block.
+    drop(replaced);
+    drop(shared);
+    Some(copy_us)
 }
 
 /// Whether `N42_ENGINE_TAKE_SEALED=1` is set; see [`find_or_take_sealed`].
@@ -1357,6 +1579,42 @@ mod tests {
         assert!(find_sealed(hash).is_none());
     }
 
+    /// `N42_OWN_PAYLOAD_PRECOPY`: after the precopy the engine's conversion
+    /// moves the store's own copy out (no copy on its thread), the block it
+    /// gets is the shared block transaction for transaction, and the shared
+    /// block the engine's insert holds is untouched. A second conversion of
+    /// the same payload still finds a block (the shared one is gone from the
+    /// store, so it is decoded by the caller -- here: none kept, `None`).
+    #[test]
+    fn a_precopied_block_is_moved_to_the_engine_and_is_the_same_block() {
+        let _guard = lock();
+        let tx = |nonce: u64| {
+            let tx = alloy_consensus::TxLegacy { nonce, gas_limit: 21_000, ..Default::default() };
+            n42_tx_types::N42TxEnvelope::Eth(reth_ethereum_primitives::TransactionSigned::new_unhashed(
+                reth_ethereum_primitives::Transaction::Legacy(tx),
+                alloy_primitives::Signature::test_signature(),
+            ))
+        };
+        let header = n42_header::N42Header::from(alloy_consensus::Header { number: 991, ..Default::default() });
+        let body = BlockBody { transactions: (0..64).map(tx).collect(), ..Default::default() };
+        let sealed = SealedBlock::<Block>::seal_slow(alloy_consensus::Block::new(header, body));
+        let hash = sealed.hash();
+        let shared = Arc::new(RecoveredBlock::new_sealed(sealed, Vec::new()));
+        remember_sealed_shared(hash, Arc::clone(&shared));
+        assert_eq!(Arc::strong_count(&shared), 2, "the store shares the insert's block");
+        assert!(precopy_sealed(hash).is_some());
+        assert_eq!(Arc::strong_count(&shared), 1, "the store now holds its own copy");
+        assert_eq!(precopy_sealed(hash), Some(0), "a second precopy finds the copy");
+        let converted = if take_sealed_enabled() {
+            find_or_take_sealed(hash, 64).expect("kept")
+        } else {
+            take_sealed(hash).expect("kept")
+        };
+        assert_eq!(converted.hash(), hash);
+        assert_eq!(converted.body(), shared.sealed_block().body(), "the same block");
+        assert!(precopy_sealed(B256::repeat_byte(0x99)).is_none(), "nothing kept: nothing copied");
+    }
+
     /// A sealed block evicted from the store is freed off the caller's
     /// path: the caller's own reference stays the only one it sees, and the
     /// evicted block is gone once the free thread has run.
@@ -1423,6 +1681,49 @@ mod tests {
 
     fn find_by(h: &Header) -> Option<(B256, BuiltExecution)> {
         find(h.parent_hash, h.number, h.state_root, h.receipts_root, h.gas_used, None)
+    }
+
+    /// A sibling of a finished build -- same parent, number, roots, gas and
+    /// transactions root, another beneficiary (another key's build of the
+    /// same transactions, loop351 FVAa) -- filed after it and still
+    /// finishing: the field search returns the sibling, a lookup by the
+    /// sealed header (or by the build hash) returns the build at once, and
+    /// the sealed header pins the build, not its sibling.
+    #[test]
+    fn a_sibling_with_the_same_fields_is_never_the_sealed_build() {
+        let _guard = lock();
+        let sealed = header(0x71, 710);
+        let execution = built(&sealed);
+        let hash = execution.block.hash();
+        remember(hash, execution);
+        let sibling = Header::from(alloy_consensus::Header {
+            beneficiary: alloy_primitives::Address::repeat_byte(5),
+            ..sealed.inner.clone()
+        });
+        let sibling_hash = built(&sibling).block.hash();
+        remember_pending(sibling_hash, Arc::clone(&built(&sibling).block));
+        assert_ne!(hash, sibling_hash);
+
+        // The ambiguity: by the fields alone the newer entry, the sibling.
+        let by_fields = find_kept_sealed(sealed.parent_hash, 710, sealed.state_root, sealed.receipts_root, sealed.gas_used, Some(sealed.transactions_root));
+        assert_eq!(by_fields.map(|(found, _, _)| found), Some(sibling_hash));
+
+        let key = BuildKey::of_sealed(&sealed);
+        let started = Instant::now();
+        assert_eq!(find_key(key).map(|(found, _)| found), Some(hash));
+        assert_eq!(find_answerable_key(key).map(|(found, _)| found), Some(hash));
+        assert_eq!(find_kept_sealed_header_key(key).map(|(found, _, _)| found), Some(hash));
+        assert_eq!(find_kept_at_key(key, Stage::StateReady).map(|(found, _)| found), Some(hash));
+        assert_eq!(find_by_hash(hash).map(|(found, _)| found), Some(hash));
+        assert!(started.elapsed() < Duration::from_millis(500), "nothing waited for the sibling: {:?}", started.elapsed());
+
+        assert!(pin_key(key));
+        assert!(is_pinned(hash), "the sealed build is pinned");
+        assert!(!is_pinned(sibling_hash), "its sibling is not");
+
+        let (taken, _) = take_key(key).expect("taken");
+        assert_eq!(taken, hash);
+        fail(sibling_hash);
     }
 
     #[test]

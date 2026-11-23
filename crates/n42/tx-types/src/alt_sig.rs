@@ -374,10 +374,249 @@ fn scalar_is_canonical(s: &[u8]) -> bool {
 ///
 /// Shape failures (unknown algorithm, bad key, non-canonical scalar) are
 /// decided per transaction without curve arithmetic. The rest go through one
-/// cofactored batch verification; if the batch fails, each is verified alone
-/// (a batch of one), so a bad signature never taints its neighbours and every
-/// verdict is the one [`AltSigTx::verify`] would give.
+/// cofactored batch verification. If that fails, each signature's terms (its
+/// `H(R || A || M)`, `R` decompressed, `A`, `s`) are computed once: a
+/// signature whose `R` does not decompress fails every batch it is in and is
+/// refused without one, the others are rechecked as a batch if any such was
+/// set aside, and otherwise named by [`BATCH_FALLBACK`] over the terms
+/// already computed. A bad signature never
+/// taints its neighbours and every verdict is the one [`AltSigTx::verify`]
+/// would give (see [`verify_batch_linear`], the reference this is tested
+/// against, and `docs/SIGNATURE_AND_BATCH_TX_SURVEY.md` section 5 for what a
+/// bad signature costs).
 pub fn verify_batch(txs: &[&AltSigTx]) -> Vec<Result<Address, AltSigError>> {
+    verify_batch_with(txs, BATCH_FALLBACK)
+}
+
+/// How [`verify_batch`] names the bad signatures of a batch that failed.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchFallback {
+    /// Each signature alone, `R + h A - s B` from the terms already computed:
+    /// one double-base multiplication a signature.
+    Single,
+    /// Halve the failing set and recheck each half with the batch equation,
+    /// down to [`BISECT_SINGLE_BELOW`]; a half whose sibling passed is known
+    /// bad and not rechecked whole; when the left half fails, the right half
+    /// goes one by one (a batch over it would only add to a dense set's cost).
+    /// Not the default: an attacker picks the position, and with the bad
+    /// signature first this costs what the linear fallback did (section 5).
+    Bisect,
+}
+
+/// The fallback [`verify_batch`] uses: measured in section 5 of
+/// `docs/SIGNATURE_AND_BATCH_TX_SURVEY.md`.
+pub const BATCH_FALLBACK: BatchFallback = BatchFallback::Single;
+
+/// Below this size a failing set is checked one signature at a time.
+#[doc(hidden)]
+pub const BISECT_SINGLE_BELOW: usize = 4;
+
+/// [`verify_batch`] with an explicit fallback (benchmarks and tests).
+#[doc(hidden)]
+pub fn verify_batch_with(txs: &[&AltSigTx], fallback: BatchFallback) -> Vec<Result<Address, AltSigError>> {
+    let mut out: Vec<Result<Address, AltSigError>> = Vec::with_capacity(txs.len());
+    let mut keys = Vec::with_capacity(txs.len());
+    let mut sigs = Vec::with_capacity(txs.len());
+    let mut hashes: Vec<B256> = Vec::with_capacity(txs.len());
+    let mut index = Vec::with_capacity(txs.len());
+    for (i, tx) in txs.iter().enumerate() {
+        match tx.tx.ed25519_key().and_then(|key| tx.ed25519_signature().map(|sig| (key, sig))) {
+            Ok((key, sig)) => {
+                keys.push(key);
+                sigs.push(sig);
+                hashes.push(tx.tx.signing_hash());
+                index.push(i);
+                out.push(Err(AltSigError::Invalid));
+            }
+            Err(err) => out.push(Err(err)),
+        }
+    }
+    if keys.is_empty() {
+        return out;
+    }
+    let messages: Vec<&[u8]> = hashes.iter().map(|h| h.as_slice()).collect();
+    // The batch that passes is the common case and stays exactly the one it
+    // was: the terms below are computed only once it has failed (computing
+    // them up front cost the all-valid batch 1-7%).
+    if batch_holds(&messages, &sigs, &keys) {
+        for &i in &index {
+            out[i] = Ok(txs[i].tx.sender());
+        }
+        return out;
+    }
+    // `R` off the curve: every batch holding it fails, a batch of one
+    // included, so it is invalid without one (`Terms::new` is `None`).
+    let terms: Vec<Option<Terms>> =
+        (0..keys.len()).map(|slot| Terms::new(messages[slot], &sigs[slot], &keys[slot])).collect();
+    let rest: Vec<usize> = (0..terms.len()).filter(|&slot| terms[slot].is_some()).collect();
+    let terms: Vec<Terms> = terms.into_iter().flatten().collect();
+    let mut valid = vec![false; terms.len()];
+    let all: Vec<usize> = (0..terms.len()).collect();
+    // With such signatures set aside, what remains may well pass as a batch.
+    let known_bad = rest.len() == keys.len();
+    if !all.is_empty() && (known_bad || !terms_hold(&terms, &all, merge_enabled())) {
+        match fallback {
+            BatchFallback::Single => {
+                for (slot, t) in terms.iter().enumerate() {
+                    valid[slot] = t.holds_alone();
+                }
+            }
+            BatchFallback::Bisect => {
+                bisect(&terms, &all, true, &mut valid);
+            }
+        }
+    } else {
+        valid.fill(true);
+    }
+    for (slot, &at) in rest.iter().enumerate() {
+        if valid[slot] {
+            let i = index[at];
+            out[i] = Ok(txs[i].tx.sender());
+        }
+    }
+    out
+}
+
+/// Names the valid signatures of `set` (slots into `terms`) into `valid`.
+/// `known_bad`: `set` is already known to fail as a batch. Returns whether
+/// `set` passed as one batch.
+fn bisect(terms: &[Terms], set: &[usize], known_bad: bool, valid: &mut [bool]) -> bool {
+    if !known_bad {
+        let holds = if set.len() == 1 { terms[set[0]].holds_alone() } else { terms_hold(terms, set, merge_enabled()) };
+        if holds {
+            for &slot in set {
+                valid[slot] = true;
+            }
+            return true;
+        }
+    }
+    // `set` fails as a batch.
+    if set.len() == 1 {
+        return false;
+    }
+    if set.len() < BISECT_SINGLE_BELOW {
+        for &slot in set {
+            valid[slot] = terms[slot].holds_alone();
+        }
+        return false;
+    }
+    let (left, right) = set.split_at(set.len() / 2);
+    let left_passed = bisect(terms, left, false, valid);
+    if left_passed {
+        // The set failed and its left half passed: the right half fails.
+        bisect(terms, right, true, valid);
+    } else {
+        // Both halves may hold bad signatures; rechecking the right half as a
+        // batch would only add to a dense set's cost, so it goes one by one.
+        for &slot in right {
+            valid[slot] = terms[slot].holds_alone();
+        }
+    }
+    false
+}
+
+fn merge_enabled() -> bool {
+    static MERGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MERGE.get_or_init(|| n42_env::flag("N42_ED25519_MERGE", true))
+}
+
+/// One signature's terms of the batch equation, computed once.
+struct Terms {
+    hram: [u8; 64],
+    s_bytes: [u8; 32],
+    s: Scalar,
+    h: Scalar,
+    r: EdwardsPoint,
+    key: [u8; 32],
+    a: EdwardsPoint,
+}
+
+impl Terms {
+    /// `None` when the signature fails every batch it is in: `s` not
+    /// canonical or `R` not a curve point (as [`batch_equation_holds`]).
+    fn new(message: &[u8], signature: &EdSignature, key: &VerifyingKey) -> Option<Self> {
+        let s = Option::<Scalar>::from(Scalar::from_canonical_bytes(*signature.s_bytes()))?;
+        let r = CompressedEdwardsY(*signature.r_bytes()).decompress()?;
+        let mut hash = Sha512::default();
+        hash.update(signature.r_bytes());
+        hash.update(key.as_bytes());
+        hash.update(message);
+        let hram: [u8; 64] = hash.finalize().into();
+        Some(Self {
+            hram,
+            s_bytes: *signature.s_bytes(),
+            s,
+            h: Scalar::from_bytes_mod_order_wide(&hram),
+            r,
+            key: *key.as_bytes(),
+            a: key.to_edwards(),
+        })
+    }
+
+    /// The cofactored equation for this signature alone:
+    /// `[8](R + h A - s B) = 0`. The batch of one ([`AltSigTx::verify`])
+    /// checks the same point times its transcript coefficient `z`, a
+    /// non-zero 128-bit scalar except with probability `2^-128`.
+    fn holds_alone(&self) -> bool {
+        let point = EdwardsPoint::vartime_double_scalar_mul_basepoint(&self.h, &self.a, &(-self.s)) + self.r;
+        point.mul_by_cofactor().is_identity()
+    }
+}
+
+/// [`batch_equation_holds`] over `set` (slots into `terms`), from terms
+/// computed once: the same transcript, the same coefficients, the same sum.
+fn terms_hold(terms: &[Terms], set: &[usize], merge: bool) -> bool {
+    let mut transcript = merlin::Transcript::new(b"ed25519 batch verification");
+    for &slot in set {
+        transcript.append_message(b"hram", &terms[slot].hram);
+    }
+    for &slot in set {
+        transcript.append_message(b"sig.s", &terms[slot].s_bytes);
+    }
+    let mut rng = transcript.build_rng().finalize(&mut ZeroRng);
+    let zs: Vec<Scalar> = set
+        .iter()
+        .map(|_| {
+            let mut bytes = [0u8; 16];
+            rand_core::RngCore::fill_bytes(&mut rng, &mut bytes);
+            Scalar::from(u128::from_le_bytes(bytes))
+        })
+        .collect();
+    let base_coefficient: Scalar = set.iter().zip(&zs).map(|(&slot, z)| z * terms[slot].s).sum();
+    let mut key_indices = std::collections::HashMap::with_capacity(set.len());
+    let mut key_points: Vec<EdwardsPoint> = Vec::new();
+    let mut key_coefficients: Vec<Scalar> = Vec::new();
+    for (&slot, z) in set.iter().zip(&zs) {
+        let t = &terms[slot];
+        let term = t.h * z;
+        if !merge {
+            key_points.push(t.a);
+            key_coefficients.push(term);
+            continue;
+        }
+        match key_indices.entry(t.key) {
+            std::collections::hash_map::Entry::Occupied(entry) => key_coefficients[*entry.get()] += term,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(key_points.len());
+                key_points.push(t.a);
+                key_coefficients.push(term);
+            }
+        }
+    }
+    let scalars = core::iter::once(-base_coefficient).chain(zs.iter().copied()).chain(key_coefficients);
+    let points = core::iter::once(ED25519_BASEPOINT_POINT)
+        .chain(set.iter().map(|&slot| terms[slot].r))
+        .chain(key_points);
+    EdwardsPoint::vartime_multiscalar_mul(scalars, points).mul_by_cofactor().is_identity()
+}
+
+/// The verification [`verify_batch`] did before its terms were computed once:
+/// one batch, and when it fails, every signature again as a batch of one
+/// ([`AltSigTx::verify`]). Kept as the reference [`verify_batch`] is tested
+/// against, and as the "before" of the benchmark.
+#[doc(hidden)]
+pub fn verify_batch_linear(txs: &[&AltSigTx]) -> Vec<Result<Address, AltSigError>> {
     let mut out: Vec<Result<Address, AltSigError>> = Vec::with_capacity(txs.len());
     let mut keys = Vec::with_capacity(txs.len());
     let mut sigs = Vec::with_capacity(txs.len());

@@ -1198,35 +1198,46 @@ fn mark_dirty(dirty: &mut Vec<u8>, twig_id: usize, level: u8) {
     dirty[twig_id] = dirty[twig_id].max(level);
 }
 
+/// The first `i` whose key equals the one before it (sorted operations name
+/// each key once), on the pool for a block-sized set: the lowest such `i`,
+/// as the one pass finds it.
+fn first_duplicate<O: LeafOps + ?Sized>(operations: &O) -> Option<usize> {
+    let count = operations.op_count();
+    #[cfg(feature = "rayon")]
+    if count >= 16_384 {
+        use rayon::prelude::*;
+        return (1..count).into_par_iter().with_min_len(4096).find_first(|&i| operations.op_key(i - 1) == operations.op_key(i));
+    }
+    (1..count).find(|&i| operations.op_key(i - 1) == operations.op_key(i))
+}
+
 /// The leaf hash of every operation that writes a value, on the worker pool
-/// when the `rayon` feature is on, into `out` (emptied first).
+/// when the `rayon` feature is on, into `out` (emptied first, then written
+/// in place a chunk to a task).
 fn leaf_hashes<O: LeafOps + ?Sized>(operations: &O, out: &mut Vec<Option<Hash>>) {
     out.clear();
     let count = operations.op_count();
+    out.resize(count, None);
     // A chunk at a time, its leaves batched across the SIMD lanes.
-    let chunk = |chunk: usize| -> Vec<Option<Hash>> {
-        let range = chunk * LEAF_CHUNK..((chunk + 1) * LEAF_CHUNK).min(count);
-        let jobs: Vec<(&Hash, &[u8])> = range
-            .clone()
+    let chunk = |(chunk, out): (usize, &mut [Option<Hash>])| {
+        let first = chunk * LEAF_CHUNK;
+        let jobs: Vec<(&Hash, &[u8])> = (first..first + out.len())
             .filter_map(|i| operations.op_value(i).map(|value| (operations.op_key(i), value)))
             .collect();
         let mut hashes = vec![NULL_HASH; jobs.len()];
         crate::simd::hash_leaves(&jobs, &mut hashes);
         let mut hashes = hashes.into_iter();
-        range.map(|i| operations.op_value(i).and_then(|_| hashes.next())).collect()
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = operations.op_value(first + i).and_then(|_| hashes.next());
+        }
     };
-    let chunks = count.div_ceil(LEAF_CHUNK);
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        let pieces: Vec<Vec<Option<Hash>>> = (0..chunks).into_par_iter().map(chunk).collect();
-        out.reserve(count);
-        for piece in pieces {
-            out.extend(piece);
-        }
+        out.par_chunks_mut(LEAF_CHUNK).enumerate().for_each(chunk);
     }
     #[cfg(not(feature = "rayon"))]
-    out.extend((0..chunks).flat_map(chunk));
+    out.chunks_mut(LEAF_CHUNK).enumerate().for_each(chunk);
 }
 
 /// A block's leaf hashes, computed ahead of its apply
@@ -1279,10 +1290,30 @@ const LEAF_CHUNK: usize = 1024;
 
 /// The slot each operation's key currently occupies, if any, into `out`
 /// (emptied first; written in place by the worker pool).
-fn held_slots<O: LeafOps + ?Sized>(index: &KeyIndex, entries: &Entries, operations: &O, out: &mut Vec<Option<u64>>) {
+fn held_slots<O: LeafOps + ?Sized>(
+    index: &KeyIndex,
+    entries: &Entries,
+    operations: &O,
+    out: &mut Vec<Option<u64>>,
+    places: Option<&mut Vec<u32>>,
+) {
     out.clear();
     let count = operations.op_count();
     out.resize(count, None);
+    // With `places`, where each found key's bucket is, for the inserts
+    // (`TagIndex::insert_sorted_known_at`).
+    if let Some(places) = places {
+        places.clear();
+        places.resize(count, crate::index::NOT_FOUND_AT);
+        index.get_batch_ahead_at(
+            out,
+            Some(places.as_mut_slice()),
+            |i| operations.op_key(i),
+            |slot| entries.key(slot as usize),
+            |slot, stage| entries.prefetch_key(slot as usize, stage),
+        );
+        return;
+    }
     // On the worker pool, buckets prefetched a few keys ahead
     // (`TagIndex::get_batch`): the same answers as one `get` a key, with the
     // probes' cache misses overlapped instead of taken one by one.
@@ -1323,6 +1354,77 @@ fn retire_twigs(slots: usize, twigs: &mut [Twig], dirty: &mut Vec<u8>, held: &[O
         twig.last_retired_at = cursor;
         dirty[twig_id] = dirty[twig_id].max(DIRTY_BITS);
     }
+}
+
+/// The slots `held` names, ascending and without repeats, into `out`
+/// (emptied first): the order the forest's delta lists them in.
+#[cfg(feature = "rayon")]
+fn sorted_retired_into(held: &[Option<u64>], out: &mut Vec<u64>) {
+    use rayon::prelude::*;
+    out.clear();
+    // Collected in chunks: an unindexed `flatten` hands rayon one-item
+    // pieces, which cost more than the sort.
+    let pieces: Vec<Vec<u64>> = held.par_chunks(4096).map(|chunk| chunk.iter().flatten().copied().collect()).collect();
+    out.reserve(pieces.iter().map(Vec::len).sum());
+    for piece in &pieces {
+        out.extend_from_slice(piece);
+    }
+    out.par_sort_unstable();
+    out.dedup();
+}
+
+/// Twigs one task of [`retire_sorted_parallel`] owns.
+#[cfg(feature = "rayon")]
+const RETIRE_GROUP: usize = 16;
+
+/// [`retire_twigs`] and the entry store's retirement (`active`, its live
+/// bits, 64 slots a word) over `sorted` (ascending, distinct) on the pool: the
+/// twigs cut into groups of [`RETIRE_GROUP`], each group's twigs, dirty marks
+/// and active words -- disjoint, since a twig is 32 whole words -- handed to
+/// one task with the group's slots. Every bit cleared and every mark and
+/// cursor set is what the serial walks set, in whatever order.
+#[cfg(feature = "rayon")]
+fn retire_sorted_parallel(active: &mut [u64], twigs: &mut [Twig], dirty: &mut Vec<u8>, cursor: u64, sorted: &[u64]) {
+    use rayon::prelude::*;
+    const WORDS: usize = TWIG_SIZE / 64;
+    if dirty.len() < twigs.len() {
+        dirty.resize(twigs.len(), 0);
+    }
+    type Task<'a> = (usize, &'a mut [Twig], &'a mut [u64], &'a mut [u8], &'a [u64]);
+    let mut tasks: Vec<Task<'_>> = Vec::new();
+    let (mut twigs_rest, mut active_rest, mut dirty_rest, mut slots_rest) = (twigs, active, dirty.as_mut_slice(), sorted);
+    // The first twig and word the rests start at.
+    let mut at_twig = 0usize;
+    while let Some(first) = slots_rest.first() {
+        let group = (*first as usize / TWIG_SIZE) / RETIRE_GROUP * RETIRE_GROUP;
+        let skip = group - at_twig;
+        let (twigs_left, dirty_left, active_left) = (twigs_rest.len(), dirty_rest.len(), active_rest.len());
+        let (_, group_twigs) = std::mem::take(&mut twigs_rest).split_at_mut(skip.min(twigs_left));
+        let (group_twigs, rest) = group_twigs.split_at_mut(RETIRE_GROUP.min(twigs_left.saturating_sub(skip)));
+        twigs_rest = rest;
+        let (_, group_dirty) = std::mem::take(&mut dirty_rest).split_at_mut(skip.min(dirty_left));
+        let (group_dirty, rest) = group_dirty.split_at_mut(RETIRE_GROUP.min(dirty_left.saturating_sub(skip)));
+        dirty_rest = rest;
+        let (_, group_active) = std::mem::take(&mut active_rest).split_at_mut((skip * WORDS).min(active_left));
+        let (group_active, rest) = group_active.split_at_mut((RETIRE_GROUP * WORDS).min(active_left.saturating_sub(skip * WORDS)));
+        active_rest = rest;
+        let end = ((group + RETIRE_GROUP) * TWIG_SIZE) as u64;
+        let (slots, rest) = slots_rest.split_at(slots_rest.partition_point(|slot| *slot < end));
+        slots_rest = rest;
+        at_twig = group + RETIRE_GROUP;
+        tasks.push((group, group_twigs, group_active, group_dirty, slots));
+    }
+    tasks.into_par_iter().for_each(|(group, twigs, active, dirty, slots)| {
+        for slot in slots {
+            let slot = *slot as usize;
+            let (twig_id, local) = (slot / TWIG_SIZE - group, slot % TWIG_SIZE);
+            let twig = &mut twigs[twig_id];
+            twig.bits[local / 8] &= !(1 << (local % 8));
+            twig.last_retired_at = cursor;
+            dirty[twig_id] = dirty[twig_id].max(DIRTY_BITS);
+            active[slot / 64 - group * WORDS] &= !(1 << (slot % 64));
+        }
+    });
 }
 
 /// The undo entries for the slots `held` names: what each holds now. The
@@ -1858,6 +1960,12 @@ pub struct QmdbCompatTree {
     /// as fast as it opens new ones, so a 128 KiB tree is recycled instead of
     /// freed on the eviction and allocated again on the append.
     spare_twig_nodes: Vec<TwigNodes>,
+    /// The last block apply's retired slots, ascending, with the append
+    /// cursor the block started from ([`Self::retired_sorted`]): the parallel
+    /// retirement sorts them to split the work by twig, and the forest's
+    /// delta, which lists the same slots sorted, takes them instead of
+    /// sorting again. Empty when the apply retired serially.
+    retired_sorted: (u64, Vec<u64>),
 }
 
 /// The most evicted leaf trees a tree keeps for reuse: 128 MiB. A head move
@@ -1924,6 +2032,7 @@ impl QmdbCompatTree {
             evicted_below: self.evicted_below,
             truncation_guard: None,
             spare_twig_nodes: Vec::new(),
+            retired_sorted: (0, Vec::new()),
         })
     }
 }
@@ -1940,6 +2049,7 @@ impl QmdbCompatTree {
             evicted_below: 0,
             truncation_guard: None,
             spare_twig_nodes: Vec::new(),
+            retired_sorted: (0, Vec::new()),
         }
     }
 
@@ -2125,6 +2235,7 @@ impl QmdbCompatTree {
             evicted_below: full,
             truncation_guard: None,
             spare_twig_nodes: Vec::new(),
+            retired_sorted: (0, Vec::new()),
         };
         for slot in 0..n {
             if tree.entries.is_active(slot) && tree.entries.is_hash_only(slot) {
@@ -2627,10 +2738,8 @@ impl QmdbCompatTree {
         let old_twigs = self.twigs.len();
         let faults_at = crate::prefault::thread_faults();
         let at = std::time::Instant::now();
-        for i in 1..operations.op_count() {
-            if operations.op_key(i - 1) == operations.op_key(i) {
-                return Err(QmdbOperationError::DuplicateKey(*operations.op_key(i - 1)));
-            }
+        if let Some(i) = first_duplicate(operations) {
+            return Err(QmdbOperationError::DuplicateKey(*operations.op_key(i - 1)));
         }
         let count = operations.op_count();
         phases.ops = count;
@@ -2655,20 +2764,21 @@ impl QmdbCompatTree {
         let pre = pre.filter(|pre| pre.len() == operations.op_count());
         if pre.is_some() {
             // Hashed ahead, off the caller's lock: only the lookups here.
-            held_slots(&self.index, &self.entries, operations, &mut scratch.held);
+            let places = parallel.then_some(&mut scratch.at);
+            held_slots(&self.index, &self.entries, operations, &mut scratch.held, places);
         } else if parallel {
             // The hashes and the lookups beside each other: both are on the
             // pool, and neither waits for the other's stragglers.
             #[cfg(feature = "rayon")]
             {
                 let (index, entries) = (&self.index, &self.entries);
-                let (leaves, held) = (&mut scratch.leaves, &mut scratch.held);
+                let (leaves, held, places) = (&mut scratch.leaves, &mut scratch.held, &mut scratch.at);
                 phases.leaf_hashes_us = rayon::join(
                     || {
                         leaf_hashes(operations, leaves);
                         at.elapsed().as_micros() as u64
                     },
-                    || held_slots(index, entries, operations, held),
+                    || held_slots(index, entries, operations, held, Some(places)),
                 )
                 .0;
             }
@@ -2680,9 +2790,10 @@ impl QmdbCompatTree {
             // write of the same block, and the lookups are the random reads
             // of a multi-million-entry index that the serial loop was waiting
             // on.
-            held_slots(&self.index, &self.entries, operations, &mut scratch.held);
+            held_slots(&self.index, &self.entries, operations, &mut scratch.held, None);
         }
-        let crate::prefault::ApplyScratch { leaves, held, pairs: appended } = &mut scratch;
+        let crate::prefault::ApplyScratch { leaves, held, pairs: appended, at: places } = &mut scratch;
+        let places = &*places;
         let (leaves, held) = (pre.unwrap_or(leaves.as_slice()), &*held);
         phases.leaves_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
@@ -2726,13 +2837,31 @@ impl QmdbCompatTree {
         // The slots the block retires, cleared on the worker pool: every
         // entry and every twig checks its own against a bitmap, instead of
         // 133,000 random writes in sequence.
+        self.retired_sorted.1.clear();
         if parallel {
             // The entries' bits and the twigs' are disjoint: beside each other.
             #[cfg(feature = "rayon")]
             {
                 let slots = self.entries.len();
+                let base = self.next_slot;
                 let (entries, twigs, dirty) = (&mut self.entries, &mut self.twigs, &mut dirty);
-                rayon::join(|| entries.retire(held), || retire_twigs(slots, twigs, dirty, held));
+                // A file store: the slots sorted once and retired a group of
+                // twigs to a task, the entries' active words and the twigs'
+                // bits together (a twig's slots are 32 whole words); the
+                // sorted list is the delta's. The same bits, marks and
+                // cursor as the two serial walks
+                // (`sorted_retirement_equals_the_serial_one`).
+                match entries.active_words_mut() {
+                    Some(active) => {
+                        let mut sorted = std::mem::take(&mut self.retired_sorted.1);
+                        sorted_retired_into(held, &mut sorted);
+                        retire_sorted_parallel(active, twigs, dirty, slots as u64, &sorted);
+                        self.retired_sorted = (base, sorted);
+                    }
+                    None => {
+                        rayon::join(|| entries.retire(held), || retire_twigs(slots, twigs, dirty, held));
+                    }
+                }
             }
         } else {
             self.entries.retire(held);
@@ -2858,9 +2987,17 @@ impl QmdbCompatTree {
             #[cfg(feature = "rayon")]
             {
                 let (index, twigs, dirty) = (&mut self.index, &mut self.twigs, &dirty);
+                // Every operation appends (a transfer block): the lookup's
+                // places line up with the pairs, and the held keys' buckets
+                // are rewritten where the lookup found them.
+                let places = (held_appended.len() == held.len() && places.len() == held.len()).then_some(places);
                 let ((indexed, index_us), rehash_us) = rayon::join(
                     || {
-                        let indexed = index.insert_sorted_known(appended, held_appended, |slot| entries.key(slot as usize));
+                        let key_at = |slot: u64| entries.key(slot as usize);
+                        let indexed = match places {
+                            Some(places) => index.insert_sorted_known_at(appended, held_appended, places, key_at),
+                            None => index.insert_sorted_known(appended, held_appended, key_at),
+                        };
                         (indexed, at.elapsed().as_micros() as u64)
                     },
                     || {
@@ -3007,9 +3144,11 @@ impl QmdbCompatTree {
         if self.twigs.get(first_twig..=last_twig).is_none_or(|twigs| twigs.iter().any(|twig| twig.nodes.is_none())) {
             return None;
         }
-        // The operation behind every append, in order.
-        let mut append_ops = vec![0usize; total];
-        {
+        // The operation behind every append, in order; none to list when
+        // every operation appends (a block of transfers): the `k`th append
+        // is then the `k`th operation.
+        let mut append_ops = if total < count { vec![0usize; total] } else { Vec::new() };
+        if total < count {
             let mut rest = append_ops.as_mut_slice();
             let mut pieces = Vec::with_capacity(chunks);
             for (chunk, n) in counts.iter().enumerate() {
@@ -3025,8 +3164,9 @@ impl QmdbCompatTree {
         }
         phases.writes_pairs_us = at.elapsed().as_micros() as u64;
         let append_ops = append_ops.as_slice();
-        let key = |k: usize| operations.op_key(append_ops[k]);
-        let record = |k: usize| (operations.op_key(append_ops[k]), operations.op_value(append_ops[k]).unwrap_or_default());
+        let op_of = |k: usize| if total == count { k } else { append_ops[k] };
+        let key = |k: usize| operations.op_key(op_of(k));
+        let record = |k: usize| (operations.op_key(op_of(k)), operations.op_value(op_of(k)).unwrap_or_default());
         let (recording, twigs, entries) = (&mut self.recording, &mut self.twigs[first_twig..=last_twig], &mut self.entries);
         let (((), ()), (pushed, ())) = rayon::join(
             || {
@@ -3049,7 +3189,7 @@ impl QmdbCompatTree {
                             let to = (first_slot as usize + total).min(twig_start + TWIG_SIZE);
                             for slot in from..to {
                                 let local = slot - twig_start;
-                                if let (Some(nodes), Some(leaf)) = (twig.nodes.as_deref_mut(), leaves[append_ops[slot - first_slot as usize]]) {
+                                if let (Some(nodes), Some(leaf)) = (twig.nodes.as_deref_mut(), leaves[op_of(slot - first_slot as usize)]) {
                                     nodes[TWIG_SIZE + local] = leaf;
                                 }
                                 twig.bits[local / 8] |= 1 << (local % 8);
@@ -3174,6 +3314,14 @@ impl QmdbCompatTree {
             upper[index] = hash_node(&upper[index * 2], &upper[index * 2 + 1]);
         }
         upper[1]
+    }
+
+    /// The last block apply's retired slots, ascending and distinct, when
+    /// that apply started from append cursor `base` and sorted them (the
+    /// parallel retirement of a file store); else `None`.
+    pub fn retired_sorted(&self, base: u64) -> Option<&[u64]> {
+        let (from, sorted) = &self.retired_sorted;
+        (*from == base && !sorted.is_empty()).then_some(sorted.as_slice())
     }
 
     /// The entry at `slot`, if the tree has one.
@@ -3751,6 +3899,16 @@ mod tests {
                     assert_eq!(parallel_undo, serial_undo, "undo record differs at block {block} (file {in_file}, ahead {ahead})");
                     assert_eq!(parallel.next_slot(), serial.next_slot(), "cursor differs at block {block}");
                     assert_eq!(parallel.snapshot(), serial.snapshot(), "snapshot differs at block {block} (file {in_file})");
+                    // A file store's parallel retirement keeps its slots
+                    // sorted for the forest's delta: the undo's, sorted.
+                    #[cfg(feature = "rayon")]
+                    if in_file && parallel_undo.retired_len() > 0 {
+                        let mut expected: Vec<u64> = parallel_undo.retired_slots().collect();
+                        expected.sort_unstable();
+                        expected.dedup();
+                        assert_eq!(parallel.retired_sorted(parallel_undo.prev_next_slot), Some(expected.as_slice()), "sorted retirements at block {block}");
+                        assert_eq!(parallel.retired_sorted(parallel_undo.prev_next_slot + 1), None);
+                    }
                     // Every fifth block is reverted on both and applied again
                     // in parallel, so appends land over abandoned slots.
                     if block % 5 == 4 {
@@ -4481,6 +4639,22 @@ mod tests {
         let encoded = proof.encode().unwrap();
         assert_eq!(QmdbProof::decode(&encoded).unwrap(), proof);
         assert!(tree.prove(&indexed_key(u64::MAX)).is_none());
+    }
+
+    /// The version byte is the only marker a v2 proof carries
+    /// (`docs/PROOF_TRUST_INVENTORY.md`): every other value is refused before
+    /// any field is read, including the v1 layout this one replaced.
+    #[test]
+    fn proof_codec_refuses_every_other_version_byte() {
+        let mut tree = QmdbCompatTree::new();
+        tree.set(key(7), b"proof-value".to_vec()).unwrap();
+        let encoded = tree.prove(&key(7)).unwrap().encode().unwrap();
+        assert_eq!(encoded[0], PROOF_CODEC_VERSION);
+        for version in (0..=u8::MAX).filter(|v| *v != PROOF_CODEC_VERSION) {
+            let mut other = encoded.clone();
+            other[0] = version;
+            assert_eq!(QmdbProof::decode(&other), Err(QmdbProofCodecError::UnsupportedVersion(version)));
+        }
     }
 }
 

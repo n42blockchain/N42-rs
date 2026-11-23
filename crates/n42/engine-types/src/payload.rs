@@ -938,6 +938,15 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
     #[allow(clippy::type_complexity)]
     let (transactions, (senders, hashes)): (Vec<TransactionSigned>, (Vec<alloy_primitives::Address>, Vec<B256>)) = pool
         .install(|| cands.par_iter().with_min_len(1024).map(|tx| (pooled_consensus(tx).clone(), (tx.sender(), *tx.hash()))).unzip());
+    // The candidates' block bytes for the byte budget, on the plan body's
+    // pool beside the rest: the build then checks one sum, not each one.
+    let bytes = pool.install(|| {
+        cands
+            .par_iter()
+            .with_min_len(1024)
+            .map(|tx| crate::byte_budget::payload_size(PoolTransaction::encoded_length(&tx.transaction)))
+            .sum::<usize>()
+    });
     let groups = crate::frame_blocks::noted_beneficiary().and_then(|beneficiary| {
         crate::parallel_transfer::partition_by_sender(&keys, beneficiary).ok().map(|groups| (beneficiary, groups))
     });
@@ -954,6 +963,7 @@ fn make_prepared_build<P: PoolTransaction<Consensus = TransactionSigned>>(
         senders,
         hashes,
         groups,
+        bytes,
         made_us: at.elapsed().as_micros() as u64,
         root_ahead,
     })
@@ -1762,6 +1772,20 @@ where
         header.beneficiary = coinbase;
     }
     let start_prepare_ms = start_prepare_at.elapsed().as_millis() as u64;
+    // Decision D1 (`docs/PROTOCOL_CONFORMANCE_2026_11.md`): on an N42-native
+    // chain the block stays inside gov5's byte budget, 9/10 of the gossip cap
+    // less 32 KiB and the header (`crate::byte_budget`), so the network can
+    // carry every block this node seals. Builder policy, not a rule. Its
+    // counts are the pool's encoded lengths; a chain that is not native has
+    // no budget and nothing is counted.
+    let native = reth_chainspec::qmdb::is_n42_native(chain_spec.genesis());
+    let mut byte_budget = if native {
+        crate::byte_budget::ByteBudget::new(crate::byte_budget::wire_cap(), alloy_rlp::Encodable::length(&header))
+    } else {
+        crate::byte_budget::ByteBudget::unlimited()
+    };
+    // Whether the budget cut this block: it is then full, as at the gas limit.
+    let mut bytes_full = false;
 
     // `N42_STATE_AFTER_PULL=1`: the parent's state opened and the
     // pre-execution changes applied once, just before the parallel step's
@@ -2177,6 +2201,35 @@ where
                 }
             }
         }
+        // The byte budget (D1): the prefix that fits, the rest handed back
+        // for the next block like a block's worth over the gas budget. With
+        // the plan's body made for exactly these candidates its sum is
+        // checked; otherwise each candidate's pooled length is read (only on
+        // a native chain: elsewhere the budget is unlimited and nothing is).
+        // Counted into the budget once the step has executed them.
+        let mut par_bytes = 0usize;
+        if native {
+            let plan_bytes = prepared_build
+                .as_deref()
+                .filter(|made| prepared_miss_of(Some(made), from_bulk, bulk_len, cands.len()).is_none())
+                .map(|made| made.bytes);
+            match plan_bytes {
+                Some(bytes) if byte_budget.fits(bytes) => par_bytes = bytes,
+                _ => {
+                    let mut trial = byte_budget;
+                    let take = trial.take_prefix(
+                        cands.iter().map(|tx| crate::byte_budget::payload_size(tx.transaction.encoded_length())),
+                    );
+                    par_bytes = trial.used() - byte_budget.used();
+                    if take < cands.len() {
+                        bytes_full = true;
+                        for tx in cands.split_off(take).into_iter().rev() {
+                            lookahead.push_front(tx);
+                        }
+                    }
+                }
+            }
+        }
         par_pull_ms = par_at.elapsed().as_millis() as u64;
         // `N42_PULLER_STOP_AT_PULL` (default on, F5g item 5): a full pull
         // on a block that can seal at the execution's end gives the
@@ -2217,18 +2270,7 @@ where
         // empty then): the take is the plan's when the bulk vector came with
         // it and was not cut (F5g8: E13 missed on every block on the
         // `made.cands` length).
-        let prepared_miss = match prepared_build.as_ref() {
-            None => Some(String::from("no_plan")),
-            Some(made) if made.keys.len() != cands.len() => Some(format!("keys_len {}!={}", made.keys.len(), cands.len())),
-            Some(made) if !made.cands.is_empty() && made.cands.len() != cands.len() => {
-                Some(format!("cands_len {}!={}", made.cands.len(), cands.len()))
-            }
-            Some(_) if made_cands_cut(from_bulk, bulk_len, cands.len()) => Some(format!("bulk_cut {}!={}", bulk_len, cands.len())),
-            Some(made) if made.transactions.len() != cands.len() => {
-                Some(format!("transactions_len {}!={}", made.transactions.len(), cands.len()))
-            }
-            Some(_) => None,
-        };
+        let prepared_miss = prepared_miss_of(prepared_build.as_deref(), from_bulk, bulk_len, cands.len());
         let prepared = if prepared_miss.is_none() { prepared_build.take() } else { None };
         prep_from_plan = prepared.is_some();
         evm2_prepared_miss = prepared_miss.unwrap_or_else(|| String::from("none"));
@@ -2378,6 +2420,7 @@ where
                     let gas_left_after = block_gas_limit.saturating_sub(cumulative_gas_used + gas);
                     let full_after = gas_left_after < MIN_TRANSACTION_GAS
                         || par_drained
+                        || bytes_full
                         || (executed_len != 0 && gas_left_after <= seal_shortfall(block_gas_limit));
                     let seal_here = seal_at_exec()
                         && seal_early_possible
@@ -2619,6 +2662,7 @@ where
                             cumulative_gas_used += committed_gas;
                             tx_count += executed_len as u64;
                             par_txs = executed_len as u64;
+                            byte_budget.add(par_bytes);
                             par_groups = groups.len();
                             par_batches = batches;
                             par_skipped = skipped.len();
@@ -2697,6 +2741,7 @@ where
     let gas_left = block_gas_limit.saturating_sub(cumulative_gas_used);
     let block_full = gas_left < MIN_TRANSACTION_GAS
         || par_drained
+        || (par_txs > 0 && bytes_full)
         || (par_txs > 0 && gas_left <= seal_shortfall(block_gas_limit));
     // Why this build will not seal early, decided from the same inputs as
     // the gate below and said once a second. Until loop207 nothing named
@@ -2914,7 +2959,8 @@ where
                         n42_core_layout::enter(n42_core_layout::Set::Critical);
                         let empty = reth_trie::bundle_state::BundleState::default();
                         let accounts = shards.view(&empty, &[]);
-                        (n42_qmdb_reth::operations_ahead(&accounts, prague), std::time::Instant::now())
+                        let ahead = crate::parallel_common::on_leader_root_pool(|| n42_qmdb_reth::operations_ahead(&accounts, prague));
+                        (ahead, std::time::Instant::now())
                     });
                     match spawned {
                         Ok(handle) => ops_ahead = Some((handle, prague)),
@@ -3265,7 +3311,7 @@ where
                             concat_us: 0,
                             sort_us: ahead.sort_us,
                         };
-                        let ops = ahead.finish(&replaced, &newer, prague);
+                        let ops = crate::parallel_common::on_leader_root_pool(|| ahead.finish(&replaced, &newer, prague));
                         Some((
                             ops,
                             split,
@@ -3275,7 +3321,9 @@ where
                     let (ops, split, mut ahead_use) = match finished {
                         Some(finished) => finished,
                         None => {
-                            let (ops, split) = n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague);
+                            let (ops, split) = crate::parallel_common::on_leader_root_pool(|| {
+                                n42_qmdb_reth::sorted_operations_from_accounts_timed(view_ref, prague)
+                            });
                             (ops, split, OpsAheadUse::default())
                         }
                     };
@@ -3287,7 +3335,7 @@ where
                     // of it reads the parent's tree or fields.
                     let (ops, leaves) = if before_gate {
                         let mut ops = ops;
-                        let leaves = n42_qmdb_reth::sort_and_hash_leaves(&mut ops);
+                        let leaves = crate::parallel_common::on_leader_root_pool(|| n42_qmdb_reth::sort_and_hash_leaves(&mut ops));
                         (ops, leaves)
                     } else {
                         (ops, None)
@@ -3303,7 +3351,9 @@ where
                     } else {
                         spawned
                     };
-                    let prepared = qmdb_job.compute_operations_with_leaves(parent_sealed, ops, leaves);
+                    let prepared = crate::parallel_common::on_leader_root_pool(|| {
+                        qmdb_job.compute_operations_with_leaves(parent_sealed, ops, leaves)
+                    });
                     let ended = std::time::Instant::now();
                     // The operations' phase is its own length whichever side
                     // of the gate it ran; the compute is the apply after it.
@@ -4157,6 +4207,11 @@ where
         if serial_closed || gas_budget.left(cumulative_gas_used) < MIN_TRANSACTION_GAS {
             break;
         }
+        // The byte budget's end (D1): too little left for any transaction, or
+        // eight candidates in a row did not fit (gov5's `packStop`).
+        if byte_budget.full() {
+            break;
+        }
         // The pool/execution split is timed with the cycle counter, not the
         // clock: round 37's clock-count shim found 99.9% of the builder
         // thread's clock reads were this loop's own per-transaction timers
@@ -4213,6 +4268,25 @@ where
             );
             continue;
         }
+        // The byte budget (D1): a transaction that does not fit goes back
+        // with its sender's later ones for the next block (gov5's
+        // `packSkipAccount`); one that cannot fit any more ends the loop and
+        // goes back with the rest of what was taken (`packStop`).
+        let tx_bytes = crate::byte_budget::payload_size(pool_tx.transaction.encoded_length());
+        match byte_budget.admit(tx_bytes) {
+            crate::byte_budget::Pack::Accept => {}
+            crate::byte_budget::Pack::SkipSender => {
+                refuse!(
+                    &pool_tx,
+                    InvalidPoolTransactionError::OversizedData { size: tx_bytes, limit: byte_budget.remaining() }
+                );
+                continue;
+            }
+            crate::byte_budget::Pack::Stop => {
+                lookahead.push_front(pool_tx);
+                break;
+            }
+        }
 
         // check if the job was cancelled, if so we can exit early
         if cancel.is_cancelled() {
@@ -4242,6 +4316,14 @@ where
 
         // convert tx to a signed transaction
         let tx = pool_tx.to_consensus();
+
+        // A blob transaction is invalid on an N42-native chain (D4): the pool
+        // and the ingest refuse it, and so does the builder, whatever reached
+        // it. (The chain's EVM refuses it too, `crate::native_tx_rules`.)
+        if native && tx.is_eip4844() {
+            refuse!(&pool_tx, InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported));
+            continue;
+        }
 
         // There's only limited amount of blob space available per block, so we need to check if
         // the EIP-4844 can still fit in the block
@@ -4397,6 +4479,7 @@ where
         total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
         cumulative_gas_used += tx_gas_used;
         gas_budget.admit(pool_tx.gas_limit());
+        byte_budget.add(tx_bytes);
         if let Some(admitted) = admitted {
             admitted.commit();
         }
@@ -5081,6 +5164,30 @@ const fn made_cands_cut(from_bulk: bool, bulk_len: usize, cands: usize) -> bool 
     !from_bulk || bulk_len != cands
 }
 
+/// Why the plan's prepared body is not for exactly the parallel step's
+/// candidates (`cands` of them), or `None` when it is: its keys, its
+/// candidates and its transactions are as many, and the candidates came as
+/// the plan's uncut bulk vector.
+fn prepared_miss_of<P: PoolTransaction>(
+    made: Option<&crate::frame_blocks::PreparedBuild<P>>,
+    from_bulk: bool,
+    bulk_len: usize,
+    cands: usize,
+) -> Option<String> {
+    match made {
+        None => Some(String::from("no_plan")),
+        Some(made) if made.keys.len() != cands => Some(format!("keys_len {}!={}", made.keys.len(), cands)),
+        Some(made) if !made.cands.is_empty() && made.cands.len() != cands => {
+            Some(format!("cands_len {}!={}", made.cands.len(), cands))
+        }
+        Some(_) if made_cands_cut(from_bulk, bulk_len, cands) => Some(format!("bulk_cut {bulk_len}!={cands}")),
+        Some(made) if made.transactions.len() != cands => {
+            Some(format!("transactions_len {}!={}", made.transactions.len(), cands))
+        }
+        Some(_) => None,
+    }
+}
+
 /// `N42_EVM2_RECEIPTS_LATE` (default on; `0` commits the receipts before the
 /// finish, as before F5g7): the evm2 step's receipts on a block sealed at the
 /// execution's end with its output in shards are built behind the seal on a
@@ -5389,6 +5496,20 @@ mod includability_tests {
     const BASE_FEE: u64 = 1_000_000_000;
     const TIMESTAMP: u64 = 1_800_000_000;
 
+    std::thread_local! {
+        /// The parent's and the builder's gas limit for this thread's builds.
+        static GAS_LIMIT_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(GAS_LIMIT) };
+    }
+
+    std::thread_local! {
+        /// Code for the accounts of this thread's builds that have some.
+        static CODE_FOR_TEST: std::cell::RefCell<Vec<(Address, Bytes)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn gas_limit() -> u64 {
+        GAS_LIMIT_FOR_TEST.with(|limit| limit.get())
+    }
+
     /// The pool's best transactions, in the order given: a refusal drops the
     /// sender's later transactions, as reth's iterator does.
     struct Listed {
@@ -5478,15 +5599,19 @@ mod includability_tests {
     ) -> RecoveredBlock<n42_tx_types::Block> {
         let client = MockEthProvider::default().with_chain_spec((*spec).clone());
         for (address, nonce, balance) in accounts {
-            client.add_account(*address, ExtendedAccount::new(*nonce, *balance));
+            let mut account = ExtendedAccount::new(*nonce, *balance);
+            if let Some((_, code)) = CODE_FOR_TEST.with(|code| code.borrow().iter().find(|(a, _)| a == address).cloned()) {
+                account = account.with_bytecode(code);
+            }
+            client.add_account(*address, account);
         }
         // Far above any height another test marks decided (the process-wide
         // `canonical_head`, which would decline the build), and before the
         // fork, so the header carries the parent's own fields.
         let parent = n42_header::N42Header::from(alloy_consensus::Header {
             number: 1_000_000_000,
-            gas_limit: GAS_LIMIT,
-            gas_used: GAS_LIMIT / 2,
+            gas_limit: gas_limit(),
+            gas_used: gas_limit() / 2,
             base_fee_per_gas: Some(BASE_FEE),
             timestamp: TIMESTAMP - 4,
             withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
@@ -5519,7 +5644,7 @@ mod includability_tests {
             evm_config,
             client,
             NoopTransactionPool::<Pooled>::new(),
-            EthereumBuilderConfig::new().with_gas_limit(GAS_LIMIT),
+            EthereumBuilderConfig::new().with_gas_limit(gas_limit()),
             args,
             move |_| Box::new(listed) as BestTransactionsIter<NoopTransactionPool<Pooled>>,
             Arc::new(crate::hotstuff_consensus::HotStuffConsensus::new(Arc::new(n42_header::N42ChainSpec::from(spec)))),
@@ -5732,6 +5857,227 @@ mod includability_tests {
         let (accounts, txs) = balance_case();
         let block = build(false, &accounts, txs);
         assert_eq!(block.body().transactions.len(), 4, "reth's rule: both of sender 1's transfers execute");
+    }
+
+    // ---- protocol conformance (docs/PROTOCOL_CONFORMANCE_2026_11.md) ----
+
+    fn osaka_chain() -> Arc<ChainSpec> {
+        Arc::new(ChainSpecBuilder::mainnet().genesis(alloy_genesis::Genesis::default()).osaka_activated().build())
+    }
+
+    /// [`build_on`] an Osaka chain with a `gas` block, `N42_PARALLEL_BUILD`
+    /// as `parallel` on this thread, and `code` installed at its accounts.
+    fn build_osaka(
+        parallel: bool,
+        gas: u64,
+        accounts: &[(Address, u64, U256)],
+        code: &[(Address, Bytes)],
+        txs: &[Candidate],
+    ) -> RecoveredBlock<n42_tx_types::Block> {
+        GAS_LIMIT_FOR_TEST.with(|limit| limit.set(gas));
+        CODE_FOR_TEST.with(|c| *c.borrow_mut() = code.to_vec());
+        PARALLEL_BUILD_FOR_TEST.with(|on| on.set(Some(parallel)));
+        let block = build_on(osaka_chain(), None, None, accounts, txs.to_vec());
+        PARALLEL_BUILD_FOR_TEST.with(|on| on.set(None));
+        CODE_FOR_TEST.with(|c| c.borrow_mut().clear());
+        GAS_LIMIT_FOR_TEST.with(|limit| limit.set(GAS_LIMIT));
+        block
+    }
+
+    /// `envelope` from `sender` at `nonce`, as the pool holds it.
+    fn candidate(sender: Address, nonce: u64, envelope: TransactionSigned) -> Candidate {
+        let encoded = alloy_eips::eip2718::Encodable2718::encode_2718_len(&envelope);
+        Arc::new(ValidPoolTransaction {
+            transaction: Pooled::new(Recovered::new_unchecked(envelope, sender), encoded),
+            transaction_id: TransactionId::new(SenderId::from(u64::from_be_bytes(sender.0[12..].try_into().unwrap())), nonce),
+            propagate: false,
+            timestamp: std::time::Instant::now(),
+            origin: TransactionOrigin::External,
+            authority_ids: None,
+        })
+    }
+
+    /// A 1559 call of `sender` at `nonce` (fee cap 10 gwei, tip 1 gwei).
+    fn call(sender: u64, nonce: u64, gas_limit: u64, to: Address, value: u64, input: Bytes) -> Candidate {
+        let inner = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: 10_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            input,
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
+        candidate(address(sender), nonce, TransactionSigned::from(reth_ethereum_primitives::TransactionSigned::from(signed)))
+    }
+
+    /// The parent's state over `accounts` with `code`, for the importers.
+    fn parent_db(accounts: &[(Address, u64, U256)], code: &[(Address, Bytes)]) -> evm2::evm::CacheDB<evm2::evm::EmptyDB> {
+        let mut db = evm2::evm::CacheDB::new(evm2::evm::EmptyDB::default());
+        for (address, nonce, balance) in accounts {
+            let mut info = evm2::evm::AccountInfo { nonce: *nonce, balance: *balance, ..Default::default() };
+            if let Some((_, bytes)) = code.iter().find(|(a, _)| a == address) {
+                info = info.with_code(evm2::bytecode::Bytecode::new_raw(bytes.clone()));
+            }
+            db.insert_account_info(address, info);
+        }
+        db
+    }
+
+    /// `block`'s header over `txs` from `senders`: a block whose contents
+    /// the builder would not have made, for the importers to refuse.
+    fn block_of(
+        block: &RecoveredBlock<n42_tx_types::Block>,
+        txs: &[&Candidate],
+    ) -> RecoveredBlock<n42_tx_types::Block> {
+        let body = n42_tx_types::BlockBody {
+            transactions: txs.iter().map(|c| c.transaction.transaction.inner().clone()).collect(),
+            ommers: Vec::new(),
+            withdrawals: block.body().withdrawals.clone(),
+        };
+        let senders = txs.iter().map(|c| c.sender()).collect();
+        RecoveredBlock::new_unhashed(n42_tx_types::Block { header: block.header().clone(), body }, senders)
+    }
+
+    /// Item 2, EIP-7825: from Osaka the builder leaves out a transaction
+    /// over 2^24 gas, serial and parallel alike, and both importers refuse
+    /// a block that carries one (gov5 refuses it in its pool and its state
+    /// transition).
+    #[test]
+    fn a_transaction_over_the_eip7825_cap_is_neither_built_nor_imported() {
+        use reth_evm::execute::Executor as _;
+        let cap = 1u64 << 24;
+        let accounts: Vec<_> = (11..=12).map(|s| (address(s), 0, RICH)).collect();
+        let over = call(11, 0, cap + 1, address(500), 1, Bytes::new());
+        let at = call(12, 0, cap, address(501), 1, Bytes::new());
+        let txs = vec![over.clone(), at.clone()];
+        let serial = build_osaka(false, 60_000_000, &accounts, &[], &txs);
+        assert_eq!(serial.senders(), &[address(12)], "only the transaction at the cap");
+        let parallel = build_osaka(true, 60_000_000, &accounts, &[], &txs);
+        assert_eq!(parallel.senders(), &[address(12)]);
+
+        let config = crate::n42_evm::N42EvmConfig::new(Arc::new(n42_header::N42ChainSpec::from((*osaka_chain()).clone())));
+        let bad = block_of(&serial, &[&at, &over]);
+        let err = config.executor(parent_db(&accounts, &[])).execute(&bad).expect_err("the serial import refuses it");
+        assert!(err.to_string().contains(&format!("exceeds cap {cap}")), "{err}");
+        let parent = || parent_db(&accounts, &[]);
+        assert!(
+            crate::parallel_build::import_block(&config, &bad, parent(), &|| Some(parent()), crate::parallel_transfer::Dispatch::LargestFirst(4), None)
+                .is_err(),
+            "the parallel import refuses it too (and the node then refuses it serially)"
+        );
+        // The good block imports.
+        assert!(config.executor(parent_db(&accounts, &[])).execute(&serial).is_ok());
+    }
+
+    /// A secp256k1 key from `seed` and its address.
+    fn key(seed: u8) -> (secp256k1::SecretKey, Address) {
+        let mut bytes = alloy_primitives::keccak256([seed; 32]);
+        let key = loop {
+            match secp256k1::SecretKey::from_secret_bytes(bytes.0) {
+                Ok(key) => break key,
+                Err(_) => bytes = alloy_primitives::keccak256(bytes),
+            }
+        };
+        let public = secp256k1::PublicKey::from_secret_key(&key).serialize_uncompressed();
+        (key, Address::from_slice(&alloy_primitives::keccak256(&public[1..])[12..]))
+    }
+
+    /// `authority`'s signed EIP-7702 authorization to delegate to `to`.
+    fn authorization(
+        key: &secp256k1::SecretKey,
+        chain_id: u64,
+        to: Address,
+        nonce: u64,
+    ) -> alloy_eips::eip7702::SignedAuthorization {
+        let auth = alloy_eips::eip7702::Authorization { chain_id: U256::from(chain_id), address: to, nonce };
+        let message = secp256k1::Message::from_digest(auth.signature_hash().0);
+        let (recovery_id, compact) =
+            secp256k1::ecdsa::RecoverableSignature::sign_ecdsa_recoverable(message, key).serialize_compact();
+        auth.into_signed(Signature::new(
+            U256::from_be_slice(&compact[..32]),
+            U256::from_be_slice(&compact[32..]),
+            recovery_id.to_u8() != 0,
+        ))
+    }
+
+    /// A type-4 transaction of `sender` carrying `authorizations`.
+    fn set_code(sender: u64, nonce: u64, to: Address, authorizations: Vec<alloy_eips::eip7702::SignedAuthorization>) -> Candidate {
+        let inner = alloy_consensus::TxEip7702 {
+            chain_id: 1,
+            nonce,
+            gas_limit: 200_000,
+            max_fee_per_gas: 10_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list: authorizations,
+            input: Bytes::new(),
+        };
+        let signed = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
+        candidate(address(sender), nonce, TransactionSigned::from(reth_ethereum_primitives::TransactionSigned::from(signed)))
+    }
+
+    /// Item 3, EIP-7702 on the N42 paths: a block of plain transfers, a
+    /// type-4 transaction with a valid authorization delegating to a
+    /// contract, one with an invalid authorization (another chain's id) and
+    /// one with a forged one, then a transfer to the delegated account (which
+    /// runs the contract's code: one SSTORE) and a transfer after it. The
+    /// parallel builder gives the serial builder's block; the follower's
+    /// parallel import runs the type-4 transactions and everything after
+    /// them in its serial tail and gives the stock executor's receipts and
+    /// state; the delegation and the delegated code's write are in it.
+    #[test]
+    fn type_4_transactions_take_the_serial_paths_and_give_the_stock_block() {
+        use reth_evm::execute::Executor as _;
+        let (authority_key, authority) = key(0x77);
+        let (other_key, _) = key(0x78);
+        // PUSH1 1 PUSH1 0 SSTORE STOP: slot 0 of whoever runs it becomes 1.
+        let contract = address(900);
+        let code = vec![(contract, Bytes::from_static(&[0x60, 0x01, 0x60, 0x00, 0x55, 0x00]))];
+        let mut accounts: Vec<_> = (11..=20).map(|s| (address(s), 0, RICH)).collect();
+        accounts.push((contract, 1, U256::ZERO));
+        accounts.push((authority, 0, U256::from(1u64)));
+        // Sender 15's list: an authorization for another chain (skipped),
+        // and one by another key at a nonce its account does not have
+        // (skipped as well).
+        let txs: Vec<Candidate> = vec![
+            call(11, 0, 21_000, address(600), 1, Bytes::new()),
+            call(12, 0, 21_000, address(601), 1, Bytes::new()),
+            call(13, 0, 21_000, address(602), 1, Bytes::new()),
+            set_code(14, 0, address(700), vec![authorization(&authority_key, 1, contract, 0)]),
+            set_code(15, 0, address(701), vec![authorization(&authority_key, 999, contract, 1), authorization(&other_key, 1, contract, 5)]),
+            call(16, 0, 100_000, authority, 1, Bytes::new()),
+            call(17, 0, 21_000, address(603), 1, Bytes::new()),
+        ];
+        let serial = build_osaka(false, 30_000_000, &accounts, &code, &txs);
+        assert_eq!(serial.body().transactions.len(), txs.len(), "every transaction is built");
+        let parallel = build_osaka(true, 30_000_000, &accounts, &code, &txs);
+        assert_eq!(parallel.header(), serial.header(), "the parallel builder's block is the serial one");
+
+        let config = crate::n42_evm::N42EvmConfig::new(Arc::new(n42_header::N42ChainSpec::from((*osaka_chain()).clone())));
+        let parent = || parent_db(&accounts, &code);
+        let stock = config.executor(parent()).execute(&serial).expect("the serial import");
+        assert!(stock.result.receipts.iter().all(|r| r.success), "{:?}", stock.result.receipts);
+        assert_eq!(stock.result.gas_used, serial.header().gas_used, "the header's gas");
+        let delegated = stock.state.state.get(&authority).and_then(|a| a.info.clone()).expect("the authority changed");
+        let designation: Vec<u8> = [&[0xef, 0x01, 0x00][..], contract.as_slice()].concat();
+        assert_eq!(delegated.code_hash, alloy_primitives::keccak256(&designation), "delegated to the contract");
+        assert_eq!(delegated.nonce, 1, "the authorization bumped the authority's nonce once");
+        let slot = stock.state.state.get(&authority).and_then(|a| a.storage.get(&U256::ZERO)).map(|s| s.present_value);
+        assert_eq!(slot, Some(U256::from(1)), "the transfer to it ran the contract's code");
+        let (ours, stats) = crate::parallel_build::import_block(&config, &serial, parent(), &|| Some(parent()), crate::parallel_transfer::Dispatch::LargestFirst(4), None)
+            .expect("the parallel import");
+        // The batches stop at the first type-4 transaction: three
+        // transfers batched, the rest in the serial tail.
+        assert_eq!((stats.txs, stats.tail), (3, 4), "{stats:?}");
+        assert_eq!(ours.result.receipts, stock.result.receipts, "receipts");
+        assert_eq!(ours.result.gas_used, stock.result.gas_used, "gas used");
+        assert_eq!(ours.state.state, stock.state.state, "state");
     }
 }
 

@@ -271,6 +271,27 @@ mod tests {
         }
     }
 
+    /// The seven-byte prefix is the envelope's only version marker
+    /// (`docs/PROOF_TRUST_INVENTORY.md`): an envelope of another protocol
+    /// version, here a `N42H2V3` prefix, is refused before the chain identity
+    /// is read, on the raw and the gossip path alike.
+    #[test]
+    fn envelope_of_another_protocol_version_is_refused() {
+        let identity = H2V4ChainIdentity {
+            chain_id: 94,
+            genesis_hash: B256::repeat_byte(0x11),
+        };
+        let fixture: EnvelopeFixture =
+            serde_json::from_str(include_str!("../testdata/h2_v4_envelope_v1.json")).unwrap();
+        let valid = hex::decode(fixture.envelope_hex).unwrap();
+        assert!(decode_envelope(&valid, identity).is_ok());
+        let mut v3 = valid;
+        v3[6] = b'3';
+        assert!(matches!(decode_envelope(&v3, identity), Err(H2V4Error::InvalidMagic)));
+        let gossip = snap::raw::Encoder::new().compress_vec(&v3).unwrap();
+        assert!(matches!(decode_gossip(&gossip, identity), Err(H2V4Error::InvalidMagic)));
+    }
+
     /// The brief lists five mandatory rejection paths for the v4 envelope
     /// codec. Each one is a way two clients could disagree about whether a
     /// byte string is a valid consensus message, so each gets a case here.

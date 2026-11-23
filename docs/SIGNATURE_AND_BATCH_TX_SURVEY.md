@@ -229,6 +229,120 @@ Verify(pk, msg, sig[:n]) // == true
   PQClean（后续换 AVX-512 实现），公钥走注册表；CPU 与现状持平，真正要解决的是每笔多出的
   ~700 B 在 gossip 和存储上的代价。在 16 万笔/块的目标下这意味着块体从 19 MB 涨到 ~130 MB。
 
+## 5. Worst case: invalid and malformed signatures (2026-11-18)
+
+The question: are invalid signatures, malformed encodings and the batch fallback part of the
+cost model? For 0x50 they matter because **an invalid 0x50 transaction at the ingest is never
+included, so its sender pays no gas**: whatever a bad signature makes the node do is free to the
+sender. Measured on this host (EPYC 9B45, one thread, best of 5, quiet box via `quiet-run.sh`),
+`crates/n42/tx-types/tests/batch_worst_case.rs` (`--release -- --ignored --nocapture`; log
+`/data/n42-build/audit-notes/ci/sigdos-bench2.log`).
+
+### 5.1 Ed25519 (0x50) `verify_batch`, us per transaction, distinct keys
+
+Amplification = cost / all-valid cost of the old code. "before" is the old fallback (batch, then
+every signature again as a batch of one, `verify_batch_linear`); "after" is the new default
+(terms computed once after the failure, off-curve `R` refused without curve work, the rest one
+double-base multiplication each); "bisect" is the measured alternative.
+
+| case | chunk 64 before | after | bisect | chunk 128 before | after | chunk 256 before | after |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| all valid | 13.77 (1.00x) | 13.75 (1.00x) | 13.73 | 12.55 | 12.78 (1.02x) | 11.55 | 11.76 (1.02x) |
+| 1 invalid, first | 49.79 (3.62x) | 42.35 (3.08x) | 53.22 (3.87x) | 48.59 (3.87x) | 41.38 (3.30x) | 47.36 (4.10x) | 40.32 (3.49x) |
+| 1 invalid, middle | 49.71 (3.61x) | 42.39 (3.08x) | 40.67 (2.95x) | 48.59 (3.87x) | 41.36 (3.30x) | 47.45 (4.11x) | 40.19 (3.48x) |
+| 1 invalid, last | 49.69 (3.61x) | 42.36 (3.08x) | 28.96 (2.10x) | 48.43 (3.86x) | 41.35 (3.30x) | 47.30 (4.10x) | 40.18 (3.48x) |
+| 2 / 8 / half invalid | 49.6-49.9 (3.6x) | 42.2-42.4 (3.1x) | 52.9-53.3 (3.9x) | 48.3-48.4 (3.9x) | 41.2-41.4 (3.3x) | 47.2-47.3 (4.1x) | 40.2 (3.5x) |
+| all invalid | 49.25 (3.58x) | 41.89 (3.04x) | 52.71 (3.83x) | 48.16 (3.84x) | 41.08 (3.27x) | 47.04 (4.07x) | 39.95 (3.46x) |
+| 1 small-order `R` | 49.52 (3.60x) | 42.18 (3.06x) | 53.01 | 48.44 (3.86x) | 41.37 (3.30x) | 47.32 (4.10x) | 40.27 (3.49x) |
+| 1 off-curve `R` | 38.55 (2.80x) | 15.63 (1.14x) | 15.63 | 37.99 (3.03x) | 14.03 (1.12x) | 38.01 (3.29x) | 12.99 (1.12x) |
+| all off-curve `R` | 10.28 (0.75x) | 5.98 (0.43x) | 5.98 | 9.47 | 5.18 | 9.44 | 5.15 |
+| all non-canonical `s`, all short signature | 0.47 (0.03x) | same | same | 0.47 | same | 0.46 | same |
+| all off-curve key / all small-order key | 3.1 / 4.0 (0.22-0.29x) | same | same | 3.1 / 4.0 | same | 3.1 / 4.0 | same |
+
+`AltSigTx::verify` alone: 37.2 us. With one key for the whole chunk (the key terms merge, the
+all-valid batch is 8.9 / 8.6 / 8.2 us) the same shapes read before 5.05x / 5.13x / 5.38x and
+after 4.22x / 4.30x / 4.49x for one invalid signature at chunks 64 / 128 / 256.
+
+Findings:
+
+- **Shape failures are cheap** (wrong length, `s >= L`, a key off the curve or of small order:
+  0.03-0.3x). They never reach the batch.
+- **One invalid signature costs a chunk ~3.1-3.5x** (distinct keys) and **4.2-4.5x** (one key)
+  after the change, against 3.6-4.1x / 5.0-5.4x before. The number does not depend on how many
+  signatures are bad: one is enough to turn the whole chunk into batch + n single checks, so an
+  attacker gets the full amplification from one bad signature per chunk, and larger chunks
+  amplify slightly more (the batch per signature gets cheaper, the fallback does not).
+- **An off-curve `R` used to be the cheapest way to force the fallback** (one per chunk: 2.8-3.3x);
+  it is now refused from its own terms and the rest re-verified as a batch (1.1x).
+- **Bisection does not lower the worst case.** It is cheap when the bad signature sits late in
+  the chunk (2.1x) but the sender picks the position: with it first, every level pays a failing
+  left half and a passing right half, ~2n batch signatures on top of the first n, which costs
+  what the linear fallback did (3.9x); two or more bad signatures make it worse. Localising one
+  bad signature with batch equations has a floor near 2x (the first batch is lost and every good
+  signature has to be covered again). So the default is the single fallback on precomputed
+  terms; `BatchFallback::Bisect` stays in the code, doc-hidden, as the measured alternative.
+- **The hot path is unchanged**: the terms are computed only after the first batch fails; all
+  valid reads 1.00x at chunk 64 (+1-2% at 128/256, within the run-to-run spread). Computing them
+  up front cost 1-7% on the all-valid batch, so it was not kept.
+- **Verdicts are identical** to the old code on every input tested: the property test
+  `fallbacks_give_the_reference_verdicts` (random batches, random invalid positions, every
+  malformed kind above plus signatures valid only under the cofactored rule: a torsion
+  component in `R` or in the key) compares, position by position, `verify_batch`, both
+  fallbacks, the old linear `verify_batch_linear` and `AltSigTx::verify`. The new single check
+  evaluates `[8](R + hA - sB) = 0`, the same cofactored equation the old batch of one checked
+  multiplied by its transcript coefficient `z`; they can differ only when that 128-bit `z` is
+  zero (probability 2^-128), and sub-batches add no new acceptance case beyond the `2^-128`
+  soundness bound the top-level batch already had. Small-order `R` and mixed-order points get
+  the same verdict both ways because both sides multiply by the cofactor.
+
+### 5.2 BLS votes (`n42-h2-primitives`, measurement only)
+
+`crates/n42/h2-primitives/tests/bls_fallback_cost.rs`; us for the whole set, invalid = signed
+over another message; f = (n-1)/3.
+
+| path | n | all valid | 1 invalid | f invalid |
+| --- | --- | --- | --- | --- |
+| same message (votes for one block) | 7 | 1,185 | 5,655 (4.8x) | 5,722 (4.8x) |
+| distinct messages | 7 | 1,032 | 5,830 (5.6x) | 5,581 (5.4x) |
+| same message | 64 | 4,313 | 46,961 (10.9x) | 47,192 (10.9x) |
+| distinct messages | 64 | 1,967 | 48,057 (24.4x) | 48,766 (24.8x) |
+| same message | 512 | 26,527 | 418,558 (15.8x) | 419,493 (15.8x) |
+| distinct messages | 512 | 3,937 | 390,466 (99x) | 392,829 (100x) |
+
+The BLS fallback is linear (one pairing check, ~0.75 ms, per position) and its amplification
+grows with n, to ~100x at 512 distinct messages. One bad vote is as expensive as f. The signer
+of a vote is named, but the name is only authenticated by the signature being checked, so a
+peer that can put a vote in front of the batch can pick a validator's index for free; at
+fleet7's n = 7 the whole fallback is ~6 ms. A bisection there would pay off (a pairing check
+dwarfs the batch's per-signature share), but it is not done here.
+
+### 5.3 What bounds a repeat today (0x50)
+
+- **Ingest (`crates/n42/tx-ingest`)**: unauthenticated, loopback-only by default (a remote bind
+  needs `N42_TX_INGEST_ALLOW_REMOTE=1` and is refused under every trusting mode), at most
+  `MAX_CONNECTIONS` connections, 10,000 transactions / 16 MiB a frame, a frame-read timeout.
+  Nothing scores or disconnects a connection for bad signatures: one client can keep sending
+  frames of bad 0x50 transactions at ~3-4.5x the CPU of valid ones, bounded only by the
+  connection cap and the recovery slots. Counters: `dropped_altsig` (refused 0x50 signatures,
+  existing) and, new, `altsig_batches_failed` (chunks that paid the fallback), both in the
+  ingest's periodic stats line.
+- **Claimed build (`claimed_build.rs`)**: verifies what it includes in chunks; a refused 0x50
+  is dropped from the build, once per transaction.
+- **Follower import / engine validator**: the body comes from an authenticated proposer; one
+  bad signature makes the block invalid, so the cost is one fallback per bad proposal.
+- **Pool (`eth_sendRawTransaction`)**: a single `verify` per transaction (37 us), no batch, so
+  no amplification beyond the single check; the RPC's own limits apply.
+
+### 5.4 Pricing a future PQC precompile
+
+- Name the standard: **ML-DSA, FIPS 204** (final, August 2024) -- not CRYSTALS-Dilithium round 3,
+  whose encoding and hashing differ; FN-DSA (Falcon) is **FIPS 206, still a draft**.
+- Price by the worst-case input, not the valid path: invalid signatures, malformed encodings
+  (wrong lengths, out-of-range coefficients, hint vectors over their bound) and keys that fail
+  to decode must cost at least what they make the node do.
+- If such a precompile or transaction type ever verifies in batches, the fallback is part of
+  the price: section 5.1's amplification (3-5x for Ed25519) is what an unpaid bad signature buys.
+
 ## 来源
 
 - EIP-7932 <https://eips.ethereum.org/EIPS/eip-7932>，讨论串 <https://ethereum-magicians.org/t/eip-7932-secondary-signature-algorithms/23514>

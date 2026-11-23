@@ -546,6 +546,33 @@ mod tests {
         assert!(result.contains("ddf252ad"), "the EIP-7708 log: {result}");
     }
 
+    /// EIP-7825 on both handlers: from Osaka a transaction over 2^24 gas is
+    /// refused before anything is charged, as gov5's state transition and
+    /// pool refuse it; Prague has no cap. On Amsterdam the bound is
+    /// EIP-8037's total cap 2^32 - 1 (gov5's `MaxTxTotalGasEIP8037`).
+    #[test]
+    fn the_transaction_gas_caps_bind_on_both_handlers() {
+        let cap = 1u64 << 24;
+        let over = eip1559(1, 0, addr(2), 100, cap + 1, Bytes::new());
+        let at = eip1559(1, 0, addr(2), 100, cap, Bytes::new());
+        for fast in [false, true] {
+            let (result, changes) = outcome(&config(true), fast, &over);
+            assert!(result.contains(&format!("exceeds cap {cap}")), "osaka, fast {fast}: {result}");
+            assert!(changes.is_empty(), "nothing charged");
+            let (result, _) = outcome(&config(true), fast, &at);
+            assert!(!result.starts_with("error"), "osaka at the cap, fast {fast}: {result}");
+            let (result, _) = outcome(&config(false), fast, &over);
+            assert!(!result.starts_with("error"), "prague has no cap, fast {fast}: {result}");
+            let total = u64::from(u32::MAX);
+            let (result, _) = outcome(&amsterdam(), fast, &eip1559(1, 0, addr(2), 100, total + 1, Bytes::new()));
+            assert!(result.contains(&format!("exceeds cap {total}")), "amsterdam, fast {fast}: {result}");
+            // Past 2^24 on Amsterdam is not the cap's refusal (here the
+            // 30M block's).
+            let (result, _) = outcome(&amsterdam(), fast, &over);
+            assert!(!result.contains("exceeds cap"), "amsterdam over 2^24, fast {fast}: {result}");
+        }
+    }
+
     #[test]
     fn everything_else_is_handed_to_the_stock_amsterdam_handler_unchanged() {
         let access_list = AccessList(vec![AccessListItem { address: addr(6), storage_keys: vec![B256::ZERO] }]);

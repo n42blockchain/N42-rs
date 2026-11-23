@@ -88,6 +88,24 @@ pub mod pending {
         SET.get_or_init(|| (Mutex::new(Vec::new()), Notify::new()))
     }
 
+    /// Hashes whose wait ran out before their insert was forwarded, newest
+    /// last: a message naming them may have reached the tree first.
+    fn released_early_set() -> &'static Mutex<std::collections::VecDeque<B256>> {
+        static SET: OnceLock<Mutex<std::collections::VecDeque<B256>>> = OnceLock::new();
+        SET.get_or_init(|| Mutex::new(std::collections::VecDeque::with_capacity(RELEASED_EARLY_KEEP)))
+    }
+
+    /// How many released-early hashes are remembered.
+    pub const RELEASED_EARLY_KEEP: usize = 256;
+
+    /// Whether a message waiting on `hash` was let through before `hash`'s
+    /// insert was forwarded (its wait ran out). Recorded before that message
+    /// went on toward the tree, so a message the tree took before the insert
+    /// is always seen here.
+    pub fn released_early(hash: B256) -> bool {
+        released_early_set().lock().unwrap_or_else(|p| p.into_inner()).contains(&hash)
+    }
+
     fn contains(hash: B256) -> bool {
         COUNT.load(Relaxed) != 0 && set().0.lock().unwrap_or_else(|p| p.into_inner()).contains(&hash)
     }
@@ -135,6 +153,11 @@ pub mod pending {
             let now = Instant::now();
             if now >= deadline {
                 TIMEOUTS.fetch_add(1, Relaxed);
+                let mut early = released_early_set().lock().unwrap_or_else(|p| p.into_inner());
+                if early.len() == RELEASED_EARLY_KEEP {
+                    early.pop_front();
+                }
+                early.push_back(hash);
                 break;
             }
             let _ = tokio::time::timeout(deadline - now, notified).await;
@@ -188,6 +211,17 @@ pub mod pending {
             let waited = waiter.await.unwrap().expect("it waited");
             assert!(waited >= Duration::from_millis(25) && waited < WAIT);
             assert!(!is_pending(hash));
+            assert!(!released_early(hash), "landed in time: not released early");
+        }
+
+        #[tokio::test]
+        async fn a_wait_that_runs_out_is_recorded_before_it_returns() {
+            let hash = B256::repeat_byte(0x5B);
+            expect(hash);
+            assert!(!released_early(hash));
+            assert!(wait_for_insert(hash).await.is_some_and(|w| w >= WAIT));
+            assert!(released_early(hash));
+            landed(hash);
         }
     }
 }

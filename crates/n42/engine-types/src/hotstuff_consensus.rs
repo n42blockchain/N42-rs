@@ -353,11 +353,12 @@ where
             return Err(ConsensusError::ParentBeaconBlockRootUnexpected);
         }
 
-        if self.chain_spec.is_prague_active_at_timestamp(timestamp) {
-            if header.requests_hash.is_none() {
-                return Err(ConsensusError::RequestsHashMissing);
-            }
-        } else if header.requests_hash.is_some() {
+        // gov5 writes `requestsHash` only when its `pragueTime` is set
+        // (`hotstuff/adapter.go`), and chain 94 schedules `pectraTime` alone:
+        // its HotStuff headers carry none although Prague's EVM rules are on.
+        // An absent hash is therefore accepted; post-execution validation
+        // still refuses it for a block that made requests.
+        if !self.chain_spec.is_prague_active_at_timestamp(timestamp) && header.requests_hash.is_some() {
             return Err(ConsensusError::RequestsHashUnexpected);
         }
 
@@ -648,7 +649,8 @@ where
         // requests, and a block that did is held to the EIP.
         if self.chain_spec.is_prague_active_at_timestamp(header.timestamp) {
             let Some(header_hash) = header.requests_hash else {
-                return Err(ConsensusError::RequestsHashMissing);
+                // See `validate_header`: gov5 without `pragueTime` writes none.
+                return if result.requests.is_empty() { Ok(()) } else { Err(ConsensusError::RequestsHashMissing) };
             };
             let matches = if result.requests.is_empty() {
                 is_empty_requests_hash(header_hash)

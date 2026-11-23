@@ -134,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: Vec<String> = Vec::new();
     let mut fault_tolerance: Option<u32> = None;
     let mut propose = false;
+    let mut observer = false;
     let mut mobile_http: Option<std::net::SocketAddr> = None;
     let mut mobile_pow_bits: u32 = 0;
     let mut mobile_packet_window: u64 = 256;
@@ -209,6 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mobile_cert_blocks = args.next().ok_or("--mobileverify.cert-blocks needs a number")?.parse()?
             }
             "--propose" => propose = true,
+            "--observer" => observer = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 return Ok(());
@@ -301,7 +303,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // that votes signs the seal.
     let gov5_profile = chain_path.is_some();
     let seal_key = secret_key.clone();
-    if secret_key.public_key() != entry.bls_public_key {
+    // `--observer`: follow, import and verify every block without a key in the
+    // set, so the engine never votes, proposes or broadcasts a timeout.
+    if observer {
+        if secret_key.public_key() == entry.bls_public_key {
+            return Err("--observer needs a --bls-key that is NOT in the validator set".into());
+        }
+        propose = false;
+        println!("observer     : yes (key not in the set: no votes, no proposals, no timeouts)");
+    } else if secret_key.public_key() != entry.bls_public_key {
         return Err(format!(
             "--bls-key does not match validator {index} in the set; this node would run as a \
              silent observer: connected, counted against quorum, never voting"
@@ -934,6 +944,7 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --body-port-offset <n>    plain TCP body channel on each member's libp2p port + n (default 1000; 0 = off)
   --listen <multiaddr>      address to listen on (repeatable)
   --propose                 build blocks when leader (default: vote only)
+  --observer                follow and verify only; --bls-key must not be in the set
   --mobileverify.http <addr>
                             serve gov5's /mobileverify phone surface here (e.g. 127.0.0.1:21010)
                             and relay the mobile-verification gossip topics

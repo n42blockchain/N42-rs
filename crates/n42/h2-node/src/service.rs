@@ -5308,7 +5308,7 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     /// The safety violation that halted the sync importer, if one did
     /// (sync standard §3.3): both blocks and both certificates.
-    pub fn sync_halt(&self) -> Option<&crate::sync_safety::SyncHalt> {
+    pub const fn sync_halt(&self) -> Option<&crate::sync_safety::SyncHalt> {
         self.sync_safety.halt()
     }
 
@@ -7298,6 +7298,7 @@ impl<E: ExecutionLayer> H2Service<E> {
 /// request costs a bounded number of lookups and bytes; and none above
 /// `ceiling`, the committed height: a request reaching past it is served the
 /// committed prefix and ends cleanly.
+#[cfg(test)]
 async fn serve_range<E: ExecutionLayer>(
     el: &E,
     request: n42_h2_net::RangeRequest,

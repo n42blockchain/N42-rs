@@ -353,6 +353,7 @@ impl RangeScheduler {
     }
 
     /// Whether `peer` is excluded from this pull.
+    #[cfg(test)]
     pub(crate) fn is_excluded(&self, peer: &PeerId) -> bool {
         self.peers.get(peer).is_some_and(|s| s.excluded)
     }

@@ -368,7 +368,17 @@ impl ExecutionLayer for MockExecutionLayer {
         if matches!(behaviour.new_payload_status, PayloadStatusEnum::Valid)
             && let Ok(block) = payload.clone().into_block_raw()
         {
-            let block = n42_h2_consensus::header_engine::block_with_payload_root(block, &payload.payload);
+            let mut block = n42_h2_consensus::header_engine::block_with_payload_root(block, &payload.payload);
+            // A gov5-profile header carries fields a payload does not (its
+            // difficulty, ommers hash, rewards root, ...): restored as the
+            // real execution layer does, by the variant that hashes to the
+            // payload's block hash, so the block is served back by range
+            // under its own hash.
+            if block.header.hash_slow() != hash
+                && let Ok(restored) = n42_h2_consensus::reconstruct_gov5_h2_block_from(block.clone(), &payload)
+            {
+                block = restored;
+            }
             let number = block.header.number;
             self.state
                 .lock()

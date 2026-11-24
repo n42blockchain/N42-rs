@@ -392,6 +392,13 @@ pub struct ConsensusEngine {
     /// block's import (audit 2026-10 R2-C9). Round 1 stays import-gated
     /// here, which is stricter than gov5's two-phase Round 1.
     pub(super) two_phase_vote_gate: bool,
+    /// The profile-1 vote rules ([`crate::VoteRules`]); the default is
+    /// today's behaviour.
+    pub(super) vote_rules: crate::VoteRules,
+    /// Blocks this node's execution layer has imported (executed), as opposed
+    /// to only checked: what the profile-1 CommitVote waits for. Bounded with
+    /// `imported_blocks`, of which it is a subset.
+    pub(super) executed_blocks: HashSet<B256>,
     /// The PrepareQC whose commit vote the two-phase gate holds.
     pub(super) held_prepare_qc: Option<PrepareQC>,
     /// Outputs `emit` could not put in a full output channel, in order. The
@@ -578,6 +585,8 @@ impl ConsensusEngine {
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
             two_phase_vote_gate: false,
+            vote_rules: crate::VoteRules::TODAY,
+            executed_blocks: HashSet::new(),
             held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::new(),
@@ -702,6 +711,8 @@ impl ConsensusEngine {
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
             two_phase_vote_gate: false,
+            vote_rules: crate::VoteRules::TODAY,
+            executed_blocks: HashSet::new(),
             held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::from_snapshot(
@@ -1083,8 +1094,24 @@ impl ConsensusEngine {
     }
 
     /// Turns progress votes on or off; see `withheld_votes`.
+    /// Never on under profile 1 ([`crate::VoteRules::progress_votes_allowed`]).
     pub fn set_progress_votes(&mut self, on: bool) {
-        self.progress_votes = on;
+        self.progress_votes = on && self.vote_rules.progress_votes_allowed();
+    }
+
+    /// Sets the vote rules ([`crate::VoteRules`]); once, before the engine
+    /// runs. Profile 1 turns progress votes off whatever was set before.
+    pub fn set_vote_rules(&mut self, rules: crate::VoteRules) {
+        self.vote_rules = rules;
+        if !rules.progress_votes_allowed() {
+            self.progress_votes = false;
+            self.withheld_votes.clear();
+        }
+    }
+
+    /// The vote rules in force; see [`Self::set_vote_rules`].
+    pub const fn vote_rules(&self) -> crate::VoteRules {
+        self.vote_rules
     }
 
     /// Records a verified Round 1 vote in `voters_seen`, keeping the last
@@ -1353,9 +1380,8 @@ impl ConsensusEngine {
             ConsensusEvent::BlockReady(block_hash, tx_root_hash) => {
                 self.on_block_ready(block_hash, tx_root_hash)
             }
-            ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) => {
-                self.on_block_imported(block_hash)
-            }
+            ConsensusEvent::BlockImported(block_hash) => self.on_block_imported(block_hash, true),
+            ConsensusEvent::BlockChecked(block_hash) => self.on_block_imported(block_hash, false),
             ConsensusEvent::BlockRejected(block_hash) => {
                 self.on_block_rejected(block_hash);
                 Ok(())
@@ -1983,9 +2009,10 @@ impl ConsensusEngine {
         // leader commonly reproposes the same uncommitted block, and reth will
         // not emit a second import completion for it. Native optimistic voting
         // does not need this cache beyond the view.
-        if !self.signing_profile.is_gov5() {
+        if !self.signing_profile.is_gov5() && !self.vote_rules.round1_needs_check() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
+            self.executed_blocks.clear();
             // The parents are kept beside the evidence and bounded by its
             // FIFO; with the evidence gone they would only accumulate.
             self.imported_parents.clear();
@@ -7339,3 +7366,7 @@ mod vote_retry_tests;
 #[cfg(test)]
 #[path = "state_machine_rotate_tests.rs"]
 mod rotate_tests;
+
+#[cfg(test)]
+#[path = "state_machine_profile1_tests.rs"]
+mod profile1_tests;

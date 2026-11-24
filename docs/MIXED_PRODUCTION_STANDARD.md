@@ -619,3 +619,26 @@ block_by_hash/1, block_push/1 and hotstuff_direct/1.
 Standard genesis (section 5): accepted as proposed, chain id 1144, with one item to verify before
 the file is cut: the JSON encoding of `devBlockReward` (number or decimal string) must be the one
 gov5 parses; the three clients agree on the file by loading it to the same genesis hash (vector V1).
+
+## Transaction type range reserved for N42 (owner, 2026-11-24)
+
+EIP-2718 type bytes `0x50`-`0x5F` are reserved for N42-specific transaction types.
+
+| Type | Use | Status |
+| --- | --- | --- |
+| `0x50` | Ed25519-signed transaction (`docs/spec/N42_TX_0x50.md`) | Not in profile 1 (decision O3); first candidate for a later profile once gov5 implements it and the shared vectors pass. |
+| `0x51` | Reserved for a post-quantum signature transaction (Falcon / FN-DSA is the candidate) | Not specified. To be designed when the FN-DSA standard and Ethereum's frame transaction (EIP-8141, type `0x06`, with its post-quantum frame mode) have settled; the choice is between a native type with batch verification and following the frame transaction. A Falcon-512 signature plus public key is ~1.5 KB against ~110 bytes for a transfer today, so it is an opt-in type, never the default. |
+| `0x52`-`0x5F` | Unassigned | Reserved. |
+
+Rules:
+- In profile 1 every type in `0x50`-`0x5F` is refused by pool, builder and block validity.
+- A type in this range is added only by a profile change (one activation point on all clients,
+  with a vector set and a mixed round).
+- If Ethereum L1 ever allocates a type inside this range, N42's NEXT new type moves to the next
+  free number (`0x53`, `0x54`, ...); a type already live on a chain keeps its number.
+- Known allocations elsewhere, for reference (not verified one by one): Ethereum L1 `0x00`-`0x04`
+  and `0x06` (frame transaction, draft); Arbitrum `0x64`-`0x6A`; zkSync `0x71`; OP-stack deposit
+  `0x7E`; other L2s in `0x7x`. Nothing known in `0x50`-`0x5F`.
+- Blob transactions (type `0x03`) stay off in profile 1 (decision O2): they exist to give rollups
+  cheap data availability on a slow L1, and no rollup posts data to N42. If N42 is ever used as
+  a data availability layer they return as a profile change.

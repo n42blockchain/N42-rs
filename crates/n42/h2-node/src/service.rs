@@ -4912,9 +4912,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         };
         let height = catch_up.next.saturating_sub(1);
-        if height > catch_up.started_at {
-            self.transport.set_advertised_height(height);
-        }
+        // The status height stays the committed head (sync standard §4.1):
+        // pulled blocks are unproven until a commit names them, and this
+        // node serves only what it committed, so advertising the pulled
+        // height would send peers for blocks it will not serve.
         self.catch_up_retry_after = Some(std::time::Instant::now() + CATCH_UP_RETRY);
         self.failed_peer = (!complete).then_some(catch_up.peer);
         // What the peer actually served replaces what it advertised, so a

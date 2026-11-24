@@ -38,9 +38,9 @@ use reth_trie::bundle_state::BundleState;
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
 
-type Config = N42EvmConfig<n42_header::N42ChainSpec>;
+pub(crate) type Config = N42EvmConfig<n42_header::N42ChainSpec>;
 
-fn gov5_dir() -> PathBuf {
+pub(crate) fn gov5_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/profile1/gov5")
 }
 
@@ -50,11 +50,11 @@ fn vector(name: &str) -> Value {
     serde_json::from_slice(&raw).expect("vector json")
 }
 
-fn hex(value: &Value) -> Vec<u8> {
+pub(crate) fn hex(value: &Value) -> Vec<u8> {
     alloy_primitives::hex::decode(value.as_str().expect("a hex string")).expect("hex")
 }
 
-fn b256(value: &Value) -> B256 {
+pub(crate) fn b256(value: &Value) -> B256 {
     B256::from_slice(&hex(value))
 }
 
@@ -68,7 +68,7 @@ fn u64_of(value: &Value) -> u64 {
 
 /// V1's test genesis (the standard genesis's execution fields) plus
 /// `additions`, through the checks the node's chain-spec parser applies.
-fn chain(additions: &Value) -> Arc<reth_chainspec::ChainSpec> {
+pub(crate) fn chain(additions: &Value) -> Arc<reth_chainspec::ChainSpec> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../qmdb-reth/testdata/profile1/gov5/V1/genesis_8s.json");
     let mut genesis: Value = serde_json::from_slice(&std::fs::read(path).expect("genesis_8s.json")).expect("json");
     for (who, account) in additions.as_object().expect("allocAdditions") {
@@ -80,12 +80,12 @@ fn chain(additions: &Value) -> Arc<reth_chainspec::ChainSpec> {
     Arc::new(reth_chainspec::ChainSpec::from(genesis))
 }
 
-fn config(spec: &Arc<reth_chainspec::ChainSpec>) -> Config {
+pub(crate) fn config(spec: &Arc<reth_chainspec::ChainSpec>) -> Config {
     N42EvmConfig::new(Arc::new(n42_header::N42ChainSpec::from((**spec).clone())))
 }
 
 /// The genesis state as the executor reads it.
-fn genesis_state(spec: &reth_chainspec::ChainSpec) -> CacheDB<EmptyDB> {
+pub(crate) fn genesis_state(spec: &reth_chainspec::ChainSpec) -> CacheDB<EmptyDB> {
     let mut db = CacheDB::new(EmptyDB::default());
     for (who, account) in &spec.genesis.alloc {
         let mut info = AccountInfo { balance: account.balance, nonce: account.nonce.unwrap_or_default(), ..Default::default() };
@@ -101,7 +101,7 @@ fn genesis_state(spec: &reth_chainspec::ChainSpec) -> CacheDB<EmptyDB> {
 }
 
 /// A block's post-state written back into `db` for the next block.
-fn apply(db: &mut CacheDB<EmptyDB>, bundle: &BundleState) {
+pub(crate) fn apply(db: &mut CacheDB<EmptyDB>, bundle: &BundleState) {
     for (who, account) in &bundle.state {
         match &account.info {
             Some(info) => {
@@ -124,7 +124,7 @@ fn apply(db: &mut CacheDB<EmptyDB>, bundle: &BundleState) {
 
 /// The withdrawals a profile-1 block pays (A8): what the validator hands its
 /// execution layer as payload attributes (`h2_validator`'s rewards).
-fn rewards(spec: &reth_chainspec::ChainSpec, coinbase: Address) -> Vec<alloy_eips::eip4895::Withdrawal> {
+pub(crate) fn rewards(spec: &reth_chainspec::ChainSpec, coinbase: Address) -> Vec<alloy_eips::eip4895::Withdrawal> {
     let hotstuff = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&spec.genesis).expect("a hotstuff genesis");
     n42_h2_consensus::rewards_to_withdrawals(&hotstuff.block_rewards(coinbase)).expect("whole gwei")
 }
@@ -148,7 +148,7 @@ fn header(fields: &Value) -> n42_header::N42Header {
     })
 }
 
-fn decode(raw: &[u8]) -> Result<N42TxEnvelope, String> {
+pub(crate) fn decode(raw: &[u8]) -> Result<N42TxEnvelope, String> {
     let mut buf = raw;
     let tx = N42TxEnvelope::decode_2718(&mut buf).map_err(|e| e.to_string())?;
     if !buf.is_empty() {

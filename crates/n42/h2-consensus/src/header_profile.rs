@@ -139,6 +139,37 @@ pub fn withdrawals_to_rewards(withdrawals: &[Withdrawal]) -> Vec<(Address, U256)
         .collect()
 }
 
+/// The timestamp from which a sealed header carries `requestsHash`; zero
+/// while it always does.
+static REQUESTS_HASH_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the chain's `requestsHashTime` for the headers sealed here (`None`:
+/// from Prague, as on Ethereum, the default).
+///
+/// The execution layer's builder fills `requestsHash` in from its one Prague
+/// time. A chain that ran the Prague rules before its headers carried the
+/// field has `requestsHashTime` in its genesis; a header sealed before that
+/// time leaves the field out, as every other producer on the chain does and
+/// as Ethereum requires before Prague.
+pub fn set_requests_hash_time(time: Option<u64>) {
+    REQUESTS_HASH_TIME.store(time.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `requestsHash` a header at `timestamp` is sealed with, given the one
+/// its builder set: none before the chain's `requestsHashTime`, and "no
+/// requests" as EIP-7685 spells it, sha256 of nothing.
+fn sealed_requests_hash(requests_hash: Option<B256>, timestamp: u64) -> Option<B256> {
+    requests_hash_from(requests_hash, timestamp, REQUESTS_HASH_TIME.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`sealed_requests_hash`] for a given `requestsHashTime` (zero: always).
+fn requests_hash_from(requests_hash: Option<B256>, timestamp: u64, requests_hash_time: u64) -> Option<B256> {
+    if timestamp < requests_hash_time {
+        return None;
+    }
+    requests_hash.map(|hash| if is_empty_requests_hash(hash) { EMPTY_REQUESTS_HASH } else { hash })
+}
+
 /// Whether a `requestsHash` says "no requests" in either convention.
 pub fn is_empty_requests_hash(hash: B256) -> bool {
     hash == EMPTY_REQUESTS_HASH || hash == GOV5_EMPTY_REQUESTS_HASH
@@ -677,8 +708,10 @@ pub fn reconstruct_gov5_h2_block_from_or_tx_root<T>(
         None => vec![None],
     };
     let requests_hashes: Vec<Option<B256>> = match block.header.requests_hash {
+        // The last is a header sealed before the chain's `requestsHashTime`:
+        // the payload names an empty request set, the header has no field.
         Some(hash) if is_empty_requests_hash(hash) => {
-            vec![Some(hash), Some(GOV5_EMPTY_REQUESTS_HASH), Some(EMPTY_REQUESTS_HASH)]
+            vec![Some(hash), Some(GOV5_EMPTY_REQUESTS_HASH), Some(EMPTY_REQUESTS_HASH), None]
         }
         other => vec![other],
     };
@@ -801,10 +834,7 @@ pub fn gov5_h2_header_for_view_with_qc(
     if header.withdrawals_root.is_some() {
         header.withdrawals_root = Some(gov5_rewards_root(withdrawals_to_rewards(withdrawals)));
     }
-    // "No requests" is sealed as EIP-7685 spells it, sha256 of nothing.
-    if header.requests_hash.is_some_and(is_empty_requests_hash) {
-        header.requests_hash = Some(EMPTY_REQUESTS_HASH);
-    }
+    header.requests_hash = sealed_requests_hash(header.requests_hash, header.timestamp);
     if let Some(key) = sealer {
         seal_header(&mut header, key)?;
     }
@@ -895,10 +925,7 @@ pub fn normalize_to_gov5_h2_with_header_with_qc(
         let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
         block.header.withdrawals_root = Some(gov5_rewards_root(rewards));
     }
-    // "No requests" is sealed as EIP-7685 spells it, sha256 of nothing.
-    if block.header.requests_hash.is_some_and(is_empty_requests_hash) {
-        block.header.requests_hash = Some(EMPTY_REQUESTS_HASH);
-    }
+    block.header.requests_hash = sealed_requests_hash(block.header.requests_hash, block.header.timestamp);
     // The access-list hash is *not* recomputed here. An earlier version of this
     // function did, on the reading that `try_into_block` fills the field with
     // keccak of the encoding rather than EIP-7928's hash. That reading came from
@@ -1395,6 +1422,43 @@ mod tests {
         assert_eq!(reconstructed.header.withdrawals_root, Some(GOV5_NIL_HASH));
         assert_eq!(reconstructed.header.requests_hash, Some(EMPTY_REQUESTS_HASH));
         assert!(proposed.sidecar.requests().is_some());
+    }
+
+    /// Before the chain's `requestsHashTime` a sealed header has no
+    /// `requestsHash`, whatever the builder set; from it, the EIP's spelling.
+    #[test]
+    fn the_requests_hash_is_sealed_from_the_requests_hash_time() {
+        let other = B256::repeat_byte(0x55);
+        for built in [None, Some(EMPTY_REQUESTS_HASH), Some(GOV5_EMPTY_REQUESTS_HASH), Some(other)] {
+            assert_eq!(requests_hash_from(built, 99, 100), None);
+        }
+        for time in [0, 100] {
+            assert_eq!(requests_hash_from(None, 100, time), None);
+            assert_eq!(requests_hash_from(Some(GOV5_EMPTY_REQUESTS_HASH), 100, time), Some(EMPTY_REQUESTS_HASH));
+            assert_eq!(requests_hash_from(Some(EMPTY_REQUESTS_HASH), 100, time), Some(EMPTY_REQUESTS_HASH));
+            assert_eq!(requests_hash_from(Some(other), 100, time), Some(other));
+        }
+    }
+
+    /// A header sealed without `requestsHash` is found again from the
+    /// builder's payload, which names an empty request set.
+    #[test]
+    fn a_header_sealed_without_requests_hash_is_reconstructed_from_a_prague_payload() {
+        let key = BlsSecretKey::random().unwrap();
+        let mut ethereum = fixture_header();
+        ethereum.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+        ethereum.extra_data = Bytes::from(vec![0u8; 97]);
+        let block = block_for_header(ethereum, vec![]);
+        let built = execution_data_for_block(block.header.hash_slow(), &block);
+        let mut proposed = normalize_to_gov5_h2(&built, 42, Some(&key)).unwrap();
+        assert!(proposed.sidecar.requests().is_some());
+
+        let mut sealed = reconstruct_gov5_h2_block::<TxEnvelope>(&proposed).unwrap().header;
+        sealed.requests_hash = None;
+        proposed.payload.as_v1_mut().block_hash = sealed.hash_slow();
+        let reconstructed = reconstruct_gov5_h2_block::<TxEnvelope>(&proposed).unwrap();
+        assert_eq!(reconstructed.header.hash_slow(), sealed.hash_slow());
+        assert_eq!(reconstructed.header.requests_hash, None);
     }
 
     /// Section 6.9 of `docs/MATURITY_HARDENING_2026_10.md`: a header carrying

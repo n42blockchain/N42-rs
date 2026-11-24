@@ -247,6 +247,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(false),
             );
             deferred_execution_time = n42_qmdb_reth::deferred_execution_time(&spec.genesis);
+            // `requestsHashTime`: before it the headers sealed here leave
+            // `requestsHash` out, as the chain's other producers do.
+            n42_h2_consensus::set_requests_hash_time(n42_qmdb_reth::requests_hash_time(&spec.genesis));
             // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
             // refused when malformed or not run by this build, never read as 1.
             deferred_execution_depth = n42_qmdb_reth::check_deferred_execution_depth(&spec.genesis)

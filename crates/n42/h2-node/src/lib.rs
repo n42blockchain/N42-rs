@@ -26,6 +26,7 @@ pub mod service;
 pub mod straggler;
 pub mod sync_anchor;
 pub mod sync_pipeline;
+pub mod sync_safety;
 pub mod tx_source;
 
 pub mod body_channel;

@@ -611,6 +611,13 @@ pub struct H2Service<E> {
     /// Under `observe`: pulled blocks executed that `enforce` would have held
     /// unexecuted, and pulls it would have ended.
     sync_anchor_would_refuse: u64,
+    /// What this node and its peers' verified anchors certified, by height
+    /// and view, and the conflict or equivocation that halted the sync
+    /// importer ([`crate::sync_safety`]).
+    sync_safety: crate::sync_safety::SyncSafety,
+    /// The highest pulled block the anchored import released for execution:
+    /// with the committed head, where the next pull starts.
+    sync_head: Option<(u64, B256)>,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -747,7 +754,15 @@ struct CatchUp {
     /// A pipelined pull whose ranges are all served, waiting for its last
     /// imports to be reported before it ends: whether it is complete.
     end: Option<bool>,
+    /// The commit QC of the highest anchor applied to the buffer: what an
+    /// authenticated block is certified by.
+    top_anchor: Option<QuorumCertificate>,
+    /// The QCs of anchors naming blocks not buffered yet, by the hash named.
+    pending_qcs: std::collections::HashMap<B256, QuorumCertificate>,
 }
+
+/// Anchor QCs a pull keeps for blocks it has not buffered yet.
+const MAX_PENDING_ANCHOR_QCS: usize = 256;
 
 /// A pulled block sent to the importer, kept on the loop for the
 /// bookkeeping its report completes.
@@ -780,6 +795,8 @@ impl CatchUp {
             sent: std::collections::HashMap::new(),
             sched: None,
             end: None,
+            top_anchor: None,
+            pending_qcs: std::collections::HashMap::new(),
         }
     }
 }
@@ -1745,6 +1762,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             pull_progress_at: None,
             range_mode: None,
             sync_anchor_would_refuse: 0,
+            sync_safety: crate::sync_safety::SyncSafety::default(),
+            sync_head: None,
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -3463,10 +3482,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // A live commit is an anchor for the catch-up too (sync
                 // standard §3.3): pulled blocks it names, and those below
                 // them, are executed on the next import step.
-                if let Some(catch_up) = self.catch_up.as_mut() {
-                    catch_up.anchored.anchor(block_hash);
-                    catch_up.shadow.anchor(block_hash);
-                }
+                let number = self.block_numbers.get(&block_hash).copied();
+                self.sync_note_commit(number, &commit_qc, events);
                 self.loop_spend.open(view);
                 events.push(ServiceEvent::Committed {
                     view,
@@ -4612,7 +4629,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.request_missing_held_parent(events);
         // A pull's last imports are reported before another starts: the
         // next one reads the execution layer's height.
-        if self.catch_up.is_some()
+        if self.sync_safety.halt().is_some()
+            || self.catch_up.is_some()
             || !self.in_import.is_empty()
             || self
                 .catch_up_retry_after
@@ -4671,6 +4689,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         // starts below them, and an honest peer's chain replaces them
         // through the forkchoice that follows its blocks.
         let latest = self.unproven_from.map_or(latest, |from| latest.min(from - 1));
+        // Under the anchor rule a pull starts on a certified block -- the
+        // committed head, or the highest block a pull released -- when the
+        // execution layer holds uncommitted ones above it, so the first
+        // pulled block is checked to join it (sync standard §3.3).
+        let latest = match (self.sync_anchor_mode, self.certified_head()) {
+            (SyncAnchorMode::Enforce, Some((certified, _))) if certified < latest => certified,
+            _ => latest,
+        };
         // Statuses arrive on connect, and a block the fleet gossiped before
         // this node connected never comes by itself — however small the gap.
         if height <= latest {
@@ -4986,12 +5012,40 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some(c) = self.catch_up.as_mut() else {
             return false;
         };
-        if let Some(named) = anchor {
-            c.anchored.anchor(named);
+        // Every verified anchor is recorded against what this node and
+        // its peers certified before (sync standard §3.3): by its height
+        // when the block it names is buffered, else by its view.
+        let mut fault = None;
+        if let Some(qc) = anchor {
+            let mark = c.anchored.authenticated_to();
+            match c.anchored.anchor(qc.block_hash) {
+                Some(named) => {
+                    if mark.is_none_or(|mark| named >= mark) {
+                        c.top_anchor = Some(qc.clone());
+                    }
+                    fault = self.sync_safety.note_anchor(Some(named), qc.block_hash, &qc).err();
+                }
+                None => {
+                    fault = self.sync_safety.note_anchor(None, qc.block_hash, &qc).err();
+                    if c.pending_qcs.len() >= MAX_PENDING_ANCHOR_QCS {
+                        c.pending_qcs.clear();
+                    }
+                    c.pending_qcs.insert(qc.block_hash, qc);
+                }
+            }
         }
-        c.anchored.push(Buffered { number, hash, bytes: rlp.len(), item: (block, rlp) });
+        if c.anchored.push(Buffered { number, hash, bytes: rlp.len(), item: (block, rlp) })
+            && let Some(qc) = c.pending_qcs.remove(&hash)
+        {
+            fault = fault.or_else(|| self.sync_safety.note_anchor(Some(number), hash, &qc).err());
+            c.top_anchor = Some(qc);
+        }
         c.next += 1;
         c.prev_hash = Some(hash);
+        if let Some(halt) = fault {
+            self.halt_sync(halt, events);
+            return false;
+        }
         if !self.release_anchored(events).await {
             return false;
         }
@@ -5029,8 +5083,29 @@ impl<E: ExecutionLayer> H2Service<E> {
             let Some(ready) = c.anchored.pop_ready() else {
                 return true;
             };
+            // An authenticated block, and for the pull's first its parent,
+            // checked against what is certified at their heights: a chain
+            // that does not join the committed one halts the importer
+            // before anything of it is executed (sync standard §3.3).
+            if let Some(qc) = c.top_anchor.clone() {
+                let first = ready.number == c.started_at + 1;
+                let parent = ready.item.0.header.parent_hash;
+                let checked = if first && ready.number > 0 {
+                    self.sync_safety.note_anchor(Some(ready.number - 1), parent, &qc)
+                } else {
+                    Ok(())
+                };
+                if let Err(halt) = checked.and_then(|()| self.sync_safety.note_anchor(Some(ready.number), ready.hash, &qc)) {
+                    self.halt_sync(halt, events);
+                    return false;
+                }
+            }
+            let Some(c) = self.catch_up.as_mut() else {
+                return false;
+            };
             let (block, rlp) = ready.item;
             if pipelined {
+                self.sync_head = Some((ready.number, ready.hash));
                 if self.imported.contains(&ready.hash) && self.in_import.is_empty() {
                     c.executed = ready.number;
                 } else {
@@ -5050,9 +5125,83 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.remember_block(ready.hash, &block.header);
                 self.remember_body(ready.hash, rlp);
             }
+            self.sync_head = Some((ready.number, ready.hash));
             if let Some(c) = self.catch_up.as_mut() {
                 c.executed = ready.number;
             }
+        }
+    }
+
+    /// A live commit, for the sync importer: recorded against the anchors
+    /// peers' data carried (a contradicting one is a conflict), and applied
+    /// as an anchor to a pull's buffer (sync standard §3.3).
+    fn sync_note_commit(&mut self, number: Option<u64>, commit_qc: &QuorumCertificate, events: &mut Vec<ServiceEvent>) {
+        if let Err(halt) = self.sync_safety.note_committed(number, commit_qc) {
+            self.halt_sync(halt, events);
+        }
+        if let Some(catch_up) = self.catch_up.as_mut() {
+            let mark = catch_up.anchored.authenticated_to();
+            if let Some(named) = catch_up.anchored.anchor(commit_qc.block_hash)
+                && mark.is_none_or(|mark| named >= mark)
+            {
+                catch_up.top_anchor = Some(commit_qc.clone());
+            }
+            catch_up.shadow.anchor(commit_qc.block_hash);
+        }
+    }
+
+    /// Halts the sync importer on a safety violation (sync standard §3.3):
+    /// one error line with both blocks and both QCs' views, the
+    /// [`crate::sync_safety::METRIC_SYNC_HALTED`] gauge, and the pull ended
+    /// with nothing more of it executed. No later pull starts; consensus
+    /// keeps running on this node's own chain, and nothing is reorged.
+    /// Read back with [`Self::sync_halt`].
+    fn halt_sync(&mut self, halt: crate::sync_safety::SyncHalt, events: &mut Vec<ServiceEvent>) {
+        let (first, second) = (&halt.first, &halt.second);
+        error!(
+            target: "n42.h2.node",
+            kind = halt.kind.label(),
+            number = ?first.number.or(second.number),
+            first = %first.hash,
+            first_number = ?first.number,
+            first_qc_view = first.qc.view,
+            first_qc_names = %first.qc.block_hash,
+            first_origin = ?first.origin,
+            second = %second.hash,
+            second_number = ?second.number,
+            second_qc_view = second.qc.view,
+            second_qc_names = %second.qc.block_hash,
+            second_origin = ?second.origin,
+            "SYNC HALTED: two verified certificates contradict each other (sync standard 3.3); the sync importer executes and reorgs nothing more, consensus continues on this node's own chain; operator action needed"
+        );
+        metrics::gauge!(crate::sync_safety::METRIC_SYNC_HALTED, "reason" => halt.kind.label()).set(1.0);
+        if halt.kind == crate::sync_safety::HaltKind::Equivocation {
+            metrics::counter!(crate::sync_safety::METRIC_SYNC_EQUIVOCATIONS_TOTAL).increment(1);
+        }
+        if self.catch_up.as_ref().is_some_and(|c| c.sched.is_some()) {
+            self.abandon_pulled_imports();
+        }
+        self.finish_catch_up(events, false);
+    }
+
+    /// The safety violation that halted the sync importer, if one did
+    /// (sync standard §3.3): both blocks and both certificates.
+    pub fn sync_halt(&self) -> Option<&crate::sync_safety::SyncHalt> {
+        self.sync_safety.halt()
+    }
+
+    /// Every anchor equivocation seen, both certificates of each (bounded;
+    /// mixed production standard E15).
+    pub fn sync_equivocation_evidence(&self) -> impl Iterator<Item = &crate::sync_safety::SyncHalt> {
+        self.sync_safety.evidence().iter()
+    }
+
+    /// The highest block certified here: this node's committed head, or the
+    /// highest block a pull released under an anchor.
+    fn certified_head(&self) -> Option<(u64, B256)> {
+        match (self.sync_safety.committed_head(), self.sync_head) {
+            (Some(a), Some(b)) => Some(if b.0 > a.0 { b } else { a }),
+            (a, b) => a.or(b),
         }
     }
 
@@ -5399,8 +5548,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some(c) = self.catch_up.as_mut() else {
             return;
         };
-        if let Some(named) = anchor {
-            c.shadow.anchor(named);
+        if let Some(qc) = anchor {
+            c.shadow.anchor(qc.block_hash);
         }
         c.shadow.push(Buffered { number, hash, bytes, item: () });
         while c.shadow.pop_ready().is_some() {}
@@ -5425,18 +5574,17 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// executed); none of them is the peer's fault. A QC that does not
     /// decode (gov5's profile), names a view past the header's own, or does
     /// not verify under a known set is an error: a provable fault.
-    fn sync_anchor_of(&self, header: &Header) -> Result<Option<B256>, String> {
+    fn sync_anchor_of(&self, header: &Header) -> Result<Option<QuorumCertificate>, String> {
         let Some((key, wire)) = self.header_qc_wire(header)? else {
             return Ok(None);
         };
         if let Some(qc) = self.sync_anchor_qcs.borrow().get(&key) {
-            return Ok(Some(qc.block_hash));
+            return Ok(Some(qc));
         }
         match self.engine.verify_sync_anchor_qc(&wire) {
             n42_h2_consensus::SyncQcVerdict::Anchor(qc) => {
-                let named = qc.block_hash;
-                self.sync_anchor_qcs.borrow_mut().insert(key, *qc);
-                Ok(Some(named))
+                self.sync_anchor_qcs.borrow_mut().insert(key, (*qc).clone());
+                Ok(Some(*qc))
             }
             n42_h2_consensus::SyncQcVerdict::Genesis => Ok(None),
             n42_h2_consensus::SyncQcVerdict::PrepareDomain => {

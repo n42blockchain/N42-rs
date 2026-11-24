@@ -33,13 +33,19 @@ fn chunks(blocks: &[(B256, Header, alloy_primitives::Bytes)]) -> Vec<BlockChunk>
 /// `n - 1`), signed by every key of `rig`'s set; the first embeds none. Each
 /// block but the last is anchored by the header above it (depth 1).
 fn anchored_chain(rig: &Rig, count: u64) -> Vec<(B256, Header, alloy_primitives::Bytes)> {
+    anchored_chain_at(rig, count, 0)
+}
+
+/// [`anchored_chain`] with every view `views` later: another chain of the
+/// same heights (every hash differs).
+fn anchored_chain_at(rig: &Rig, count: u64, views: u64) -> Vec<(B256, Header, alloy_primitives::Bytes)> {
     let signers: Vec<usize> = (0..rig.keys.len()).collect();
     let mut parent = B256::ZERO;
     let mut blocks = Vec::new();
     for number in 1..=count {
-        let qc =
-            if number == 1 { Vec::new() } else { header_qc(&rig.svc, &rig.keys, &signers, number - 1, parent, parent) };
-        let block = block_with_extra(number, parent, number, qc);
+        let view = views + number;
+        let qc = if number == 1 { Vec::new() } else { header_qc(&rig.svc, &rig.keys, &signers, view - 1, parent, parent) };
+        let block = block_with_extra(number, parent, view, qc);
         parent = block.0;
         blocks.push(block);
     }
@@ -862,6 +868,83 @@ async fn a_prepare_qc_or_a_qc_of_an_unknown_set_anchors_nothing_and_blames_no_on
         assert!(!rig.svc.refused_range_peers.contains_key(&peer), "{case}: not a fault");
         assert!(rig.svc.catch_up.is_some(), "{case}: the pull goes on");
     }
+}
+
+/// A commit QC of this node's own, naming `hash` at `view`.
+fn own_commit_qc(view: u64, hash: B256) -> n42_h2_primitives::consensus::QuorumCertificate {
+    let mut qc = n42_h2_primitives::consensus::QuorumCertificate::genesis();
+    qc.view = view;
+    qc.block_hash = hash;
+    qc
+}
+
+/// Sync standard §3.3, conflict: this node committed block X at height 2;
+/// a peer serves an anchored chain whose block 3 names another block at
+/// height 2. The importer halts with both blocks and both QCs' views on
+/// record, executes nothing of that chain, and starts no later pull;
+/// nothing is reorged and the peer is not refused for it.
+#[tokio::test]
+async fn an_anchored_chain_that_does_not_join_the_committed_head_halts_the_importer() {
+    let mut rig = node(1, 0, None).await;
+    let peer = PeerId::random();
+    let ours = B256::repeat_byte(0x42);
+    let mut events = Vec::new();
+    rig.svc.sync_note_commit(Some(2), &own_commit_qc(50, ours), &mut events);
+    assert!(rig.svc.sync_halt().is_none());
+    let theirs = anchored_chain(&rig, 5);
+    catching_up(&mut rig, peer, 3, 5);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 3, count: 3, step: 1 }, chunks(&theirs[2..])));
+    let events = import(&mut rig).await;
+
+    assert_eq!(events, vec![ServiceEvent::Synced { height: 2, complete: false }]);
+    assert!(executed(&rig).is_empty(), "nothing of the conflicting chain is executed");
+    assert!(rig.el.calls().iter().all(|c| !matches!(c, ElCall::ForkchoiceUpdated(_))), "no reorg");
+    let halt = rig.svc.sync_halt().expect("halted");
+    assert_eq!(halt.kind, crate::sync_safety::HaltKind::Conflict);
+    assert_eq!((halt.first.hash, halt.first.number, halt.first.qc.view), (ours, Some(2), 50));
+    assert_eq!((halt.second.hash, halt.second.number), (theirs[1].0, Some(2)));
+    assert_eq!(halt.second.qc.view, 3, "the QC that authenticated block 3, from block 4's header");
+    assert!(!rig.svc.refused_range_peers.contains_key(&peer), "a verified certificate is not the relay's fault");
+
+    // No pull starts again, however far ahead a peer says it is.
+    rig.svc.catch_up_retry_after = None;
+    rig.svc.note_peer_height(PeerId::random(), 100);
+    let mut events = Vec::new();
+    within(rig.svc.consider_catch_up(&mut events)).await;
+    assert!(rig.svc.catch_up.is_none() && events.is_empty(), "the importer stays halted");
+}
+
+/// Sync standard §3.3, equivocation: one peer's anchored chain is executed
+/// up to block 3; a later pull from another peer brings a chain whose
+/// authenticated block 4 names another block 3. Two verified certificates
+/// for different blocks at height 3: halted as a conflict is, both kept as
+/// evidence, the relaying peer not refused.
+#[tokio::test]
+async fn two_verified_anchors_for_different_blocks_at_one_height_halt_and_keep_the_evidence() {
+    let mut rig = node(1, 0, None).await;
+    let (first, second) = (PeerId::random(), PeerId::random());
+    let a = anchored_chain(&rig, 4);
+    catching_up(&mut rig, first, 1, 4);
+    rig.svc.pending_imports.push((first, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&a)));
+    import(&mut rig).await;
+    rig.svc.pending_imports.push((first, RangeRequest { start: 5, count: 1, step: 1 }, Vec::new()));
+    assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 3, complete: true }]);
+    assert_eq!(rig.svc.certified_head(), Some((3, a[2].0)), "the next pull starts on block 3");
+
+    let b = anchored_chain_at(&rig, 6, 100);
+    catching_up(&mut rig, second, 4, 6);
+    rig.svc.pending_imports.push((second, RangeRequest { start: 4, count: 3, step: 1 }, chunks(&b[3..])));
+    import(&mut rig).await;
+
+    let ran = executed(&rig);
+    assert_eq!(ran, a[..3].iter().map(|x| x.0).collect::<Vec<_>>(), "nothing of the second chain executed");
+    let halt = rig.svc.sync_halt().expect("halted");
+    assert_eq!(halt.kind, crate::sync_safety::HaltKind::Equivocation);
+    assert_eq!((halt.first.hash, halt.second.hash), (a[2].0, b[2].0));
+    assert_eq!((halt.first.qc.view, halt.second.qc.view), (3, 104));
+    let evidence: Vec<_> = rig.svc.sync_equivocation_evidence().cloned().collect();
+    assert_eq!(evidence, vec![halt.clone()], "both certificates kept");
+    assert!(!rig.svc.refused_range_peers.contains_key(&second));
 }
 
 #[tokio::test]

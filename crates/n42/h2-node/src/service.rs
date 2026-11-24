@@ -391,6 +391,10 @@ pub struct H2Service<E> {
     /// The mixed production standard's profile-1 header rules
     /// ([`Self::with_header_rules`]); the default checks nothing more.
     header_rules: n42_h2_consensus::HeaderRules,
+    /// The last header range catch-up took (profile 1): the parent of the
+    /// next pulled block, whose header is not remembered until it imports,
+    /// for the parent rules (B4, B13, B14) before execution.
+    last_pulled_header: Option<Header>,
     /// Whether consensus messages go out on gov5's native topic in gov5's
     /// own encoding, as a Go fleet member sends them, rather than on the
     /// chain-bound v4 topic. Inbound traffic is accepted from both either
@@ -1687,6 +1691,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             defer_reason: None,
             header_profile: HeaderProfile::Ethereum,
             header_rules: n42_h2_consensus::HeaderRules::default(),
+            last_pulled_header: None,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
             unsolicited_heights: std::collections::BTreeMap::new(),
@@ -4887,7 +4892,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // batch (what passed before it stays imported), and its peer
                 // is not asked for this gap again.
                 let proven = match self.check_pulled_block(&block.header) {
-                    Ok(proven) => proven,
+                    Ok(proven) => {
+                        if self.header_rules.is_profile1() {
+                            self.last_pulled_header = Some(block.header.clone());
+                        }
+                        proven
+                    }
                     Err(reason) => {
                         warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
                         self.refused_range_peers.insert(peer, number);
@@ -5037,11 +5047,14 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.finish_catch_up(events, false);
             return false;
         }
-        if let Some(reason) = self.profile1_import_refusal(&block.header, Some(rlp.len())) {
+        if let Some(reason) = self.profile1_pulled_refusal(&block.header, Some(rlp.len())) {
             warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block profile 1 refuses; the rest of its range is dropped");
             self.refused_range_peers.insert(peer, number);
             self.finish_catch_up(events, false);
             return false;
+        }
+        if self.header_rules.is_profile1() {
+            self.last_pulled_header = Some(block.header.clone());
         }
         let anchor = match self.sync_anchor_of(&block.header) {
             Ok(anchor) => anchor,
@@ -5559,7 +5572,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn check_pulled_block(&self, header: &Header) -> Result<Option<u64>, String> {
         // Profile 1: every header rule but the clock, seal included (AM4:
         // import of a committed block is checked too, B4's bound is not).
-        if let Some(reason) = self.profile1_import_refusal(header, None) {
+        if let Some(reason) = self.profile1_pulled_refusal(header, None) {
             return Err(reason);
         }
         if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
@@ -5696,6 +5709,24 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// the parent's header is held (B4's lower bound, B13, B14), and the
     /// block's decoded size when the caller has it (B15). `None` on every
     /// other chain.
+    /// [`Self::profile1_import_refusal`] for a block range catch-up pulled,
+    /// before it executes: its parent is the block pulled before it, whose
+    /// header is not remembered yet, so the parent rules (B4's lower bound,
+    /// B13, B14) are checked against that one.
+    fn profile1_pulled_refusal(&self, header: &Header, block_bytes: Option<usize>) -> Option<String> {
+        if let Some(reason) = self.profile1_import_refusal(header, block_bytes) {
+            return Some(reason);
+        }
+        if let Some(parent) = self.last_pulled_header.as_ref()
+            && !self.block_headers.contains_key(&header.parent_hash)
+            && parent.hash_slow() == header.parent_hash
+            && let Err(err) = self.header_rules.check_against_parent(header, parent, header.parent_hash)
+        {
+            return Some(err.to_string());
+        }
+        None
+    }
+
     fn profile1_import_refusal(&self, header: &Header, block_bytes: Option<usize>) -> Option<String> {
         let rules = &self.header_rules;
         if !rules.is_profile1() {

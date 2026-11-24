@@ -361,6 +361,11 @@ pub struct H2Service<E> {
     /// The highest block number consensus has committed here: a build ahead
     /// on a parent below it is stale ([`stale_build_parent`]).
     committed_height: Option<u64>,
+    /// The block of the commit restored at start (the engine's persisted
+    /// `last_committed_qc`) and its number as the execution layer gave it:
+    /// what is known committed before the first live commit. Read for range
+    /// serving ([`Self::serve_ceiling`]) and the status height.
+    restored_committed: Option<(B256, u64)>,
     /// Whether to start a build before this node is leader. Off by default:
     /// it is a change to when the execution layer is asked for a payload, and
     /// the first measurement of it was a fourfold regression rather than the
@@ -1575,6 +1580,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             always_publish_topic: n42_env::flag("N42_BLOCK_TOPIC_ALWAYS", false),
             prepare_on: None,
             committed_height: None,
+            restored_committed: None,
             prepare_ahead: false,
             defer_reason: None,
             header_profile: HeaderProfile::Ethereum,
@@ -2864,12 +2870,17 @@ impl<E: ExecutionLayer> H2Service<E> {
                 //
                 // Off the loop: up to 32 sequential lookups and the replies'
                 // bytes used to sit on this loop, which is the view's.
+                //
+                // Committed blocks only (sync standard Q-S5, B4): the
+                // execution layer's canonical chain also holds the head
+                // consensus has not committed and blocks pulled unproven.
                 if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
                     let el = self.driver.execution_layer_arc();
                     let back = self.served_txns.0.clone();
                     let budget = self.serve_bytes.clone();
+                    let ceiling = self.serve_ceiling();
                     tokio::spawn(async move {
-                        let range = serve_range(&*el, request, &budget).await;
+                        let range = serve_range(&*el, request, &budget, ceiling).await;
                         let _ = back.send(Served::Range { peer, request, channel, range, slot }).await;
                     });
                 } else {
@@ -4550,6 +4561,15 @@ impl<E: ExecutionLayer> H2Service<E> {
             if chunks.is_empty() {
                 if catch_up.probing {
                     self.finish_catch_up(events, true);
+                } else if catch_up.next > catch_up.started_at + 1 {
+                    // This pull already took blocks: an empty answer (or a
+                    // refusal, which reaches here as one) after them is
+                    // where the peer's served chain ends -- its committed
+                    // head, or a gov5 main / n42-26 server's stored one. Not
+                    // a fault (sync standard §3.5); what is left arrives by
+                    // gossip or from another peer's pull.
+                    debug!(target: "n42.h2.node", %peer, ?request, "peer served up to its head; catch-up done");
+                    self.finish_catch_up(events, true);
                 } else {
                     warn!(target: "n42.h2.node", %peer, ?request, "peer served none of the range; catch-up stopped");
                     self.finish_catch_up(events, false);
@@ -4806,16 +4826,57 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// starts above the commit. `None` on a fresh consensus state (a node
     /// started on a snapshot has nothing to measure from) or when the layer
     /// is not ahead.
-    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     async fn unproven_after_restart(&mut self) -> Option<u64> {
         let qc = self.engine.last_committed_qc();
         if qc.view == 0 {
             return None;
         }
-        let el = self.driver.execution_layer();
+        let el = self.driver.execution_layer_arc();
         let committed = el.block_by_hash(qc.block_hash).await.ok().flatten()?.header.number;
+        self.learn_restored_commit((qc.block_hash, committed));
         let latest = el.latest_block_number().await.ok().flatten()?;
         (latest > committed).then_some(committed + 1)
+    }
+
+    /// The highest block this node serves by range: what it knows committed
+    /// (sync standard Q-S5: v1 serves committed blocks only; B4).
+    ///
+    /// - The height of the last live commit ([`Self::committed_height`]).
+    /// - Before the first live commit, the block of the commit restored at
+    ///   start (the engine's persisted `last_committed_qc`, commit domain
+    ///   only), by the number the execution layer gives it.
+    /// - Nothing committed at all (a fresh consensus state, also a node
+    ///   started on a snapshot): genesis only.
+    fn serve_ceiling(&self) -> ServeCeiling {
+        if let Some(height) = self.committed_height {
+            return ServeCeiling::Height(height);
+        }
+        let qc = self.engine.last_committed_qc();
+        if qc.view == 0 {
+            return ServeCeiling::Height(0);
+        }
+        if let Some((hash, number)) = self.restored_committed
+            && hash == qc.block_hash
+        {
+            return ServeCeiling::Height(number);
+        }
+        match self.block_numbers.get(&qc.block_hash) {
+            Some(number) => ServeCeiling::Height(*number),
+            None => ServeCeiling::Block(qc.block_hash),
+        }
+    }
+
+    /// Records the restored commit's number, and advertises it while no live
+    /// commit has: the status height is the committed head (sync standard
+    /// §4.1).
+    fn learn_restored_commit(&mut self, restored: (B256, u64)) {
+        if self.restored_committed == Some(restored) {
+            return;
+        }
+        self.restored_committed = Some(restored);
+        if self.committed_height.is_none() {
+            self.transport.set_advertised_height(restored.1);
+        }
     }
 
     /// Whether `certified` lies on `header`'s parent chain, walking the
@@ -4854,9 +4915,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         };
         let height = catch_up.next.saturating_sub(1);
-        if height > catch_up.started_at {
-            self.transport.set_advertised_height(height);
-        }
+        // The status height stays the committed head (sync standard §4.1):
+        // pulled blocks are unproven until a commit names them, and this
+        // node serves only what it committed, so advertising the pulled
+        // height would send peers for blocks it will not serve.
         self.catch_up_retry_after = Some(std::time::Instant::now() + CATCH_UP_RETRY);
         self.failed_peer = (!complete).then_some(catch_up.peer);
         // What the peer actually served replaces what it advertised, so a
@@ -5351,9 +5413,21 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.respond_block_within_budget(peer, channel, body);
             }
             Served::Range { peer, request, channel, mut range, slot } => {
-                debug!(target: "n42.h2.node", %peer, ?request, served = range.rlps.len(), short_of_budget = range.short_of_budget, "peer asked for a range");
+                debug!(target: "n42.h2.node", %peer, ?request, served = range.rlps.len(), short_of_budget = range.short_of_budget, ceiling = ?range.ceiling, "peer asked for a range");
+                if let Some(restored) = range.restored {
+                    self.learn_restored_commit(restored);
+                }
                 if range.rlps.is_empty() && range.short_of_budget {
                     self.transport.respond_range_error(channel, "server busy".to_owned());
+                    return;
+                }
+                if range.rlps.is_empty() {
+                    // Not one block to serve -- the start is past what this
+                    // node has committed, or not held: gov5's answer for a
+                    // first block it does not have, one error chunk with
+                    // the server-error code (`ErrInvalidBlockNr`). A reply
+                    // with blocks always ends cleanly (sync standard §4.3).
+                    self.transport.respond_range_error(channel, "invalid block number".to_owned());
                     return;
                 }
                 let rlps = std::mem::take(&mut range.rlps);
@@ -6085,13 +6159,33 @@ impl<E: ExecutionLayer> H2Service<E> {
 ///
 /// At most [`MAX_SERVED_RANGE_BLOCKS`] blocks and
 /// [`n42_h2_net::MAX_RANGE_REPLY_BYTES`] of them (one block always), so one
-/// request costs a bounded number of lookups and bytes.
+/// request costs a bounded number of lookups and bytes; and none above
+/// `ceiling`, the committed height: a request reaching past it is served the
+/// committed prefix and ends cleanly.
 async fn serve_range<E: ExecutionLayer>(
     el: &E,
     request: n42_h2_net::RangeRequest,
     budget: &Arc<tokio::sync::Semaphore>,
+    ceiling: ServeCeiling,
 ) -> ServedRange {
-    let count = request.count.min(MAX_RANGE_BLOCKS).min(MAX_SERVED_RANGE_BLOCKS);
+    let (ceiling, restored) = match ceiling {
+        ServeCeiling::Height(height) => (height, None),
+        // The restored commit's number, once: a block the execution layer
+        // does not give is served nothing above genesis (fail closed).
+        ServeCeiling::Block(hash) => match el.block_by_hash(hash).await {
+            Ok(Some(block)) => (block.header.number, Some((hash, block.header.number))),
+            Ok(None) => (0, None),
+            Err(err) => {
+                debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not give the restored commit's number");
+                (0, None)
+            }
+        },
+    };
+    let count = request
+        .count
+        .min(MAX_RANGE_BLOCKS)
+        .min(MAX_SERVED_RANGE_BLOCKS)
+        .min(ceiling.saturating_add(1).saturating_sub(request.start));
     let mut rlps = Vec::new();
     let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let mut short_of_budget = false;
@@ -6131,7 +6225,18 @@ async fn serve_range<E: ExecutionLayer>(
             }
         }
     }
-    ServedRange { rlps, held, short_of_budget }
+    ServedRange { rlps, held, short_of_budget, ceiling, restored }
+}
+
+/// The highest block a range reply may carry: the committed height (v1
+/// serves committed blocks only, sync standard Q-S5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServeCeiling {
+    /// The height, known.
+    Height(u64),
+    /// The block of the commit restored at start, whose number the
+    /// execution layer gives.
+    Block(B256),
 }
 
 /// A range reply and the share of [`MAX_SERVE_BYTES`] it holds until it is
@@ -6144,6 +6249,10 @@ struct ServedRange {
     held: Option<tokio::sync::OwnedSemaphorePermit>,
     /// The budget ran out before the reply was complete.
     short_of_budget: bool,
+    /// The committed height the reply was capped at.
+    ceiling: u64,
+    /// The restored commit's block and number, when this reply looked it up.
+    restored: Option<(B256, u64)>,
 }
 
 /// A share of `budget` (KiB permits) for a reply of `bytes`, or none while

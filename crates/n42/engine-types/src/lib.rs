@@ -109,3 +109,5 @@ mod tests;
 mod profile1_vectors;
 #[cfg(test)]
 mod profile1_requests;
+#[cfg(test)]
+mod profile1_v5;

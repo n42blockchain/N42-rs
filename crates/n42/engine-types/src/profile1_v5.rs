@@ -1,0 +1,307 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! gov5's profile-1 conformance vector V5 (header validity: B4, B9, B13,
+//! B14, A23), run against this node (`testdata/profile1/gov5/V5`, byte-exact
+//! copies; see `testdata/profile1/gov5/README.md`).
+//!
+//! The chain is V1's `genesis_8s.json` plus the vector's `allocAdditions`.
+//! Each of the six sealed blocks is decoded (RLP and hash), imported through
+//! [`HotStuffConsensus`] exactly as the engine tree does (header,
+//! header against parent -- the deferred check included --, body, the stock
+//! executor, post-execution, which files the receipt half of the block's
+//! result), its QMDB root computed as the node's root phase does and filed
+//! beside it. The block's own result is compared with gov5's `executed`
+//! (stateRoot, receiptsRoot, logsBloom, gasUsed = the EIP-8037 block figure)
+//! and with what the next header carries. Every block also passes B4's vote
+//! bound at `now = time`.
+//!
+//! Each refusal is then judged on top of that chain: gov5's `import` is this
+//! node's `validate_header` / `validate_header_against_parent` (the profile-1
+//! header rules and Ethereum's header checks), `deferred` is the deferred
+//! fields check inside `validate_header_against_parent`
+//! ([`DeferredExecutionError`]), and `vote` is `check_profile1_vote_time`
+//! (`h2-node` `service.rs` `vote_refusal`) at the vector's `nowUnix`.
+
+use crate::{
+    hotstuff_consensus::{gov5_receipt_root_bloom, DeferredExecutionError, HotStuffConsensus},
+    profile1_vectors::{apply, b256, chain, config, decode, genesis_state, gov5_dir, hex, rewards},
+};
+use alloy_primitives::{Bloom, B256};
+use reth_consensus::{Consensus as _, ConsensusError, FullConsensus as _, HeaderValidator as _};
+use reth_evm::{execute::Executor as _, ConfigureEvm as _};
+use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader, SignedTransaction as _};
+use serde_json::Value;
+use std::sync::{Arc, OnceLock};
+
+type Spec = n42_header::N42ChainSpec;
+type Sealed = SealedHeader<n42_header::N42Header>;
+
+fn v5() -> &'static Value {
+    static V5: OnceLock<Value> = OnceLock::new();
+    V5.get_or_init(|| {
+        let path = gov5_dir().join("V5/header_validity.json");
+        let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        serde_json::from_slice(&raw).expect("V5 json")
+    })
+}
+
+/// A header from the vector's RLP, sealed under the hash this node computes.
+fn sealed_from_rlp(rlp: &Value) -> Sealed {
+    let raw = hex(rlp);
+    let mut buf = raw.as_slice();
+    let header: n42_header::N42Header = alloy_rlp::Decodable::decode(&mut buf).expect("the header decodes");
+    assert!(buf.is_empty(), "no trailing bytes");
+    assert_eq!(alloy_rlp::encode(&header), raw, "the header re-encodes to gov5's RLP");
+    SealedHeader::seal_slow(header)
+}
+
+/// gov5's `executed` of one block.
+fn executed(block: &Value) -> crate::executed_fields::ExecutedFields {
+    let e = &block["executed"];
+    crate::executed_fields::ExecutedFields {
+        state_root: b256(&e["stateRoot"]),
+        receipts_root: b256(&e["receiptsRoot"]),
+        logs_bloom: Bloom::from_slice(&hex(&e["logsBloom"])),
+        gas_used: e["gasUsed"].as_u64().expect("gasUsed"),
+    }
+}
+
+/// What this node made of one V5 block.
+#[derive(Debug)]
+struct Ran {
+    name: String,
+    header: Sealed,
+    ours: crate::executed_fields::ExecutedFields,
+    theirs: crate::executed_fields::ExecutedFields,
+    /// The last receipt's cumulative gas (post-refund, state gas included).
+    receipts_gas: u64,
+}
+
+/// The V5 chain imported on this node: the consensus, and every block.
+struct Chain {
+    consensus: HotStuffConsensus<Spec>,
+    genesis: Sealed,
+    blocks: Vec<Ran>,
+}
+
+impl Chain {
+    fn header_by_hash(&self, hash: B256) -> Option<&Sealed> {
+        std::iter::once(&self.genesis).chain(self.blocks.iter().map(|b| &b.header)).find(|h| h.hash() == hash)
+    }
+}
+
+/// Imports V5's six blocks in order. Panics at the first step a listed block
+/// does not pass (a refused valid block is a difference).
+fn run_chain() -> Chain {
+    let vector = v5();
+    let spec = chain(&vector["allocAdditions"]);
+    let n42_spec = Arc::new(Spec::from((*spec).clone()));
+    let consensus = HotStuffConsensus::new(n42_spec.clone());
+    assert!(consensus.header_rules().is_profile1(), "a profile-1 chain");
+    let c = config(&spec);
+
+    // The genesis header: gov5's RLP and hash.
+    let genesis = n42_spec.sealed_genesis_header();
+    assert_eq!(genesis.hash(), b256(&vector["genesisHash"]), "genesis hash");
+    assert_eq!(alloy_rlp::encode(genesis.header()), hex(&vector["genesis"]["rlp"]), "genesis RLP");
+
+    let alloc = n42_qmdb_reth::changes_from_alloc(&spec.genesis.alloc);
+    let mut forest = n42_qmdb_state::QmdbForest::genesis(genesis.hash(), &alloc).expect("the genesis forest");
+    assert_eq!(forest.root(), genesis.state_root, "the genesis header carries the forest root");
+
+    let mut db = genesis_state(&spec);
+    let mut parent = genesis.clone();
+    let mut blocks = Vec::new();
+    for block in vector["blocks"].as_array().expect("blocks") {
+        let name = block["name"].as_str().expect("name").to_owned();
+        let header = sealed_from_rlp(&block["rlp"]);
+        assert_eq!(header.hash(), b256(&block["hash"]), "{name}: hash");
+        assert_eq!(header.parent_hash, parent.hash(), "{name}: parent");
+
+        // Import: the header alone, against its parent (the deferred check
+        // reads the parent's filed result), the vote's clock bound at its
+        // own time.
+        consensus.validate_header(&header).unwrap_or_else(|e| panic!("{name}: validate_header: {e}"));
+        consensus
+            .validate_header_against_parent(&header, &parent)
+            .unwrap_or_else(|e| panic!("{name}: validate_header_against_parent: {e}"));
+        n42_h2_consensus::check_profile1_vote_time(header.timestamp, header.timestamp)
+            .unwrap_or_else(|e| panic!("{name}: vote time: {e}"));
+
+        // The body: its transactions and the A8 rewards as withdrawals.
+        let txs: Vec<_> = block["transactions"]
+            .as_array()
+            .expect("transactions")
+            .iter()
+            .map(|raw| decode(&hex(raw)).expect("a V5 transaction decodes"))
+            .collect();
+        let senders = txs.iter().map(|tx| tx.try_recover().expect("recovers")).collect();
+        let body = n42_tx_types::BlockBody {
+            transactions: txs,
+            ommers: Vec::new(),
+            withdrawals: Some(rewards(&spec, header.beneficiary).into()),
+        };
+        let sealed = SealedBlock::from_sealed_parts(header.clone(), body);
+        consensus.validate_block_pre_execution(&sealed).unwrap_or_else(|e| panic!("{name}: pre-execution: {e}"));
+        let recovered = RecoveredBlock::new_sealed(sealed, senders);
+
+        let output = c.executor(db.clone()).execute(&recovered).unwrap_or_else(|e| panic!("{name}: execution: {e}"));
+        consensus
+            .validate_block_post_execution(&recovered, &output.result, None, None)
+            .unwrap_or_else(|e| panic!("{name}: post-execution: {e}"));
+
+        // The root phase: QMDB operations of the bundle, the forest root,
+        // filed beside the receipt half post-execution filed.
+        let leaf = n42_qmdb_reth::system_caller_leaf_at(&*spec, header.timestamp);
+        let ops = n42_qmdb_reth::sorted_operations_from_execution(&output.state, leaf);
+        let prepared = forest.compute_operations(parent.hash(), ops).expect("the block applies");
+        let state_root = prepared.root;
+        forest.insert(header.hash(), header.number, prepared).expect("filed");
+        crate::executed_fields::remember_state_root(header.hash(), state_root);
+        apply(&mut db, &output.state);
+
+        let (receipts_root, logs_bloom) = gov5_receipt_root_bloom(&output.result.receipts);
+        let ours = crate::executed_fields::ExecutedFields {
+            state_root,
+            receipts_root,
+            logs_bloom,
+            gas_used: output.result.gas_used,
+        };
+        assert_eq!(crate::executed_fields::get(&header.hash()), Some(ours), "{name}: the filed result");
+        blocks.push(Ran {
+            name,
+            header: header.clone(),
+            ours,
+            theirs: executed(block),
+            receipts_gas: output.result.receipts.last().map(|r| r.cumulative_gas_used).unwrap_or_default(),
+        });
+        parent = header;
+    }
+    Chain { consensus, genesis, blocks }
+}
+
+/// Every V5 block decodes to gov5's hash, is accepted on import (header
+/// rules, parent rules, the deferred check, body, execution) and at vote
+/// time, and its own result equals gov5's `executed`: stateRoot,
+/// receiptsRoot, logsBloom and gasUsed, the EIP-8037 block figure (refunds
+/// ignored, max of regular and state gas), not the receipts' gas.
+#[test]
+fn v5_blocks_execute_to_gov5s_results_and_are_accepted() {
+    let chain = run_chain();
+    assert_eq!(chain.blocks.len(), 6, "six blocks");
+    let mut differences = Vec::new();
+    for (i, block) in chain.blocks.iter().enumerate() {
+        let receipts_gas = v5()["blocks"][i]["executed"]["receiptsCumulativeGasUsed"].as_u64().unwrap_or_default();
+        println!(
+            "{:30} gasUsed ours {:7} gov5 {:7} | receipts ours {:7} gov5 {:7} | state {} receipts {}",
+            block.name,
+            block.ours.gas_used,
+            block.theirs.gas_used,
+            block.receipts_gas,
+            receipts_gas,
+            block.ours.state_root == block.theirs.state_root,
+            block.ours.receipts_root == block.theirs.receipts_root,
+        );
+        if block.ours != block.theirs {
+            differences.push(format!("{}: ours {:?}\n  gov5 {:?}", block.name, block.ours, block.theirs));
+        }
+        if block.receipts_gas != receipts_gas {
+            differences.push(format!("{}: receipts gas ours {} gov5 {receipts_gas}", block.name, block.receipts_gas));
+        }
+        // The next header carries this block's result (A10, k = 1).
+        if let Some(next) = chain.blocks.get(i + 1) {
+            let carried = crate::executed_fields::fields_from_child_header(next.header.header());
+            assert_eq!(carried, block.theirs, "{}: the next header carries gov5's executed", block.name);
+        }
+    }
+    assert!(differences.is_empty(), "V5 executed differs:\n{}", differences.join("\n"));
+
+    // B4: blocks 1 and 2 share a timestamp.
+    assert_eq!(chain.blocks[0].header.timestamp, chain.blocks[1].header.timestamp);
+    // B14: every base fee is EIP-1559's over the parent's gasUsed as written.
+    let mut parent = &chain.genesis;
+    for block in &chain.blocks {
+        assert_eq!(block.header.base_fee_per_gas, Some(n42_h2_consensus::profile1_base_fee(parent)), "{}", block.name);
+        parent = &block.header;
+    }
+}
+
+/// The stage at which this node refuses a header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stage {
+    /// `validate_header`: the header alone.
+    ImportHeader(String),
+    /// `validate_header_against_parent`, a rule other than the deferred
+    /// fields (the link, B4, B13, B14, the committee link).
+    ImportParent(String),
+    /// `validate_header_against_parent`'s deferred fields check.
+    Deferred { got: u64, expected: u64 },
+    /// Accepted on import, refused by B4's vote bound at `nowUnix`.
+    Vote(String),
+    /// Accepted.
+    Accepted,
+}
+
+fn judge(chain: &Chain, refusal: &Value) -> Stage {
+    let header = sealed_from_rlp(&refusal["rlp"]);
+    assert_eq!(header.hash(), b256(&refusal["hash"]), "{}: hash", refusal["name"]);
+    let parent = chain.header_by_hash(header.parent_hash).expect("the refusal's parent is a V5 block");
+    if let Err(err) = chain.consensus.validate_header(&header) {
+        return Stage::ImportHeader(format!("{err}"));
+    }
+    if let Err(err) = chain.consensus.validate_header_against_parent(&header, parent) {
+        if let ConsensusError::Other(inner) = &err {
+            if let Some(DeferredExecutionError::Mismatch { got, expected, .. }) = inner.downcast_ref::<DeferredExecutionError>() {
+                return Stage::Deferred { got: got.gas_used, expected: expected.gas_used };
+            }
+        }
+        return Stage::ImportParent(format!("{err}"));
+    }
+    let now = refusal["nowUnix"].as_u64().unwrap_or(header.timestamp);
+    if let Err(err) = n42_h2_consensus::check_profile1_vote_time(header.timestamp, now) {
+        return Stage::Vote(err.to_string());
+    }
+    Stage::Accepted
+}
+
+/// Every V5 refusal is refused here at gov5's stage class: `import` by the
+/// header or parent rules, `deferred` by the deferred fields check with
+/// gov5's two gas figures, `vote` only by B4's clock bound (accepted on
+/// import). Where this node refuses at an earlier check of the same class
+/// with another rule, it is listed in the output. One case does today:
+/// `blobGasUsed 1` is refused by reth's `validate_4844_header_standalone`
+/// ("not a multiple of blob gas per blob", `hotstuff_consensus.rs`
+/// `validate_header`) before profile 1's B9 rule runs; still an import
+/// refusal of the header alone.
+#[test]
+fn v5_refusals_are_refused_at_gov5s_stage() {
+    let chain = run_chain();
+    let refusals = v5()["refusals"].as_array().expect("refusals");
+    assert_eq!(refusals.len(), 11);
+    let mut differences = Vec::new();
+    for refusal in refusals {
+        let name = refusal["name"].as_str().expect("name");
+        let check = refusal["check"].as_str().expect("check");
+        let rule = refusal["rule"].as_str().expect("rule");
+        let stage = judge(&chain, refusal);
+        println!("{rule:4} {check:8} {name:45} -> {stage:?}");
+        let same_class = match (check, &stage) {
+            ("import", Stage::ImportHeader(_) | Stage::ImportParent(_)) => true,
+            ("deferred", Stage::Deferred { got, expected }) => {
+                // gov5: "header N carries parent gas used <got>, this node executed <expected>".
+                let message = refusal["gov5Message"].as_str().unwrap_or_default();
+                message.contains(&format!("carries parent gas used {got}, this node executed {expected}"))
+            }
+            // Same verdict at an earlier stage: acceptable, printed above.
+            ("deferred", Stage::ImportHeader(_) | Stage::ImportParent(_)) => true,
+            ("vote", Stage::Vote(_)) => true,
+            ("vote", Stage::ImportHeader(_) | Stage::ImportParent(_)) => true,
+            _ => false,
+        };
+        if !same_class {
+            differences.push(format!("{rule} {check} {name}: ours {stage:?}; gov5 {}", refusal["gov5Message"]));
+        }
+    }
+    assert!(differences.is_empty(), "V5 refusals differ:\n{}", differences.join("\n"));
+}

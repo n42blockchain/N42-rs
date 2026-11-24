@@ -388,6 +388,13 @@ pub struct H2Service<E> {
     /// Which header shapes this node puts on, and accepts from, the block
     /// topic. See [`HeaderProfile`].
     header_profile: HeaderProfile,
+    /// The mixed production standard's profile-1 header rules
+    /// ([`Self::with_header_rules`]); the default checks nothing more.
+    header_rules: n42_h2_consensus::HeaderRules,
+    /// The last header range catch-up took (profile 1): the parent of the
+    /// next pulled block, whose header is not remembered until it imports,
+    /// for the parent rules (B4, B13, B14) before execution.
+    last_pulled_header: Option<Header>,
     /// Whether consensus messages go out on gov5's native topic in gov5's
     /// own encoding, as a Go fleet member sends them, rather than on the
     /// chain-bound v4 topic. Inbound traffic is accepted from both either
@@ -1765,6 +1772,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             prepare_ahead: false,
             defer_reason: None,
             header_profile: HeaderProfile::Ethereum,
+            header_rules: n42_h2_consensus::HeaderRules::default(),
+            last_pulled_header: None,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
             unsolicited_heights: std::collections::BTreeMap::new(),
@@ -2085,6 +2094,24 @@ impl<E: ExecutionLayer> H2Service<E> {
             return Err(ServiceError::Fatal { reason, detail });
         }
         Ok(())
+    }
+
+    /// Runs the chain under the profile-1 header rules `rules` (the mixed
+    /// production standard, B1-B15): every header that arrives -- gossip,
+    /// push, by-hash, compact, range -- is checked, seal included, before it
+    /// is remembered or imported, and again with the clock bound (B4) and
+    /// the commit domain of its QC (B1) before a vote. On profile 1 the
+    /// chain's `maxBlockBytes` becomes every carrier's block bound (B15,
+    /// [`n42_h2_net::set_max_block_bytes`]). The default rules change
+    /// nothing.
+    pub fn with_header_rules(mut self, rules: n42_h2_consensus::HeaderRules) -> Self {
+        if rules.is_profile1()
+            && let Err(existing) = n42_h2_net::set_max_block_bytes(rules.max_block_bytes)
+        {
+            warn!(target: "n42.h2.node", existing, wanted = rules.max_block_bytes, "the block size bound was already set; it stays");
+        }
+        self.header_rules = rules;
+        self
     }
 
     /// Runs this node under gov5's `HotStuff` header profile.
@@ -2965,6 +2992,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     decode_block_rlp_raw(&rlp, self.header_profile).map(|block| (block, rlp))
                 });
                 match decoded {
+                    Ok((block, rlp)) if let Some(reason) = self.profile1_import_refusal(&block.header, Some(rlp.len())) => {
+                        debug!(target: "n42.h2.node", block_hash = ?block.block_hash, %reason, "dropped a block body refused by profile 1");
+                    }
                     Ok((block, rlp)) => {
                         let block_hash = block.block_hash;
                         if let Some(peer) = from {
@@ -3216,6 +3246,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // The same path a gossiped body takes; the hash the peer
                     // sent it under is checked by the decode, not trusted.
                     match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
+                        Ok(block) if let Some(reason) = self.profile1_import_refusal(&block.header, Some(chunk.rlp.len())) => {
+                            debug!(target: "n42.h2.node", %peer, ?hash, %reason, "peer answered a block request with a block profile 1 refuses");
+                        }
                         Ok(block) if block.block_hash == hash => {
                             self.note_peer_height(peer, block.header.number);
                             self.remember_block(hash, &block.header);
@@ -3260,6 +3293,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // everything below is idempotent, and `awaiting_bodies` has
                 // already been emptied by whichever copy came first.
                 match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
+                    Ok(block) if let Some(reason) = self.profile1_import_refusal(&block.header, Some(chunk.rlp.len())) => {
+                        debug!(target: "n42.h2.node", %peer, hash = ?block.block_hash, %reason, "a pushed body profile 1 refuses");
+                    }
                     Ok(block) => {
                         self.note_peer_height(peer, block.header.number);
                         let hash = block.block_hash;
@@ -3686,8 +3722,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             // The parent first, as for every import: a block the pull brought
             // in never told the engine, and an unknown parent withholds the
             // vote (audit 2026-10 round 2, R2-R1).
-            if let Some(reason) = self.header_qc_refusal(block_hash) {
-                warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no vote");
+            if let Some(reason) = self.vote_refusal(block_hash) {
+                warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no vote");
                 return Ok(());
             }
             if let Some(header) = self.block_headers.get(block_hash) {
@@ -4573,9 +4609,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // nor built on (audit 2026-10 round 3, R3-C2).
                 if let ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) =
                     event.as_ref()
-                    && let Some(reason) = self.header_qc_refusal(block_hash)
+                    && let Some(reason) = self.vote_refusal(block_hash)
                 {
-                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no vote");
+                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no vote");
                     return Ok(());
                 }
                 // The engine's extends rule reads the parent of an imported
@@ -5156,7 +5192,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // batch (what passed before it stays imported), and its peer
                 // is not asked for this gap again.
                 let proven = match self.check_pulled_block(&block.header) {
-                    Ok(proven) => proven,
+                    Ok(proven) => {
+                        if self.header_rules.is_profile1() {
+                            self.last_pulled_header = Some(block.header.clone());
+                        }
+                        proven
+                    }
                     Err(reason) => {
                         warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
                         if self.pull_fault(peer, number, events) {
@@ -5325,6 +5366,18 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.finish_catch_up(events, false);
             }
             return false;
+        }
+        // Profile 1: every header rule but the clock, seal included, and
+        // the parent rules against the block pulled before it, before
+        // anything is buffered for execution. A refusal is the peer's fault,
+        // as a forged certificate is.
+        if let Some(reason) = self.profile1_pulled_refusal(&block.header, Some(rlp.len())) {
+            warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block profile 1 refuses; the rest of its range is dropped");
+            self.pull_fault(peer, number, events);
+            return false;
+        }
+        if self.header_rules.is_profile1() {
+            self.last_pulled_header = Some(block.header.clone());
         }
         let Some(c) = self.catch_up.as_mut() else {
             return false;
@@ -6021,6 +6074,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// `height` on this block's parent chain (the chain up to it is the one
     /// the validator set certified), `Ok(None)` when nothing was proven.
     fn check_pulled_block(&self, header: &Header) -> Result<Option<u64>, String> {
+        // Profile 1: every header rule but the clock, seal included (AM4:
+        // import of a committed block is checked too, B4's bound is not).
+        if let Some(reason) = self.profile1_pulled_refusal(header, None) {
+            return Err(reason);
+        }
         if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
             && header.parent_hash != prev
         {
@@ -6112,6 +6170,114 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn header_qc_refusal(&self, block_hash: &B256) -> Option<String> {
         let header = self.block_headers.get(block_hash)?;
         self.check_header_qc(header).err()
+    }
+
+    /// Why this node must not vote for a block (or count it imported): its
+    /// header QC ([`Self::header_qc_refusal`]), and on profile 1 every
+    /// header rule, the seal, the clock bound of B4 and the commit domain of
+    /// the embedded QC (B1, E13). A profile-1 block whose header this node
+    /// does not hold is refused: its rules cannot have been checked.
+    fn vote_refusal(&self, block_hash: &B256) -> Option<String> {
+        if let Some(reason) = self.header_qc_refusal(block_hash) {
+            return Some(reason);
+        }
+        if !self.header_rules.is_profile1() {
+            return None;
+        }
+        let Some(header) = self.block_headers.get(block_hash) else {
+            return Some("profile 1: the block's header is not held here".to_owned());
+        };
+        if let Some(reason) = self.profile1_import_refusal(header, None) {
+            return Some(reason);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        if let Err(err) = n42_h2_consensus::check_profile1_vote_time(header.timestamp, now) {
+            return Some(err.to_string());
+        }
+        match self.header_qc_wire(header) {
+            Err(reason) => Some(reason),
+            Ok(None) => None,
+            Ok(Some((_, wire))) => match self.engine.verify_sync_anchor_qc(&wire) {
+                n42_h2_consensus::SyncQcVerdict::Anchor(_) | n42_h2_consensus::SyncQcVerdict::Genesis => None,
+                other => Some(format!("B1: the embedded QC is not a commit-domain QC of its view's set: {other:?}")),
+            },
+        }
+    }
+
+    /// [`Self::profile1_import_refusal`] for a block range catch-up pulled,
+    /// before it executes: its parent is the block pulled before it, whose
+    /// header is not remembered yet, so the parent rules (B4's lower bound,
+    /// B13, B14) are checked against that one.
+    fn profile1_pulled_refusal(&self, header: &Header, block_bytes: Option<usize>) -> Option<String> {
+        if let Some(reason) = self.profile1_import_refusal(header, block_bytes) {
+            return Some(reason);
+        }
+        if let Some(parent) = self.last_pulled_header.as_ref()
+            && !self.block_headers.contains_key(&header.parent_hash)
+            && parent.hash_slow() == header.parent_hash
+            && let Err(err) = self.header_rules.check_against_parent(header, parent, header.parent_hash)
+        {
+            return Some(err.to_string());
+        }
+        None
+    }
+
+    /// Why a header that arrived on any road is not taken on profile 1:
+    /// the header rules that need no clock (B1-B3, B5, B6, B8-B12, A23), the
+    /// seal of its view's proposer (B2), the rules against its parent when
+    /// the parent's header is held (B4's lower bound, B13, B14), and the
+    /// block's decoded size when the caller has it (B15). `None` on every
+    /// other chain.
+    fn profile1_import_refusal(&self, header: &Header, block_bytes: Option<usize>) -> Option<String> {
+        let rules = &self.header_rules;
+        if !rules.is_profile1() {
+            return None;
+        }
+        if let Some(len) = block_bytes
+            && let Err(err) = rules.check_block_bytes(len)
+        {
+            return Some(err.to_string());
+        }
+        if header.number == 0 {
+            return None;
+        }
+        let extra = match n42_h2_consensus::validate_profile1_header(header, rules) {
+            Ok(extra) => extra,
+            Err(err) => return Some(err.to_string()),
+        };
+        // The seal (B2) and the coinbase (B3) against the proposer the
+        // rules name; without a schedule, the seal against the leader key
+        // the engine knows for the view.
+        let sealed = match &rules.proposers {
+            Some(schedule) => match schedule.proposer(extra.view) {
+                Some(proposer) => n42_h2_consensus::verify_profile1_seal(header, proposer).map_err(|err| err.to_string()),
+                None => Err(format!("B2: no proposer for view {}", extra.view)),
+            },
+            None => match self.engine.leader_public_key_for_view(extra.view) {
+                Some(key) => n42_h2_consensus::verify_seal(header, &key).map_err(|err| format!("B2: seal: {err}")),
+                None => Err(format!("B2: no validator set known for view {}", extra.view)),
+            },
+        };
+        if let Err(reason) = sealed {
+            return Some(reason);
+        }
+        if let Some(parent) = self.block_headers.get(&header.parent_hash)
+            && let Err(err) = rules.check_against_parent(header, parent, header.parent_hash)
+        {
+            return Some(err.to_string());
+        }
+        // B1: a QC whose block is known here names an ancestor (gov5's
+        // reading: walked at most 4096 blocks; an unknown block is checked by
+        // its signature alone).
+        if let Err(err) = rules.check_qc_ancestry(header, |hash| {
+            self.block_headers.get(hash).map(|known| (known.number, known.parent_hash))
+        }) {
+            return Some(err.to_string());
+        }
+        None
     }
 
     /// After a restart: the height past which the execution layer holds
@@ -6723,6 +6889,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(B256, Header, bool), n42_h2_consensus::BlockBodyError> {
         let (block_hash, header) =
             n42_h2_consensus::decode_block_body_header(&rlp, self.header_profile)?;
+        if let Some(reason) = self.profile1_import_refusal(&header, Some(rlp.len())) {
+            return Err(n42_h2_consensus::BlockBodyError::HeaderProfile(self.header_profile, reason));
+        }
         if self.body_store.contains_key(&block_hash) {
             return Ok((block_hash, header, false));
         }
@@ -6929,6 +7098,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(B256, Header, bool), n42_h2_consensus::BlockBodyError> {
         let (block_hash, header) =
             n42_h2_consensus::decode_compact_body_header(&bytes, self.header_profile)?;
+        if let Some(reason) = self.profile1_import_refusal(&header, None) {
+            return Err(n42_h2_consensus::BlockBodyError::HeaderProfile(self.header_profile, reason));
+        }
         // A second copy must not replace the frame of record: that one may
         // carry fills this one does not (defect 18).
         if self.body_store.contains_key(&block_hash) || self.compact_bodies.contains_key(&block_hash) {
@@ -7034,8 +7206,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             // R2-C9): the header releases Round 1, once its QC passes the
             // check every vote of this node passes (R3-C2).
             if self.engine.two_phase_vote_gate() {
-                if let Some(reason) = self.header_qc_refusal(&block_hash) {
-                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no header vote");
+                if let Some(reason) = self.vote_refusal(&block_hash) {
+                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no header vote");
                 } else if let Err(err) = self.engine.header_known(block_hash, header.parent_hash) {
                     report_engine_error(&err, "header vote", &mut self.fatal);
                 }

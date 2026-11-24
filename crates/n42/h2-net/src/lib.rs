@@ -41,7 +41,7 @@ pub use rpc::{
     BLOCK_BY_HASH_PROTOCOL, BLOCK_PUSH_PROTOCOL, BLOCK_TXNS_PROTOCOL, BODIES_BY_RANGE_PROTOCOL,
     MAX_BLOCK_TXNS_BYTES, MAX_RANGE_BLOCKS, MAX_RANGE_READ_BYTES, MAX_RANGE_REPLY_BYTES, RANGE_REQUEST_TIMEOUT, VOTE_PROTOCOL, VoteRequest, vote_hello_message,
 };
-pub use config::{gov5_gossipsub_config, max_gossip_size, max_gossip_wire_size};
+pub use config::{gov5_gossipsub_config, max_block_chunk, max_gossip_size, max_gossip_wire_size, set_max_block_bytes};
 pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};
 pub use observer::{H2V4Observer, ObserverConfig, ObserverError, ObserverEvent};
 pub use status::{Status, StatusError, STATUS_PROTOCOL};

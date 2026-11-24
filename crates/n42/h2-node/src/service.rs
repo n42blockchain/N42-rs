@@ -4671,6 +4671,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some((peer, height)) = best(failed).or_else(|| best(None)) else {
             return;
         };
+        // How far to go: the (f+1)-th highest height peers advertise, never
+        // one peer's alone (sync standard §3.4.1, §6.4) -- a peer claiming a
+        // height no f others back neither starts a pull nor sizes one.
+        let Some(height) = self.quorum_height().map(|quorum| quorum.min(height)) else {
+            return;
+        };
         // The execution layer is asked only when a peer may be past what was
         // last read from it -- below the unproven start, when pulled blocks
         // wait for a proof: that start stays put, and the layer was read on
@@ -5266,13 +5272,33 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     /// The candidates of a pipelined pull: every peer with a known height
-    /// that has not served a block that failed its check in this gap.
+    /// that has not served a block that failed its check in this gap, its
+    /// height capped at [`Self::quorum_height`]: no range is asked past
+    /// what f+1 peers advertise.
     fn pipeline_peers(&self) -> Vec<(PeerId, u64)> {
+        let cap = self.quorum_height().unwrap_or(0);
         self.peer_heights
             .iter()
             .filter(|(peer, _)| !self.refused_range_peers.contains_key(*peer))
-            .map(|(peer, height)| (*peer, *height))
+            .map(|(peer, height)| (*peer, (*height).min(cap)))
             .collect()
+    }
+
+    /// The catch-up target from advertised heights (sync standard §3.4.1):
+    /// the (f+1)-th highest height among the peers not refused for the gap,
+    /// f the fault tolerance of the current validator set -- at least one
+    /// honest peer is at or past it. With fewer than f+1 such peers, the
+    /// lowest of them. `None` with no peer.
+    fn quorum_height(&self) -> Option<u64> {
+        let mut heights: Vec<u64> = self
+            .peer_heights
+            .iter()
+            .filter(|(peer, _)| !self.refused_range_peers.contains_key(*peer))
+            .map(|(_, height)| *height)
+            .collect();
+        heights.sort_unstable_by(|a, b| b.cmp(a));
+        let backed = self.engine.epoch_manager().current_validator_set().fault_tolerance() as usize + 1;
+        heights.get(backed - 1).or_else(|| heights.last()).copied()
     }
 
     /// Sends the range requests the scheduler hands out now.
@@ -5550,7 +5576,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some(near) = self.range_mode else {
             return;
         };
-        let best = self.peer_heights.values().copied().max().unwrap_or(0);
+        let best = self.quorum_height().unwrap_or(0);
         let tip = self.imported_height.unwrap_or(0);
         let near = if best.saturating_sub(tip) <= 2 { near.saturating_add(1) } else { 0 };
         if near >= 3 && self.catch_up.is_none() {

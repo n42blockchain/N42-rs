@@ -117,6 +117,34 @@ async fn a_peer_level_with_us_or_a_pause_after_a_failure_starts_nothing() {
     assert!(rig.svc.catch_up.is_some(), "the pause over, the pull starts");
 }
 
+/// Sync standard §3.4.1: the target is the (f+1)-th highest advertised
+/// height, never one peer's. In a set of four (f = 1) one peer claiming a
+/// million while the others are level starts no pull, so it cannot make
+/// the node wait or pull for ever; once a second peer is ahead the pull
+/// goes as far as that one, and a pipelined pull asks the liar for nothing
+/// past it either.
+#[tokio::test]
+async fn one_peer_alone_advertising_a_huge_height_neither_starts_nor_sizes_a_pull() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let (liar, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+    rig.svc.note_peer_height(liar, 1_000_000);
+    rig.svc.note_peer_height(b, 0);
+    rig.svc.note_peer_height(c, 0);
+    let mut events = Vec::new();
+    within(rig.svc.consider_catch_up(&mut events)).await;
+    assert!(rig.svc.catch_up.is_none() && events.is_empty(), "no f+1 peers back the height");
+    assert_eq!(rig.svc.quorum_height(), Some(0));
+
+    rig.svc.note_peer_height(b, 5);
+    within(rig.svc.consider_catch_up(&mut events)).await;
+    let pull = rig.svc.catch_up.as_ref().expect("a second peer is ahead");
+    assert_eq!(pull.target, 5, "as far as f+1 peers advertise");
+    assert_eq!(events, vec![ServiceEvent::Syncing { from: 0, to: 5 }]);
+    let capped: std::collections::HashMap<_, _> = rig.svc.pipeline_peers().into_iter().collect();
+    assert_eq!(capped[&liar], 5, "a pipelined pull asks the liar nothing past it");
+}
+
 #[tokio::test]
 async fn the_peer_whose_pull_failed_last_is_passed_over_for_another() {
     let mut rig = node(1, 0, None).await;

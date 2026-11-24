@@ -1,4 +1,4 @@
-# N42 mixed block production standard, profile 1 — v1.0-rc2, frozen 2026-11-24
+# N42 mixed block production standard, profile 1 — v1.0-rc3, frozen 2026-11-24
 
 This is the single normative text of profile 1. It consolidates `docs/MIXED_PRODUCTION_STANDARD.md`
 (v0.2 + decisions O1-O10 of 2026-11-23 + the `0x50`-`0x5F` reservation + amendments AM1-AM23) and the pins
@@ -96,7 +96,7 @@ field gates this.
 
 **A10. Deferred execution.** Always on, depth `k = config.hotstuff.deferredExecutionDepth`, a mandatory
 per-chain constant that MUST be 1 (any other value refuses the genesis). Header N carries `stateRoot`,
-`receiptsRoot`, `logsBloom` and `gasUsed` of block N−1; block 1 carries genesis's.
+`receiptsRoot`, `logsBloom`, `gasUsed` and `requestsHash` (AM25) of block N−1; block 1 carries genesis's.
 
 **A11. Type `0x50` (AltSig).** Not in profile 1. A `0x50` transaction is invalid in pool, builder, block
 validity, includability and execution; the genesis key `altSigTx` refuses the genesis (C4).
@@ -183,11 +183,13 @@ checked against the root after execution.
 **B7. receiptsRoot.** `keccak256(concat(rlp([status, cumulativeGas, logs])))`, `keccak256("")` when empty
 (genesis: A6). Under A10 the value describes block N−1.
 
-**B8. requestsHash.** EIP-7685's hash of no requests, `sha256("")` =
-`0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`, in every header including genesis,
-checked (AM24, owner decision: where Ethereum defines a value, N42 takes Ethereum's). Neither the empty-trie
-root (`0x56e81f17…b421`, the rule until rc1) nor the empty-ommers hash (`0x1dcc4de8…`) is valid. A block whose
-execution produces a request is invalid. No EIP-7685 requests and no EIP-8282 calls run.
+**B8. requestsHash.** EIP-7685's `requests_hash`, a deferred field (A10, AM25): header N carries the hash of
+the requests block N−1's execution produced, `sha256("")` =
+`0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` when there were none; genesis and block 1
+carry `sha256("")`; checked against the node's own execution (AM24: where Ethereum defines a value, N42 takes
+Ethereum's). Neither the empty-trie root (`0x56e81f17…b421`, the rule until rc1) nor the empty-ommers hash
+(`0x1dcc4de8…`) is valid. Requests are produced as on Ethereum (Prague system calls) and are otherwise ignored
+by the native chain; a block that produces requests is valid (AM25 removes the one-transaction chain halt). No EIP-7685 requests and no EIP-8282 calls run.
 
 **B9. Blob gas fields.** `blobGasUsed = 0`, `excessBlobGas = 0`, checked.
 
@@ -610,6 +612,7 @@ that settled them).
 | AM22 | 8000 / 24000 / 96000 / tenure 1 / epoch 10800 / 480M / depth 1; batched verification and non-quadratic TC before 100 | A15-A18, A23, A10, §4, §6 gate 5 |
 | AM23 | gov5 agrees AM19; fallback adopted; committee pool kept, no security meaning | A13, B11, I2, A19 |
 | AM24 | owner decision: requestsHash = EIP-7685's `sha256("")`; genesis hash and V1/V3/V4/V6 regenerated (rc2) | B8, A6, §4, §5 |
+| AM25 | owner decision: requests produced as on Ethereum and ignored; requestsHash carried as a deferred field (rc3) | A10, B8, A13, §5 (V5) |
 | gov5 02:55 readings (accepted in v0.2.1) | D3 caller only if changed; D5 gap; C6 no exemption; ommers zero in genesis; B15 gossip; J4 extra entries | D3, D5, C6, B3, B15, J4 |
 | gov5 02:55 | type `0x05` refused | C4 |
 | PN gov5 03:46 (V1 readings, unobjected; V1 equal both ways 04:09/04:28) | QC ancestry checked when known; "QC absent only while none" not enforced; stamp cache local | B1, B4 |

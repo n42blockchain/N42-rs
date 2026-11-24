@@ -903,3 +903,30 @@ A native chain still produces no EIP-7685 requests; a block whose execution prod
 - n42-rs: CHANGE `PROFILE1_REQUESTS_HASH`; REMOVE `GOV5_EMPTY_REQUESTS_HASH` and
   `is_empty_requests_hash` (no second spelling anywhere); take the new vectors (N42-rs PR #62).
 - n42-26: CHANGE when it implements Profile 1; its chain-94 path uses the value since PR #32.
+
+### Amendment AM25: requests follow Ethereum, requestsHash is a deferred field (owner, 2026-11-24)
+
+**AM25 (owner decision; replaces AM24's "a block whose execution produces a request is invalid" and extends
+A10).** Found by the paper/EIP recheck (`docs/MIXED_PRODUCTION_STANDARD_VS_PAPERS_RC2.md`): the profile-1
+alloc deploys the EIP-7002 and EIP-7251 contracts and every client runs their end-of-block system calls, so one
+fee-paying call to `0x00000961…7002` made a block produce a request, which AM24 made invalid; the request stays
+queued in the contract, every later block dequeues it and is invalid too, and the chain never makes progress
+again. Any user could trigger it.
+
+- Rule: block execution produces EIP-7685 requests exactly as on Ethereum (Prague: the EIP-6110 deposit log
+  scan, the EIP-7002 and EIP-7251 end-of-block calls; a failing system call or a call to a contract without code
+  makes the block invalid, as on Ethereum). A block that produces requests is VALID.
+- `requestsHash` joins the deferred fields of A10: header N carries the EIP-7685 `requests_hash` of block
+  N−1's execution (`sha256` over `sha256(type ‖ data)` of every non-empty request, `sha256("")` when there are
+  none); genesis and block 1 carry `sha256("")`. It is checked like the other deferred fields: the Round-1 vote
+  gate (A13) compares it with the node's own execution of N−1, and import refuses a header whose carried value
+  differs.
+- The native chain has no consensus layer that consumes requests: a request is produced, hashed and otherwise
+  ignored (no deposit, withdrawal or consolidation is credited from it). The contracts' queues drain at
+  Ethereum's per-block rates.
+- Unchanged: on an idle chain and on any chain where no request is ever produced every header still carries
+  `sha256("")`, so the V1 genesis hash `0x188e9d93…90dc` and every published vector (V1, V3, V4, V6, V8) stay
+  valid. V5 MUST add a block that produces one withdrawal request and one consolidation request, and the next
+  block carrying their hash.
+- gov5: CHANGE (record the requests hash with the executed result, carry it, check it; stop refusing requests).
+  n42-rs: CHANGE (same; `validate_requests_hash` on profile 1). n42-26: CHANGE when it implements A10.

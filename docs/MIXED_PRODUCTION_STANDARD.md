@@ -645,7 +645,7 @@ Rules:
 
 ## Amendments of 2026-11-24 (v0.2.1): n42-26's review and gov5's confirmation
 
-gov5 confirmed v0.2 (handoff posts of 2026-11-24 03:00 and 03:40 EST). n42-26 reviewed it and raised
+gov5 confirmed v0.2 (handoff posts of 2026-11-24, about 02:52 and 02:55 EST). n42-26 reviewed it and raised
 the points below; each was checked against the code and decided under the owner's delegation. Where
 an amendment contradicts the text above, the amendment holds.
 
@@ -731,7 +731,7 @@ profile is called production-ready (after milestone 3).
 ### Amendments AM12-AM15 (n42-26's C9, C10, C12; with these the document is v0.3)
 
 Source: n42-26's written review, `n42-26/.artifacts/profile1-reply/n42-26-reply-v0.2.md` (C1-C12).
-gov5 agreed AM1-AM11 item by item (handoff post 2026-11-24 04:50 EST).
+gov5 agreed AM1-AM11 item by item (handoff post of 2026-11-24, about 03:02 EST).
 
 **AM12: byte-level gaps closed (C9).**
 - A15 / A18: on Profile 1 `leaderTenure` and `epochLength` are mandatory and ≥ 1; no default from
@@ -770,7 +770,7 @@ V1, V3, V5 and V8 (with the standard genesis file and its hash) exist. gov5 prod
 n42-26: facts confirmed; its agreement and its milestone-1 entry form (recommended by its session:
 verifying non-validator node in M1, producer in M2) are with its owner.
 
-**AM16 (gov5, 2026-11-24 05:35 EST).** gov5 agrees v0.3. `devFaucetAddress` MUST be non-zero on a
+**AM16 (gov5, 2026-11-24, about 03:07 EST).** gov5 agrees v0.3. `devFaucetAddress` MUST be non-zero on a
 Profile-1 genesis (a zero address refuses the genesis). B11: gov5 followers check only that the
 field is present after activation and carry the value, which is the interim rule of AM12. V8's
 refused cases also include zero `epochLength`, a reward above `u64::MAX` gwei, and a non-zero

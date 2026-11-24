@@ -1,4 +1,4 @@
-# N42 mixed block production standard, profile 1 (v0.2, decisions of 2026-11-23 applied)
+# N42 mixed block production standard, profile 1 (v0.3 = v0.2 + decisions O1-O10 + amendments AM1-AM15)
 
 Status: proposal for the owner, 2026-11-23. Read-only research; no repo was changed.
 Supersedes the 2026-11-23 draft (`MIXED-PRODUCTION-STANDARD-DRAFT.md`, "the draft"), keeping its item ids
@@ -727,3 +727,45 @@ so a Profile-1 round is never compared with a single-client performance figure. 
 owner: (a) how the 500 ms block interval relates to the project's 8-second slot; (b) the values are
 proven on 4-7 validators only: a mixed round with 100+ validators is added as a gate before the
 profile is called production-ready (after milestone 3).
+
+### Amendments AM12-AM15 (n42-26's C9, C10, C12; with these the document is v0.3)
+
+Source: n42-26's written review, `n42-26/.artifacts/profile1-reply/n42-26-reply-v0.2.md` (C1-C12).
+gov5 agreed AM1-AM11 item by item (handoff post 2026-11-24 04:50 EST).
+
+**AM12: byte-level gaps closed (C9).**
+- A15 / A18: on Profile 1 `leaderTenure` and `epochLength` are mandatory and ≥ 1; no default from
+  the sync spec applies. A genesis without them, or with 0, is refused.
+- A8: `devBlockReward` (AM8: decimal string of wei) MUST be a whole number of gwei and at most
+  `u64::MAX` gwei, because rewards are paid as EIP-4895 withdrawals; anything else refuses the
+  genesis. Whether a zero `devFaucetAddress` is legal is fixed by the genesis cases of V8 (gov5 cuts
+  them; until then: a non-zero faucet amount requires a non-zero address).
+- P4: the allowed `config` and `config.hotstuff` keys are a CLOSED list, published with the
+  standard genesis file; any other key refuses the start. V8 carries refused-genesis cases (unknown
+  key, legacy activation field, missing mandatory field, zero tenure, reward not whole gwei, a
+  JSON-number reward, a storage-only alloc entry).
+- B4: V3/V5 gain a pair of consecutive blocks with EQUAL timestamps, including the EIP-4788
+  system call's effect for both.
+- B13: under EIP-8037 `gasUsed = max(regular gas, state gas)`; V5 gains a block where state gas is
+  the larger.
+- B11 (`mobileRegistryRoot`): OPEN. Today a follower carries the root and does not validate it.
+  Until a rule is agreed that cannot split honest nodes over registry gossip timing, Profile 1's
+  rule is explicit: the root is the proposer's statement, covered by the seal and the QC, not
+  re-derived by followers. gov5 states its follower behaviour; the item is revisited before
+  milestone 3.
+
+**AM13: n42-26's status (C10, AM7), from its own post (n42-26 main 4831e77).** Done: B1 QC in
+Extra (34bad2b, `n42-network/src/gov5_block.rs`), 64 MiB block chunks (`gov5_rpc.rs:23-25`), clean
+EOF after a served prefix (`gov5_rpc.rs:184-248`), reward parsing (string or integer, whole gwei),
+a range catch-up client with strict anchors (`range_catchup.rs`), tenure from genesis and
+rotate-on-timeout with the §10.4 vectors. Still CHANGE: AM2's 8 MiB cap, `bodies_by_range/2`,
+`commit_qc/1`, the state-sync servers, `code_by_hash`, and the rest of §4 of its review. The
+n42-26 lines of section 2, section 3 and section 6 above are read with this correction.
+
+**AM14: dates (C12).** Milestones are counted from T0 = the owner accepts v0.3 AND the vector files
+V1, V3, V5 and V8 (with the standard genesis file and its hash) exist. gov5 produces them under
+`/data/blockchain/wr-logs/qs-scratch/profile1/vectors/`, V1 first.
+
+**AM15: positions on v0.3.** gov5: agrees (AM1-AM11; AM12-AM15 to confirm). n42-rs: agrees.
+n42-26: facts confirmed; its agreement and its milestone-1 entry form (recommended by its session:
+verifying non-validator node in M1, producer in M2) are with its owner.

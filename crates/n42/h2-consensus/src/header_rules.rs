@@ -99,12 +99,16 @@ pub struct HeaderRules {
     /// The proposer of every view, for the seal and the coinbase (B2, B3).
     /// `None` leaves both to a caller that knows the proposer itself.
     pub proposers: Option<ProposerSchedule>,
+    /// The chain's H2-v4 signing identity: with it and the proposer
+    /// schedule, the embedded QC is verified as a commit-domain QC of the
+    /// genesis set (B1, E13). `None` leaves that to the caller.
+    pub chain: Option<n42_h2_primitives::consensus::H2V4ChainIdentity>,
 }
 
 impl HeaderRules {
     /// Profile 1 with these chain constants.
     pub const fn profile1(gas_limit: u64, max_block_bytes: u64, proposers: Option<ProposerSchedule>) -> Self {
-        Self { profile1: true, gas_limit, max_block_bytes, proposers }
+        Self { profile1: true, gas_limit, max_block_bytes, proposers, chain: None }
     }
 
     /// Whether the chain runs profile 1.
@@ -142,10 +146,48 @@ impl HeaderRules {
         }
         let extra = validate_profile1_header(header, self)?;
         if let Some(schedule) = &self.proposers {
+            if let Some(chain) = self.chain {
+                verify_profile1_qc(&extra, schedule, chain)?;
+            }
             let proposer = schedule.proposer(extra.view).ok_or(Profile1Error::NoProposer(extra.view))?;
             verify_profile1_seal(header, proposer)?;
         }
         Ok(())
+    }
+
+    /// B1's "the QC names an ancestor", gov5's reading: when the QC's block
+    /// is known here (`lookup` gives a block's number and parent hash) it
+    /// must be on the header's parent chain, walked at most
+    /// [`PROFILE1_ANCESTOR_WALK`] blocks; an unknown block is checked by the
+    /// QC's signature alone. Nothing off profile 1 or without a QC.
+    pub fn check_qc_ancestry(
+        &self,
+        header: &N42Header,
+        lookup: impl Fn(&B256) -> Option<(u64, B256)>,
+    ) -> Result<(), Profile1Error> {
+        if !self.profile1 || header.number == 0 {
+            return Ok(());
+        }
+        let extra = decode_profile1_extra(&header.extra_data)?;
+        if extra.qc.is_empty() {
+            return Ok(());
+        }
+        let qc = n42_h2_wire::h2_wire::decode_h2_qc(&extra.qc)
+            .map_err(|err| Profile1Error::Qc(format!("does not decode: {err}")))?;
+        let Some((target_number, _)) = lookup(&qc.block_hash) else {
+            return Ok(());
+        };
+        let mut cursor = header.parent_hash;
+        for _ in 0..PROFILE1_ANCESTOR_WALK {
+            if cursor == qc.block_hash {
+                return Ok(());
+            }
+            match lookup(&cursor) {
+                Some((number, parent)) if number > target_number => cursor = parent,
+                _ => break,
+            }
+        }
+        Err(Profile1Error::Qc(format!("QC block {} is not an ancestor", qc.block_hash)))
     }
 
     /// The rules between a header and its parent (B4's lower bound, B13,
@@ -297,8 +339,37 @@ pub enum Profile1Error {
     Genesis(String),
 }
 
+/// How far back [`HeaderRules::check_qc_ancestry`] walks (gov5's bound).
+pub const PROFILE1_ANCESTOR_WALK: usize = 4096;
+
+/// B1 / E13: the embedded QC is a commit-domain QC (changes hash zero) by a
+/// quorum of the genesis set (AM5: the set of every view on profile 1).
+pub fn verify_profile1_qc(
+    extra: &HeaderExtra,
+    schedule: &ProposerSchedule,
+    chain: n42_h2_primitives::consensus::H2V4ChainIdentity,
+) -> Result<(), Profile1Error> {
+    if extra.qc.is_empty() {
+        return Ok(());
+    }
+    let wire = n42_h2_wire::h2_wire::decode_h2_qc(&extra.qc)
+        .map_err(|err| Profile1Error::Qc(format!("does not decode: {err}")))?;
+    let n = schedule.validators.len();
+    let qc = crate::wire_bridge::qc_to_engine(&wire, n, "profile-1 header QC")
+        .map_err(|err| Profile1Error::Qc(err.to_string()))?;
+    let set = crate::ValidatorSet::new(&schedule.validators, (n as u32).saturating_sub(1) / 3);
+    crate::verify_commit_qc_with_profile(
+        &qc,
+        &set,
+        &B256::ZERO,
+        crate::protocol::quorum::ConsensusSigningProfile::H2V4(chain),
+    )
+    .map_err(|err| Profile1Error::Qc(err.to_string()))
+}
+
 /// B1: the extra data, strictly: magic, view, seal reserved, the QC part
-/// empty or one certificate in gov5's encoding at or below the header's view.
+/// empty or one certificate in gov5's encoding below the header's view (an
+/// encoded empty QC is refused).
 pub fn decode_profile1_extra(extra: &[u8]) -> Result<HeaderExtra, Profile1Error> {
     if extra.len() > MAX_HEADER_EXTRA_LEN {
         return Err(Profile1Error::Extra(format!("{} bytes, past the 4096-byte bound", extra.len())));
@@ -317,8 +388,12 @@ pub fn decode_profile1_extra(extra: &[u8]) -> Result<HeaderExtra, Profile1Error>
     if !decoded.qc.is_empty() {
         let qc = n42_h2_wire::h2_wire::decode_h2_qc(&decoded.qc)
             .map_err(|err| Profile1Error::Qc(format!("does not decode: {err}")))?;
-        if qc.view > decoded.view {
-            return Err(Profile1Error::Qc(format!("view {} is past the header's view {}", qc.view, decoded.view)));
+        // gov5: an absent QC is zero bytes, never an encoded empty one.
+        if qc.view == 0 {
+            return Err(Profile1Error::Extra("an absent QC is zero bytes, not an encoded empty QC".into()));
+        }
+        if qc.view >= decoded.view {
+            return Err(Profile1Error::Qc(format!("QC view {} is not below the header's view {}", qc.view, decoded.view)));
         }
     }
     Ok(decoded)
@@ -483,3 +558,7 @@ pub fn validate_profile1_genesis_header(header: &N42Header, rules: &HeaderRules)
 #[cfg(test)]
 #[path = "header_rules_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "header_rules_v1_tests.rs"]
+mod v1_tests;

@@ -862,6 +862,38 @@ async fn an_anchor_in_a_later_range_releases_a_block_buffered_from_an_earlier_on
     assert_eq!(executed(&rig), blocks[..4].iter().map(|b| b.0).collect::<Vec<_>>(), "block 3 released by block 4's QC");
 }
 
+/// gov5's 2026-11-24 finding, pinned for this node: under `enforce` a pulled
+/// chain whose header QCs name views in many later epochs of the genesis
+/// `epochLength` (20, the devnet's), with every step jumping over a boundary
+/// so no view lands on one, is anchored all the way up. The engine is built
+/// as `h2_validator` builds it (`EpochManager::new`: the static set answers
+/// every view), so no epoch boundary has to be crossed for a set to be known.
+#[tokio::test]
+async fn a_pulled_chain_many_epochs_on_is_anchored_with_the_static_set() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    rig.svc.engine.set_rotate_on_timeout(Some(1), 20);
+    assert!(!rig.svc.engine.epoch_manager().epochs_enabled(), "the node's engine runs one static set");
+    let quorum = [0, 1, 3];
+    // Epochs (length 20) 2, 3, 5, 8, 21, 60: no view is a boundary's first.
+    let views = [45u64, 63, 107, 168, 433, 1203];
+    let peer = PeerId::random();
+    let mut blocks: Vec<(B256, Header, alloy_primitives::Bytes)> = Vec::new();
+    let mut parent = B256::ZERO;
+    for (i, view) in views.iter().copied().enumerate() {
+        let qc = if i == 0 { Vec::new() } else { header_qc(&rig.svc, &keys, &quorum, views[i - 1], parent, parent) };
+        let block = block_with_extra(i as u64 + 1, parent, view, qc);
+        parent = block.0;
+        blocks.push(block);
+    }
+    catching_up(&mut rig, peer, 1, views.len() as u64);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: views.len() as u64, step: 1 }, chunks(&blocks)));
+    import(&mut rig).await;
+    let anchored: Vec<_> = blocks[..views.len() - 1].iter().map(|b| b.0).collect();
+    assert_eq!(executed(&rig), anchored, "every block a later QC names is anchored; only the top is tail");
+    assert!(!rig.svc.refused_range_peers.contains_key(&peer));
+}
+
 /// Sync standard §3.3: a header QC is an anchor only in the commit domain
 /// and only under the set of its exact view. A prepare-domain QC, or a
 /// commit QC whose set this node does not know (fails closed), anchors

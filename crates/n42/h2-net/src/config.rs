@@ -65,26 +65,30 @@ pub fn max_gossip_size() -> usize {
 /// The chain's own block size bound, when one was set.
 static MAX_BLOCK_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Sets the chain's block size bound (profile 1's `maxBlockBytes`, B15): the
-/// largest decoded block RLP this node publishes or accepts on every carrier
-/// -- gossip ([`max_gossip_size`]), and the `block_by_hash`, `block_push`
-/// and range chunks ([`max_block_chunk`]). Unset, every carrier keeps its
-/// own default (the gossip cap from `N42_MAX_GOSSIP_MB`, the chunk constant
+/// Sets the chain's block size bound (profile 1's `maxBlockBytes`, B15) --
+/// the one setter for every carrier's bound: the largest decoded block RLP
+/// this node publishes or accepts on gossip ([`max_gossip_size`]) and in a
+/// `block_by_hash`, `block_push` or range chunk ([`max_block_chunk`]). A
+/// profile-1 node sets it from its genesis before the transport is built
+/// (`N42_MAX_GOSSIP_MB` is refused there). Unset, every carrier keeps its own
+/// default (the gossip cap from `N42_MAX_GOSSIP_MB`, the chunk constant
 /// [`crate::rpc::MAX_BLOCK_CHUNK`]).
 ///
-/// Set once, before the transport is built: a cap that changed under a
-/// running node would let it publish a block it would then refuse. Setting
-/// the same value again is fine; another value is refused with the one in
-/// force.
+/// A cap that changed under a running node would let it publish a block it
+/// would then refuse: setting the same value again is fine; another value,
+/// or any value after the gossip cap was already read from the environment
+/// and differs, is refused with the size in force.
 pub fn set_max_block_bytes(bytes: u64) -> Result<(), u64> {
     let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
-    match MAX_BLOCK_BYTES.set(bytes) {
-        Ok(()) => Ok(()),
-        Err(_) => match MAX_BLOCK_BYTES.get() {
-            Some(existing) if *existing == bytes => Ok(()),
-            Some(existing) => Err(*existing as u64),
-            None => Ok(()),
-        },
+    if let Some(read) = GOSSIP_SIZE.get()
+        && *read != bytes
+        && MAX_BLOCK_BYTES.get().is_none()
+    {
+        return Err(*read as u64);
+    }
+    match MAX_BLOCK_BYTES.get_or_init(|| bytes) {
+        existing if *existing == bytes => Ok(()),
+        existing => Err(*existing as u64),
     }
 }
 
@@ -100,20 +104,9 @@ fn block_bytes_or(chain: Option<usize>, default: impl FnOnce() -> usize) -> usiz
     chain.unwrap_or_else(default)
 }
 
+/// The gossip cap read from the environment, on a chain without its own
+/// bound.
 static GOSSIP_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Fixes [`max_gossip_size`] to `bytes` before anything reads it: a
-/// profile-1 chain takes the bound from its genesis (`maxBlockBytes`,
-/// standard B15) and refuses `N42_MAX_GOSSIP_MB`. Returns the size already
-/// in force when it was read (or set) first and differs.
-pub fn set_max_gossip_size(bytes: usize) -> Result<(), usize> {
-    let size = *GOSSIP_SIZE.get_or_init(|| bytes);
-    if size == bytes {
-        Ok(())
-    } else {
-        Err(size)
-    }
-}
 
 /// The cap `N42_MAX_GOSSIP_MB` names, in bytes. Anything unset, unparseable or
 /// zero leaves the default: a misread variable must not silently shrink the cap

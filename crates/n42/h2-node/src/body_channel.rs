@@ -212,8 +212,11 @@ const PER_PEER_QUEUE: usize = 4;
 const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Connections the listener serves at once; one per fleet member is the
-/// normal load. Further ones are closed on accept.
-const MAX_CONNECTIONS: usize = 64;
+/// normal load (every member dials every other, `BodyPushers::connect`).
+/// Further ones are closed on accept. 64 shut out a third of a 100-member
+/// fleet; 1024 holds a 200-member one with room for reconnects. An idle
+/// connection holds no body buffer.
+const MAX_CONNECTIONS: usize = 1024;
 
 /// What a body's buffer is reserved to before any of it has arrived. The
 /// rest grows with the bytes received, so a declared length alone cannot
@@ -600,6 +603,29 @@ mod tests {
         drop(writer);
         let err = read_body(&mut reader, &mut body, 20, std::time::Duration::from_secs(1)).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Every other member of a 200-member fleet gets a served connection:
+    /// each is greeted (a refused one is closed on accept and reads EOF).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_200_member_fleet_is_served() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (tx, _rx) = mpsc::channel(4);
+        listen(addr, tx).await.unwrap();
+        let mut streams = Vec::new();
+        for _ in 0..199 {
+            streams.push(TcpStream::connect(addr).await.unwrap());
+        }
+        for (i, stream) in streams.iter_mut().enumerate() {
+            let mut magic = [0u8; 4];
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut magic))
+                .await
+                .unwrap_or_else(|_| panic!("connection {i} not greeted in time"))
+                .unwrap_or_else(|err| panic!("connection {i} refused: {err}"));
+            assert_eq!(magic, GREETING_MAGIC, "connection {i}");
+        }
     }
 
     /// A body offered to the pushers arrives at the listener, whole and once.

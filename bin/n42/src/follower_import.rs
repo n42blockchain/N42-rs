@@ -4611,6 +4611,71 @@ mod tests {
         }
     }
 
+    /// AM19 (`docs/MIXED_PRODUCTION_STANDARD.md`): a block that passes the
+    /// deferred-execution check is importable. Over the generated blocks --
+    /// clean, and with each flaw, alone or in pairs -- every block the check
+    /// accepts against the parent's state executes in full on that state,
+    /// transaction after transaction, through the node's EVM configuration:
+    /// none is refused (nonce, balance, intrinsic gas, fee cap, chain id). A
+    /// block the check passed and the execution refused would lock honest
+    /// nodes on a block nobody can commit; such a case is a bug in the check.
+    #[test]
+    fn a_block_that_passes_the_check_executes() {
+        use alloy_primitives::Address;
+        use evm2::evm::{CacheDB, EmptyDB};
+        use reth_evm::{ConfigureEvm as _, Evm as _};
+
+        let genesis: alloy_genesis::Genesis = serde_json::from_str(&format!(
+            r#"{{"config":{{"chainId":{CHAIN_ID},"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"terminalTotalDifficultyPassed":true,"shanghaiTime":0,"cancunTime":0,"pragueTime":0,"osakaTime":0}},"alloc":{{}}}}"#
+        ))
+        .expect("genesis");
+        let config = n42_engine_types::N42EvmConfig::new(std::sync::Arc::new(n42_header::N42ChainSpec::from(
+            reth_chainspec::ChainSpec::from_genesis(genesis),
+        )));
+        let all = [
+            Flaw::NonceGap,
+            Flaw::DuplicateNonce,
+            Flaw::ShortBalance,
+            Flaw::AbsentSender,
+            Flaw::OnlyInParentOutput,
+            Flaw::ForeignChainId,
+            Flaw::UnderIntrinsicGas,
+            Flaw::FeeCapUnderBase,
+            Flaw::PriorityOverCap,
+        ];
+        let (mut passed, mut refused) = (0usize, 0usize);
+        for seed in 1..600u64 {
+            let mut rng = Rng(seed * 2_654_435_761);
+            let flaws: Vec<Flaw> = (0..rng.below(3)).map(|_| all[rng.below(all.len() as u64) as usize]).collect();
+            let case = random_case(seed * 7_919, &flaws);
+            let state = provider(&case.state);
+            if check_includable(&state, B256::random(), None, &case.block, CHAIN_ID, SpecId::OSAKA).is_err() {
+                refused += 1;
+                continue;
+            }
+            passed += 1;
+            let mut db = CacheDB::new(EmptyDB::default());
+            for (address, account) in &case.state {
+                db.insert_account_info(
+                    address,
+                    AccountInfo { nonce: account.nonce, balance: account.balance, ..Default::default() },
+                );
+            }
+            let env = config.evm_env(case.block.header()).expect("the block's environment");
+            let mut evm = config.evm_with_env(db, env);
+            for (index, (sender, tx)) in case.block.transactions_with_sender().enumerate() {
+                let tx = reth_primitives_traits::Recovered::new_unchecked(
+                    evm2::ethereum::TxEnvelope::from(tx.clone()),
+                    Address::from(*sender),
+                );
+                if let Err(err) = evm.transact_commit(&tx) {
+                    panic!("seed {seed}, {flaws:?}: transaction {index} passed the check and failed execution: {err}");
+                }
+            }
+        }
+        assert!(passed > 150 && refused > 150, "both roads exercised: {passed} passed, {refused} refused");
+    }
+
     /// Blocks wrong in several ways at once: both implementations refuse the
     /// same blocks. Which of the failures is named can differ -- the
     /// implementation this replaced picked the sender group its hash map

@@ -255,8 +255,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // size bound is the genesis's `maxBlockBytes`.
             n42_qmdb_reth::profile1::refuse_process_overrides(&spec.genesis)?;
             if let Some(bytes) = n42_qmdb_reth::profile1::max_block_bytes(&spec.genesis) {
-                n42_h2_net::config::set_max_gossip_size(bytes).map_err(|cap| {
-                    format!("the gossip size was fixed at {cap} bytes before the genesis's maxBlockBytes {bytes}")
+                n42_h2_net::set_max_block_bytes(bytes as u64).map_err(|cap| {
+                    format!("the block size bound was fixed at {cap} bytes before the genesis's maxBlockBytes {bytes}")
                 })?;
             }
             if n42_qmdb_reth::profile1::is_profile1(&spec.genesis) {
@@ -522,6 +522,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("signing      : H2-v4");
         }
         engine.set_leader_tenure(leader_tenure);
+        // Profile 1 (AM5): the validator set is the genesis set; every
+        // reconfiguration entry point of the engine refuses.
+        if hotstuff_config.as_ref().is_some_and(|config| config.profile1().is_some()) {
+            engine.epoch_manager_mut().set_fixed_validator_set(true);
+            println!("validators   : fixed to the genesis set (profile 1)");
+        }
         engine.set_rotate_on_timeout(
             rotate_on_timeout_view,
             hotstuff_config.as_ref().map_or(0, |config| config.epoch_length),
@@ -605,6 +611,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
+        // The chain's vote rules (profile 1: `VoteRules::PROFILE1`, from the
+        // genesis's `n42Profile`; today's otherwise).
+        let vote_rules = hotstuff_config
+            .as_ref()
+            .map_or(n42_h2_consensus::VoteRules::TODAY, n42_qmdb_reth::HotStuffGenesisConfig::vote_rules);
+        if vote_rules.profile1 {
+            service = service.with_vote_rules(vote_rules);
+            println!("vote rules   : profile 1 (Round 1 after the check, commit vote after the own import)");
+        }
         if let Some(store) = store {
             // Inside the service, not on the event it emits: the checkpoint has
             // to be durable before the commit reaches the execution layer, and
@@ -712,6 +727,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The leader names its committed registry root; the builder stamps
             // it where the chain's schedule carries `mobileRegistryRoot`.
             let registry_root = mobile.clone();
+            // Without a service, profile 1 repeats the parent's root (AM21).
+            let vote_rules = service.vote_rules();
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -748,15 +765,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     profile1,
                 )
                 .map(|mut attributes| {
-                    attributes.mobile_registry_root = registry_root.as_ref().map(|mobile| mobile.registry_root());
-                    // Profile 1 (B11, AM21/AM23): every header carries the
-                    // root; a leader without a mobileverify service repeats
-                    // its parent's.
-                    if profile1 && attributes.mobile_registry_root.is_none() {
-                        attributes.mobile_registry_root = Some(
-                            context.head_header.as_ref().and_then(|header| header.mobile_registry_root).unwrap_or_default(),
-                        );
-                    }
+                    attributes.mobile_registry_root = n42_h2_node::mobile::registry_root_for_build(
+                        registry_root.as_ref().map(|mobile| mobile.registry_root()),
+                        context.head_header.as_ref(),
+                        vote_rules,
+                    );
                     attributes
                 })
             });

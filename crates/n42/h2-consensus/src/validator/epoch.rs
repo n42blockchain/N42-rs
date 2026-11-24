@@ -73,6 +73,10 @@ pub struct EpochManager {
     pending_adds: Vec<ValidatorInfo>,
     /// Validator addresses proposed for removal at the next CommitQC.
     pending_removes: Vec<Address>,
+    /// The validator set is the genesis set for the chain's whole life (mixed
+    /// production standard profile 1, AM5): every reconfiguration entry point
+    /// refuses with [`ConsensusError::ValidatorSetFixed`].
+    fixed_set: bool,
 }
 
 impl EpochManager {
@@ -88,6 +92,7 @@ impl EpochManager {
             max_historical_epochs: DEFAULT_MAX_HISTORICAL_EPOCHS,
             pending_adds: Vec::new(),
             pending_removes: Vec::new(),
+            fixed_set: false,
         }
     }
 
@@ -118,6 +123,7 @@ impl EpochManager {
             max_historical_epochs: clamp_max_historical(max_historical_epochs),
             pending_adds: Vec::new(),
             pending_removes: Vec::new(),
+            fixed_set: false,
         }
     }
 
@@ -149,6 +155,7 @@ impl EpochManager {
             max_historical_epochs: clamp_max_historical(max_historical_epochs),
             pending_adds: Vec::new(),
             pending_removes: Vec::new(),
+            fixed_set: false,
         }
     }
 
@@ -204,6 +211,7 @@ impl EpochManager {
             max_historical_epochs,
             pending_adds: Vec::new(),
             pending_removes: Vec::new(),
+            fixed_set: false,
         })
     }
 
@@ -321,6 +329,9 @@ impl EpochManager {
         validators: &[ValidatorInfo],
         fault_tolerance: u32,
     ) -> ConsensusResult<()> {
+        if self.fixed_set {
+            return Err(ConsensusError::ValidatorSetFixed);
+        }
         self.next_set = Some(ValidatorSet::try_new(validators, fault_tolerance)?);
         self.staged_info = Some((validators.to_vec(), fault_tolerance));
         Ok(())
@@ -389,6 +400,25 @@ impl EpochManager {
         true
     }
 
+    /// Fixes the validator set to the current one for good (profile 1, AM5):
+    /// from now on `propose_add_validator`, `propose_remove_validator`,
+    /// `stage_next_epoch` and a non-empty `apply_committed_changes_from_sync`
+    /// return [`ConsensusError::ValidatorSetFixed`], and pending changes are
+    /// dropped. A set already staged is kept: a node fixes its set at
+    /// construction, before anything can be staged.
+    pub fn set_fixed_validator_set(&mut self, fixed: bool) {
+        self.fixed_set = fixed;
+        if fixed {
+            self.pending_adds.clear();
+            self.pending_removes.clear();
+        }
+    }
+
+    /// Whether the validator set is fixed ([`Self::set_fixed_validator_set`]).
+    pub const fn validator_set_fixed(&self) -> bool {
+        self.fixed_set
+    }
+
     /// Returns the number of historical epoch sets stored.
     pub fn historical_epoch_count(&self) -> usize {
         self.historical_sets.len()
@@ -413,6 +443,9 @@ impl EpochManager {
     /// Checks that proposals are allowed: epochs must be enabled and
     /// no epoch transition may be staged yet.
     fn check_proposals_allowed(&self) -> ConsensusResult<()> {
+        if self.fixed_set {
+            return Err(ConsensusError::ValidatorSetFixed);
+        }
         if self.epoch_length == 0 {
             return Err(ConsensusError::EpochsDisabled);
         }
@@ -638,6 +671,9 @@ impl EpochManager {
         &mut self,
         changes: &[ValidatorChange],
     ) -> ConsensusResult<()> {
+        if self.fixed_set && !changes.is_empty() {
+            return Err(ConsensusError::ValidatorSetFixed);
+        }
         self.replace_pending_from_proposal(changes);
         self.commit_pending_changes()
     }
@@ -1509,6 +1545,28 @@ mod tests {
         let vs = ValidatorSet::new(&infos, 1);
         let em = EpochManager::with_epoch_length(vs, 10);
         assert_eq!(em.pending_changes_hash(), alloy_primitives::B256::ZERO);
+    }
+
+    #[test]
+    fn a_fixed_set_refuses_every_reconfiguration_entry_point() {
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos[..4], 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+        em.set_fixed_validator_set(true);
+        assert!(em.validator_set_fixed());
+        assert!(matches!(em.propose_add_validator(infos[4].clone()), Err(ConsensusError::ValidatorSetFixed)));
+        assert!(matches!(em.propose_remove_validator(infos[1].address), Err(ConsensusError::ValidatorSetFixed)));
+        assert!(matches!(em.stage_next_epoch(&infos, 1), Err(ConsensusError::ValidatorSetFixed)));
+        let change = ValidatorChange::Remove { address: infos[1].address };
+        assert!(matches!(
+            em.apply_committed_changes_from_sync(std::slice::from_ref(&change)),
+            Err(ConsensusError::ValidatorSetFixed)
+        ));
+        em.apply_committed_changes_from_sync(&[]).expect("no change is no reconfiguration");
+        assert!(!em.has_staged_next() && !em.has_pending_changes());
+        // Unfixed, the same manager accepts a change as before.
+        em.set_fixed_validator_set(false);
+        em.propose_add_validator(infos[4].clone()).expect("queued");
     }
 
     #[test]

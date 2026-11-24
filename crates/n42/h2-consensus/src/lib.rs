@@ -28,6 +28,7 @@ pub mod rotor;
 pub mod validator;
 mod validator_info;
 pub mod vote_log;
+pub mod vote_rules;
 pub mod wire_bridge;
 
 pub mod block_body;
@@ -81,3 +82,4 @@ pub use validator::{
 };
 pub use validator_info::ValidatorInfo;
 pub use vote_log::{NoopVoteLog, VoteLogWriter};
+pub use vote_rules::VoteRules;

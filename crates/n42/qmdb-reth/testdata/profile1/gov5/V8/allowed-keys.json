@@ -1,0 +1,65 @@
+{
+  "config": {
+    "mandatory": [
+      "amsterdamTime",
+      "berlinBlock",
+      "byzantiumBlock",
+      "cancunTime",
+      "chainId",
+      "consensus",
+      "constantinopleBlock",
+      "eip150Block",
+      "eip155Block",
+      "eip158Block",
+      "homesteadBlock",
+      "hotstuff",
+      "istanbulBlock",
+      "londonBlock",
+      "mergeNetsplitBlock",
+      "n42Profile",
+      "osakaTime",
+      "petersburgBlock",
+      "pragueTime",
+      "shanghaiTime",
+      "stateScheme",
+      "terminalTotalDifficulty",
+      "terminalTotalDifficultyPassed"
+    ],
+    "optional": [
+      "blobSchedule"
+    ]
+  },
+  "config.hotstuff": {
+    "mandatory": [
+      "baseTimeoutMs",
+      "blockIntervalMs",
+      "committeePool",
+      "deferredExecutionDepth",
+      "devBlockReward",
+      "devFaucetAddress",
+      "epochLength",
+      "gasLimit",
+      "leaderTenure",
+      "maxBlockBytes",
+      "maxTimeoutMs",
+      "validators"
+    ],
+    "optional": []
+  },
+  "config.hotstuff.committeePool": {
+    "mandatory": [
+      "committeeSize",
+      "poolSize",
+      "rampBlocks",
+      "seedHex"
+    ],
+    "optional": []
+  },
+  "config.hotstuff.validators[]": {
+    "mandatory": [
+      "address",
+      "blsKey"
+    ],
+    "optional": []
+  }
+}

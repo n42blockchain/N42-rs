@@ -201,6 +201,23 @@ impl HeaderRules {
         Err(Profile1Error::Qc(format!("QC block {} is not an ancestor", qc.block_hash)))
     }
 
+    /// B8 under AM25: the header's requests hash against `carried`, the
+    /// EIP-7685 requests hash of the parent's execution (`requestsHash` is a
+    /// deferred field; block 1 carries the genesis's, the hash of no
+    /// requests). Only the execution layer knows `carried`; this is the
+    /// rule's spelling for a caller that does. Nothing on a chain that is
+    /// not profile 1.
+    pub fn check_carried_requests_hash(&self, header: &N42Header, carried: B256) -> Result<(), Profile1Error> {
+        if !self.profile1 {
+            return Ok(());
+        }
+        match header.requests_hash {
+            None => Err(Profile1Error::Missing { item: "B8", field: "requestsHash" }),
+            Some(hash) if hash != carried => Err(Profile1Error::CarriedRequestsHash { got: hash, carried }),
+            Some(_) => Ok(()),
+        }
+    }
+
     /// The rules between a header and its parent (B4's lower bound, B13,
     /// B14, the parent link). Nothing on a chain that is not profile 1.
     pub fn check_against_parent(
@@ -291,6 +308,14 @@ pub enum Profile1Error {
     /// carries the genesis's, which is the hash of no requests).
     #[error("B8: requests hash {0} of block 1 is not sha256(\"\") (EIP-7685's hash of no requests)")]
     RequestsHash(B256),
+    /// B8 / AM25: the requests hash is not the parent's execution's.
+    #[error("B8: requests hash {got} is not the parent's execution's {carried}")]
+    CarriedRequestsHash {
+        /// What the header carries.
+        got: B256,
+        /// The EIP-7685 requests hash of the parent's execution.
+        carried: B256,
+    },
     /// B9: blob gas used or excess blob gas is not 0.
     #[error("B9: blob gas used {used} / excess blob gas {excess} are not 0")]
     BlobGas {

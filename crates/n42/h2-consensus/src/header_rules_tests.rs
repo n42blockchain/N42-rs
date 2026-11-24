@@ -278,6 +278,7 @@ fn b8_am25_block_1_carries_the_hash_of_no_requests_later_headers_the_parents() {
     let at_1 = |hash| {
         let mut header = unsealed(5);
         header.number = 1;
+        header.slot_number = Some(1);
         header.requests_hash = hash;
         seal(header)
     };
@@ -287,10 +288,19 @@ fn b8_am25_block_1_carries_the_hash_of_no_requests_later_headers_the_parents() {
         assert!(matches!(rules.check_header(&at_1(Some(wrong))), Err(Profile1Error::RequestsHash(_))));
     }
     assert!(matches!(rules.check_header(&at_1(None)), Err(Profile1Error::Missing { item: "B8", .. })));
-    // Block 5 carrying block 4's requests hash: any value passes the header alone.
+    // Block 5 carrying block 4's requests hash: any value passes the header
+    // alone, and the carried check holds it to the parent's execution's.
     for carried in [PROFILE1_REQUESTS_HASH, B256::repeat_byte(7), alloy_consensus::EMPTY_ROOT_HASH] {
-        check(&edited(|h| h.requests_hash = Some(carried))).expect("a carried requests hash");
+        let header = edited(|h| h.requests_hash = Some(carried));
+        check(&header).expect("a carried requests hash");
+        rules.check_carried_requests_hash(&header, carried).expect("the parent's");
+        let other = if carried == PROFILE1_REQUESTS_HASH { B256::repeat_byte(7) } else { PROFILE1_REQUESTS_HASH };
+        assert!(matches!(
+            rules.check_carried_requests_hash(&header, other),
+            Err(Profile1Error::CarriedRequestsHash { .. })
+        ));
     }
+    assert!(HeaderRules::default().check_carried_requests_hash(&valid(), B256::repeat_byte(7)).is_ok(), "nothing off profile 1");
 }
 
 #[test]

@@ -90,6 +90,10 @@ fn import_verdict(
 ) -> Result<(), Profile1Error> {
     rules.check_header(header)?;
     rules.check_against_parent(header, parent, parent.hash_slow())?;
+    // B8 under AM25: the requests hash is the parent's execution's. V1's
+    // genesis and blocks carry no transactions, so every parent's execution
+    // produced no requests: sha256("").
+    rules.check_carried_requests_hash(header, crate::PROFILE1_REQUESTS_HASH)?;
     rules.check_qc_ancestry(header, |hash| known.get(hash).copied())
 }
 

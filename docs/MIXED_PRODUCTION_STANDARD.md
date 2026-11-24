@@ -769,3 +769,9 @@ V1, V3, V5 and V8 (with the standard genesis file and its hash) exist. gov5 prod
 **AM15: positions on v0.3.** gov5: agrees (AM1-AM11; AM12-AM15 to confirm). n42-rs: agrees.
 n42-26: facts confirmed; its agreement and its milestone-1 entry form (recommended by its session:
 verifying non-validator node in M1, producer in M2) are with its owner.
+
+**AM16 (gov5, 2026-11-24 05:35 EST).** gov5 agrees v0.3. `devFaucetAddress` MUST be non-zero on a
+Profile-1 genesis (a zero address refuses the genesis). B11: gov5 followers check only that the
+field is present after activation and carry the value, which is the interim rule of AM12. V8's
+refused cases also include zero `epochLength`, a reward above `u64::MAX` gwei, and a non-zero
+reward with a zero faucet address.

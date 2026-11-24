@@ -1,4 +1,4 @@
-# N42 mixed block production standard, profile 1 (v0.2, decisions of 2026-11-23 applied)
+# N42 mixed block production standard, profile 1 (v0.3 = v0.2 + decisions O1-O10 + amendments AM1-AM15)
 
 Status: proposal for the owner, 2026-11-23. Read-only research; no repo was changed.
 Supersedes the 2026-11-23 draft (`MIXED-PRODUCTION-STANDARD-DRAFT.md`, "the draft"), keeping its item ids
@@ -225,7 +225,9 @@ Rule: `keccak(concat(enc(reward_i)))`, `keccak("")` when empty; the body's rewar
 Rule: `keccak(concat(rlp([status, cumulativeGas, logs])))`, `keccak("")` when empty. — all OK.
 
 **B8. requestsHash.** (draft: AP)
-Rule: `keccak(rlp([]))` (no EIP-7685 requests on a native chain; the EIP-8282 calls do not run). One spelling.
+Rule (AM24, which replaces AM3 and the text below): EIP-7685's hash of no requests, `sha256("")` =
+`0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`, as on Ethereum. One spelling.
+Superseded text: `keccak(rlp([]))` (no EIP-7685 requests on a native chain; the EIP-8282 calls do not run).
 — gov5 CHANGE (check) · n42-rs REMOVE (second accepted spelling) · n42-26 CHANGE (verify).
 
 **B9. Blob gas fields.** (draft: AU)
@@ -642,3 +644,262 @@ Rules:
 - Blob transactions (type `0x03`) stay off in profile 1 (decision O2): they exist to give rollups
   cheap data availability on a slow L1, and no rollup posts data to N42. If N42 is ever used as
   a data availability layer they return as a profile change.
+
+## Amendments of 2026-11-24 (v0.2.1): n42-26's review and gov5's confirmation
+
+gov5 confirmed v0.2 (handoff posts of 2026-11-24, about 02:52 and 02:55 EST). n42-26 reviewed it and raised
+the points below; each was checked against the code and decided under the owner's delegation. Where
+an amendment contradicts the text above, the amendment holds.
+
+**AM1 (n42-26, accepted): what `amsterdamTime` means.** On Profile 1 `amsterdamTime: 0` activates
+exactly the execution changes tabled in `docs/GLAMSTERDAM_EXECUTION_PARITY.md` (the set gov5 and
+n42-rs run byte-equal today) and nothing else. It is NOT the upstream client's own bundle of that
+name: a reth-derived client must not enable any other EIP its library ties to the same field. The
+vector set V2/V3 pins the result; a client lists, in its conformance note, every EIP its library
+would have enabled and how it is switched off.
+
+**AM2 (n42-26, accepted): block size.** The only size bound is `config.hotstuff.maxBlockBytes`
+(B15). The Ethereum block-RLP size cap (EIP-7934) and any client's own smaller cap do not apply to
+production or import on a native chain. n42-26 still enforces 8 MiB at build and import
+(`native_payload.rs:227`, `:447`): CHANGE.
+
+**AM3 (n42-26, accepted; corrects B8 and gov5's reading of it; SUPERSEDED by AM24): requestsHash.** B8's
+"`keccak(rlp([]))`" was a mislabel. The rule is the value gov5 and n42-rs produce today on every
+live header, the empty-trie root:
+`0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`, in every header including
+genesis, checked. Neither EIP-7685's `sha256("")` (`0xe3b0c442…`) nor the empty-ommers hash
+(`0x1dcc4de8…`) is valid. gov5: do NOT implement `0x1dcc4de8…` (your 03:40 post); only your genesis
+header changes. n42-rs REMOVE (the second spelling, `is_empty_requests_hash`). n42-26 CHANGE.
+
+**AM4 (n42-26, accepted): the seal, byte for byte.** `sealHash = keccak256(rlp(H'))` where `H'` is
+the full header (every element, `mobileRegistryRoot` included) with the last 96 bytes of
+`extraData` removed (removed only when `extraData` is longer than 96 bytes). The seal is the
+proposer's BLS signature over those 32 bytes with the H2-v4 proof-of-possession DST, placed in the
+last 96 bytes of `extraData`. Reference: gov5 `sealHash` / `Seal`, n42-rs
+`h2-consensus/src/header_profile.rs` `seal_hash` / `seal_header` / `verify_seal`; pinned by V1. On
+Profile 1 the seal IS verified on import and before the Round-1 vote; this overrides the sync
+spec's statement that the seal is not checked (that described pre-profile chains).
+
+**AM5 (n42-26, formal objection, accepted): validator-set changes.** As written, E2 leaves a staged
+set covered by no signature (`changesHash` zero, sets not on chain), so a faulty leader could make
+honest nodes activate different sets. Decision: on Profile 1 the validator set is the genesis set;
+the reconfiguration API is disabled and a node refuses a staged change. Milestones 1 and 2 run on
+the fixed set. E2 is reopened: before milestone 3 a design is agreed in which the change is carried
+in a block and bound by the votes on that block (a non-zero `changesHash` over the canonical
+encoding of the new set is the candidate), with a vector and a mixed round. Milestone 3's
+"validator added / removed" gate waits for it.
+
+**AM6 (n42-26, accepted; amends O1 and the M1' gate).** A voting member that does not propose times
+out every one of its tenures, so "voting follower" cannot pass "every client leads a full tenure".
+O1 becomes: a client is in the validator set of a mixed round only if it can lead. A client not yet
+able to lead joins as a verifying non-validator node (imports and verifies every block, same
+hashes, not in the set). M1' gate: every client IN THE SET leads at least one full tenure; every
+participating client holds the same hash at every height. n42-26 is a full producer by milestone 2.
+
+**AM7 (n42-26): stale status lines about n42-26.** Accepted in principle (W6 QC embedding, 64 MiB,
+reward parsing are reported done). n42-26 posts its corrected status per item id with file:line in
+the handoff file; the per-client status column is then updated from that post.
+
+**AM8 (gov5): `devBlockReward` encoding.** A decimal string of wei on a Profile-1 genesis; a JSON
+number is refused. All three clients.
+
+gov5's 03:40 readings of D3 (the system caller appears only if it changed), D5, C6, B3 (ommersHash
+zero in genesis too), B15, A13 and J4 are accepted as the reading of the standard. n42-rs takes D3
+(the `0xff…fe` live empty leaf goes away) and A13 on its milestone-1 list.
+
+### Amendments AM9-AM11 (n42-26, second batch, accepted)
+
+**AM9: "deleted" means "not available on Profile 1".** Wherever this standard says a rule, format,
+transaction type or switch is deleted or removed, read: it MUST NOT be reachable on a chain whose
+genesis says `"n42Profile": 1`. A client may keep the code for chains outside the profile (its own
+performance or research chains: type `0x50`, frame blocks, deferred depth 2, bench knobs). Joining
+Profile 1 with such a feature later is welcome and goes through a profile change; it is not
+required of any client.
+
+**AM10: forbidden environment and flags (J4).** On a genesis with `"n42Profile": 1`, a node that
+finds one of the J4 variables or flags set REFUSES TO START, naming it. On a genesis without the
+field the same variables remain that client's ordinary configuration. (Precedent in n42-26: the
+test chain-id range and `N42_BENCH_UNSAFE=1`.)
+
+**AM11: the Profile-1 numbers are Profile 1's only.** `leaderTenure` 8, gas limit 480M and
+`blockIntervalMs` 500 are the values of the standard genesis, chosen so three clients can run
+together; they are per-chain genesis constants (O4, O8, O9), not limits on any client's own chains.
+At 480M gas and 500 ms a block holds at most 480M / 21,000 ≈ 22,857 plain transfers, about 46k TPS,
+so a Profile-1 round is never compared with a single-client performance figure. Open, for the
+owner: (a) how the 500 ms block interval relates to the project's 8-second slot; (b) the values are
+proven on 4-7 validators only: a mixed round with 100+ validators is added as a gate before the
+profile is called production-ready (after milestone 3).
+
+### Amendments AM12-AM15 (n42-26's C9, C10, C12; with these the document is v0.3)
+
+Source: n42-26's written review, `n42-26/.artifacts/profile1-reply/n42-26-reply-v0.2.md` (C1-C12).
+gov5 agreed AM1-AM11 item by item (handoff post of 2026-11-24, about 03:02 EST).
+
+**AM12: byte-level gaps closed (C9).**
+- A15 / A18: on Profile 1 `leaderTenure` and `epochLength` are mandatory and ≥ 1; no default from
+  the sync spec applies. A genesis without them, or with 0, is refused.
+- A8: `devBlockReward` (AM8: decimal string of wei) MUST be a whole number of gwei and at most
+  `u64::MAX` gwei, because rewards are paid as EIP-4895 withdrawals; anything else refuses the
+  genesis. Whether a zero `devFaucetAddress` is legal is fixed by the genesis cases of V8 (gov5 cuts
+  them; until then: a non-zero faucet amount requires a non-zero address).
+- P4: the allowed `config` and `config.hotstuff` keys are a CLOSED list, published with the
+  standard genesis file; any other key refuses the start. V8 carries refused-genesis cases (unknown
+  key, legacy activation field, missing mandatory field, zero tenure, reward not whole gwei, a
+  JSON-number reward, a storage-only alloc entry).
+- B4: V3/V5 gain a pair of consecutive blocks with EQUAL timestamps, including the EIP-4788
+  system call's effect for both.
+- B13: under EIP-8037 `gasUsed = max(regular gas, state gas)`; V5 gains a block where state gas is
+  the larger.
+- B11 (`mobileRegistryRoot`): OPEN. Today a follower carries the root and does not validate it.
+  Until a rule is agreed that cannot split honest nodes over registry gossip timing, Profile 1's
+  rule is explicit: the root is the proposer's statement, covered by the seal and the QC, not
+  re-derived by followers. gov5 states its follower behaviour; the item is revisited before
+  milestone 3.
+
+**AM13: n42-26's status (C10, AM7), from its own post (n42-26 main 4831e77).** Done: B1 QC in
+Extra (34bad2b, `n42-network/src/gov5_block.rs`), 64 MiB block chunks (`gov5_rpc.rs:23-25`), clean
+EOF after a served prefix (`gov5_rpc.rs:184-248`), reward parsing (string or integer, whole gwei),
+a range catch-up client with strict anchors (`range_catchup.rs`), tenure from genesis and
+rotate-on-timeout with the §10.4 vectors. Still CHANGE: AM2's 8 MiB cap, `bodies_by_range/2`,
+`commit_qc/1`, the state-sync servers, `code_by_hash`, and the rest of §4 of its review. The
+n42-26 lines of section 2, section 3 and section 6 above are read with this correction.
+
+**AM14: dates (C12).** Milestones are counted from T0 = the owner accepts v0.3 AND the vector files
+V1, V3, V5 and V8 (with the standard genesis file and its hash) exist. gov5 produces them under
+`/data/blockchain/wr-logs/qs-scratch/profile1/vectors/`, V1 first.
+
+**AM15: positions on v0.3.** gov5: agrees (AM1-AM11; AM12-AM15 to confirm). n42-rs: agrees.
+n42-26: facts confirmed; its agreement and its milestone-1 entry form (recommended by its session:
+verifying non-validator node in M1, producer in M2) are with its owner.
+
+**AM16 (gov5, 2026-11-24, about 03:07 EST).** gov5 agrees v0.3. `devFaucetAddress` MUST be non-zero on a
+Profile-1 genesis (a zero address refuses the genesis). B11: gov5 followers check only that the
+field is present after activation and carry the value, which is the interim rule of AM12. V8's
+refused cases also include zero `epochLength`, a reward above `u64::MAX` gwei, and a non-zero
+reward with a zero faucet address.
+
+**AM17 (owner, 2026-11-24): the slot is 8 seconds; 500 ms belongs to the performance line; 100
+validators are a design and test requirement.**
+- N42's own chain, which Profile 1 standardises, has an 8-second slot. The standard genesis sets
+  `blockIntervalMs: 8000`. The 500 ms interval (and everything measured at it) is the performance
+  line: chains outside the profile (AM9, AM11). This replaces the `blockIntervalMs` value of O8 and
+  of section 5.
+- Values that depend on the slot are re-derived before the genesis file is cut, with gov5 (whose
+  production fleet runs this slot): `baseTimeoutMs` / `maxTimeoutMs` (a view timeout must exceed
+  the slot plus a block's cycle; 6000 / 30000 were chosen for sub-second pacing), `leaderTenure`
+  (8 slots = 64 s a tenure; with n validators a member leads once every n × 64 s), `epochLength` in
+  blocks, the gas limit per 8-second block, and the timestamp rule's bound (B4: with an 8-second
+  slot timestamps are strictly increasing in practice; the `>=` rule stays valid).
+- 100 validators: the profile must be DESIGNED for 100+ validators and PROVEN at that size. Review
+  before milestone 2, per item: quorum certificate size and BLS aggregation / verification cost at
+  100 signers, vote transport (gossip mesh and direct votes) at 100 members, timeout certificates
+  and rotate-on-timeout with many absent members, tenure and epoch arithmetic, the committee pool
+  alongside a 100-member validator set, range/state sync serving with many peers, status handshake
+  fan-out. Test: a mixed round with at least 100 validators (several per execution layer, all three
+  clients' validators present) is a gate of milestone 2, not a late add-on; it replaces the
+  post-milestone-3 gate of AM11(b). A round with members absent (f = 33) and a leader killed is
+  part of it.
+
+**AM18 (owner, 2026-11-24): n42-26 agrees.** The owner confirmed n42-26's agreement to v0.3. With
+gov5 (AM16) and n42-rs (AM15) all three clients agree to the standard as amended through AM17. The
+remaining open items are named in the text: the slot-dependent genesis values (AM17), E2
+validator-set changes (AM5), B11 (AM12), the 100-validator review and round (AM17), and n42-26's
+milestone-1 entry form (AM6: verifying non-validator node first, unless its owner says otherwise).
+
+### Amendments AM19-AM21: check against the papers and design documents (2026-11-24)
+
+`docs/MIXED_PRODUCTION_STANDARD_VS_PAPERS.md` checks v0.3 against the whitepaper and the design
+documents of the three repositories (33 findings). The whitepaper is about the decision network and
+fixes no protocol parameter; the HotStuff-2 and QMDB papers are not on this host, so those checks
+rest on the local review documents. The 8-second slot is n42-26's block interval, which the owner
+has since made Profile 1's (AM17).
+
+**AM19: safety under deferred execution (accepted; consensus rules, all clients).**
+- A13 / E6, Round-1 vote: static header validity is NOT enough. A node votes in Round 1 only if
+  the block also passes the deferred-execution proposal check of
+  `docs/PHASE_D_DEFERRED_EXECUTION.md` (the header's carried execution fields match this node's
+  own execution of the ancestor they describe, and the block's transactions pass the includability
+  check against the state they will run on). Reason: a block that gathers a PrepareQC and then
+  cannot be imported locks honest nodes on a block nobody can commit. A block that passes the
+  check MUST be importable; a case where it is not is a bug to be fixed, never a rule.
+- "Own import" (CommitVote gate) means this node's own independent execution of the block, not
+  applying a diff or a result received from the leader.
+- E14: a CommitQC on block N finalises N's ORDER. N's EXECUTION is certified only when a committed
+  descendant carries N's execution fields (depth 1: the commit of N+1). `safe` = the highest block
+  whose execution is certified; `finalized` = certified and persisted by this node; `latest` = the
+  highest committed block. (n42-rs `N42_SETTLEMENT_TAGS=split`.)
+- E-rules stated explicitly, as gov5's `hotstuff2-spec` has them: a node locks on the block of the
+  highest PrepareQC it has seen and votes only for proposals extending its lock unless the
+  proposal's justification is higher; a leader entering a view by a timeout certificate proposes on
+  the highest QC the certificate carries. V6 covers both.
+
+**AM20: stated limits and pins of Profile 1 (accepted).**
+- D6: one unsharded QMDB tree; compaction and any storage maintenance MUST be root-neutral.
+- Not in Profile 1, said plainly: state proofs as a consensus object, an LtHash summary in the
+  header, post-quantum consensus or phone signatures, phone rewards, staking and slashing, dynamic
+  validator sets (AM5). Each is a later profile change. The whitepaper's throughput figure belongs
+  to the performance line, not to Profile 1 (AM11).
+- A slow but live leader keeps its tenure; only a timeout rotates it (AM17 re-derives the tenure).
+
+**AM21: two proposals that change a proven header behaviour (need gov5's answer before they hold).**
+- I2 / B11, phones must never delay a block (gov5 mobile-attestation design; n42-26 system
+  architecture): a validator without a running mobileverify service MUST still be able to lead.
+  Proposed rule: such a leader repeats its parent's `mobileRegistryRoot` (valid under AM12, since
+  followers do not re-derive the root). Collection windows are defined against the 8-second slot.
+- A19, the committee pool (200,000 derived keys, 512 signers per block): every key comes from a
+  public seed, so the per-block evidence carries no security; gov5's own comment says the pool
+  exists so a replayed chain stays byte-identical, which is an old-data reason (P5). Proposed:
+  drop it from Profile 1 (headers carry a zero parent-beacon-root link), or keep it with the
+  statement that it is a load generator with no security meaning. gov5 owns the mechanism and
+  answers; until then A19 stands as written.
+
+**AM22: the standard genesis values for the 8-second slot (gov5's proposal, accepted; to be proven
+before the file is cut).** `blockIntervalMs` 8000, `baseTimeoutMs` 24000, `maxTimeoutMs` 96000,
+`leaderTenure` 1, `epochLength` 10800 (about 24 h), gas limit 480M fixed (not scaled by the slot),
+`deferredExecutionDepth` 1. These replace O8 and the section-5 values.
+- The view timer runs from view start and the pacing happens inside the view, so the base timeout
+  must exceed slot + build + two network hops; 6000 ms is wrong at 8 s.
+- Tenure 1: a tenure longer than one block serves sub-second pipelining, which Profile 1 does not
+  have; at 100 validators tenure 8 would give each leader 64 s and a slow leader a long hold.
+  Rotate-on-timeout stays in the rule set (from view 0) and is a no-op at tenure 1; a chain that
+  sets a longer tenure gets it with no further change.
+- Honest baseline (gov5): no client has run an 8-second slot; gov5's proven chains are 3-4 s with
+  6000 / 30000 and tenure 1, always 7 validators; the largest in-process test is 100, and vote
+  collection, timeout certificates and view change have never run at 100. So: (a) a gov5 round at
+  8 s with these values comes BEFORE the genesis file is cut, and a mixed one is part of M1';
+  (b) batched vote verification and a timeout-certificate path that is not quadratic in the
+  validator count are milestone-2 work for every client, ahead of the 100-validator round (AM17).
+
+**AM23 (gov5's answers to AM19 and AM21, accepted).** AM19: gov5 agrees; its deferred check
+already compares the carried root / receipts / bloom / gasUsed with its own execution of the parent
+and checks per-sender includability on that state, but its two-phase mode cast Round 1 on the
+header alone; on Profile 1 Round 1 comes only after static header checks, the deferred check and
+the parent's import. E14 matches. AM21: a leader without a mobileverify service repeats its
+parent's `mobileRegistryRoot` (all clients add this fallback). The committee pool STAYS in
+Profile 1 (A19 as written), because `parentBeaconRoot = Blake3(committee evidence)` derives from
+it and is byte-equal between gov5 and n42-rs today; it is stated here that the pool's keys come
+from a public seed and the evidence has NO security meaning. Removing it is a later profile change.
+
+### Amendment AM24: requestsHash is Ethereum's value (owner, 2026-11-24)
+
+**AM24 (owner decision; replaces AM3 and the B8 rule).** `requestsHash` on every Profile-1 header,
+genesis included, is EIP-7685's hash of no requests:
+`sha256("")` = `0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`, checked.
+The empty-trie root `0x56e81f17…b421` (AM3) and the empty-ommers hash `0x1dcc4de8…` are not valid.
+A native chain still produces no EIP-7685 requests; a block whose execution produces one is invalid.
+
+- Why: the owner's rule for N42 is that wherever Ethereum defines a value, N42 takes Ethereum's
+  (P6: "pure execution and header validity follow Ethereum"). AM3's value was not a design choice:
+  it is the `requests_root` of an EIP-7685 draft, the trie root of an empty list, which gov5 was
+  written against. Ethereum shipped `requests_hash` as sha256 over the requests, sha256 of nothing
+  when there are none. AM3's only stated reason was that gov5 and n42-rs produced the old value.
+- Consequences: every header hash changes, so every vector that commits to a header is
+  regenerated by gov5 (V1, V3, V4, V6). The standard genesis hash moves from `0x6f733745…7e4f` to
+  `0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc`. V8 (the closed key list and
+  the refused geneses) does not change.
+- gov5: CHANGE `Profile1RequestsHash`, the header a leader builds, the genesis header; regenerate
+  the vectors (N42-gov5 PR #6, against `feat/profile1`). gov5 `main` writes the same value outside
+  Profile 1 since PR #5.
+- n42-rs: CHANGE `PROFILE1_REQUESTS_HASH`; REMOVE `GOV5_EMPTY_REQUESTS_HASH` and
+  `is_empty_requests_hash` (no second spelling anywhere); take the new vectors (N42-rs PR #62).
+- n42-26: CHANGE when it implements Profile 1; its chain-94 path uses the value since PR #32.

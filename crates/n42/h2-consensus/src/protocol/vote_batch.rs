@@ -439,6 +439,9 @@ impl ConsensusEngine {
             if self.progress_votes {
                 messages.push((progress_message, false));
                 messages.push((vote_message, true));
+            } else if !self.vote_rules.progress_votes_allowed() {
+                // Profile 1 has no progress votes: one is not read (E9).
+                messages.push((vote_message, true));
             } else {
                 messages.push((vote_message, true));
                 messages.push((progress_message, false));

@@ -24,6 +24,25 @@ pub const STATE_SCHEME_KEY: &str = "stateScheme";
 /// The value that selects QMDB.
 pub const STATE_SCHEME_QMDB: &str = "qmdb";
 
+/// Genesis `config` key of the mixed block production standard's profile
+/// (`docs/MIXED_PRODUCTION_STANDARD.md`): `"n42Profile": 1` is the single
+/// switch that says "every rule of profile 1, from block 0". A genesis
+/// without it is read exactly as before.
+pub const N42_PROFILE_KEY: &str = "n42Profile";
+
+/// The one profile this build implements.
+pub const N42_PROFILE_1: u64 = 1;
+
+/// Whether the genesis declares profile 1 (`"n42Profile": 1`).
+///
+/// Every activation predicate in this module answers "on from block 0" (or
+/// "off") on such a chain, so no call site needs to know about the profile.
+/// Any other value of the key is refused at start-up by
+/// `n42_qmdb_reth::profile1`; here it reads as "not profile 1".
+pub fn is_profile1(genesis: &Genesis) -> bool {
+    genesis.config.extra_fields.get(N42_PROFILE_KEY).and_then(serde_json::Value::as_u64) == Some(N42_PROFILE_1)
+}
+
 /// How a chain commits to its state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateScheme {
@@ -38,6 +57,11 @@ pub enum StateScheme {
 /// Absent means MPT, matching gov5's default; a present value that is not
 /// `"qmdb"` also means MPT, since gov5's other presets are all trie-shaped.
 pub fn state_scheme(genesis: &Genesis) -> StateScheme {
+    // Profile 1 is QMDB only (standard A5); its genesis still writes the
+    // field, and start-up refuses one that does not.
+    if is_profile1(genesis) {
+        return StateScheme::Qmdb;
+    }
     let declared: Option<String> = genesis
         .config
         .extra_fields
@@ -57,6 +81,10 @@ pub const ALT_SIG_TX_KEY: &str = "altSigTx";
 /// Absent or anything but `true` means disabled: the type is rejected at
 /// admission and in block validation.
 pub fn alt_sig_tx_enabled(genesis: &Genesis) -> bool {
+    // Not in profile 1 (standard A11, O3).
+    if is_profile1(genesis) {
+        return false;
+    }
     genesis
         .config
         .extra_fields
@@ -74,6 +102,10 @@ pub const FRAME_BLOCKS_KEY: &str = "frameBlocks";
 /// Whether a genesis enables frame blocks. Absent or anything but `true`
 /// means disabled: every block's transactions root is the MPT root.
 pub fn frame_blocks_enabled(genesis: &Genesis) -> bool {
+    // Not in profile 1 (standard A12).
+    if is_profile1(genesis) {
+        return false;
+    }
     genesis
         .config
         .extra_fields
@@ -89,6 +121,11 @@ pub const DEFERRED_EXECUTION_TIME_KEY: &str = "deferredExecutionTime";
 
 /// The deferred-execution fork time, if the genesis declares one.
 pub fn deferred_execution_time(genesis: &Genesis) -> Option<u64> {
+    // Profile 1: always on, from block 1 (standard A10). 0 is the gate the
+    // bench chains that run deferred execution from genesis carry.
+    if is_profile1(genesis) {
+        return Some(0);
+    }
     genesis
         .config
         .extra_fields
@@ -118,6 +155,11 @@ pub const MOBILE_ANCHOR_TIME_KEY: &str = "mobileAnchorTime";
 /// fork the Ethereum way; the earlier of the two when both are set. `None`
 /// means never.
 pub fn glamsterdam_time(genesis: &Genesis) -> Option<u64> {
+    // Profile 1: `amsterdamTime: 0` names gov5's Glamsterdam rule set from
+    // block 0 (standard A4, AM1); `glamsterdamTime` itself is refused there.
+    if is_profile1(genesis) {
+        return Some(0);
+    }
     let gov5 = genesis.config.extra_fields.get_deserialized::<u64>(GLAMSTERDAM_TIME_KEY).and_then(Result::ok);
     match (gov5, genesis.config.amsterdam_time) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -139,6 +181,9 @@ pub const CONSENSUS_KEY: &str = "consensus";
 /// (`params/config.go:473`), consensus `hotstuff` or `apos`, or a `hotstuff`
 /// / `apos` section in the config.
 pub fn is_n42_native(genesis: &Genesis) -> bool {
+    if is_profile1(genesis) {
+        return true;
+    }
     let fields = &genesis.config.extra_fields;
     let consensus: Option<String> = fields.get_deserialized(CONSENSUS_KEY).and_then(Result::ok);
     matches!(consensus.as_deref(), Some("hotstuff" | "apos")) || fields.contains_key("hotstuff") || fields.contains_key("apos")
@@ -159,6 +204,10 @@ pub fn glamsterdam_execution_active_at(genesis: &Genesis, timestamp: u64) -> boo
 
 /// gov5's `mobileAnchorTime`, if the genesis declares one.
 pub fn mobile_anchor_time(genesis: &Genesis) -> Option<u64> {
+    // Profile 1: MobileAnchor from block 0 (standard A20).
+    if is_profile1(genesis) {
+        return Some(0);
+    }
     genesis.config.extra_fields.get_deserialized::<u64>(MOBILE_ANCHOR_TIME_KEY).and_then(Result::ok)
 }
 
@@ -206,6 +255,9 @@ pub enum DeferredDepthError {
     },
     /// A valid depth this build of the node does not implement yet.
     NotImplemented(u64),
+    /// A profile-1 genesis without `hotstuff.deferredExecutionDepth`, which
+    /// the profile makes mandatory (standard O4).
+    MissingOnProfile1,
 }
 
 impl core::fmt::Display for DeferredDepthError {
@@ -233,6 +285,10 @@ impl core::fmt::Display for DeferredDepthError {
                 "{DEFERRED_EXECUTION_DEPTH_KEY} {depth} is not implemented by this node yet (it runs depth \
                  {SUPPORTED_DEFERRED_EXECUTION_DEPTH} at most)"
             ),
+            Self::MissingOnProfile1 => write!(
+                f,
+                "a profile-1 genesis must set hotstuff.{DEFERRED_EXECUTION_DEPTH_KEY} (no default applies)"
+            ),
         }
     }
 }
@@ -248,6 +304,9 @@ impl core::error::Error for DeferredDepthError {}
 /// the depth that would be a silent change of rule: a typo would give depth 1,
 /// and a depth-1 member of a depth-2 fleet refuses every header.
 pub fn deferred_execution_depth(genesis: &Genesis) -> Result<u64, DeferredDepthError> {
+    if is_profile1(genesis) {
+        return profile1_deferred_execution_depth(genesis);
+    }
     let Some(value) = genesis.config.extra_fields.get(DEFERRED_EXECUTION_DEPTH_KEY) else {
         return Ok(1);
     };
@@ -261,6 +320,22 @@ pub fn deferred_execution_depth(genesis: &Genesis) -> Result<u64, DeferredDepthE
     }
     if depth > 1 && gate > genesis.timestamp {
         return Err(DeferredDepthError::GateAfterGenesis { gate, genesis: genesis.timestamp });
+    }
+    Ok(depth)
+}
+
+/// Profile 1 keeps the depth under `config.hotstuff` (standard section 5,
+/// A10, O4), mandatory, with no gate: deferred execution is on from block 1.
+fn profile1_deferred_execution_depth(genesis: &Genesis) -> Result<u64, DeferredDepthError> {
+    let value = genesis
+        .config
+        .extra_fields
+        .get("hotstuff")
+        .and_then(|hotstuff| hotstuff.get(DEFERRED_EXECUTION_DEPTH_KEY))
+        .ok_or(DeferredDepthError::MissingOnProfile1)?;
+    let depth = value.as_u64().ok_or_else(|| DeferredDepthError::NotAnInteger(value.to_string()))?;
+    if !(1..=MAX_DEFERRED_EXECUTION_DEPTH).contains(&depth) {
+        return Err(DeferredDepthError::OutOfRange(depth));
     }
     Ok(depth)
 }
@@ -313,7 +388,61 @@ pub fn genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header {
         header.state_root = qmdb_genesis_root(genesis)
             .expect("a genesis allocation always has a QMDB root");
     }
+    if is_profile1(genesis) {
+        // The mixed production standard, profile 1 (A6 with B3, B8/AM24, B10,
+        // B12), as gov5 writes it (vector V1): ommers hash zero, the
+        // requests hash EIP-7685's sha256 of nothing, element 22 the 0x80 gap, slot
+        // number 0. Element 24 (`mobileRegistryRoot`, zero) is not an
+        // Ethereum field: it is in the hash ([`sealed_genesis_header`]) and on
+        // the N42 header.
+        header.ommers_hash = B256::ZERO;
+        header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+        header.block_access_list_hash = None;
+        header.slot_number = Some(0);
+    }
     header
+}
+
+/// [`genesis_header`], sealed. On a profile-1 genesis the hash is the N42
+/// header's, which carries `mobileRegistryRoot` (zero) as element 24 after
+/// the Ethereum fields; every other genesis hashes as reth does.
+pub fn sealed_genesis_header(
+    genesis: &Genesis,
+    hardforks: &ChainHardforks,
+) -> reth_primitives_traits::SealedHeader<Header> {
+    let header = genesis_header(genesis, hardforks);
+    if !is_profile1(genesis) {
+        return reth_primitives_traits::SealedHeader::new_unhashed(header);
+    }
+    let hash = hash_with_zero_registry_root(&header);
+    reth_primitives_traits::SealedHeader::new(header, hash)
+}
+
+/// keccak of the N42 header with `mobileRegistryRoot` zero: the Ethereum
+/// fields through the requests hash, then element 22 (the access-list hash,
+/// `0x80` when absent), element 23 (the slot number) and element 24 (a zero
+/// 32-byte string). alloy's own encoding stops at the last present field and
+/// knows no element 24, so the three are written here.
+fn hash_with_zero_registry_root(header: &Header) -> B256 {
+    use alloy_rlp::Encodable as _;
+    let mut head = header.clone();
+    head.block_access_list_hash = None;
+    head.slot_number = None;
+    let mut ethereum = Vec::new();
+    head.encode(&mut ethereum);
+    let mut cursor = ethereum.as_slice();
+    let list = alloy_rlp::Header::decode(&mut cursor).expect("a header encodes as a list");
+    let mut payload = cursor[..list.payload_length].to_vec();
+    match header.block_access_list_hash {
+        Some(hash) => hash.encode(&mut payload),
+        None => payload.push(alloy_rlp::EMPTY_STRING_CODE),
+    }
+    header.slot_number.unwrap_or_default().encode(&mut payload);
+    B256::ZERO.encode(&mut payload);
+    let mut out = Vec::with_capacity(payload.len() + 9);
+    alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut out);
+    out.extend_from_slice(&payload);
+    alloy_primitives::keccak256(out)
 }
 
 #[cfg(test)]

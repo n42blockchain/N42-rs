@@ -785,6 +785,10 @@ pub struct ExecutionDriver<E> {
     in_flight_cap: usize,
     /// `N42_VOTE_BEFORE_SLOT` ([`vote_before_slot`]).
     vote_before_slot: bool,
+    /// The profile-1 vote rules ([`n42_h2_consensus::VoteRules`]): under
+    /// profile 1 `vote_before_slot` stays off and the settlement tags stay
+    /// `split`.
+    vote_rules: n42_h2_consensus::VoteRules,
     /// `N42_CHECK_BEFORE_SLOT` ([`check_before_slot`]).
     check_before_slot: bool,
     /// Blocks the check-ahead may queue past the in-flight cap
@@ -1091,6 +1095,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             queued_at: HashMap::new(),
             in_flight_cap: deferred_in_flight(),
             vote_before_slot: vote_before_slot(),
+            vote_rules: n42_h2_consensus::VoteRules::TODAY,
             check_before_slot: check_before_slot(),
             check_ahead_queue: check_ahead_queue(),
             released_checks: std::collections::VecDeque::new(),
@@ -1192,8 +1197,35 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Picks the settlement tags mode; the default is
     /// [`crate::settlement::settlement_tags`] (`N42_SETTLEMENT_TAGS`). This is
     /// how a test picks it without the process environment.
+    ///
+    /// Under profile 1 ([`Self::set_vote_rules`]) `legacy` is refused: the
+    /// mode stays `split` (E14, AM19).
     pub fn set_settlement_tags(&mut self, mode: crate::settlement::SettlementTags) {
+        if mode == crate::settlement::SettlementTags::Legacy && !self.vote_rules.legacy_settlement_allowed() {
+            warn!(target: "n42.h2.el", "legacy settlement tags are not available on a profile-1 chain; keeping split");
+            return;
+        }
         self.settlement.set_mode(mode);
+    }
+
+    /// Sets the vote rules ([`n42_h2_consensus::VoteRules`]); once, before the
+    /// driver runs. Profile 1 turns `N42_VOTE_BEFORE_SLOT` off, puts the
+    /// settlement tags on `split` whatever the environment said, and holds
+    /// `finalized` until the execution layer reports a persisted height.
+    pub fn set_vote_rules(&mut self, rules: n42_h2_consensus::VoteRules) {
+        self.vote_rules = rules;
+        if !rules.vote_before_slot_allowed() {
+            self.vote_before_slot = false;
+        }
+        if !rules.legacy_settlement_allowed() {
+            self.settlement.set_mode(crate::settlement::SettlementTags::Split);
+        }
+        self.settlement.set_needs_reported_persistence(rules.finalized_needs_reported_persistence());
+    }
+
+    /// The vote rules in force; see [`Self::set_vote_rules`].
+    pub const fn vote_rules(&self) -> n42_h2_consensus::VoteRules {
+        self.vote_rules
     }
 
     /// The settlement tags mode in use.
@@ -2213,8 +2245,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// which the check reads, would not exist yet), and fewer than
     /// [`FOLLOWER_LAG_CAP`] imports are in flight or held. Otherwise the
     /// block waits for its slot, vote and all, as without the switch.
+    ///
+    /// Never on under profile 1 ([`Self::set_vote_rules`]).
     pub fn set_vote_before_slot(&mut self, on: bool) {
-        self.vote_before_slot = on;
+        self.vote_before_slot = on && self.vote_rules.vote_before_slot_allowed();
     }
 
     /// `N42_CHECK_BEFORE_SLOT` (see [`check_before_slot`], whose value is the
@@ -2976,28 +3010,49 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// catch-up that skips a block leaves every later one without a parent.
     pub async fn import_pulled(&mut self, payload: ExecutionData) -> Result<B256, ElError> {
         let block_hash = payload.block_hash();
-        let split = self.settlement.mode() == crate::settlement::SettlementTags::Split;
-        if split {
+        self.note_pulled(&payload);
+        Self::pulled_new_payload(&*self.el, payload).await?;
+        self.head_to_pulled(block_hash).await?;
+        Ok(block_hash)
+    }
+
+    /// The settlement bookkeeping of a pulled block (split mode), which the
+    /// forkchoice of [`Self::head_to_pulled`] reads its tags from. Every
+    /// pulled block below the head that forkchoice names must be noted
+    /// first, in height order.
+    pub fn note_pulled(&mut self, payload: &ExecutionData) {
+        if self.settlement.mode() == crate::settlement::SettlementTags::Split {
             self.settlement.note(
-                block_hash,
+                payload.block_hash(),
                 payload.payload.block_number(),
                 payload.payload.parent_hash(),
                 payload.payload.timestamp(),
             );
         }
-        let status = self
-            .el
-            .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, payload)
-            .await?;
+    }
+
+    /// The `newPayload` of a pulled block alone, on the historical path:
+    /// any verdict but VALID is an error. Holds no driver state, so a task
+    /// off the consensus loop can run it on the shared execution layer
+    /// ([`Self::execution_layer_arc`]); the caller keeps pulled blocks in
+    /// height order and moves the head afterwards on the loop
+    /// ([`Self::head_to_pulled`]).
+    pub async fn pulled_new_payload(el: &E, payload: ExecutionData) -> Result<(), ElError> {
+        let block_hash = payload.block_hash();
+        let status = el.new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, payload).await?;
         match status.status {
-            PayloadStatusEnum::Valid => {}
+            PayloadStatusEnum::Valid => Ok(()),
             PayloadStatusEnum::Invalid { validation_error } => {
-                return Err(ElError::new(format!("execution layer rejected block {block_hash}: {validation_error}")));
+                Err(ElError::new(format!("execution layer rejected block {block_hash}: {validation_error}")))
             }
-            other => {
-                return Err(ElError::new(format!("execution layer did not accept block {block_hash}: {other:?}")));
-            }
+            other => Err(ElError::new(format!("execution layer did not accept block {block_hash}: {other:?}"))),
         }
+    }
+
+    /// Makes an executed pulled block the head (head only: see
+    /// [`Self::import_pulled`]). One call after a run of pulled blocks
+    /// covers all of them: the forkchoice names the highest.
+    pub async fn head_to_pulled(&mut self, block_hash: B256) -> Result<(), ElError> {
         // A pulled block is neither committed nor certified here, so it
         // moves neither tag in either mode: split carries the tags the
         // driver has, when they are on the pulled block's chain; legacy
@@ -3012,7 +3067,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             return Err(ElError::new(format!("forkchoice to {block_hash} refused: {validation_error}")));
         }
         self.head = block_hash;
-        Ok(block_hash)
+        Ok(())
     }
 
     /// Handles one consensus output.

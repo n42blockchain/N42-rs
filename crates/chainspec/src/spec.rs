@@ -189,10 +189,7 @@ fn make_chain_spec(
     }
     let hardforks = N42_HARDFORKS.clone();
     //let genesis_hash = alloy_primitives::keccak256(alloy_rlp::encode(genesis.header()));
-    let genesis_header = SealedHeader::new_unhashed(
-        crate::qmdb::genesis_header(&genesis, &hardforks),
-        //genesis_hash,
-    );
+    let genesis_header = crate::qmdb::sealed_genesis_header(&genesis, &hardforks);
     let mut spec = ChainSpec {
         chain,
         genesis,
@@ -1033,7 +1030,14 @@ impl From<Genesis> for ChainSpec {
             (EthereumHardfork::Bpo3.boxed(), genesis.config.bpo3_time),
             (EthereumHardfork::Bpo4.boxed(), genesis.config.bpo4_time),
             (EthereumHardfork::Bpo5.boxed(), genesis.config.bpo5_time),
-            (EthereumHardfork::Amsterdam.boxed(), genesis.config.amsterdam_time),
+            // N42: on a profile-1 genesis `amsterdamTime: 0` names gov5's
+            // Glamsterdam rule set (standard AM1, `qmdb::glamsterdam_time`),
+            // not reth's Amsterdam bundle, which stays unscheduled as it is on
+            // every native chain that runs Glamsterdam today.
+            (
+                EthereumHardfork::Amsterdam.boxed(),
+                genesis.config.amsterdam_time.filter(|_| !crate::qmdb::is_profile1(&genesis)),
+            ),
             (EthereumHardfork::Bogota.boxed(), genesis.config.bogota_time),
         ];
 
@@ -1081,9 +1085,7 @@ impl From<Genesis> for ChainSpec {
 
         Self {
             chain: genesis.config.chain_id.into(),
-            genesis_header: SealedHeader::new_unhashed(crate::qmdb::genesis_header(
-                &genesis, &hardforks,
-            )),
+            genesis_header: crate::qmdb::sealed_genesis_header(&genesis, &hardforks),
             genesis,
             hardforks,
             paris_block_and_final_difficulty,

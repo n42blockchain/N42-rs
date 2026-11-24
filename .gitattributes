@@ -2,3 +2,4 @@
 # A Windows checkout with core.autocrlf=true would rewrite them to CRLF and
 # produce phantom drift against the pinned SHA-256 values. Mirrors gov5's pin.
 crates/n42/*/testdata/*.json -text
+crates/n42/*/testdata/profile1/gov5/** -text

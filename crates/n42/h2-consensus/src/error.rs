@@ -139,6 +139,11 @@ pub enum ConsensusError {
     )]
     EpochsDisabled,
 
+    /// The chain's validator set is its genesis set (mixed production
+    /// standard profile 1, AM5); reconfiguration is disabled.
+    #[error("the validator set is fixed to the genesis set on this chain (profile 1, AM5); validator changes are refused")]
+    ValidatorSetFixed,
+
     /// gov5 H2-v4 currently commits a static validator-set hash of zero.
     #[error("H2-v4 participant mode does not support dynamic validator changes")]
     H2V4ValidatorChangesUnsupported,

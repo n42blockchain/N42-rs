@@ -323,6 +323,9 @@ pub struct H2Service<E> {
     /// Votes straight to the leader (`N42_VOTE_TRANSPORT`; see
     /// [`crate::direct_votes`]).
     direct_votes: crate::direct_votes::DirectVotes,
+    /// The profile-1 vote rules ([`n42_h2_consensus::VoteRules`]); see
+    /// [`Self::with_vote_rules`].
+    vote_rules: n42_h2_consensus::VoteRules,
     /// This validator's hello, signed once.
     vote_hello: Option<[u8; 96]>,
     /// The leader's build throttle (see [`crate::build_throttle`] and
@@ -385,6 +388,13 @@ pub struct H2Service<E> {
     /// Which header shapes this node puts on, and accepts from, the block
     /// topic. See [`HeaderProfile`].
     header_profile: HeaderProfile,
+    /// The mixed production standard's profile-1 header rules
+    /// ([`Self::with_header_rules`]); the default checks nothing more.
+    header_rules: n42_h2_consensus::HeaderRules,
+    /// The last header range catch-up took (profile 1): the parent of the
+    /// next pulled block, whose header is not remembered until it imports,
+    /// for the parent rules (B4, B13, B14) before execution.
+    last_pulled_header: Option<Header>,
     /// Whether consensus messages go out on gov5's native topic in gov5's
     /// own encoding, as a Go fleet member sends them, rather than on the
     /// chain-bound v4 topic. Inbound traffic is accepted from both either
@@ -560,6 +570,8 @@ pub struct H2Service<E> {
     pending_status: Vec<(PeerId, u64)>,
     /// A catch-up in progress, if any.
     catch_up: Option<CatchUp>,
+    /// The timing of the last catch-up that ended (for tests and reports).
+    last_catch_up_times: Option<crate::sync_pipeline::CatchUpTimes>,
     /// Range replies to import on the next drain.
     pending_imports: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>,
     /// Block requests the store could not answer, for the execution layer
@@ -585,9 +597,44 @@ pub struct H2Service<E> {
     /// How the catch-up treats blocks no verified anchor covers
     /// (`N42_SYNC_ANCHOR`, see [`crate::sync_anchor`]).
     sync_anchor_mode: SyncAnchorMode,
+    /// `N42_SYNC_PIPELINE`: pulls run as a pipeline (ranges in flight across
+    /// peers, execution on [`crate::sync_pipeline::PulledImporter`]). Turned
+    /// off for the rest of the run by the stall watchdog.
+    sync_pipeline: bool,
+    /// `N42_SYNC_STALL_SECS`: how long the executed head may stand still
+    /// while pulled blocks wait for execution before the pipeline is given up.
+    sync_stall: Duration,
+    /// The importer of pulled blocks, spawned with the first pipelined pull.
+    pulled_importer: Option<crate::sync_pipeline::PulledImporter>,
+    /// Where the importer reports.
+    pulled_reports: Option<tokio::sync::mpsc::UnboundedReceiver<crate::sync_pipeline::ImportBatch>>,
+    /// Pulled blocks sent to the importer and not yet reported, in order.
+    in_import: std::collections::VecDeque<InImport>,
+    /// The importer generation: bumped when a pull's imports are abandoned,
+    /// so their late reports are ignored.
+    import_generation: u64,
+    /// When the executed head last moved while a pipelined pull ran.
+    pull_progress_at: Option<std::time::Instant>,
+    /// Live/Range mode (sync standard §3.4.7): `Some` while in Range mode,
+    /// counting consecutive commits seen with the gap at most 2.
+    range_mode: Option<u8>,
     /// Under `observe`: pulled blocks executed that `enforce` would have held
     /// unexecuted, and pulls it would have ended.
     sync_anchor_would_refuse: u64,
+    /// What this node and its peers' verified anchors certified, by height
+    /// and view, and the conflict or equivocation that halted the sync
+    /// importer ([`crate::sync_safety`]).
+    sync_safety: crate::sync_safety::SyncSafety,
+    /// The highest pulled block the anchored import released for execution:
+    /// with the committed head, where the next pull starts.
+    sync_head: Option<(u64, B256)>,
+    /// Each peer's range-serving byte bucket (sync standard §6.3).
+    range_buckets: std::collections::HashMap<PeerId, SharedBucket>,
+    /// The buckets' refill rate and burst, in bytes ([`RANGE_RATE_BYTES`],
+    /// [`RANGE_BURST_BYTES`]).
+    range_rate: (f64, f64),
+    /// Range requests refused because the peer's bucket was empty.
+    range_rate_limited: u64,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -714,6 +761,78 @@ struct CatchUp {
     shadow: AnchorBuffer<()>,
     /// The highest height this pull executed (or found already imported).
     executed: u64,
+    /// Where the pull's time went (logged when it ends).
+    times: crate::sync_pipeline::CatchUpTimes,
+    /// When each range request in flight was sent, by peer and start.
+    sent: std::collections::HashMap<(PeerId, u64), std::time::Instant>,
+    /// A pipelined pull's scheduler (`N42_SYNC_PIPELINE`); `None` for the
+    /// serial pull, one range of one peer at a time.
+    sched: Option<crate::sync_pipeline::RangeScheduler>,
+    /// A pipelined pull whose ranges are all served, waiting for its last
+    /// imports to be reported before it ends: whether it is complete.
+    end: Option<bool>,
+    /// The commit QC of the highest anchor applied to the buffer: what an
+    /// authenticated block is certified by.
+    top_anchor: Option<QuorumCertificate>,
+    /// The QCs of anchors naming blocks not buffered yet, by the hash named.
+    pending_qcs: std::collections::HashMap<B256, QuorumCertificate>,
+    /// The peer that served the block `prev_hash` names.
+    prev_peer: Option<PeerId>,
+}
+
+/// The range bytes one peer is served per second, on average (sync
+/// standard §6.3: a token bucket of 64 MiB/s).
+const RANGE_RATE_BYTES: f64 = (64u64 << 20) as f64;
+
+/// The range bytes one peer may be served in a burst (§6.3: 256 MiB).
+const RANGE_BURST_BYTES: f64 = (256u64 << 20) as f64;
+
+/// A [`ByteBucket`] the loop and a serving task share.
+type SharedBucket = Arc<std::sync::Mutex<ByteBucket>>;
+
+/// Byte buckets kept before the full ones are forgotten.
+const MAX_RANGE_BUCKETS: usize = 1024;
+
+/// A per-peer token bucket of range bytes. A request is served while the
+/// bucket holds anything; the reply's bytes are taken afterwards and may
+/// leave it in debt, which the refill pays back before the next.
+#[derive(Debug, Clone, Copy)]
+struct ByteBucket {
+    tokens: f64,
+    at: std::time::Instant,
+}
+
+impl ByteBucket {
+    /// The bucket refilled at `rate` bytes/s up to `burst`, as of `now`.
+    fn refill(&mut self, (rate, burst): (f64, f64), now: std::time::Instant) {
+        let secs = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = rate.mul_add(secs, self.tokens).min(burst);
+        self.at = now;
+    }
+
+    /// Takes `bytes` from `bucket`: whether it still holds anything.
+    fn spend(bucket: &SharedBucket, rate: (f64, f64), bytes: usize) -> bool {
+        let mut bucket = bucket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        bucket.refill(rate, std::time::Instant::now());
+        bucket.tokens -= bytes as f64;
+        bucket.tokens > 0.0
+    }
+}
+
+/// Anchor QCs a pull keeps for blocks it has not buffered yet.
+const MAX_PENDING_ANCHOR_QCS: usize = 256;
+
+/// A pulled block sent to the importer, kept on the loop for the
+/// bookkeeping its report completes.
+#[derive(Debug)]
+struct InImport {
+    number: u64,
+    hash: B256,
+    header: Header,
+    rlp: Bytes,
+    /// Off/observe: what the header's certificate proved (the unproven
+    /// bookkeeping); `None` under the anchor rule.
+    proven: Option<Option<u64>>,
 }
 
 impl CatchUp {
@@ -730,6 +849,13 @@ impl CatchUp {
             anchored: AnchorBuffer::default(),
             shadow: AnchorBuffer::default(),
             executed: started_at,
+            times: crate::sync_pipeline::CatchUpTimes::start(),
+            sent: std::collections::HashMap::new(),
+            sched: None,
+            end: None,
+            top_anchor: None,
+            pending_qcs: std::collections::HashMap::new(),
+            prev_peer: None,
         }
     }
 }
@@ -967,6 +1093,14 @@ const HELD_TOO_LONG: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_IMPORTED: usize = 8192;
 /// Between the end of one catch-up and the start of the next.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(3);
+
+/// The pause between pulls in Range mode (sync standard §3.4.7): the gap is
+/// known to be open, so the next pull starts almost at once.
+const CATCH_UP_RETRY_IN_RANGE: Duration = Duration::from_millis(250);
+
+/// How often an idle loop looks at a pipelined pull's deadlines and stall
+/// watchdog.
+const PULL_TICK: Duration = Duration::from_millis(250);
 /// The committed QC this node embeds in the headers it seals, in gov5's
 /// encoding (empty: none yet).
 ///
@@ -1603,6 +1737,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             straggler_wait: None,
             straggler_waits: 0,
             direct_votes: crate::direct_votes::DirectVotes::new(crate::direct_votes::VoteTransport::from_env()),
+            vote_rules: n42_h2_consensus::VoteRules::TODAY,
             vote_hello: None,
             build_throttle: None,
             last_drain: (0, 0, 0, ""),
@@ -1621,6 +1756,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             prepare_ahead: false,
             defer_reason: None,
             header_profile: HeaderProfile::Ethereum,
+            header_rules: n42_h2_consensus::HeaderRules::default(),
+            last_pulled_header: None,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
             unsolicited_heights: std::collections::BTreeMap::new(),
@@ -1668,6 +1805,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_outbox: Vec::new(),
             pending_status: Vec::new(),
             catch_up: None,
+            last_catch_up_times: None,
             pending_imports: Vec::new(),
             pending_block_requests: Vec::new(),
             serve_slots: ServeSlots::shared(MAX_SERVES_PER_PEER, MAX_SERVES_IN_FLIGHT),
@@ -1677,7 +1815,20 @@ impl<E: ExecutionLayer> H2Service<E> {
             verified_header_qcs: std::cell::RefCell::default(),
             sync_anchor_qcs: std::cell::RefCell::default(),
             sync_anchor_mode: SyncAnchorMode::from_env(),
+            sync_pipeline: crate::sync_pipeline::pipeline_from_env(),
+            sync_stall: crate::sync_pipeline::stall_from_env(),
+            pulled_importer: None,
+            pulled_reports: None,
+            in_import: std::collections::VecDeque::new(),
+            import_generation: 0,
+            pull_progress_at: None,
+            range_mode: None,
             sync_anchor_would_refuse: 0,
+            sync_safety: crate::sync_safety::SyncSafety::default(),
+            sync_head: None,
+            range_buckets: std::collections::HashMap::new(),
+            range_rate: (RANGE_RATE_BYTES, RANGE_BURST_BYTES),
+            range_rate_limited: 0,
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -1778,6 +1929,24 @@ impl<E: ExecutionLayer> H2Service<E> {
         Ok(())
     }
 
+    /// Runs the chain under the profile-1 header rules `rules` (the mixed
+    /// production standard, B1-B15): every header that arrives -- gossip,
+    /// push, by-hash, compact, range -- is checked, seal included, before it
+    /// is remembered or imported, and again with the clock bound (B4) and
+    /// the commit domain of its QC (B1) before a vote. On profile 1 the
+    /// chain's `maxBlockBytes` becomes every carrier's block bound (B15,
+    /// [`n42_h2_net::set_max_block_bytes`]). The default rules change
+    /// nothing.
+    pub fn with_header_rules(mut self, rules: n42_h2_consensus::HeaderRules) -> Self {
+        if rules.is_profile1()
+            && let Err(existing) = n42_h2_net::set_max_block_bytes(rules.max_block_bytes)
+        {
+            warn!(target: "n42.h2.node", existing, wanted = rules.max_block_bytes, "the block size bound was already set; it stays");
+        }
+        self.header_rules = rules;
+        self
+    }
+
     /// Runs this node under gov5's `HotStuff` header profile.
     ///
     /// Blocks it builds are finished before they are proposed — the view
@@ -1854,6 +2023,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 warn!(target: "n42.h2.node", view = qc.view, %err, "the committed QC does not encode; headers keep the previous one");
             }
         }
+    }
+
+    /// Turns the pipelined catch-up on or off, in place of
+    /// `N42_SYNC_PIPELINE` (see [`crate::sync_pipeline`]).
+    pub const fn with_sync_pipeline(mut self, on: bool) -> Self {
+        self.sync_pipeline = on;
+        self
+    }
+
+    /// Sets the stall watchdog's period (see `N42_SYNC_STALL_SECS`).
+    pub const fn with_sync_stall(mut self, stall: Duration) -> Self {
+        self.sync_stall = stall;
+        self
     }
 
     /// Sets how the range catch-up treats pulled blocks no verified anchor
@@ -1976,9 +2158,37 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     /// Chooses how votes travel (`N42_VOTE_TRANSPORT`, read by
     /// [`Self::new`]); see [`crate::direct_votes`].
+    ///
+    /// Under profile 1 ([`Self::with_vote_rules`]) every vote goes by the
+    /// consensus topic alone: `gossip` whatever is asked.
     pub fn with_vote_transport(mut self, mode: crate::direct_votes::VoteTransport) -> Self {
+        let mode = if self.vote_rules.direct_votes_allowed() { mode } else { crate::direct_votes::VoteTransport::Gossip };
         self.direct_votes = crate::direct_votes::DirectVotes::new(mode);
         self
+    }
+
+    /// Sets the profile-1 vote rules ([`n42_h2_consensus::VoteRules`]) on
+    /// this node: the engine's Round 1 and `CommitVote` gates and its progress
+    /// votes, the driver's vote before the slot and settlement tags, and the
+    /// vote transport (E16: every vote is published on the consensus topic;
+    /// `/n42/vote/1` is not a standard protocol). Once, before the node runs;
+    /// the default is today's behaviour.
+    pub fn with_vote_rules(mut self, rules: n42_h2_consensus::VoteRules) -> Self {
+        self.vote_rules = rules;
+        self.engine.set_vote_rules(rules);
+        self.driver.set_vote_rules(rules);
+        if !rules.direct_votes_allowed()
+            && self.direct_votes.mode() != crate::direct_votes::VoteTransport::Gossip
+        {
+            warn!(target: "n42.h2.node", "direct votes are not available on a profile-1 chain; votes go by the consensus topic");
+            self.direct_votes = crate::direct_votes::DirectVotes::new(crate::direct_votes::VoteTransport::Gossip);
+        }
+        self
+    }
+
+    /// The vote rules in force; see [`Self::with_vote_rules`].
+    pub const fn vote_rules(&self) -> n42_h2_consensus::VoteRules {
+        self.vote_rules
     }
 
     /// Holds this leader's proposals back while its execution layer carries
@@ -2103,7 +2313,7 @@ impl<E: ExecutionLayer> H2Service<E> {
 
         // A range reply half imported is finished the same way: the swarm
         // gets one poll and the step returns to import the next batch.
-        if still_advancing || !self.pending_imports.is_empty() {
+        if still_advancing || self.pull_has_work() {
             // The bound stopped a leader that was still making progress.
             // Blocking now would trade the rest of its views for a timeout, so
             // look at the network without waiting and come straight back —
@@ -2154,8 +2364,28 @@ impl<E: ExecutionLayer> H2Service<E> {
         let own_import_ends = self.own_import_ends.as_mut();
         let foreign_imports = self.foreign_imports.as_mut();
         let commit_reports = self.commit_reports.as_mut();
+        let pulled_reports = self.pulled_reports.as_mut();
+        let pull_ticks = !self.in_import.is_empty() || self.catch_up.as_ref().is_some_and(|c| c.sched.is_some());
 
         tokio::select! {
+            batch = async {
+                match pulled_reports {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // The pulled blocks' importer reported a run: the head moves
+                // once for it, and the pull screens and releases more.
+                if let Some(batch) = batch {
+                    let at = std::time::Instant::now();
+                    self.drain_pulled_imports(&mut events, Some(batch)).await;
+                    self.loop_spend.note("pulled_report", at);
+                }
+            }
+            () = tokio::time::sleep(PULL_TICK), if pull_ticks => {
+                // A pipelined pull's deadlines and stall watchdog are looked
+                // at in the drain below, also when nothing else happens.
+            }
             commit = async {
                 match commit_reports {
                     Some(rx) => rx.recv().await,
@@ -2595,6 +2825,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     decode_block_rlp_raw(&rlp, self.header_profile).map(|block| (block, rlp))
                 });
                 match decoded {
+                    Ok((block, rlp)) if let Some(reason) = self.profile1_import_refusal(&block.header, Some(rlp.len())) => {
+                        debug!(target: "n42.h2.node", block_hash = ?block.block_hash, %reason, "dropped a block body refused by profile 1");
+                    }
                     Ok((block, rlp)) => {
                         let block_hash = block.block_hash;
                         if let Some(peer) = from {
@@ -2846,6 +3079,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // The same path a gossiped body takes; the hash the peer
                     // sent it under is checked by the decode, not trusted.
                     match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
+                        Ok(block) if let Some(reason) = self.profile1_import_refusal(&block.header, Some(chunk.rlp.len())) => {
+                            debug!(target: "n42.h2.node", %peer, ?hash, %reason, "peer answered a block request with a block profile 1 refuses");
+                        }
                         Ok(block) if block.block_hash == hash => {
                             self.note_peer_height(peer, block.header.number);
                             self.remember_block(hash, &block.header);
@@ -2890,6 +3126,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // everything below is idempotent, and `awaiting_bodies` has
                 // already been emptied by whichever copy came first.
                 match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
+                    Ok(block) if let Some(reason) = self.profile1_import_refusal(&block.header, Some(chunk.rlp.len())) => {
+                        debug!(target: "n42.h2.node", %peer, hash = ?block.block_hash, %reason, "a pushed body profile 1 refuses");
+                    }
                     Ok(block) => {
                         self.note_peer_height(peer, block.header.number);
                         let hash = block.block_hash;
@@ -2921,13 +3160,20 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Committed blocks only (sync standard Q-S5, B4): the
                 // execution layer's canonical chain also holds the head
                 // consensus has not committed and blocks pulled unproven.
-                if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
+                if !self.range_bucket_allows(peer) {
+                    // Over its byte rate (sync standard §6.3): refused before
+                    // the first block, which a client backs off from.
+                    self.range_rate_limited += 1;
+                    debug!(target: "n42.h2.node", %peer, ?request, "peer over its range byte rate; range refused");
+                    self.transport.respond_range_error(channel, "server busy: rate limited".to_owned());
+                } else if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
                     let el = self.driver.execution_layer_arc();
                     let back = self.served_txns.0.clone();
                     let budget = self.serve_bytes.clone();
                     let ceiling = self.serve_ceiling();
+                    let meter = self.range_buckets.get(&peer).map(|bucket| (Arc::clone(bucket), self.range_rate));
                     tokio::spawn(async move {
-                        let range = serve_range(&*el, request, &budget, ceiling).await;
+                        let range = serve_range_metered(&*el, request, &budget, ceiling, meter).await;
                         let _ = back.send(Served::Range { peer, request, channel, range, slot }).await;
                     });
                 } else {
@@ -2935,7 +3181,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.transport.respond_range_error(channel, "server busy".to_owned());
                 }
             }
-            TransportEvent::RangeFetched { peer, request, reply } => match reply {
+            TransportEvent::RangeFetched { peer, request, reply } => {
+              if let Some(c) = self.catch_up.as_mut()
+                  && let Some(sent) = c.sent.remove(&(peer, request.start))
+              {
+                  c.times.note_reply(sent.elapsed());
+                  if let Ok(chunks) = &reply {
+                      c.times.bytes += chunks.iter().map(|chunk| chunk.rlp.len() as u64).sum::<u64>();
+                  }
+              }
+              if self.catch_up.as_ref().is_some_and(|c| c.sched.is_some()) {
+                  self.pipeline_reply(peer, request, reply);
+              } else {
+              match reply {
                 Ok(chunks) => self.pending_imports.push((peer, request, chunks)),
                 Err(reason) => {
                     if self.catch_up.as_ref().is_some_and(|c| c.peer == peer) {
@@ -2948,7 +3206,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                         warn!(target: "n42.h2.node", %peer, ?request, reason, "range request refused");
                     }
                 }
-            },
+              }
+              }
+            }
             TransportEvent::StatusExchanged {
                 peer,
                 height,
@@ -3098,6 +3358,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         for action in self.driver.retry_failed_imports().await {
             self.apply_driver_action(action, events)?;
         }
+        self.drain_pulled_imports(events, None).await;
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
         // Only blocks taken elided are queued. The first request for one
@@ -3274,8 +3535,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             // The parent first, as for every import: a block the pull brought
             // in never told the engine, and an unknown parent withholds the
             // vote (audit 2026-10 round 2, R2-R1).
-            if let Some(reason) = self.header_qc_refusal(block_hash) {
-                warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no vote");
+            if let Some(reason) = self.vote_refusal(block_hash) {
+                warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no vote");
                 return Ok(());
             }
             if let Some(header) = self.block_headers.get(block_hash) {
@@ -3338,6 +3599,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if let Some(number) = self.block_numbers.get(&block_hash).copied() {
                     self.transport.set_advertised_height(number);
                     self.committed_height = Some(self.committed_height.map_or(number, |height| height.max(number)));
+                    self.note_range_mode_commit();
                     // A commit at or past the unproven run puts the head on
                     // the chain consensus decided.
                     if self.unproven_from.is_some_and(|from| number >= from) {
@@ -3347,10 +3609,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // A live commit is an anchor for the catch-up too (sync
                 // standard §3.3): pulled blocks it names, and those below
                 // them, are executed on the next import step.
-                if let Some(catch_up) = self.catch_up.as_mut() {
-                    catch_up.anchored.anchor(block_hash);
-                    catch_up.shadow.anchor(block_hash);
-                }
+                let number = self.block_numbers.get(&block_hash).copied();
+                self.sync_note_commit(number, &commit_qc, events);
                 self.loop_spend.open(view);
                 events.push(ServiceEvent::Committed {
                     view,
@@ -4159,9 +4419,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // nor built on (audit 2026-10 round 3, R3-C2).
                 if let ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) =
                     event.as_ref()
-                    && let Some(reason) = self.header_qc_refusal(block_hash)
+                    && let Some(reason) = self.vote_refusal(block_hash)
                 {
-                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no vote");
+                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no vote");
                     return Ok(());
                 }
                 // The engine's extends rule reads the parent of an imported
@@ -4374,7 +4634,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) {
         use crate::direct_votes::VoteTransport;
         use n42_h2_primitives::consensus::ConsensusMessage as M;
-        let mode = self.direct_votes.mode();
+        let mode = if self.vote_rules.direct_votes_allowed() { self.direct_votes.mode() } else { VoteTransport::Gossip };
         if mode != VoteTransport::Gossip && matches!(message, M::Vote(_) | M::CommitVote(_)) {
             match self.direct_votes.peer_of(target) {
                 Some(peer) => {
@@ -4493,8 +4753,21 @@ impl<E: ExecutionLayer> H2Service<E> {
         for (peer, height) in std::mem::take(&mut self.pending_status) {
             self.note_peer_height(peer, height);
         }
+        // At start-up, on the first drain: the commit restored from the
+        // consensus store is this node's committed head until a live one
+        // lands -- served, advertised and the base of a pull at once.
+        if !self.unproven_checked {
+            self.unproven_checked = true;
+            if let Some(from) = self.unproven_after_restart().await {
+                self.unproven_from = Some(self.unproven_from.map_or(from, |known| known.min(from)));
+            }
+        }
         self.request_missing_held_parent(events);
-        if self.catch_up.is_some()
+        // A pull's last imports are reported before another starts: the
+        // next one reads the execution layer's height.
+        if self.sync_safety.halt().is_some()
+            || self.catch_up.is_some()
+            || !self.in_import.is_empty()
             || self
                 .catch_up_retry_after
                 .is_some_and(|after| std::time::Instant::now() < after)
@@ -4522,6 +4795,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some((peer, height)) = best(failed).or_else(|| best(None)) else {
             return;
         };
+        // How far to go: the (f+1)-th highest height peers advertise, never
+        // one peer's alone (sync standard §3.4.1, §6.4) -- a peer claiming a
+        // height no f others back neither starts a pull nor sizes one.
+        let Some(height) = self.quorum_height().map(|quorum| quorum.min(height)) else {
+            return;
+        };
         // The execution layer is asked only when a peer may be past what was
         // last read from it -- below the unproven start, when pulled blocks
         // wait for a proof: that start stays put, and the layer was read on
@@ -4529,14 +4808,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         let held = self
             .imported_height
             .map(|tip| self.unproven_from.map_or(tip, |from| tip.min(from.saturating_sub(1))));
-        if self.unproven_checked && held.is_some_and(|held| height <= held) {
+        if held.is_some_and(|held| height <= held) {
             return;
-        }
-        if !self.unproven_checked {
-            self.unproven_checked = true;
-            if let Some(from) = self.unproven_after_restart().await {
-                self.unproven_from = Some(self.unproven_from.map_or(from, |known| known.min(from)));
-            }
         }
         let latest = match self.driver.execution_layer().latest_block_number().await {
             Ok(Some(latest)) => latest,
@@ -4552,6 +4825,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         // starts below them, and an honest peer's chain replaces them
         // through the forkchoice that follows its blocks.
         let latest = self.unproven_from.map_or(latest, |from| latest.min(from - 1));
+        // Under the anchor rule a pull starts on a certified block -- the
+        // committed head, or the highest block a pull released -- when the
+        // execution layer holds uncommitted ones above it, so the first
+        // pulled block is checked to join it (sync standard §3.3).
+        let latest = match (self.sync_anchor_mode, self.certified_head()) {
+            (SyncAnchorMode::Enforce, Some((certified, _))) if certified < latest => certified,
+            _ => latest,
+        };
         // Statuses arrive on connect, and a block the fleet gossiped before
         // this node connected never comes by itself — however small the gap.
         if height <= latest {
@@ -4567,7 +4848,19 @@ impl<E: ExecutionLayer> H2Service<E> {
         let height = capped_catch_up_target(advertised, latest, far_ahead_limit());
         info!(target: "n42.h2.node", %peer, from = latest, to = height, advertised, "behind a peer; pulling the gap by range");
         self.catch_up = Some(CatchUp::new(peer, latest, height));
-        self.request_next_range();
+        if self.sync_pipeline {
+            if let Some(c) = self.catch_up.as_mut() {
+                c.sched = Some(crate::sync_pipeline::RangeScheduler::new(latest + 1));
+            }
+            self.pull_progress_at = Some(std::time::Instant::now());
+            if self.range_mode.is_none() {
+                info!(target: "n42.h2.node", from = latest, to = height, "sync mode: range");
+                self.range_mode = Some(0);
+            }
+            self.pipeline_assign();
+        } else {
+            self.request_next_range();
+        }
         events.push(ServiceEvent::Syncing {
             from: latest,
             to: height,
@@ -4575,10 +4868,12 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     fn request_next_range(&mut self) {
-        let Some(catch_up) = &self.catch_up else {
+        let Some(catch_up) = self.catch_up.as_mut() else {
             return;
         };
         let count = (catch_up.target - catch_up.next + 1).min(MAX_RANGE_BLOCKS);
+        catch_up.times.requests += 1;
+        catch_up.sent.insert((catch_up.peer, catch_up.next), std::time::Instant::now());
         self.transport.request_range(
             catch_up.peer,
             RangeRequest {
@@ -4599,6 +4894,10 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// authenticates are executed, in order (see [`Self::buffer_pulled`]).
     async fn import_ranges(&mut self, events: &mut Vec<ServiceEvent>) {
         let enforce = self.sync_anchor_mode == SyncAnchorMode::Enforce;
+        let pipelined = self.catch_up.as_ref().is_some_and(|c| c.sched.is_some());
+        if pipelined {
+            self.pipeline_tick(events);
+        }
         // Pulled blocks a live commit anchored since the last step.
         if enforce && self.catch_up.is_some() && !self.release_anchored(events).await {
             return;
@@ -4609,7 +4908,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             let Some(catch_up) = self.catch_up.as_ref() else {
                 continue;
             };
-            if catch_up.peer != peer || request.start != catch_up.next {
+            if (!pipelined && catch_up.peer != peer) || request.start != catch_up.next {
                 debug!(target: "n42.h2.node", %peer, ?request, "range reply not part of the catch-up; dropped");
                 continue;
             }
@@ -4632,31 +4931,49 @@ impl<E: ExecutionLayer> H2Service<E> {
                 continue;
             }
             let mut chunks = std::collections::VecDeque::from(chunks);
-            while budget > 0 {
+            // Pipelined, the importer's queue bounds the screening too:
+            // what does not fit waits here, in order.
+            while budget > 0 && (!pipelined || self.import_room()) {
                 let Some(chunk) = chunks.pop_front() else {
                     break;
                 };
                 budget -= 1;
+                let screened_at = std::time::Instant::now();
+                let expected = self.catch_up.as_ref().map(|c| c.next).unwrap_or_default();
                 let block = match decode_block_rlp_raw(&chunk.rlp, self.header_profile) {
                     Ok(block) => block,
                     Err(err) => {
-                        warn!(target: "n42.h2.node", %peer, %err, "peer served a block this node cannot read; catch-up stopped");
-                        self.finish_catch_up(events, false);
+                        warn!(target: "n42.h2.node", %peer, %err, "peer served a block this node cannot read");
+                        if self.pull_fault(peer, expected, events) {
+                            self.requeue_after_fault(peer, chunks.len() as u64, replies.collect());
+                        }
                         return;
                     }
                 };
-                let expected = self.catch_up.as_ref().map(|c| c.next).unwrap_or_default();
                 if block.header.number != expected {
-                    warn!(target: "n42.h2.node", %peer, got = block.header.number, expected, "peer served blocks out of order; catch-up stopped");
-                    self.finish_catch_up(events, false);
+                    warn!(target: "n42.h2.node", %peer, got = block.header.number, expected, "peer served blocks out of order");
+                    if self.pull_fault(peer, expected, events) {
+                        self.requeue_after_fault(peer, chunks.len() as u64, replies.collect());
+                    }
                     return;
                 }
                 let hash = block.block_hash;
                 let number = block.header.number;
                 self.note_peer_height(peer, number);
                 if enforce {
+                    // `buffer_pulled` releases what an anchor covers; the
+                    // execution inside it is timed apart and taken out.
+                    let executing_before = self.catch_up.as_ref().map(|c| c.times.new_payload + c.times.forkchoice);
                     if !self.buffer_pulled(peer, block, chunk.rlp, events).await {
+                        // A pipelined pull goes on without the peer.
+                        if self.catch_up.is_some() {
+                            self.requeue_after_fault(peer, chunks.len() as u64, replies.collect());
+                        }
                         return;
+                    }
+                    if let (Some(c), Some(before)) = (self.catch_up.as_mut(), executing_before) {
+                        let executing = (c.times.new_payload + c.times.forkchoice).saturating_sub(before);
+                        c.times.verify += screened_at.elapsed().saturating_sub(executing);
                     }
                     continue;
                 }
@@ -4677,11 +4994,17 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // batch (what passed before it stays imported), and its peer
                 // is not asked for this gap again.
                 let proven = match self.check_pulled_block(&block.header) {
-                    Ok(proven) => proven,
+                    Ok(proven) => {
+                        if self.header_rules.is_profile1() {
+                            self.last_pulled_header = Some(block.header.clone());
+                        }
+                        proven
+                    }
                     Err(reason) => {
                         warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
-                        self.refused_range_peers.insert(peer, number);
-                        self.finish_catch_up(events, false);
+                        if self.pull_fault(peer, number, events) {
+                            self.requeue_after_fault(peer, chunks.len() as u64, replies.collect());
+                        }
                         return;
                     }
                 };
@@ -4698,7 +5021,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return;
                 }
                 self.observe_pulled(peer, &block.header, hash, chunk.rlp.len());
-                match self.driver.import_pulled(block.execution_data()).await {
+                if let Some(c) = self.catch_up.as_mut() {
+                    c.times.verify += screened_at.elapsed();
+                }
+                if pipelined {
+                    let payload = block.execution_data();
+                    self.dispatch_pulled(number, hash, block.header, payload, chunk.rlp, Some(proven));
+                    if let Some(c) = self.catch_up.as_mut() {
+                        c.next += 1;
+                        c.prev_hash = Some(hash);
+                    }
+                    continue;
+                }
+                match self.import_pulled_timed(block.execution_data()).await {
                     Ok(_) => {
                         // A verified header QC proves the chain up to the
                         // block it names; this block, above it, is still
@@ -4744,6 +5079,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.pending_imports = pending;
                 return;
             }
+            if catch_up.sched.is_some() {
+                // The scheduler asks for what comes next.
+                continue;
+            }
             let window_filled = catch_up.next > catch_up.target;
             if window_filled {
                 // The status's target is reached, or a probe window came back
@@ -4768,6 +5107,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // the peer's head by itself: ask on from where it got to.
                 self.request_next_range();
             }
+        }
+        if pipelined {
+            self.pipeline_assign();
         }
     }
 
@@ -4800,32 +5142,83 @@ impl<E: ExecutionLayer> H2Service<E> {
         events: &mut Vec<ServiceEvent>,
     ) -> bool {
         let (hash, number) = (block.block_hash, block.header.number);
-        if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
-            && block.header.parent_hash != prev
-        {
-            warn!(target: "n42.h2.node", %peer, number, parent = %block.header.parent_hash, %prev, "peer served a block that does not extend the one before it; the rest of its range is dropped");
-            self.refused_range_peers.insert(peer, number);
-            self.finish_catch_up(events, false);
-            return false;
-        }
+        // The header's own QC first: a forged one is this peer's fault
+        // whatever came before it.
         let anchor = match self.sync_anchor_of(&block.header) {
             Ok(anchor) => anchor,
             Err(reason) => {
                 warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
-                self.refused_range_peers.insert(peer, number);
-                self.finish_catch_up(events, false);
+                self.pull_fault(peer, number, events);
                 return false;
             }
         };
+        if let Some(c) = self.catch_up.as_ref()
+            && let Some(prev) = c.prev_hash
+            && block.header.parent_hash != prev
+        {
+            // The peer's fault when the block before is its own or is
+            // authenticated. Across two peers' replies above the last
+            // anchor either may be the forger: the pull ends, no one blamed.
+            let certified = c.anchored.authenticated_to().is_some_and(|to| to + 1 >= number) || c.executed + 1 >= number;
+            if c.prev_peer == Some(peer) || certified {
+                warn!(target: "n42.h2.node", %peer, number, parent = %block.header.parent_hash, %prev, "peer served a block that does not extend the one before it; the rest of its range is dropped");
+                self.pull_fault(peer, number, events);
+            } else {
+                warn!(target: "n42.h2.node", %peer, number, parent = %block.header.parent_hash, %prev, prev_peer = ?c.prev_peer, "two peers' replies do not link above the last anchor; the pull ends, neither is blamed");
+                self.finish_catch_up(events, false);
+            }
+            return false;
+        }
+        // Profile 1: every header rule but the clock, seal included, and
+        // the parent rules against the block pulled before it, before
+        // anything is buffered for execution. A refusal is the peer's fault,
+        // as a forged certificate is.
+        if let Some(reason) = self.profile1_pulled_refusal(&block.header, Some(rlp.len())) {
+            warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block profile 1 refuses; the rest of its range is dropped");
+            self.pull_fault(peer, number, events);
+            return false;
+        }
+        if self.header_rules.is_profile1() {
+            self.last_pulled_header = Some(block.header.clone());
+        }
         let Some(c) = self.catch_up.as_mut() else {
             return false;
         };
-        if let Some(named) = anchor {
-            c.anchored.anchor(named);
+        // Every verified anchor is recorded against what this node and
+        // its peers certified before (sync standard §3.3): by its height
+        // when the block it names is buffered, else by its view.
+        let mut fault = None;
+        if let Some(qc) = anchor {
+            let mark = c.anchored.authenticated_to();
+            match c.anchored.anchor(qc.block_hash) {
+                Some(named) => {
+                    if mark.is_none_or(|mark| named >= mark) {
+                        c.top_anchor = Some(qc.clone());
+                    }
+                    fault = self.sync_safety.note_anchor(Some(named), qc.block_hash, &qc).err();
+                }
+                None => {
+                    fault = self.sync_safety.note_anchor(None, qc.block_hash, &qc).err();
+                    if c.pending_qcs.len() >= MAX_PENDING_ANCHOR_QCS {
+                        c.pending_qcs.clear();
+                    }
+                    c.pending_qcs.insert(qc.block_hash, qc);
+                }
+            }
         }
-        c.anchored.push(Buffered { number, hash, bytes: rlp.len(), item: (block, rlp) });
+        if c.anchored.push(Buffered { number, hash, bytes: rlp.len(), item: (block, rlp) })
+            && let Some(qc) = c.pending_qcs.remove(&hash)
+        {
+            fault = fault.or_else(|| self.sync_safety.note_anchor(Some(number), hash, &qc).err());
+            c.top_anchor = Some(qc);
+        }
         c.next += 1;
         c.prev_hash = Some(hash);
+        c.prev_peer = Some(peer);
+        if let Some(halt) = fault {
+            self.halt_sync(halt, events);
+            return false;
+        }
         if !self.release_anchored(events).await {
             return false;
         }
@@ -4846,20 +5239,90 @@ impl<E: ExecutionLayer> H2Service<E> {
         true
     }
 
+    /// A pulled block failed its screening: a provable fault of `peer`
+    /// (sync standard §3.5), which is not asked for this gap again. A serial
+    /// pull ends. A pipelined one goes on without it (`true`): the peer is
+    /// excluded for the rest of the pull and its ranges go to the others
+    /// ([`Self::requeue_after_fault`]).
+    fn pull_fault(&mut self, peer: PeerId, number: u64, events: &mut Vec<ServiceEvent>) -> bool {
+        self.refused_range_peers.insert(peer, number);
+        if self.catch_up.as_ref().is_some_and(|c| c.sched.is_some()) {
+            info!(target: "n42.h2.node", %peer, number, "pipelined pull: the peer is excluded for the rest of the pull, its ranges go to the others");
+            return true;
+        }
+        self.finish_catch_up(events, false);
+        false
+    }
+
+    /// After a screening fault of `peer` in a pipelined pull that goes on:
+    /// the failing block, the `rest` of its reply after it, every range of
+    /// the peer's in flight or buffered, go back to be asked of another
+    /// peer; the `later` replies queued behind it go back to the reorder
+    /// buffer.
+    fn requeue_after_fault(&mut self, peer: PeerId, rest: u64, later: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>) {
+        let Some(c) = self.catch_up.as_mut() else {
+            return;
+        };
+        let next = c.next;
+        let Some(sched) = c.sched.as_mut() else {
+            return;
+        };
+        sched.exclude(peer, Some((next, rest + 1)));
+        for (from, request, chunks) in later {
+            sched.put_back(from, request.start, chunks);
+        }
+    }
+
     /// Executes, in order, the buffered pulled blocks an anchor covers.
     /// `false` when the pull ended (the execution layer refused one, or
     /// there is no pull).
     async fn release_anchored(&mut self, events: &mut Vec<ServiceEvent>) -> bool {
         loop {
+            let room = self.import_room();
             let Some(c) = self.catch_up.as_mut() else {
                 return false;
             };
+            let pipelined = c.sched.is_some();
+            if pipelined && !room {
+                // Released as the importer reports.
+                return true;
+            }
             let Some(ready) = c.anchored.pop_ready() else {
                 return true;
             };
+            // An authenticated block, and for the pull's first its parent,
+            // checked against what is certified at their heights: a chain
+            // that does not join the committed one halts the importer
+            // before anything of it is executed (sync standard §3.3).
+            if let Some(qc) = c.top_anchor.clone() {
+                let first = ready.number == c.started_at + 1;
+                let parent = ready.item.0.header.parent_hash;
+                let checked = if first && ready.number > 0 {
+                    self.sync_safety.note_anchor(Some(ready.number - 1), parent, &qc)
+                } else {
+                    Ok(())
+                };
+                if let Err(halt) = checked.and_then(|()| self.sync_safety.note_anchor(Some(ready.number), ready.hash, &qc)) {
+                    self.halt_sync(halt, events);
+                    return false;
+                }
+            }
+            let Some(c) = self.catch_up.as_mut() else {
+                return false;
+            };
             let (block, rlp) = ready.item;
+            if pipelined {
+                self.sync_head = Some((ready.number, ready.hash));
+                if self.imported.contains(&ready.hash) && self.in_import.is_empty() {
+                    c.executed = ready.number;
+                } else {
+                    let payload = block.execution_data();
+                    self.dispatch_pulled(ready.number, ready.hash, block.header, payload, rlp, None);
+                }
+                continue;
+            }
             if !self.imported.contains(&ready.hash) {
-                if let Err(err) = self.driver.import_pulled(block.execution_data()).await {
+                if let Err(err) = self.import_pulled_timed(block.execution_data()).await {
                     warn!(target: "n42.h2.node", number = ready.number, %err, "could not import an anchored pulled block; catch-up stopped");
                     self.finish_catch_up(events, false);
                     return false;
@@ -4869,10 +5332,435 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.remember_block(ready.hash, &block.header);
                 self.remember_body(ready.hash, rlp);
             }
+            self.sync_head = Some((ready.number, ready.hash));
             if let Some(c) = self.catch_up.as_mut() {
                 c.executed = ready.number;
             }
         }
+    }
+
+    /// A live commit, for the sync importer: recorded against the anchors
+    /// peers' data carried (a contradicting one is a conflict), and applied
+    /// as an anchor to a pull's buffer (sync standard §3.3).
+    fn sync_note_commit(&mut self, number: Option<u64>, commit_qc: &QuorumCertificate, events: &mut Vec<ServiceEvent>) {
+        if let Err(halt) = self.sync_safety.note_committed(number, commit_qc) {
+            self.halt_sync(halt, events);
+        }
+        if let Some(catch_up) = self.catch_up.as_mut() {
+            let mark = catch_up.anchored.authenticated_to();
+            if let Some(named) = catch_up.anchored.anchor(commit_qc.block_hash)
+                && mark.is_none_or(|mark| named >= mark)
+            {
+                catch_up.top_anchor = Some(commit_qc.clone());
+            }
+            catch_up.shadow.anchor(commit_qc.block_hash);
+        }
+    }
+
+    /// Halts the sync importer on a safety violation (sync standard §3.3):
+    /// one error line with both blocks and both QCs' views, the
+    /// [`crate::sync_safety::METRIC_SYNC_HALTED`] gauge, and the pull ended
+    /// with nothing more of it executed. No later pull starts; consensus
+    /// keeps running on this node's own chain, and nothing is reorged.
+    /// Read back with [`Self::sync_halt`].
+    fn halt_sync(&mut self, halt: crate::sync_safety::SyncHalt, events: &mut Vec<ServiceEvent>) {
+        let (first, second) = (&halt.first, &halt.second);
+        error!(
+            target: "n42.h2.node",
+            kind = halt.kind.label(),
+            number = ?first.number.or(second.number),
+            first = %first.hash,
+            first_number = ?first.number,
+            first_qc_view = first.qc.view,
+            first_qc_names = %first.qc.block_hash,
+            first_origin = ?first.origin,
+            second = %second.hash,
+            second_number = ?second.number,
+            second_qc_view = second.qc.view,
+            second_qc_names = %second.qc.block_hash,
+            second_origin = ?second.origin,
+            "SYNC HALTED: two verified certificates contradict each other (sync standard 3.3); the sync importer executes and reorgs nothing more, consensus continues on this node's own chain; operator action needed"
+        );
+        metrics::gauge!(crate::sync_safety::METRIC_SYNC_HALTED, "reason" => halt.kind.label()).set(1.0);
+        if halt.kind == crate::sync_safety::HaltKind::Equivocation {
+            metrics::counter!(crate::sync_safety::METRIC_SYNC_EQUIVOCATIONS_TOTAL).increment(1);
+        }
+        if self.catch_up.as_ref().is_some_and(|c| c.sched.is_some()) {
+            self.abandon_pulled_imports();
+        }
+        self.finish_catch_up(events, false);
+    }
+
+    /// The safety violation that halted the sync importer, if one did
+    /// (sync standard §3.3): both blocks and both certificates.
+    pub const fn sync_halt(&self) -> Option<&crate::sync_safety::SyncHalt> {
+        self.sync_safety.halt()
+    }
+
+    /// Every anchor equivocation seen, both certificates of each (bounded;
+    /// mixed production standard E15).
+    pub fn sync_equivocation_evidence(&self) -> impl Iterator<Item = &crate::sync_safety::SyncHalt> {
+        self.sync_safety.evidence().iter()
+    }
+
+    /// The highest block certified here: this node's committed head, or the
+    /// highest block a pull released under an anchor.
+    fn certified_head(&self) -> Option<(u64, B256)> {
+        match (self.sync_safety.committed_head(), self.sync_head) {
+            (Some(a), Some(b)) => Some(if b.0 > a.0 { b } else { a }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The candidates of a pipelined pull: every peer with a known height
+    /// that has not served a block that failed its check in this gap, its
+    /// height capped at [`Self::quorum_height`]: no range is asked past
+    /// what f+1 peers advertise.
+    fn pipeline_peers(&self) -> Vec<(PeerId, u64)> {
+        let cap = self.quorum_height().unwrap_or(0);
+        self.peer_heights
+            .iter()
+            .filter(|(peer, _)| !self.refused_range_peers.contains_key(*peer))
+            .map(|(peer, height)| (*peer, (*height).min(cap)))
+            .collect()
+    }
+
+    /// The catch-up target from advertised heights (sync standard §3.4.1):
+    /// the (f+1)-th highest height among the peers not refused for the gap,
+    /// f the fault tolerance of the current validator set -- at least one
+    /// honest peer is at or past it. With fewer than f+1 such peers, the
+    /// lowest of them. `None` with no peer.
+    fn quorum_height(&self) -> Option<u64> {
+        let mut heights: Vec<u64> = self
+            .peer_heights
+            .iter()
+            .filter(|(peer, _)| !self.refused_range_peers.contains_key(*peer))
+            .map(|(_, height)| *height)
+            .collect();
+        heights.sort_unstable_by(|a, b| b.cmp(a));
+        let backed = self.engine.epoch_manager().current_validator_set().fault_tolerance() as usize + 1;
+        heights.get(backed - 1).or_else(|| heights.last()).copied()
+    }
+
+    /// Sends the range requests the scheduler hands out now.
+    fn pipeline_assign(&mut self) {
+        let peers = self.pipeline_peers();
+        let Some(c) = self.catch_up.as_mut() else {
+            return;
+        };
+        let deliver = c.next;
+        let Some(sched) = c.sched.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        for (peer, request) in sched.assign(deliver, &peers, now) {
+            debug!(target: "n42.h2.node", %peer, ?request, rate = ?sched.rate(&peer), "pipelined range requested");
+            c.times.requests += 1;
+            c.sent.insert((peer, request.start), now);
+            self.transport.request_range(peer, request);
+        }
+    }
+
+    /// A range reply (or refusal) of a pipelined pull, into the reorder
+    /// buffer.
+    fn pipeline_reply(&mut self, peer: PeerId, request: RangeRequest, reply: Result<Vec<BlockChunk>, String>) {
+        let idle = self.in_import.is_empty();
+        let Some(sched) = self.catch_up.as_mut().and_then(|c| c.sched.as_mut()) else {
+            return;
+        };
+        let was_empty = sched.buffered() == 0;
+        if let Err(reason) = &reply
+            && reason.contains("busy")
+        {
+            // Over a server quota (sync standard §6.3): back off, no score,
+            // and the range goes to whichever peer is free.
+            debug!(target: "n42.h2.node", %peer, ?request, reason, "pipelined range refused as busy; the peer backs off");
+            sched.on_busy(peer, &request, std::time::Instant::now());
+            return;
+        }
+        let chunks = reply.unwrap_or_else(|reason| {
+            debug!(target: "n42.h2.node", %peer, ?request, reason, "pipelined range refused");
+            Vec::new()
+        });
+        match sched.on_reply(peer, &request, chunks, std::time::Instant::now()) {
+            crate::sync_pipeline::ReplyOutcome::Buffered(_) => {
+                // Pulled blocks now wait: the stall watchdog counts from
+                // here when nothing waited before.
+                if was_empty && idle {
+                    self.pull_progress_at = Some(std::time::Instant::now());
+                }
+            }
+            crate::sync_pipeline::ReplyOutcome::Empty => {
+                debug!(target: "n42.h2.node", %peer, ?request, "peer served nothing from the range's start; not asked past it again in this pull");
+            }
+            crate::sync_pipeline::ReplyOutcome::Stale => {
+                debug!(target: "n42.h2.node", %peer, ?request, "range reply not in flight (reassigned or after the pull); dropped");
+            }
+        }
+    }
+
+    /// A pipelined pull's housekeeping, once per drain: ranges past their
+    /// deadline reassigned, the end of the pull, buffered replies handed to
+    /// the screening in height order, and the next requests.
+    fn pipeline_tick(&mut self, events: &mut Vec<ServiceEvent>) {
+        let peers = self.pipeline_peers();
+        let pending_empty = self.pending_imports.is_empty();
+        let in_import_empty = self.in_import.is_empty();
+        let Some(c) = self.catch_up.as_mut() else {
+            return;
+        };
+        let Some(sched) = c.sched.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        for (peer, start, count) in sched.on_deadlines(now) {
+            info!(target: "n42.h2.node", %peer, start, count, "pipelined range missed its deadline; reassigned, the peer backs off");
+        }
+        if c.end.is_none() && pending_empty && sched.exhausted(&peers) {
+            // Every peer is served up to where it can go. An empty answer
+            // after blocks were taken is where the peers' served chain ends
+            // (sync standard §3.5); none at all is a failed pull.
+            let complete = c.next > c.started_at + 1;
+            if !complete {
+                warn!(target: "n42.h2.node", from = c.started_at + 1, "no peer served any of the range; catch-up stopped");
+            }
+            if in_import_empty {
+                self.finish_catch_up(events, complete);
+            } else {
+                c.end = Some(complete);
+            }
+            return;
+        }
+        if pending_empty {
+            let mut deliver = c.next;
+            while let Some((peer, request, chunks)) = sched.pop_ready(deliver) {
+                deliver = request.start + chunks.len() as u64;
+                self.pending_imports.push((peer, request, chunks));
+            }
+        }
+        self.pipeline_assign();
+    }
+
+    /// Whether the importer can take another pulled block (always, before it
+    /// is spawned).
+    fn import_room(&self) -> bool {
+        self.pulled_importer.as_ref().is_none_or(|importer| importer.capacity() > 0)
+    }
+
+    /// Whether a pull has screening it can do now: the step's fast path
+    /// comes straight back for it.
+    fn pull_has_work(&self) -> bool {
+        let Some(c) = self.catch_up.as_ref() else {
+            return !self.pending_imports.is_empty();
+        };
+        if c.sched.is_none() {
+            return !self.pending_imports.is_empty();
+        }
+        self.import_room()
+            && (!self.pending_imports.is_empty() || c.sched.as_ref().is_some_and(|s| s.has_ready(c.next)))
+    }
+
+    /// Sends a screened (and, under the anchor rule, authenticated) pulled
+    /// block to the importer, spawning it on first use. The settlement
+    /// bookkeeping is noted here, in height order, for the forkchoice its
+    /// report brings.
+    fn dispatch_pulled(
+        &mut self,
+        number: u64,
+        hash: B256,
+        header: Header,
+        payload: alloy_rpc_types_engine::ExecutionData,
+        rlp: Bytes,
+        proven: Option<Option<u64>>,
+    ) {
+        if self.pulled_importer.is_none() {
+            let (importer, reports) = crate::sync_pipeline::PulledImporter::spawn(self.driver.execution_layer_arc());
+            self.pulled_importer = Some(importer);
+            self.pulled_reports = Some(reports);
+        }
+        self.driver.note_pulled(&payload);
+        let job = crate::sync_pipeline::ImportJob { generation: self.import_generation, number, hash, payload };
+        let Some(importer) = self.pulled_importer.as_ref() else {
+            return;
+        };
+        if importer.try_send(job).is_err() {
+            // The caller checked for room; a closed queue is an importer
+            // that died, which the stall watchdog turns into a fallback.
+            warn!(target: "n42.h2.node", number, "the pulled-block importer did not take a block");
+            return;
+        }
+        if self.in_import.is_empty() {
+            self.pull_progress_at = Some(std::time::Instant::now());
+        }
+        self.in_import.push_back(InImport { number, hash, header, rlp, proven });
+    }
+
+    /// Applies the importer's reports: the bookkeeping of every executed
+    /// block, one forkchoice for the highest, the end of a pull that waited
+    /// for them -- and the stall watchdog: when the executed head has not
+    /// moved for [`Self::sync_stall`] while pulled blocks wait, the pipeline
+    /// is given up for the serial pull.
+    pub(crate) async fn drain_pulled_imports(
+        &mut self,
+        events: &mut Vec<ServiceEvent>,
+        first: Option<crate::sync_pipeline::ImportBatch>,
+    ) {
+        let mut batches: Vec<_> = first.into_iter().collect();
+        if let Some(rx) = self.pulled_reports.as_mut() {
+            while let Ok(batch) = rx.try_recv() {
+                batches.push(batch);
+            }
+        }
+        let mut head = None;
+        for batch in batches {
+            if batch.generation != self.import_generation {
+                continue;
+            }
+            if let Some(c) = self.catch_up.as_mut() {
+                c.times.new_payload += batch.new_payload;
+            }
+            for (number, hash) in batch.done {
+                let Some(sent) = self.in_import.pop_front() else {
+                    break;
+                };
+                if sent.hash != hash {
+                    warn!(target: "n42.h2.node", number, reported = %hash, sent = %sent.hash, sent_number = sent.number, "the importer reported another block than was sent; the pull's imports are abandoned");
+                    self.abandon_pulled_imports();
+                    self.finish_catch_up(events, false);
+                    return;
+                }
+                if let Some(proven) = sent.proven {
+                    let from = match proven {
+                        Some(certified) => self.unproven_from.filter(|from| *from > certified).unwrap_or(certified + 1),
+                        None => self.unproven_from.unwrap_or(number),
+                    };
+                    self.unproven_from = Some(from.min(number));
+                }
+                self.remember_imported(hash);
+                self.note_imported(number);
+                self.remember_block(hash, &sent.header);
+                self.remember_body(hash, sent.rlp);
+                if let Some(c) = self.catch_up.as_mut() {
+                    c.executed = c.executed.max(number);
+                    c.times.executed += 1;
+                }
+                self.pull_progress_at = Some(std::time::Instant::now());
+                head = Some((number, hash));
+            }
+            if let Some((number, hash, err)) = batch.failed {
+                warn!(target: "n42.h2.node", number, %hash, %err, "could not import a pulled block; catch-up stopped");
+                self.abandon_pulled_imports();
+                self.finish_catch_up(events, false);
+                break;
+            }
+        }
+        // The head moves forward only: a live import or commit that got
+        // past the batch meanwhile keeps its head.
+        let current = self.block_numbers.get(&self.driver.head()).copied();
+        if let Some((_, head)) = head.filter(|(number, _)| current.is_none_or(|current| *number > current)) {
+            let at = std::time::Instant::now();
+            let headed = self.driver.head_to_pulled(head).await;
+            if let Some(c) = self.catch_up.as_mut() {
+                c.times.forkchoice += at.elapsed();
+                c.times.forkchoices += 1;
+            }
+            if let Err(err) = headed {
+                warn!(target: "n42.h2.node", %head, %err, "forkchoice to a pulled block failed; catch-up stopped");
+                self.abandon_pulled_imports();
+                self.finish_catch_up(events, false);
+            }
+        }
+        if self.in_import.is_empty()
+            && let Some(complete) = self.catch_up.as_ref().and_then(|c| c.end)
+        {
+            self.finish_catch_up(events, complete);
+        }
+        self.watch_pull_stall(events);
+    }
+
+    /// The stall watchdog (the livelock gov5's run 98 showed): progress is
+    /// the executed head moving, nothing else. When pulled blocks wait --
+    /// with the importer, in the reorder buffer, or screened replies queued
+    /// -- and the head has not moved for [`Self::sync_stall`], the pipeline
+    /// is turned off for the rest of the run, its imports abandoned, the
+    /// pull ended, and the next pull runs serially. The live path never
+    /// waits on the pull either way.
+    fn watch_pull_stall(&mut self, events: &mut Vec<ServiceEvent>) {
+        let pipelined = self.catch_up.as_ref().is_some_and(|c| c.sched.is_some());
+        let waiting = !self.in_import.is_empty()
+            || (pipelined
+                && (!self.pending_imports.is_empty()
+                    || self.catch_up.as_ref().and_then(|c| c.sched.as_ref()).is_some_and(|s| s.buffered() > 0)));
+        let Some(since) = self.pull_progress_at else {
+            return;
+        };
+        if !waiting || since.elapsed() < self.sync_stall {
+            return;
+        }
+        warn!(
+            target: "n42.h2.node",
+            stalled_ms = since.elapsed().as_millis() as u64,
+            in_import = self.in_import.len(),
+            executed = ?self.imported_height,
+            "sync pipeline: the executed head has not moved while pulled blocks wait; falling back to the serial pull for the rest of this run"
+        );
+        self.sync_pipeline = false;
+        self.abandon_pulled_imports();
+        self.pulled_importer = None;
+        self.pulled_reports = None;
+        self.pending_imports.clear();
+        self.finish_catch_up(events, false);
+    }
+
+    /// Forgets the pulled blocks sent to the importer and not reported:
+    /// their late reports are ignored (a new generation).
+    fn abandon_pulled_imports(&mut self) {
+        self.in_import.clear();
+        self.import_generation += 1;
+    }
+
+    /// A live commit in Range mode: three consecutive commits with the gap
+    /// to the peers at most 2 return the node to Live mode (sync standard
+    /// §3.4.7).
+    fn note_range_mode_commit(&mut self) {
+        let Some(near) = self.range_mode else {
+            return;
+        };
+        let best = self.quorum_height().unwrap_or(0);
+        let tip = self.imported_height.unwrap_or(0);
+        let near = if best.saturating_sub(tip) <= 2 { near.saturating_add(1) } else { 0 };
+        if near >= 3 && self.catch_up.is_none() {
+            info!(target: "n42.h2.node", tip, best, "sync mode: live");
+            self.range_mode = None;
+        } else {
+            self.range_mode = Some(near);
+        }
+    }
+
+    /// The serial import of one pulled block -- `newPayload`, then the
+    /// forkchoice that makes it the head -- each timed into the pull's
+    /// [`crate::sync_pipeline::CatchUpTimes`].
+    async fn import_pulled_timed(&mut self, payload: alloy_rpc_types_engine::ExecutionData) -> Result<(), n42_h2_execution::ElError> {
+        let block_hash = payload.block_hash();
+        self.driver.note_pulled(&payload);
+        let at = std::time::Instant::now();
+        let el = self.driver.execution_layer_arc();
+        let executed = ExecutionDriver::pulled_new_payload(&*el, payload).await;
+        let new_payload = at.elapsed();
+        let at = std::time::Instant::now();
+        let headed = match executed {
+            Ok(()) => self.driver.head_to_pulled(block_hash).await,
+            Err(err) => Err(err),
+        };
+        if let Some(c) = self.catch_up.as_mut() {
+            c.times.new_payload += new_payload;
+            if headed.is_ok() {
+                c.times.forkchoice += at.elapsed();
+                c.times.forkchoices += 1;
+                c.times.executed += 1;
+            }
+        }
+        headed
     }
 
     /// Under `N42_SYNC_ANCHOR=observe`: the anchored import's bookkeeping
@@ -4896,8 +5784,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some(c) = self.catch_up.as_mut() else {
             return;
         };
-        if let Some(named) = anchor {
-            c.shadow.anchor(named);
+        if let Some(qc) = anchor {
+            c.shadow.anchor(qc.block_hash);
         }
         c.shadow.push(Buffered { number, hash, bytes, item: () });
         while c.shadow.pop_ready().is_some() {}
@@ -4922,18 +5810,17 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// executed); none of them is the peer's fault. A QC that does not
     /// decode (gov5's profile), names a view past the header's own, or does
     /// not verify under a known set is an error: a provable fault.
-    fn sync_anchor_of(&self, header: &Header) -> Result<Option<B256>, String> {
+    fn sync_anchor_of(&self, header: &Header) -> Result<Option<QuorumCertificate>, String> {
         let Some((key, wire)) = self.header_qc_wire(header)? else {
             return Ok(None);
         };
         if let Some(qc) = self.sync_anchor_qcs.borrow().get(&key) {
-            return Ok(Some(qc.block_hash));
+            return Ok(Some(qc));
         }
         match self.engine.verify_sync_anchor_qc(&wire) {
             n42_h2_consensus::SyncQcVerdict::Anchor(qc) => {
-                let named = qc.block_hash;
-                self.sync_anchor_qcs.borrow_mut().insert(key, *qc);
-                Ok(Some(named))
+                self.sync_anchor_qcs.borrow_mut().insert(key, (*qc).clone());
+                Ok(Some(*qc))
             }
             n42_h2_consensus::SyncQcVerdict::Genesis => Ok(None),
             n42_h2_consensus::SyncQcVerdict::PrepareDomain => {
@@ -4985,6 +5872,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// `height` on this block's parent chain (the chain up to it is the one
     /// the validator set certified), `Ok(None)` when nothing was proven.
     fn check_pulled_block(&self, header: &Header) -> Result<Option<u64>, String> {
+        // Profile 1: every header rule but the clock, seal included (AM4:
+        // import of a committed block is checked too, B4's bound is not).
+        if let Some(reason) = self.profile1_pulled_refusal(header, None) {
+            return Err(reason);
+        }
         if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
             && header.parent_hash != prev
         {
@@ -5078,6 +5970,114 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.check_header_qc(header).err()
     }
 
+    /// Why this node must not vote for a block (or count it imported): its
+    /// header QC ([`Self::header_qc_refusal`]), and on profile 1 every
+    /// header rule, the seal, the clock bound of B4 and the commit domain of
+    /// the embedded QC (B1, E13). A profile-1 block whose header this node
+    /// does not hold is refused: its rules cannot have been checked.
+    fn vote_refusal(&self, block_hash: &B256) -> Option<String> {
+        if let Some(reason) = self.header_qc_refusal(block_hash) {
+            return Some(reason);
+        }
+        if !self.header_rules.is_profile1() {
+            return None;
+        }
+        let Some(header) = self.block_headers.get(block_hash) else {
+            return Some("profile 1: the block's header is not held here".to_owned());
+        };
+        if let Some(reason) = self.profile1_import_refusal(header, None) {
+            return Some(reason);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        if let Err(err) = n42_h2_consensus::check_profile1_vote_time(header.timestamp, now) {
+            return Some(err.to_string());
+        }
+        match self.header_qc_wire(header) {
+            Err(reason) => Some(reason),
+            Ok(None) => None,
+            Ok(Some((_, wire))) => match self.engine.verify_sync_anchor_qc(&wire) {
+                n42_h2_consensus::SyncQcVerdict::Anchor(_) | n42_h2_consensus::SyncQcVerdict::Genesis => None,
+                other => Some(format!("B1: the embedded QC is not a commit-domain QC of its view's set: {other:?}")),
+            },
+        }
+    }
+
+    /// [`Self::profile1_import_refusal`] for a block range catch-up pulled,
+    /// before it executes: its parent is the block pulled before it, whose
+    /// header is not remembered yet, so the parent rules (B4's lower bound,
+    /// B13, B14) are checked against that one.
+    fn profile1_pulled_refusal(&self, header: &Header, block_bytes: Option<usize>) -> Option<String> {
+        if let Some(reason) = self.profile1_import_refusal(header, block_bytes) {
+            return Some(reason);
+        }
+        if let Some(parent) = self.last_pulled_header.as_ref()
+            && !self.block_headers.contains_key(&header.parent_hash)
+            && parent.hash_slow() == header.parent_hash
+            && let Err(err) = self.header_rules.check_against_parent(header, parent, header.parent_hash)
+        {
+            return Some(err.to_string());
+        }
+        None
+    }
+
+    /// Why a header that arrived on any road is not taken on profile 1:
+    /// the header rules that need no clock (B1-B3, B5, B6, B8-B12, A23), the
+    /// seal of its view's proposer (B2), the rules against its parent when
+    /// the parent's header is held (B4's lower bound, B13, B14), and the
+    /// block's decoded size when the caller has it (B15). `None` on every
+    /// other chain.
+    fn profile1_import_refusal(&self, header: &Header, block_bytes: Option<usize>) -> Option<String> {
+        let rules = &self.header_rules;
+        if !rules.is_profile1() {
+            return None;
+        }
+        if let Some(len) = block_bytes
+            && let Err(err) = rules.check_block_bytes(len)
+        {
+            return Some(err.to_string());
+        }
+        if header.number == 0 {
+            return None;
+        }
+        let extra = match n42_h2_consensus::validate_profile1_header(header, rules) {
+            Ok(extra) => extra,
+            Err(err) => return Some(err.to_string()),
+        };
+        // The seal (B2) and the coinbase (B3) against the proposer the
+        // rules name; without a schedule, the seal against the leader key
+        // the engine knows for the view.
+        let sealed = match &rules.proposers {
+            Some(schedule) => match schedule.proposer(extra.view) {
+                Some(proposer) => n42_h2_consensus::verify_profile1_seal(header, proposer).map_err(|err| err.to_string()),
+                None => Err(format!("B2: no proposer for view {}", extra.view)),
+            },
+            None => match self.engine.leader_public_key_for_view(extra.view) {
+                Some(key) => n42_h2_consensus::verify_seal(header, &key).map_err(|err| format!("B2: seal: {err}")),
+                None => Err(format!("B2: no validator set known for view {}", extra.view)),
+            },
+        };
+        if let Err(reason) = sealed {
+            return Some(reason);
+        }
+        if let Some(parent) = self.block_headers.get(&header.parent_hash)
+            && let Err(err) = rules.check_against_parent(header, parent, header.parent_hash)
+        {
+            return Some(err.to_string());
+        }
+        // B1: a QC whose block is known here names an ancestor (gov5's
+        // reading: walked at most 4096 blocks; an unknown block is checked by
+        // its signature alone).
+        if let Err(err) = rules.check_qc_ancestry(header, |hash| {
+            self.block_headers.get(hash).map(|known| (known.number, known.parent_hash))
+        }) {
+            return Some(err.to_string());
+        }
+        None
+    }
+
     /// After a restart: the height past which the execution layer holds
     /// blocks consensus has not committed here, when the restored commit is
     /// a real one the layer holds. Blocks above it may be a chain a range
@@ -5125,9 +6125,10 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
-    /// Records the restored commit's number, and advertises it while no live
-    /// commit has: the status height is the committed head (sync standard
-    /// §4.1).
+    /// Records the restored commit's number, and while no live commit has
+    /// landed takes it as the committed height: advertised (the status
+    /// height is the committed head, sync standard §4.1), served, and the
+    /// certified base a pull starts on and is checked against (§3.3).
     fn learn_restored_commit(&mut self, restored: (B256, u64)) {
         if self.restored_committed == Some(restored) {
             return;
@@ -5135,6 +6136,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.restored_committed = Some(restored);
         if self.committed_height.is_none() {
             self.transport.set_advertised_height(restored.1);
+            self.committed_height = Some(restored.1);
+        }
+        let qc = self.engine.last_committed_qc().clone();
+        if qc.block_hash == restored.0
+            && let Err(halt) = self.sync_safety.note_committed(Some(restored.1), &qc)
+        {
+            // Only an anchor recorded before the restored commit's number
+            // was known can contradict it; there is no pull to end yet.
+            let mut events = Vec::new();
+            self.halt_sync(halt, &mut events);
         }
     }
 
@@ -5173,6 +6184,11 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some(catch_up) = self.catch_up.take() else {
             return;
         };
+        if catch_up.sched.is_some() {
+            // Replies still in flight are dropped as not part of a pull;
+            // queued ones go with the pull.
+            self.pending_imports.clear();
+        }
         let pulled = catch_up.next.saturating_sub(1);
         // What this pull executed: under the anchor rule the unanchored tail
         // is not, and it is dropped with the pull -- the live path or the
@@ -5204,10 +6220,25 @@ impl<E: ExecutionLayer> H2Service<E> {
         // What the peer actually served replaces what it advertised, so a
         // height it cannot back stops starting a pull every retry; blocks it
         // gossips later raise it again.
-        if let Some(known) = self.peer_heights.get_mut(&catch_up.peer) {
+        if let Some(sched) = catch_up.sched.as_ref() {
+            // Pipelined, each peer that served nothing from a height is
+            // known up to below it; the others keep what they advertised.
+            for (peer, known) in &mut self.peer_heights {
+                if let Some(from) = sched.exhausted_from(peer) {
+                    *known = (*known).min(from.saturating_sub(1).max(catch_up.started_at));
+                }
+            }
+        } else if let Some(known) = self.peer_heights.get_mut(&catch_up.peer) {
             *known = (*known).min(pulled.max(catch_up.started_at));
         }
         info!(target: "n42.h2.node", from = catch_up.started_at, height, target = catch_up.target, complete, "catch-up finished");
+        catch_up.times.log(if catch_up.sched.is_some() { "pipeline" } else { "serial" }, complete);
+        self.last_catch_up_times = Some(catch_up.times);
+        // Range mode (sync standard §3.4.7): a pull that reached its peers'
+        // heads is followed at once by the next while the gap stays open.
+        if complete && self.range_mode.is_some() && height > catch_up.started_at {
+            self.catch_up_retry_after = Some(std::time::Instant::now() + CATCH_UP_RETRY_IN_RANGE);
+        }
         events.push(ServiceEvent::Synced { height, complete });
     }
 
@@ -5656,6 +6687,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(B256, Header, bool), n42_h2_consensus::BlockBodyError> {
         let (block_hash, header) =
             n42_h2_consensus::decode_block_body_header(&rlp, self.header_profile)?;
+        if let Some(reason) = self.profile1_import_refusal(&header, Some(rlp.len())) {
+            return Err(n42_h2_consensus::BlockBodyError::HeaderProfile(self.header_profile, reason));
+        }
         if self.body_store.contains_key(&block_hash) {
             return Ok((block_hash, header, false));
         }
@@ -5680,6 +6714,29 @@ impl<E: ExecutionLayer> H2Service<E> {
         });
         self.remember_body(block_hash, rlp);
         Ok((block_hash, header, true))
+    }
+
+    /// Whether `peer`'s range byte bucket holds anything (refilled first).
+    /// The serving task takes each block's bytes from it as it reads them
+    /// ([`serve_range_metered`]).
+    fn range_bucket_allows(&mut self, peer: PeerId) -> bool {
+        let now = std::time::Instant::now();
+        let rate = self.range_rate;
+        if self.range_buckets.len() >= MAX_RANGE_BUCKETS && !self.range_buckets.contains_key(&peer) {
+            // Forget the buckets that are full again: they hold no debt.
+            self.range_buckets.retain(|_, bucket| {
+                let mut bucket = bucket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                bucket.refill(rate, now);
+                bucket.tokens < rate.1
+            });
+        }
+        let bucket = self
+            .range_buckets
+            .entry(peer)
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(ByteBucket { tokens: rate.1, at: now })));
+        let mut bucket = bucket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        bucket.refill(rate, now);
+        bucket.tokens > 0.0
     }
 
     /// Hands a fill prepared on a worker to the swarm, and says how long it
@@ -5839,6 +6896,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(B256, Header, bool), n42_h2_consensus::BlockBodyError> {
         let (block_hash, header) =
             n42_h2_consensus::decode_compact_body_header(&bytes, self.header_profile)?;
+        if let Some(reason) = self.profile1_import_refusal(&header, None) {
+            return Err(n42_h2_consensus::BlockBodyError::HeaderProfile(self.header_profile, reason));
+        }
         // A second copy must not replace the frame of record: that one may
         // carry fills this one does not (defect 18).
         if self.body_store.contains_key(&block_hash) || self.compact_bodies.contains_key(&block_hash) {
@@ -5944,8 +7004,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             // R2-C9): the header releases Round 1, once its QC passes the
             // check every vote of this node passes (R3-C2).
             if self.engine.two_phase_vote_gate() {
-                if let Some(reason) = self.header_qc_refusal(&block_hash) {
-                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header QC refused; no header vote");
+                if let Some(reason) = self.vote_refusal(&block_hash) {
+                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no header vote");
                 } else if let Err(err) = self.engine.header_known(block_hash, header.parent_hash) {
                     report_engine_error(&err, "header vote", &mut self.fatal);
                 }
@@ -6442,11 +7502,25 @@ impl<E: ExecutionLayer> H2Service<E> {
 /// request costs a bounded number of lookups and bytes; and none above
 /// `ceiling`, the committed height: a request reaching past it is served the
 /// committed prefix and ends cleanly.
+#[cfg(test)]
 async fn serve_range<E: ExecutionLayer>(
     el: &E,
     request: n42_h2_net::RangeRequest,
     budget: &Arc<tokio::sync::Semaphore>,
     ceiling: ServeCeiling,
+) -> ServedRange {
+    serve_range_metered(el, request, budget, ceiling, None).await
+}
+
+/// [`serve_range`], each block's bytes taken from the asking peer's byte
+/// bucket (sync standard §6.3) as it is read: the reply ends cleanly after
+/// the block that empties it.
+async fn serve_range_metered<E: ExecutionLayer>(
+    el: &E,
+    request: n42_h2_net::RangeRequest,
+    budget: &Arc<tokio::sync::Semaphore>,
+    ceiling: ServeCeiling,
+    meter: Option<(SharedBucket, (f64, f64))>,
 ) -> ServedRange {
     let (ceiling, restored) = match ceiling {
         ServeCeiling::Height(height) => (height, None),
@@ -6496,7 +7570,11 @@ async fn serve_range<E: ExecutionLayer>(
                     }
                 }
                 bytes = bytes.saturating_add(rlp.len());
+                let spent = meter.as_ref().is_some_and(|(bucket, rate)| !ByteBucket::spend(bucket, *rate, rlp.len()));
                 rlps.push(rlp);
+                if spent {
+                    break;
+                }
             }
             Ok(None) => break,
             Err(err) => {

@@ -35,7 +35,10 @@ pub struct GenesisValidator {
 /// Unknown fields are ignored on purpose: `gov5`'s block carries settings for
 /// subsystems this node does not have (the simulated committee pool, dev
 /// rewards), and a genesis that adds one must not stop a Rust node reading
-/// the rest.
+/// the rest. A profile-1 genesis (`"n42Profile": 1`) is the exception: its
+/// key list is closed and checked at start-up by [`crate::profile1`], and
+/// [`Self::from_genesis`] writes the profile's from-view-0 switches into the
+/// fields below.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HotStuffGenesisConfig {
@@ -75,8 +78,12 @@ pub struct HotStuffGenesisConfig {
     /// coinbase (the leader) and, when one is named, to the dev faucet
     /// address as well (`hotstuff/adapter.go` `Finalize`). Consensus-relevant:
     /// it is in every block's state root. Zero pays nothing.
-    #[serde(default)]
-    pub dev_block_reward: u64,
+    ///
+    /// Read from a JSON integer (gov5's `uint64`, every pre-profile genesis)
+    /// or a decimal string of wei (profile 1, standard AM8, where a number is
+    /// refused by `crate::profile1`).
+    #[serde(default, deserialize_with = "deserialize_wei")]
+    pub dev_block_reward: alloy_primitives::U256,
     /// The dev faucet paid the same reward each block, if any.
     #[serde(default)]
     pub dev_faucet_address: Option<alloy_primitives::Address>,
@@ -101,6 +108,56 @@ pub struct HotStuffGenesisConfig {
     /// variable changes it.
     #[serde(default)]
     pub rotate_on_timeout_view: Option<u64>,
+    /// Profile 1's pacing (`blockIntervalMs`, standard A17): a leader
+    /// proposes no earlier than this long after it first held the parent.
+    /// Absent on pre-profile chains, which pace by `period`.
+    #[serde(default)]
+    pub block_interval_ms: Option<u64>,
+    /// Profile 1's first view timeout (`baseTimeoutMs`, A16).
+    #[serde(default)]
+    pub base_timeout_ms: Option<u64>,
+    /// Profile 1's backoff ceiling (`maxTimeoutMs`, A16).
+    #[serde(default)]
+    pub max_timeout_ms: Option<u64>,
+    /// Profile 1's fixed block gas limit (`gasLimit`, A23).
+    #[serde(default)]
+    pub gas_limit: Option<u64>,
+    /// Profile 1's block size bound in decoded RLP bytes (`maxBlockBytes`,
+    /// B15), for production and every carrier.
+    #[serde(default)]
+    pub max_block_bytes: Option<u64>,
+    /// Profile 1's deferred-execution depth (`deferredExecutionDepth`, A10).
+    /// Read through `reth_chainspec::qmdb::deferred_execution_depth`, which
+    /// knows where each kind of chain keeps it.
+    #[serde(default)]
+    pub deferred_execution_depth: Option<u64>,
+    /// The validated profile-1 view of the genesis, when it declares
+    /// `"n42Profile": 1` and passes [`crate::profile1::profile1`]; see
+    /// [`Self::profile1`]. Never read from JSON.
+    #[serde(skip)]
+    pub profile1: Option<crate::profile1::Profile1Config>,
+}
+
+/// Reads a wei amount from a JSON unsigned integer or a decimal string.
+fn deserialize_wei<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<alloy_primitives::U256, D::Error> {
+    use serde::de::Error as _;
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .map(alloy_primitives::U256::from)
+            .ok_or_else(|| D::Error::custom(format!("a wei amount must be an unsigned integer, found {number}"))),
+        serde_json::Value::String(text) => parse_decimal_wei(&text).map_err(D::Error::custom),
+        serde_json::Value::Null => Ok(alloy_primitives::U256::ZERO),
+        other => Err(D::Error::custom(format!("a wei amount must be an integer or a decimal string, found {other}"))),
+    }
+}
+
+/// A decimal string of wei: digits only, no sign, no `0x`, no exponent.
+pub(crate) fn parse_decimal_wei(text: &str) -> Result<alloy_primitives::U256, String> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("a wei amount string must be decimal digits, found {text:?}"));
+    }
+    alloy_primitives::U256::from_str_radix(text, 10).map_err(|e| format!("{text:?} is not a 256-bit wei amount: {e}"))
 }
 
 /// `hotstuff.committeePool` in the genesis.
@@ -157,10 +214,10 @@ impl HotStuffGenesisConfig {
     /// gov5's order: the coinbase first, then the faucet. Empty when the
     /// chain pays none.
     pub fn block_rewards(&self, coinbase: alloy_primitives::Address) -> Vec<(alloy_primitives::Address, alloy_primitives::U256)> {
-        if self.dev_block_reward == 0 {
+        if self.dev_block_reward.is_zero() {
             return Vec::new();
         }
-        let amount = alloy_primitives::U256::from(self.dev_block_reward);
+        let amount = self.dev_block_reward;
         let mut rewards = vec![(coinbase, amount)];
         if let Some(faucet) = self.dev_faucet_address.filter(|faucet| !faucet.is_zero()) {
             rewards.push((faucet, amount));
@@ -257,14 +314,88 @@ fn refuse_listed_rules(genesis: &Genesis, fields: &[&'static str]) -> Result<(),
 
 impl HotStuffGenesisConfig {
     /// Reads the block from a genesis, or `None` if there is none.
+    ///
+    /// On a profile-1 genesis the profile's switches are written into the
+    /// fields (`apply_profile1`) and, when the genesis is valid, the typed
+    /// [`crate::profile1::Profile1Config`] is attached ([`Self::profile1`]).
+    /// An invalid profile-1 genesis is refused at start-up by
+    /// [`crate::check_genesis`]; here it reads without the attachment.
     pub fn from_genesis(genesis: &Genesis) -> Result<Self, HotStuffConfigError> {
+        let mut config = Self::from_genesis_unvalidated(genesis)?;
+        if reth_chainspec::qmdb::is_profile1(genesis) {
+            config.profile1 = crate::profile1::profile1(genesis).ok().flatten();
+        }
+        Ok(config)
+    }
+
+    /// The validated profile-1 parameters of the chain, or `None` on a
+    /// chain without `"n42Profile": 1`. The one typed source the header,
+    /// vote and pacing rules of profile 1 read.
+    pub const fn profile1(&self) -> Option<&crate::profile1::Profile1Config> {
+        self.profile1.as_ref()
+    }
+
+    /// The vote and execution-write rules the chain runs: profile 1's when
+    /// the genesis is a valid profile-1 genesis ([`Self::profile1`]),
+    /// today's otherwise. What `h2_validator` hands
+    /// `H2Service::with_vote_rules`.
+    pub const fn vote_rules(&self) -> n42_h2_consensus::VoteRules {
+        if self.profile1.is_some() {
+            n42_h2_consensus::VoteRules::PROFILE1
+        } else {
+            n42_h2_consensus::VoteRules::TODAY
+        }
+    }
+
+    /// [`Self::from_genesis`] without the profile-1 validation (which itself
+    /// reads the block through this).
+    pub(crate) fn from_genesis_unvalidated(genesis: &Genesis) -> Result<Self, HotStuffConfigError> {
         let raw: serde_json::Value = genesis
             .config
             .extra_fields
             .get_deserialized(HOTSTUFF_KEY)
             .ok_or(HotStuffConfigError::Missing)?
             .map_err(|e| HotStuffConfigError::Shape(e.to_string()))?;
-        serde_json::from_value(raw).map_err(|e| HotStuffConfigError::Shape(e.to_string()))
+        let mut config: Self = serde_json::from_value(raw).map_err(|e| HotStuffConfigError::Shape(e.to_string()))?;
+        if reth_chainspec::qmdb::is_profile1(genesis) {
+            config.apply_profile1();
+        }
+        Ok(config)
+    }
+
+    /// The switches profile 1 turns on from view 0 / block 0, written into
+    /// the fields every consumer already reads, so no call site needs to
+    /// know about the profile (`docs/MIXED_PRODUCTION_STANDARD.md`). The
+    /// genesis itself is validated by [`crate::profile1::profile1`] at
+    /// start-up; a field it makes mandatory but this finds absent keeps the
+    /// pre-profile value here, and the start-up refusal names it.
+    fn apply_profile1(&mut self) {
+        // A16: the `*Ms` names replace `baseTimeout` / `maxTimeout`.
+        if let Some(base) = self.base_timeout_ms {
+            self.base_timeout = base;
+        }
+        if let Some(max) = self.max_timeout_ms {
+            self.max_timeout = max;
+        }
+        // A17: `blockIntervalMs` replaces `period`. Engine API timestamps
+        // are whole seconds, so the period the leader stamps from is the
+        // interval rounded up to a second.
+        if let Some(interval) = self.block_interval_ms {
+            self.period = interval.div_ceil(1000).max(1);
+        }
+        // A22: rotate-on-timeout from view 0.
+        self.rotate_on_timeout_view = Some(0);
+        // A13 / AM19 / AM23: the vote gates are `n42_h2_consensus::VoteRules`
+        // (`Self::vote_rules`), not gov5's `twoPhaseVoteGate` (refused on
+        // profile 1): its header-vote road is closed there, so the flag stays
+        // off and the two cannot pull in different directions.
+        self.two_phase_vote_gate = false;
+        // A14: H2-v4 signing only.
+        self.interop_v4 = true;
+        // A19: the committee pool is always on; the `enabled` flag is gone.
+        if let Some(pool) = self.committee_pool.as_mut() {
+            pool.enabled = true;
+        }
     }
 
     /// The validator set in the form the consensus engine takes, in genesis

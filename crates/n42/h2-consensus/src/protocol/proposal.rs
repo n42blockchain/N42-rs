@@ -470,7 +470,12 @@ impl ConsensusEngine {
         // Gov5's H2 profile is import-gated: an R1 vote attests that this node
         // has executed and validated the proposed payload, not merely seen its
         // hash. Keep the native profile's established optimistic path intact.
-        if self.signing_profile.is_gov5() && !self.vote_before_import
+        // Profile 1 (A13, AM19, E8) is always gated, whatever the signing
+        // profile or the bench flag: a vote waits for the execution layer's
+        // check (the deferred-execution proposal check on the imported
+        // parent) or the import.
+        if (self.signing_profile.is_gov5() && !self.vote_before_import)
+            || self.vote_rules.round1_needs_check()
         {
             self.pending_proposal = Some(super::state_machine::PendingProposal {
                 view,
@@ -513,8 +518,15 @@ impl ConsensusEngine {
     /// non-zero parent recorded -- and extends its justify QC's block. The
     /// commit vote stays the execution attestation (held until the import,
     /// [`Self::process_prepare_qc`]). Returns whether it voted.
+    ///
+    /// Never under profile 1 (AM23): there Round 1 needs the deferred check
+    /// and the parent's import, which a header alone does not show.
     pub(super) fn try_header_vote(&mut self) -> ConsensusResult<bool> {
-        if !self.two_phase_vote_gate || !self.signing_profile.is_gov5() || self.vote_before_import {
+        if !self.two_phase_vote_gate
+            || !self.signing_profile.is_gov5()
+            || self.vote_before_import
+            || self.vote_rules.round1_needs_check()
+        {
             return Ok(false);
         }
         let current = self.round_state.current_view();
@@ -588,7 +600,14 @@ impl ConsensusEngine {
         // gov5's two-phase gate: the commit vote is the execution
         // attestation, held until the block is imported here (audit 2026-10
         // R2-C9). `on_block_imported` re-enters with the held PrepareQC.
-        if self.two_phase_vote_gate && !self.imported_blocks.contains(&pqc.block_hash) {
+        // Profile 1 (A13, AM19): held until this node's own import -- its
+        // execution of the block -- whatever the gate; a check is not one.
+        let held = if self.vote_rules.commit_vote_needs_own_import() {
+            !self.executed_blocks.contains(&pqc.block_hash)
+        } else {
+            self.two_phase_vote_gate && !self.imported_blocks.contains(&pqc.block_hash)
+        };
+        if held {
             tracing::info!(target: "n42::interop::h2v4", view, block_hash = %pqc.block_hash, "two-phase vote: holding the commit vote until the block imports");
             self.held_prepare_qc = Some(pqc);
             return Ok(());
@@ -684,6 +703,7 @@ impl ConsensusEngine {
 
     /// Withdraws a block's import evidence (see `ConsensusEvent::BlockRejected`).
     pub(super) fn on_block_rejected(&mut self, block_hash: B256) {
+        self.executed_blocks.remove(&block_hash);
         if self.imported_blocks.remove(&block_hash) {
             self.imported_block_fifo.retain(|h| *h != block_hash);
             self.imported_parents.remove(&block_hash);
@@ -691,20 +711,27 @@ impl ConsensusEngine {
         }
     }
 
-    /// Handles the BlockImported event from the orchestrator.
+    /// Handles the BlockImported event from the orchestrator (`executed`)
+    /// and the BlockChecked one (not `executed`: checked, still executing).
     ///
     /// Native optimistic voting uses this as execution diagnostics. Gov5 H2
     /// participant mode also releases the matching deferred R1 vote here.
-    pub(super) fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
+    pub(super) fn on_block_imported(&mut self, block_hash: B256, executed: bool) -> ConsensusResult<()> {
         if self.imported_blocks.insert(block_hash) {
             if self.imported_block_fifo.len() >= MAX_IMPORTED_BLOCKS {
                 self.evict_oldest_imported_block();
             }
             self.imported_block_fifo.push_back(block_hash);
         }
+        if executed {
+            self.executed_blocks.insert(block_hash);
+        }
 
-        // The commit vote the two-phase gate held for this block.
-        if self.held_prepare_qc.as_ref().is_some_and(|held| held.block_hash == block_hash)
+        // The commit vote the two-phase gate held for this block. Under
+        // profile 1 only this node's own import releases it.
+        let releases_commit = executed || !self.vote_rules.commit_vote_needs_own_import();
+        if releases_commit
+            && self.held_prepare_qc.as_ref().is_some_and(|held| held.block_hash == block_hash)
             && let Some(held) = self.held_prepare_qc.take()
                 && held.view == self.round_state.current_view() {
                     tracing::info!(target: "n42::interop::h2v4", view = held.view, %block_hash, "two-phase vote: block imported, casting the held commit vote");
@@ -722,8 +749,8 @@ impl ConsensusEngine {
                     && self.round_state.may_vote_in(pending.view)
             })
             .map(|pending| pending.view);
-        let profile_is_h2_v4 = self.signing_profile.is_gov5();
-        if let Some(view) = pending_vote_view.filter(|_| profile_is_h2_v4) {
+        let gated = self.signing_profile.is_gov5() || self.vote_rules.round1_needs_check();
+        if let Some(view) = pending_vote_view.filter(|_| gated) {
             if !self.extends_justify(block_hash) {
                 return Ok(());
             }
@@ -824,6 +851,7 @@ impl ConsensusEngine {
                 continue;
             }
             self.imported_blocks.remove(&oldest);
+            self.executed_blocks.remove(&oldest);
             self.imported_parents.remove(&oldest);
             return;
         }

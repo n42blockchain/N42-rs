@@ -293,9 +293,10 @@ impl ConsensusEngine {
 
         // Clear pending block data: similar to Tendermint's "prevote nil".
         self.pending_proposal = None;
-        if !self.signing_profile.is_gov5() {
+        if !self.signing_profile.is_gov5() && !self.vote_rules.round1_needs_check() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
+            self.executed_blocks.clear();
         }
 
         // Preserve any timeouts already collected from validators who timed out before us.

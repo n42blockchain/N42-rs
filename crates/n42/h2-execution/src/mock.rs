@@ -89,6 +89,19 @@ pub struct MockBehaviour {
     /// for the block asked about; `Some(Some(other))` answers CHECKED naming
     /// `other` -- another build -- which must release no vote.
     pub check_only: Option<Option<B256>>,
+    /// How long a `newPayload` takes: a test's stand-in for execution.
+    pub new_payload_delay: Option<std::time::Duration>,
+    /// When set, a `newPayload` waits for a permit before it is recorded:
+    /// a test stops the execution layer mid-catch-up.
+    pub new_payload_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// How long an attribute-less forkchoice takes.
+    pub forkchoice_delay: Option<std::time::Duration>,
+    /// The execution layer's check refuses a body (its header's execution
+    /// fields are not this node's result for the parent, or a transaction is
+    /// not includable on the parent's post-state): no check is answered, as
+    /// the real channel sends no `CHECKED` frame, and the import's verdict is
+    /// [`Self::new_payload_status`].
+    pub check_refused: bool,
 }
 
 impl Default for MockBehaviour {
@@ -106,6 +119,10 @@ impl Default for MockBehaviour {
             body_gate: None,
             elide_builds: false,
             check_only: None,
+            new_payload_delay: None,
+            new_payload_gate: None,
+            forkchoice_delay: None,
+            check_refused: false,
         }
     }
 }
@@ -280,8 +297,12 @@ impl ExecutionLayer for MockExecutionLayer {
             return crate::BodyOutcome::Answered(Err(ElError(error)));
         }
         // The check first, as the real channel does: it is the vote, and it
-        // arrives before the import's verdict.
-        let _ = checked.send(PayloadStatus::from_status(PayloadStatusEnum::Valid));
+        // arrives before the import's verdict. A refused check answers none.
+        if behaviour.check_refused {
+            drop(checked);
+        } else {
+            let _ = checked.send(PayloadStatus::from_status(PayloadStatusEnum::Valid));
+        }
         self.answer_body(body, behaviour).await
     }
 
@@ -306,6 +327,10 @@ impl ExecutionLayer for MockExecutionLayer {
         }
         if let Some(error) = behaviour.new_payload_error.clone() {
             return crate::BodyOutcome::Answered(Err(ElError(error)));
+        }
+        if behaviour.check_refused {
+            drop(checked);
+            return self.answer_body(body, behaviour).await;
         }
         let _ = checked.send(PayloadStatus::from_status(PayloadStatusEnum::Valid));
         // The execution waits for its slot.
@@ -336,6 +361,18 @@ impl ExecutionLayer for MockExecutionLayer {
 
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
         let hash = payload.payload.block_hash();
+        let (gate, delay) = {
+            let behaviour = self.behaviour.lock().expect("mock behaviour lock");
+            (behaviour.new_payload_gate.clone(), behaviour.new_payload_delay)
+        };
+        if let Some(gate) = gate
+            && let Ok(permit) = gate.acquire().await
+        {
+            permit.forget();
+        }
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.record(ElCall::NewPayload(hash));
         let behaviour = self.behaviour.lock().expect("mock behaviour lock").clone();
         if let Some(error) = behaviour.new_payload_error {
@@ -346,7 +383,17 @@ impl ExecutionLayer for MockExecutionLayer {
         if matches!(behaviour.new_payload_status, PayloadStatusEnum::Valid)
             && let Ok(block) = payload.clone().into_block_raw()
         {
-            let block = n42_h2_consensus::header_engine::block_with_payload_root(block, &payload.payload);
+            let mut block = n42_h2_consensus::header_engine::block_with_payload_root(block, &payload.payload);
+            // A gov5-profile header carries fields a payload does not (its
+            // difficulty, ommers hash, rewards root, ...): restored as the
+            // real execution layer does, by the variant that hashes to the
+            // payload's block hash, so the block is served back by range
+            // under its own hash.
+            if block.header.hash_slow() != hash
+                && let Ok(restored) = n42_h2_consensus::reconstruct_gov5_h2_block_from(block.clone(), &payload)
+            {
+                block = restored;
+            }
             let number = block.header.number;
             self.state
                 .lock()
@@ -371,11 +418,17 @@ impl ExecutionLayer for MockExecutionLayer {
         &self,
         state: ForkchoiceState,
     ) -> Result<ForkchoiceUpdated, ElError> {
-        let gate = self.behaviour.lock().unwrap_or_else(|p| p.into_inner()).forkchoice_gate.clone();
+        let (gate, delay) = {
+            let behaviour = self.behaviour.lock().unwrap_or_else(|p| p.into_inner());
+            (behaviour.forkchoice_gate.clone(), behaviour.forkchoice_delay)
+        };
         if let Some(gate) = gate
             && let Ok(permit) = gate.acquire().await
         {
             permit.forget();
+        }
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
         self.record(ElCall::ForkchoiceUpdated(state));
         let failure = self.behaviour.lock().unwrap_or_else(|p| p.into_inner()).forkchoice_error.clone();

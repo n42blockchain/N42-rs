@@ -225,6 +225,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut deferred_execution_time: Option<u64> = None;
     // The chain's `deferredExecutionDepth` (1 when absent).
     let mut deferred_execution_depth: u64 = 1;
+    // The chain's header validity rules (standard section 2): profile 1's on
+    // a profile-1 genesis, the default (nothing more) on every other.
+    let mut header_rules = n42_h2_consensus::HeaderRules::default();
     if chain_path.is_none() {
         // No genesis to read a feature from: the chain-gated knobs a profile
         // set are withdrawn.
@@ -246,6 +249,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(Result::ok)
                     .unwrap_or(false),
             );
+            // Profile 1 of the mixed production standard: the genesis is
+            // the only source of consensus-visible values; a variable or
+            // flag that could change one refuses the start, and the block
+            // size bound is the genesis's `maxBlockBytes`.
+            n42_qmdb_reth::profile1::refuse_process_overrides(&spec.genesis)?;
+            if let Some(bytes) = n42_qmdb_reth::profile1::max_block_bytes(&spec.genesis) {
+                n42_h2_net::set_max_block_bytes(bytes as u64).map_err(|cap| {
+                    format!("the block size bound was fixed at {cap} bytes before the genesis's maxBlockBytes {bytes}")
+                })?;
+            }
+            if n42_qmdb_reth::profile1::is_profile1(&spec.genesis) {
+                // `--block-interval-ms` is refused above; the pacing is the
+                // genesis's `blockIntervalMs` in milliseconds, not the
+                // whole-second period derived from it.
+                block_interval_ms = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&spec.genesis)?.block_interval_ms;
+            }
+            header_rules = n42_qmdb_reth::profile1::header_rules(&spec.genesis);
             deferred_execution_time = n42_qmdb_reth::deferred_execution_time(&spec.genesis);
             // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
             // refused when malformed or not run by this build, never read as 1.
@@ -502,6 +522,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("signing      : H2-v4");
         }
         engine.set_leader_tenure(leader_tenure);
+        // Profile 1 (AM5): the validator set is the genesis set; every
+        // reconfiguration entry point of the engine refuses.
+        if hotstuff_config.as_ref().is_some_and(|config| config.profile1().is_some()) {
+            engine.epoch_manager_mut().set_fixed_validator_set(true);
+            println!("validators   : fixed to the genesis set (profile 1)");
+        }
         engine.set_rotate_on_timeout(
             rotate_on_timeout_view,
             hotstuff_config.as_ref().map_or(0, |config| config.epoch_length),
@@ -585,6 +611,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
+        // The chain's vote rules (profile 1: `VoteRules::PROFILE1`, from the
+        // genesis's `n42Profile`; today's otherwise).
+        let vote_rules = hotstuff_config
+            .as_ref()
+            .map_or(n42_h2_consensus::VoteRules::TODAY, n42_qmdb_reth::HotStuffGenesisConfig::vote_rules);
+        if vote_rules.profile1 {
+            service = service.with_vote_rules(vote_rules);
+            println!("vote rules   : profile 1 (Round 1 after the check, commit vote after the own import)");
+        }
         if let Some(store) = store {
             // Inside the service, not on the event it emits: the checkpoint has
             // to be durable before the commit reaches the execution layer, and
@@ -599,6 +634,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if gov5_profile {
             service = service.with_gov5_h2_profile(seal_key);
         }
+        let profile1 = header_rules.is_profile1();
+        if profile1 {
+            // The H2-v4 identity the embedded QC is signed under (B1, E13).
+            header_rules.chain = Some(identity);
+        }
+        service = service.with_header_rules(header_rules.clone());
         if let Some(channels) = mobile_gossip {
             service = service.with_mobile_gossip(channels.inbound, channels.outbound);
         }
@@ -686,6 +727,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The leader names its committed registry root; the builder stamps
             // it where the chain's schedule carries `mobileRegistryRoot`.
             let registry_root = mobile.clone();
+            // Without a service, profile 1 repeats the parent's root (AM21).
+            let vote_rules = service.vote_rules();
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -719,9 +762,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // count from, and a chain before Amsterdam must not carry
                     // one at all.
                     context.head_header.as_ref().map(|header| header.number + 1),
+                    profile1,
                 )
                 .map(|mut attributes| {
-                    attributes.mobile_registry_root = registry_root.as_ref().map(|mobile| mobile.registry_root());
+                    attributes.mobile_registry_root = n42_h2_node::mobile::registry_root_for_build(
+                        registry_root.as_ref().map(|mobile| mobile.registry_root()),
+                        context.head_header.as_ref(),
+                        vote_rules,
+                    );
                     attributes
                 })
             });
@@ -816,6 +864,7 @@ fn block_attributes(
     head_timestamp: Option<u64>,
     head_seen: Option<std::time::Instant>,
     slot_number: Option<u64>,
+    profile1: bool,
 ) -> Option<PayloadAttributes> {
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     let now_ms = SystemTime::now()
@@ -870,6 +919,10 @@ fn block_attributes(
     // `ErrFutureBlock` rule that made this look like an interop hazard lives in
     // their APoA engine, which is a different chain.
     let timestamp = match head_timestamp {
+        // Profile 1 (B4, O7): `max(parent.time, floor(now))`, which every
+        // member's vote bounds by its own clock plus two seconds; equal
+        // timestamps are valid there.
+        Some(parent) if profile1 => n42_h2_consensus::profile1_timestamp(parent, now_ms / 1000),
         Some(parent) => parent.saturating_add(period_secs.max(1)),
         // Genesis is the only block with no parent to derive from.
         None => now_ms / 1000,

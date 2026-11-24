@@ -22,11 +22,13 @@
 pub mod error;
 pub mod h2_finality;
 pub mod header_profile;
+pub mod header_rules;
 pub mod protocol;
 pub mod rotor;
 pub mod validator;
 mod validator_info;
 pub mod vote_log;
+pub mod vote_rules;
 pub mod wire_bridge;
 
 pub mod block_body;
@@ -60,6 +62,12 @@ pub use header_profile::{
     EXTRA_SEAL_LEN, GOV5_HEADER_EXTRA_MAGIC, GOV5_NIL_HASH,
     MAX_HEADER_EXTRA_LEN,
 };
+pub use header_rules::{
+    check_profile1_vote_time, decode_profile1_extra, profile1_base_fee, profile1_timestamp,
+    validate_profile1_against_parent, validate_profile1_genesis_header, validate_profile1_header,
+    verify_profile1_seal, HeaderRules, Profile1Error, ProposerSchedule, PROFILE1_FUTURE_SLACK_SECS,
+    PROFILE1_MAX_BLOCK_BYTES, PROFILE1_REQUESTS_HASH,
+};
 pub use protocol::quorum::{
     validator_changes_hash, verify_commit_qc, verify_commit_qc_with_profile, verify_qc, verify_tc,
 };
@@ -74,3 +82,4 @@ pub use validator::{
 };
 pub use validator_info::ValidatorInfo;
 pub use vote_log::{NoopVoteLog, VoteLogWriter};
+pub use vote_rules::VoteRules;

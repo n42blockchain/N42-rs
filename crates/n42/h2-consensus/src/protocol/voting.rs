@@ -42,7 +42,9 @@ impl ConsensusEngine {
         let late = self.signing_profile.vote_message(vote.view, vote.block_hash);
         let progress = self.signing_profile.progress_vote_message(vote.view, vote.block_hash);
         let started = std::time::Instant::now();
-        let progress_ok = self.signing_profile.verify_single(pk, &progress, &vote.signature);
+        // Profile 1 has no progress votes: one is not read (E9).
+        let progress_ok = self.vote_rules.progress_votes_allowed()
+            && self.signing_profile.verify_single(pk, &progress, &vote.signature);
         let ok = progress_ok || self.signing_profile.verify_single(pk, &late, &vote.signature);
         self.view_timing
             .note_verify(started, if progress_ok { 1 } else { 2 }, false, false);

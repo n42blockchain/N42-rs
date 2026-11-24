@@ -57,9 +57,8 @@ pub const DEFAULT_MAX_GOSSIP_SIZE: usize = 1 << 20;
 /// mixed production standard's `maxBlockBytes`, B15) that bound is the cap
 /// and the environment is not read.
 pub fn max_gossip_size() -> usize {
-    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     block_bytes_or(MAX_BLOCK_BYTES.get().copied(), || {
-        *SIZE.get_or_init(|| gossip_size_from(std::env::var("N42_MAX_GOSSIP_MB").ok().as_deref()))
+        *GOSSIP_SIZE.get_or_init(|| gossip_size_from(std::env::var("N42_MAX_GOSSIP_MB").ok().as_deref()))
     })
 }
 
@@ -99,6 +98,21 @@ pub fn max_block_chunk() -> u64 {
 /// `chain` when the chain sets a bound, the carrier's `default` otherwise.
 fn block_bytes_or(chain: Option<usize>, default: impl FnOnce() -> usize) -> usize {
     chain.unwrap_or_else(default)
+}
+
+static GOSSIP_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Fixes [`max_gossip_size`] to `bytes` before anything reads it: a
+/// profile-1 chain takes the bound from its genesis (`maxBlockBytes`,
+/// standard B15) and refuses `N42_MAX_GOSSIP_MB`. Returns the size already
+/// in force when it was read (or set) first and differs.
+pub fn set_max_gossip_size(bytes: usize) -> Result<(), usize> {
+    let size = *GOSSIP_SIZE.get_or_init(|| bytes);
+    if size == bytes {
+        Ok(())
+    } else {
+        Err(size)
+    }
 }
 
 /// The cap `N42_MAX_GOSSIP_MB` names, in bytes. Anything unset, unparseable or

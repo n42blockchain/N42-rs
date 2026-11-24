@@ -4946,7 +4946,10 @@ where
         // Build payload builder with consensus
         let conf = ctx.payload_builder_config();
         let chain = ctx.chain_spec().chain();
-        let gas_limit = conf.gas_limit_for(chain);
+        // Profile 1: every header's gas limit is the genesis constant
+        // (standard A23); `--builder.gaslimit` is refused at start-up there.
+        let gas_limit = n42_qmdb_reth::profile1::fixed_gas_limit(ctx.chain_spec().genesis())
+            .unwrap_or_else(|| conf.gas_limit_for(chain));
 
         // The same EVM factory the engine imports with (the fast transfer
         // path lives in it). Until round 37 the builder had a plain

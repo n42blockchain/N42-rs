@@ -225,6 +225,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut deferred_execution_time: Option<u64> = None;
     // The chain's `deferredExecutionDepth` (1 when absent).
     let mut deferred_execution_depth: u64 = 1;
+    // The chain's header validity rules (standard section 2): profile 1's on
+    // a profile-1 genesis, the default (nothing more) on every other.
+    let mut header_rules = n42_h2_consensus::HeaderRules::default();
     if chain_path.is_none() {
         // No genesis to read a feature from: the chain-gated knobs a profile
         // set are withdrawn.
@@ -262,6 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // whole-second period derived from it.
                 block_interval_ms = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&spec.genesis)?.block_interval_ms;
             }
+            header_rules = n42_qmdb_reth::profile1::header_rules(&spec.genesis);
             deferred_execution_time = n42_qmdb_reth::deferred_execution_time(&spec.genesis);
             // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
             // refused when malformed or not run by this build, never read as 1.
@@ -615,6 +619,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if gov5_profile {
             service = service.with_gov5_h2_profile(seal_key);
         }
+        let profile1 = header_rules.is_profile1();
+        if profile1 {
+            // The H2-v4 identity the embedded QC is signed under (B1, E13).
+            header_rules.chain = Some(identity);
+        }
+        service = service.with_header_rules(header_rules.clone());
         if let Some(channels) = mobile_gossip {
             service = service.with_mobile_gossip(channels.inbound, channels.outbound);
         }
@@ -735,9 +745,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // count from, and a chain before Amsterdam must not carry
                     // one at all.
                     context.head_header.as_ref().map(|header| header.number + 1),
+                    profile1,
                 )
                 .map(|mut attributes| {
                     attributes.mobile_registry_root = registry_root.as_ref().map(|mobile| mobile.registry_root());
+                    // Profile 1 (B11, AM21/AM23): every header carries the
+                    // root; a leader without a mobileverify service repeats
+                    // its parent's.
+                    if profile1 && attributes.mobile_registry_root.is_none() {
+                        attributes.mobile_registry_root = Some(
+                            context.head_header.as_ref().and_then(|header| header.mobile_registry_root).unwrap_or_default(),
+                        );
+                    }
                     attributes
                 })
             });
@@ -832,6 +851,7 @@ fn block_attributes(
     head_timestamp: Option<u64>,
     head_seen: Option<std::time::Instant>,
     slot_number: Option<u64>,
+    profile1: bool,
 ) -> Option<PayloadAttributes> {
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     let now_ms = SystemTime::now()
@@ -886,6 +906,10 @@ fn block_attributes(
     // `ErrFutureBlock` rule that made this look like an interop hazard lives in
     // their APoA engine, which is a different chain.
     let timestamp = match head_timestamp {
+        // Profile 1 (B4, O7): `max(parent.time, floor(now))`, which every
+        // member's vote bounds by its own clock plus two seconds; equal
+        // timestamps are valid there.
+        Some(parent) if profile1 => n42_h2_consensus::profile1_timestamp(parent, now_ms / 1000),
         Some(parent) => parent.saturating_add(period_secs.max(1)),
         // Genesis is the only block with no parent to derive from.
         None => now_ms / 1000,

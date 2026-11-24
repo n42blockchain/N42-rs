@@ -271,6 +271,32 @@ pub struct Profile1Config {
 }
 
 impl Profile1Config {
+    /// The header validity rules of this chain (standard section 2, B1-B15):
+    /// profile 1 with the chain's gas limit, block size and fixed proposer
+    /// schedule (the genesis set, AM5, and its leader tenure, A15). `None`
+    /// when a validator's BLS key does not parse (the genesis is then
+    /// refused elsewhere).
+    pub fn header_rules(&self) -> Option<n42_h2_consensus::HeaderRules> {
+        let validators = self
+            .validators
+            .iter()
+            .map(|validator| {
+                let bytes = alloy_primitives::hex::decode(validator.bls_key.trim_start_matches("0x")).ok()?;
+                let bytes: [u8; 48] = bytes.try_into().ok()?;
+                Some(n42_h2_consensus::ValidatorInfo {
+                    address: validator.address,
+                    bls_public_key: n42_h2_primitives::BlsPublicKey::from_bytes(&bytes).ok()?,
+                    p2p_peer_id: None,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(n42_h2_consensus::HeaderRules::profile1(
+            self.gas_limit,
+            self.max_block_bytes,
+            Some(n42_h2_consensus::ProposerSchedule { validators, leader_tenure: self.leader_tenure }),
+        ))
+    }
+
     /// The block reward in gwei, as the withdrawals carry it.
     pub fn dev_block_reward_gwei(&self) -> u64 {
         // Validated: whole gwei, at most u64::MAX gwei.
@@ -540,6 +566,13 @@ fn expect_string(object: &Map<String, Value>, path: &str, key: &str, want: &str)
 
 /// The fixed block gas limit of a profile-1 genesis (A23): what the builder
 /// targets instead of `--builder.gaslimit`. `None` on any other chain.
+/// The header validity rules of the chain `genesis` describes: profile 1's
+/// ([`Profile1Config::header_rules`]) on a valid profile-1 genesis, the
+/// default (today's behaviour, nothing more checked) on every other.
+pub fn header_rules(genesis: &Genesis) -> n42_h2_consensus::HeaderRules {
+    profile1(genesis).ok().flatten().and_then(|config| config.header_rules()).unwrap_or_default()
+}
+
 pub fn fixed_gas_limit(genesis: &Genesis) -> Option<u64> {
     hotstuff_u64(genesis, "gasLimit")
 }
@@ -759,8 +792,12 @@ mod tests {
         assert!(spec.is_osaka_active_at_timestamp(ts));
         let header = spec.genesis_header();
         assert_eq!(header.state_root, qmdb::qmdb_genesis_root(g).expect("a root"));
-        assert_eq!(header.block_access_list_hash, Some(alloy_eips::eip7928::EMPTY_BLOCK_ACCESS_LIST_HASH));
-        assert_eq!(header.slot_number, None);
+        // gov5's profile-1 genesis (vector V1): element 22 the 0x80 gap, slot
+        // number 0, ommers hash zero, the requests hash the empty trie root.
+        assert_eq!(header.block_access_list_hash, None);
+        assert_eq!(header.slot_number, Some(0));
+        assert_eq!(header.ommers_hash, B256::ZERO);
+        assert_eq!(header.requests_hash, Some(alloy_consensus::EMPTY_ROOT_HASH));
         assert!(header.extra_data.is_empty());
         assert_eq!(header.gas_limit, 480_000_000);
 

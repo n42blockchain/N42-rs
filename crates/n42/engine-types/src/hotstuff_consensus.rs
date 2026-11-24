@@ -78,15 +78,20 @@ pub struct HotStuffConsensus<ChainSpec> {
     header_rules: HeaderRules,
 }
 
-/// The header rules of the chain `genesis` describes.
-///
-/// The single place the genesis layer's profile-1 configuration
-/// (`n42_qmdb_reth::Profile1Config`, built on a parallel branch) is mapped
-/// onto [`HeaderRules`]: until that mapping lands every chain gets the
-/// default, today's behaviour, byte for byte. The consensus engine, the
-/// engine validator and the payload builder all read it from here.
-pub fn chain_header_rules(_genesis: &alloy_genesis::Genesis) -> HeaderRules {
-    HeaderRules::default()
+/// The header rules of the chain `genesis` describes: profile 1's on a
+/// profile-1 genesis (`n42_qmdb_reth::profile1::header_rules`), the default
+/// -- today's behaviour, byte for byte -- on every other. The consensus
+/// engine and the engine validator read it from here.
+pub fn chain_header_rules<C: EthChainSpec>(chain_spec: &C) -> HeaderRules {
+    let mut rules = n42_qmdb_reth::profile1::header_rules(chain_spec.genesis());
+    if rules.is_profile1() {
+        // The H2-v4 identity the embedded QC is signed under (B1, E13).
+        rules.chain = Some(n42_h2_primitives::consensus::H2V4ChainIdentity {
+            chain_id: chain_spec.chain().id(),
+            genesis_hash: chain_spec.genesis_hash(),
+        });
+    }
+    rules
 }
 
 /// A header whose parent beacon root is not the parent's committee evidence.
@@ -112,7 +117,7 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> HotStuffConsensus<ChainSpec> {
             },
             Err(_) => None,
         };
-        let header_rules = chain_header_rules(chain_spec.genesis());
+        let header_rules = chain_header_rules(chain_spec.as_ref());
         Self {
             ethereum: EthBeaconConsensus::new(chain_spec.clone()),
             chain_spec,
@@ -1353,6 +1358,52 @@ mod tests {
         consensus().validate_header(&sealed(requests.clone())).expect("today: either requests spelling");
         let err = profile1_consensus().validate_header(&sealed(requests)).unwrap_err();
         assert!(err.to_string().starts_with("B8") || err.to_string().contains("B8"), "{err}");
+    }
+
+    /// gov5's V1 test genesis (`h2-consensus/testdata/profile1/genesis_8s.json`)
+    /// loads to gov5's genesis header, field by field and by hash, and its
+    /// header rules are profile 1's.
+    #[test]
+    fn v1_profile1_genesis_hash_is_gov5s() {
+        let genesis: alloy_genesis::Genesis =
+            serde_json::from_str(include_str!("../../h2-consensus/testdata/profile1/genesis_8s.json")).expect("parses");
+        let v1: serde_json::Value =
+            serde_json::from_str(include_str!("../../h2-consensus/testdata/profile1/header_profile_v1.json")).expect("parses");
+        let gov5_rlp = alloy_primitives::hex::decode(v1["genesis"]["rlp"].as_str().unwrap()).unwrap();
+        let gov5: n42_header::N42Header = alloy_rlp::Decodable::decode(&mut gov5_rlp.as_slice()).expect("gov5 genesis decodes");
+        let spec = n42_header::N42ChainSpec::from(Arc::new(ChainSpec::from(genesis.clone())));
+        let ours = spec.sealed_genesis_header();
+        let mut differs = Vec::new();
+        for (name, a, b) in [
+            ("ommers", format!("{:?}", ours.ommers_hash), format!("{:?}", gov5.ommers_hash)),
+            ("state_root", format!("{:?}", ours.state_root), format!("{:?}", gov5.state_root)),
+            ("tx_root", format!("{:?}", ours.transactions_root), format!("{:?}", gov5.transactions_root)),
+            ("receipts_root", format!("{:?}", ours.receipts_root), format!("{:?}", gov5.receipts_root)),
+            ("withdrawals_root", format!("{:?}", ours.withdrawals_root), format!("{:?}", gov5.withdrawals_root)),
+            ("requests_hash", format!("{:?}", ours.requests_hash), format!("{:?}", gov5.requests_hash)),
+            ("bal_hash", format!("{:?}", ours.block_access_list_hash), format!("{:?}", gov5.block_access_list_hash)),
+            ("slot_number", format!("{:?}", ours.slot_number), format!("{:?}", gov5.slot_number)),
+            ("registry_root", format!("{:?}", ours.mobile_registry_root), format!("{:?}", gov5.mobile_registry_root)),
+            ("base_fee", format!("{:?}", ours.base_fee_per_gas), format!("{:?}", gov5.base_fee_per_gas)),
+            ("blob", format!("{:?}/{:?}", ours.blob_gas_used, ours.excess_blob_gas), format!("{:?}/{:?}", gov5.blob_gas_used, gov5.excess_blob_gas)),
+            ("beacon_root", format!("{:?}", ours.parent_beacon_block_root), format!("{:?}", gov5.parent_beacon_block_root)),
+            ("extra", format!("{:?}", ours.extra_data), format!("{:?}", gov5.extra_data)),
+        ] {
+            if a != b {
+                differs.push(format!("{name}: ours {a} gov5 {b}"));
+            }
+        }
+        assert!(differs.is_empty(), "genesis fields differ:\n{}", differs.join("\n"));
+        assert_eq!(alloy_rlp::encode(ours.header()), gov5_rlp, "genesis RLP");
+        let gov5_hash: B256 = "0x6f733745517957b421dcea37f6c879db89501aac0715f769fbc76ec54efe7e4f".parse().unwrap();
+        assert_eq!(ours.hash(), gov5_hash, "our genesis hash");
+        assert_eq!(spec.inner().genesis_hash(), gov5_hash, "the Ethereum view names the same hash");
+        let rules = chain_header_rules(&spec);
+        n42_h2_consensus::validate_profile1_genesis_header(ours.header(), &rules).expect("a profile-1 genesis");
+        assert!(rules.is_profile1());
+        assert_eq!(rules.chain.map(|c| (c.chain_id, c.genesis_hash)), Some((1144, gov5_hash)));
+        assert_eq!(rules.gas_limit, 480_000_000);
+        assert_eq!(rules.proposers.as_ref().map(|p| p.validators.len()), Some(4));
     }
 
     fn deferred_consensus() -> HotStuffConsensus<n42_header::N42ChainSpec> {

@@ -1477,14 +1477,7 @@ where
         suggested_fee_recipient: coinbase,
         prev_randao: attributes.prev_randao,
         gas_limit: {
-            // Profile 1 (A23): every header's gas limit is the chain's
-            // constant, whatever `--builder.gaslimit` asks for.
-            let rules = crate::hotstuff_consensus::chain_header_rules(chain_spec.genesis());
-            let computed = if rules.is_profile1() {
-                rules.gas_limit
-            } else {
-                builder_config.gas_limit(parent_header.gas_limit)
-            };
+            let computed = builder_config.gas_limit(parent_header.gas_limit);
             // `deferredExecutionDepth` 2 (docs/DEFERRED_DEPTH_2_DESIGN.md item
             // 19): the header's `gasUsed` is the grandparent's, which a limit
             // that shrank twice could fall under. Depth 1 is left as it was.

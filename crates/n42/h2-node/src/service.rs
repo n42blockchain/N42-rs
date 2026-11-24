@@ -5702,6 +5702,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         {
             return Some(err.to_string());
         }
+        // B1: a QC whose block is known here names an ancestor (gov5's
+        // reading: walked at most 4096 blocks; an unknown block is checked by
+        // its signature alone).
+        if let Err(err) = rules.check_qc_ancestry(header, |hash| {
+            self.block_headers.get(hash).map(|known| (known.number, known.parent_hash))
+        }) {
+            return Some(err.to_string());
+        }
         None
     }
 

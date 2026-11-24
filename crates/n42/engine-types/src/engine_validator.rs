@@ -992,7 +992,7 @@ where
     async fn build(self, ctx: &AddOnsContext<'_, Node>) -> eyre::Result<Self::Validator> {
         let chain_spec = ctx.config.chain.clone();
         let profile = header_profile_for(chain_spec.as_ref());
-        let rules = crate::hotstuff_consensus::chain_header_rules(chain_spec.genesis());
+        let rules = crate::hotstuff_consensus::chain_header_rules(chain_spec.as_ref());
         Ok(N42EngineValidator::new(chain_spec, profile).with_header_rules(rules))
     }
 }

@@ -7339,3 +7339,7 @@ mod vote_retry_tests;
 #[cfg(test)]
 #[path = "state_machine_rotate_tests.rs"]
 mod rotate_tests;
+
+#[cfg(test)]
+#[path = "state_machine_scale_tests.rs"]
+mod scale_tests;

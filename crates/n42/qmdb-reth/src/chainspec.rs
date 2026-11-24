@@ -32,7 +32,9 @@ pub fn with_declared_state_scheme(spec: ChainSpec) -> Result<ChainSpec, StateErr
     let mut spec = spec;
     let mut header = spec.genesis_header.clone_header();
     header.state_root = root;
-    spec.genesis_header = reth_primitives_traits::SealedHeader::new_unhashed(header);
+    // Resealed by the chain's rule: alloy's hash would drop a profile-1
+    // genesis's elements 22 and 24 (gov5 vector V1).
+    spec.genesis_header = reth_chainspec::qmdb::seal_genesis_header(&spec.genesis, header);
     Ok(spec)
 }
 

@@ -39,6 +39,34 @@ struct N42Args {
     qmdb_history: Option<n42_qmdb_reth::history::HistoryMode>,
 }
 
+/// The CLI's chain spec parser with the node's chain spec type
+/// ([`n42_header::N42ChainSpec`], whose genesis header is an `N42Header`).
+#[derive(Debug, Clone, Copy, Default)]
+struct N42HeaderChainSpecParser;
+
+impl reth_cli::chainspec::ChainSpecParser for N42HeaderChainSpecParser {
+    type ChainSpec = n42_header::N42ChainSpec;
+
+    const SUPPORTED_CHAINS: &'static [&'static str] = N42ChainSpecParser::SUPPORTED_CHAINS;
+
+    fn parse(s: &str) -> eyre::Result<Arc<Self::ChainSpec>> {
+        Ok(Arc::new(n42_header::N42ChainSpec::new(N42ChainSpecParser::parse(s)?)))
+    }
+}
+
+/// `n42 init` on the node's own types ([`N42Node`]: `N42Header` storage), so
+/// the genesis header written is the one the node serves and hashes.
+fn profile1_init() -> eyre::Result<()> {
+    let mut cli = Cli::<N42HeaderChainSpecParser, N42Args>::parse();
+    let runner = reth_cli_runner::CliRunner::try_default_runtime()?;
+    let _guards = cli.init_tracing(&runner, reth_tracing::Layers::new())?;
+    let n42::cli::Commands::Init(command) = cli.command else {
+        return Err(eyre::eyre!("profile1_init runs only the init command"));
+    };
+    let runtime = runner.runtime();
+    runner.run_blocking_until_ctrl_c(command.execute::<N42Node>(runtime))
+}
+
 fn parse_history_mode(raw: &str) -> Result<n42_qmdb_reth::history::HistoryMode, String> {
     n42_qmdb_reth::history::HistoryMode::parse(raw)
 }
@@ -100,6 +128,19 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+    // `init` on a profile-1 chain writes the genesis as the node stores it:
+    // reth's `init` runs on Ethereum's node types, whose header has no
+    // element 24, so the stored genesis would lack the zero
+    // `mobileRegistryRoot` its hash covers (gov5 vector V1).
+    if matches!(cli.command, n42::cli::Commands::Init(_))
+        && cli.command.chain_spec().is_some_and(|spec| reth_chainspec::qmdb::is_profile1(&spec.genesis))
+    {
+        if let Err(err) = profile1_init() {
+            eprintln!("Error: {err:?}");
+            std::process::exit(1);
+        }
+        return;
     }
     // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
     // would silently verify everything (or nothing); refuse to start instead.

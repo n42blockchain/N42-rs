@@ -686,6 +686,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The leader names its committed registry root; the builder stamps
             // it where the chain's schedule carries `mobileRegistryRoot`.
             let registry_root = mobile.clone();
+            // Without a service, profile 1 repeats the parent's root (AM21).
+            let vote_rules = service.vote_rules();
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -721,7 +723,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     context.head_header.as_ref().map(|header| header.number + 1),
                 )
                 .map(|mut attributes| {
-                    attributes.mobile_registry_root = registry_root.as_ref().map(|mobile| mobile.registry_root());
+                    attributes.mobile_registry_root = n42_h2_node::mobile::registry_root_for_build(
+                        registry_root.as_ref().map(|mobile| mobile.registry_root()),
+                        context.head_header.as_ref(),
+                        vote_rules,
+                    );
                     attributes
                 })
             });

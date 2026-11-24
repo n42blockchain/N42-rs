@@ -564,8 +564,6 @@ fn expect_string(object: &Map<String, Value>, path: &str, key: &str, want: &str)
     }
 }
 
-/// The fixed block gas limit of a profile-1 genesis (A23): what the builder
-/// targets instead of `--builder.gaslimit`. `None` on any other chain.
 /// The header validity rules of the chain `genesis` describes: profile 1's
 /// ([`Profile1Config::header_rules`]) on a valid profile-1 genesis, the
 /// default (today's behaviour, nothing more checked) on every other.
@@ -573,6 +571,8 @@ pub fn header_rules(genesis: &Genesis) -> n42_h2_consensus::HeaderRules {
     profile1(genesis).ok().flatten().and_then(|config| config.header_rules()).unwrap_or_default()
 }
 
+/// The fixed block gas limit of a profile-1 genesis (A23): what the builder
+/// targets instead of `--builder.gaslimit`. `None` on any other chain.
 pub fn fixed_gas_limit(genesis: &Genesis) -> Option<u64> {
     hotstuff_u64(genesis, "gasLimit")
 }

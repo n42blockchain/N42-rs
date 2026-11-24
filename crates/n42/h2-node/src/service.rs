@@ -1849,13 +1849,6 @@ impl<E: ExecutionLayer> H2Service<E> {
         Ok(())
     }
 
-    /// Runs this node under gov5's `HotStuff` header profile.
-    ///
-    /// Blocks it builds are finished before they are proposed — the view
-    /// stamped into the extra data, the seal signed with `key`, the ommers
-    /// hash and difficulty set to what gov5's producer writes — and blocks it
-    /// receives are decoded under the same profile. What a Go fleet member
-    /// does, so the two can share a chain.
     /// Runs the chain under the profile-1 header rules `rules` (the mixed
     /// production standard, B1-B15): every header that arrives -- gossip,
     /// push, by-hash, compact, range -- is checked, seal included, before it
@@ -1874,6 +1867,13 @@ impl<E: ExecutionLayer> H2Service<E> {
         self
     }
 
+    /// Runs this node under gov5's `HotStuff` header profile.
+    ///
+    /// Blocks it builds are finished before they are proposed — the view
+    /// stamped into the extra data, the seal signed with `key`, the ommers
+    /// hash and difficulty set to what gov5's producer writes — and blocks it
+    /// receives are decoded under the same profile. What a Go fleet member
+    /// does, so the two can share a chain.
     pub fn with_gov5_h2_profile(mut self, key: n42_h2_primitives::bls::BlsSecretKey) -> Self {
         self.header_profile = HeaderProfile::Gov5H2;
         self.native_wire = true;

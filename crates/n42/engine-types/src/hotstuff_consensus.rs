@@ -75,7 +75,7 @@ pub struct HotStuffConsensus<ChainSpec> {
     /// The mixed production standard's profile-1 header rules, when the
     /// chain runs profile 1 ([`chain_header_rules`]); the default checks
     /// nothing more than before.
-    header_rules: HeaderRules,
+    header_rules: Box<HeaderRules>,
 }
 
 /// The header rules of the chain `genesis` describes: profile 1's on a
@@ -123,13 +123,13 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> HotStuffConsensus<ChainSpec> {
             chain_spec,
             signer: RwLock::new(None),
             committee,
-            header_rules,
+            header_rules: Box::new(header_rules),
         }
     }
 
     /// The same rules under the profile-1 header rules `rules`.
     pub fn with_header_rules(mut self, rules: HeaderRules) -> Self {
-        self.header_rules = rules;
+        self.header_rules = Box::new(rules);
         self
     }
 

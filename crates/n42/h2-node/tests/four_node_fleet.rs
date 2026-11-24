@@ -463,6 +463,11 @@ async fn a_member_that_starts_behind_pulls_the_chain_from_its_peers() {
     // execution layer. Its peers' status shows them ahead, it pulls the gap
     // by range, imports each block through its execution layer, and ends
     // level with them. Views are the engine's problem and not asserted here.
+    //
+    // Under gov5's header profile, so every header embeds its parent's
+    // commit QC and the pull runs the anchor rule as a node does by default
+    // (`N42_SYNC_ANCHOR=enforce`): only blocks those QCs authenticate are
+    // executed.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -475,7 +480,7 @@ async fn a_member_that_starts_behind_pulls_the_chain_from_its_peers() {
     let mut handles = Vec::new();
     let mut first_addr = None;
     for (index, key) in keys.into_iter().enumerate() {
-        let (node, addr) = build_node(index, key, &validator_set, identity, first_addr.clone(), true, false).await;
+        let (node, addr) = build_node(index, key, &validator_set, identity, first_addr.clone(), true, true).await;
         if first_addr.is_none() {
             first_addr = Some(addr);
         }
@@ -497,16 +502,8 @@ async fn a_member_that_starts_behind_pulls_the_chain_from_its_peers() {
     .await;
     started.expect("the three-member fleet commits five blocks");
 
-    let (mut late, _) = build_node(3, late_key, &validator_set, identity, first_addr, false, false).await;
-    // Under the Ethereum header profile this fleet runs, a header embeds no
-    // QC, so nothing anchors a pull (sync standard §3.3) and `enforce` would
-    // execute none of it. gov5's profile embeds them, but the mock execution
-    // layer cannot serve a gov5-profile header back by range (a payload does
-    // not carry its difficulty and other gov5 fields, so the served block
-    // hashes differently). This test is about the pull mechanics end to end,
-    // so it runs `observe`; the anchored pull between two real services is
-    // `a_member_behind_its_peer_pulls_the_gap_and_finishes_level`.
-    late.service = late.service.with_sync_anchor_mode(n42_h2_node::sync_anchor::SyncAnchorMode::Observe);
+    let (mut late, _) = build_node(3, late_key, &validator_set, identity, first_addr, false, true).await;
+    late.service = late.service.with_sync_anchor_mode(n42_h2_node::sync_anchor::SyncAnchorMode::Enforce);
     handles.push(spawn_node(3, late, tx.clone()));
 
     let synced = tokio::time::timeout(Duration::from_secs(60), async {

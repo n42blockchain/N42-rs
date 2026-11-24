@@ -173,7 +173,6 @@ impl<T> AnchorBuffer<T> {
     }
 
     /// The highest number an anchor covers, buffered or released.
-    #[cfg(test)]
     pub(crate) const fn authenticated_to(&self) -> Option<u64> {
         self.authenticated_to
     }

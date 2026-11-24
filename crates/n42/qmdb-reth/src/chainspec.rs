@@ -45,7 +45,9 @@ pub fn with_declared_state_scheme(spec: ChainSpec) -> Result<ChainSpec, StateErr
 ///   ([`n42_qmdb_state::validate_alloc`], sync standard Q-S1, as gov5's
 ///   `validateGenesisAlloc`);
 /// - a `hotstuff` block that switches on a rule this node does not implement
-///   ([`crate::refuse_unimplemented_rules`]).
+///   ([`crate::refuse_unimplemented_rules`]);
+/// - a genesis that declares `n42Profile` and is not a valid profile-1
+///   genesis ([`crate::profile1::profile1`]).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct N42ChainSpecParser;
@@ -72,6 +74,7 @@ impl ChainSpecParser for N42ChainSpecParser {
 pub fn check_genesis(genesis: &alloy_genesis::Genesis) -> eyre::Result<()> {
     n42_qmdb_state::validate_alloc(&genesis.alloc)?;
     crate::refuse_unimplemented_rules(genesis)?;
+    crate::profile1::profile1(genesis)?;
     Ok(())
 }
 

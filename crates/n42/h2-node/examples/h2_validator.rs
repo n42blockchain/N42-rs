@@ -246,6 +246,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(Result::ok)
                     .unwrap_or(false),
             );
+            // Profile 1 of the mixed production standard: the genesis is
+            // the only source of consensus-visible values; a variable or
+            // flag that could change one refuses the start, and the block
+            // size bound is the genesis's `maxBlockBytes`.
+            n42_qmdb_reth::profile1::refuse_process_overrides(&spec.genesis)?;
+            if let Some(bytes) = n42_qmdb_reth::profile1::max_block_bytes(&spec.genesis) {
+                n42_h2_net::config::set_max_gossip_size(bytes).map_err(|cap| {
+                    format!("the gossip size was fixed at {cap} bytes before the genesis's maxBlockBytes {bytes}")
+                })?;
+            }
+            if n42_qmdb_reth::profile1::is_profile1(&spec.genesis) {
+                // `--block-interval-ms` is refused above; the pacing is the
+                // genesis's `blockIntervalMs` in milliseconds, not the
+                // whole-second period derived from it.
+                block_interval_ms = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&spec.genesis)?.block_interval_ms;
+            }
             deferred_execution_time = n42_qmdb_reth::deferred_execution_time(&spec.genesis);
             // `deferredExecutionDepth` (docs/DEFERRED_DEPTH_2_DESIGN.md):
             // refused when malformed or not run by this build, never read as 1.
@@ -686,6 +702,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The leader names its committed registry root; the builder stamps
             // it where the chain's schedule carries `mobileRegistryRoot`.
             let registry_root = mobile.clone();
+            // Without a service, profile 1 repeats the parent's root (AM21).
+            let vote_rules = service.vote_rules();
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -721,7 +739,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     context.head_header.as_ref().map(|header| header.number + 1),
                 )
                 .map(|mut attributes| {
-                    attributes.mobile_registry_root = registry_root.as_ref().map(|mobile| mobile.registry_root());
+                    attributes.mobile_registry_root = n42_h2_node::mobile::registry_root_for_build(
+                        registry_root.as_ref().map(|mobile| mobile.registry_root()),
+                        context.head_header.as_ref(),
+                        vote_rules,
+                    );
                     attributes
                 })
             });

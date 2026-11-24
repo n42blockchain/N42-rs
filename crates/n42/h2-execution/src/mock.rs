@@ -96,6 +96,12 @@ pub struct MockBehaviour {
     pub new_payload_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// How long an attribute-less forkchoice takes.
     pub forkchoice_delay: Option<std::time::Duration>,
+    /// The execution layer's check refuses a body (its header's execution
+    /// fields are not this node's result for the parent, or a transaction is
+    /// not includable on the parent's post-state): no check is answered, as
+    /// the real channel sends no `CHECKED` frame, and the import's verdict is
+    /// [`Self::new_payload_status`].
+    pub check_refused: bool,
 }
 
 impl Default for MockBehaviour {
@@ -116,6 +122,7 @@ impl Default for MockBehaviour {
             new_payload_delay: None,
             new_payload_gate: None,
             forkchoice_delay: None,
+            check_refused: false,
         }
     }
 }
@@ -290,8 +297,12 @@ impl ExecutionLayer for MockExecutionLayer {
             return crate::BodyOutcome::Answered(Err(ElError(error)));
         }
         // The check first, as the real channel does: it is the vote, and it
-        // arrives before the import's verdict.
-        let _ = checked.send(PayloadStatus::from_status(PayloadStatusEnum::Valid));
+        // arrives before the import's verdict. A refused check answers none.
+        if behaviour.check_refused {
+            drop(checked);
+        } else {
+            let _ = checked.send(PayloadStatus::from_status(PayloadStatusEnum::Valid));
+        }
         self.answer_body(body, behaviour).await
     }
 
@@ -316,6 +327,10 @@ impl ExecutionLayer for MockExecutionLayer {
         }
         if let Some(error) = behaviour.new_payload_error.clone() {
             return crate::BodyOutcome::Answered(Err(ElError(error)));
+        }
+        if behaviour.check_refused {
+            drop(checked);
+            return self.answer_body(body, behaviour).await;
         }
         let _ = checked.send(PayloadStatus::from_status(PayloadStatusEnum::Valid));
         // The execution waits for its slot.

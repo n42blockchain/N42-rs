@@ -32,6 +32,7 @@ pub mod hotstuff;
 pub mod node_state;
 mod recovery_frontier;
 pub mod occupancy;
+pub mod profile1;
 pub mod read_view;
 pub mod state_reader;
 pub mod strategy;
@@ -55,6 +56,7 @@ pub use n42_qmdb_state::forest::PreparedBlock;
 pub use node_state::{
     canonical_fatal, committed_floor, committed_floor_for, settle_wait, sort_and_hash_leaves, NodeStateError, OfflockCounters, PersistSplit, QmdbNodeState, RenameOutcome, RootSplit,
 };
+pub use profile1::{Profile1Config, Profile1Error};
 pub use read_view::{QmdbReadView, ViewLockWaits};
 pub use state_reader::{check_hashed_tables_setting, register_state_reader, QmdbStateReader};
 /// The latest-state reader registry the providers consult (`N42_QMDB_READS`).

@@ -548,6 +548,19 @@
   fleet 用 `F7_GENESIS=<该文件>` 选择；`fleet7-bench.sh` 头部打印 `chain : <文件>, deferred execution depth N`，
   `fleet7-verify.py` 输出与 JSON 带 `deferred_depth`。未实现：重启日志（第 6 步，D=2 重启后丢一个出块视图或弃权一次）。
 
+## 混合出块标准 profile 1 的创世/配置层（chainspec 仅新增，其余在 `crates/n42/qmdb-reth`）:
+`docs/MIXED_PRODUCTION_STANDARD.md`。创世 `config.n42Profile: 1` 是唯一开关；没有该字段的创世逐字节按以前读取。
+- `crates/chainspec/src/qmdb.rs`（fork 的 reth crate，**仅新增**）：`N42_PROFILE_KEY`、`is_profile1`；profile 1 上
+  `deferred_execution_time` = 0、深度读 `hotstuff.deferredExecutionDepth`（必填）、`glamsterdam_time` /
+  `mobile_anchor_time` = 0、`is_n42_native` 真、`state_scheme` = QMDB、`alt_sig_tx_enabled` /
+  `frame_blocks_enabled` 假。`crates/chainspec/src/spec.rs` `from_genesis`：profile 1 上 `amsterdamTime` 不调度
+  reth 自己的 Amsterdam（AM1：它指 gov5 的 Glamsterdam 规则集）。
+- `crates/n42/qmdb-reth/src/profile1.rs`：封闭键表（`config`、`hotstuff`、`committeePool`、validator）、旧激活字段
+  拒绝、必填与取值检查、`Profile1Config`（`HotStuffGenesisConfig::profile1()`）、环境变量/命令行拒绝表
+  （`refuse_process_overrides`，`n42` 与 `h2_validator` 启动时调用）。`check_genesis` 调用 `profile1()`。
+- 草案创世 `crates/chainspec/res/genesis/n42_profile1_draft.json`（DRAFT，权威文件由 gov5 发布）；拒绝用例
+  `crates/n42/qmdb-reth/testdata/profile1/`。
+
 ## E=1 多密钥：投票批量验证、quorum 等待规则、gossip 离开共识循环、投票直达 leader（不改任何 fork 的 reth crate）:
 `docs/E1_MANY_KEYS.md` 第 6 节（审计见第 1 节）。四个开关默认全关；关闭时行为与以前相同，线上字节不变。
 - `N42_VOTE_AGGREGATE_VERIFY=1`（验证者进程；`h2-primitives` `bls/verify.rs` `verify_same_message_batch` /

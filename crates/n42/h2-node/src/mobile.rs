@@ -250,6 +250,29 @@ impl MobileVerify {
     }
 }
 
+/// The `mobileRegistryRoot` a leader's payload attributes carry.
+///
+/// `service_root` is this node's mobileverify service's committed root
+/// ([`MobileVerify::registry_root`]), `None` when the node runs none; `parent`
+/// is the header the block will extend, when known. With a service its root is
+/// named, as always. Without one, today's rules name none, and the build fails
+/// on a chain whose headers must carry the field. Under profile 1 (AM21, AM23:
+/// phones never keep a validator from leading) the leader repeats its parent's
+/// root -- valid since followers carry the root and do not re-derive it
+/// (AM12) -- zero for a parent that carries none (genesis, whose root is
+/// zero, A6); an execution layer on a chain without the field drops it. Still
+/// `None` while the parent is unknown.
+pub fn registry_root_for_build(
+    service_root: Option<B256>,
+    parent: Option<&n42_h2_consensus::N42Header>,
+    rules: n42_h2_consensus::VoteRules,
+) -> Option<B256> {
+    if service_root.is_some() || !rules.repeat_parent_registry_root() {
+        return service_root;
+    }
+    parent.map(|parent| parent.mobile_registry_root.unwrap_or(B256::ZERO))
+}
+
 /// gov5's `EpochCommitter`: fold the pending set every `every`, persist and
 /// log what changed.
 async fn commit_epochs(registry: Arc<Registry>, every: Duration, snapshot: Option<PathBuf>) {
@@ -328,6 +351,26 @@ async fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AM21/AM23: without a mobileverify service today's rules name no root
+    /// (the build then fails on a MobileAnchor chain); profile 1 repeats the
+    /// parent's, zero for a parent without one. A service's root wins on
+    /// both roads, and an unknown parent names nothing.
+    #[test]
+    fn a_leader_without_the_service_repeats_its_parents_root_on_profile1() {
+        use n42_h2_consensus::{N42Header, VoteRules};
+        let parent = N42Header::new(alloy_consensus::Header::default(), Some(B256::repeat_byte(0x5a)));
+        let genesis = N42Header::new(alloy_consensus::Header::default(), None);
+        let own = Some(B256::repeat_byte(0x11));
+        // Today's road.
+        assert_eq!(registry_root_for_build(None, Some(&parent), VoteRules::TODAY), None);
+        assert_eq!(registry_root_for_build(own, Some(&parent), VoteRules::TODAY), own);
+        // Profile 1.
+        assert_eq!(registry_root_for_build(None, Some(&parent), VoteRules::PROFILE1), Some(B256::repeat_byte(0x5a)));
+        assert_eq!(registry_root_for_build(None, Some(&genesis), VoteRules::PROFILE1), Some(B256::ZERO));
+        assert_eq!(registry_root_for_build(own, Some(&parent), VoteRules::PROFILE1), own);
+        assert_eq!(registry_root_for_build(None, None, VoteRules::PROFILE1), None);
+    }
 
     #[test]
     fn committed_head_moves_forward_and_forgets_old_blocks() {

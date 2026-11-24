@@ -1318,6 +1318,34 @@ async fn both_sends_by_both_paths_and_gossip_by_one() {
     assert_eq!(rig.svc.outbox.len(), 2, "and by gossip");
 }
 
+/// E16 under profile 1: every vote is published on the consensus topic and
+/// none goes by `/n42/vote/1`, whether direct votes were asked for before the
+/// rules or after them; the engine and the driver take the rules too.
+#[tokio::test]
+async fn profile1_publishes_every_vote_on_the_consensus_topic() {
+    let (keys, set) = keys(4);
+    for rules_first in [false, true] {
+        let mut rig = node_in(&keys, &set, 0, None).await;
+        rig.svc = if rules_first {
+            rig.svc
+                .with_vote_rules(n42_h2_consensus::VoteRules::PROFILE1)
+                .with_vote_transport(crate::direct_votes::VoteTransport::Direct)
+        } else {
+            rig.svc
+                .with_vote_transport(crate::direct_votes::VoteTransport::Direct)
+                .with_vote_rules(n42_h2_consensus::VoteRules::PROFILE1)
+        };
+        assert_eq!(rig.svc.engine.vote_rules(), n42_h2_consensus::VoteRules::PROFILE1);
+        assert_eq!(rig.svc.driver.vote_rules(), n42_h2_consensus::VoteRules::PROFILE1);
+        assert_eq!(rig.svc.direct_votes.mode(), crate::direct_votes::VoteTransport::Gossip);
+        rig.svc.direct_votes.learn(1, some_peer());
+        let mut events = Vec::new();
+        rig.svc.send_to_validator(1, test_vote(&keys, 0), &mut events);
+        assert_eq!(rig.svc.direct_votes.sent, 0, "rules first {rules_first}: nothing direct");
+        assert_eq!(rig.svc.outbox.len(), 1, "rules first {rules_first}: published");
+    }
+}
+
 /// One vote arriving directly and then by gossip reaches the engine once.
 #[tokio::test]
 async fn a_vote_by_gossip_and_directly_reaches_the_engine_once() {

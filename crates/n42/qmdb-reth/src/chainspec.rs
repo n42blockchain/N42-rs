@@ -38,6 +38,14 @@ pub fn with_declared_state_scheme(spec: ChainSpec) -> Result<ChainSpec, StateErr
 
 /// The chain spec parser for this node: everything reth's accepts, with the
 /// genesis header built for the scheme the genesis declares.
+///
+/// It is also where a genesis this node must not run is refused, for every
+/// chain and scheme, before anything is initialised or started:
+/// - an alloc entry with storage but nonce 0, zero balance and no code
+///   ([`n42_qmdb_state::validate_alloc`], sync standard Q-S1, as gov5's
+///   `validateGenesisAlloc`);
+/// - a `hotstuff` block that switches on a rule this node does not implement
+///   ([`crate::refuse_unimplemented_rules`]).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct N42ChainSpecParser;
@@ -51,12 +59,20 @@ impl ChainSpecParser for N42ChainSpecParser {
         // `From<Genesis>` already applies the scheme; this is a belt over those
         // braces for a spec assembled by any other route.
         let spec = chain_value_parser(s)?;
+        check_genesis(&spec.genesis)?;
         if state_scheme(&spec.genesis) != StateScheme::Qmdb {
             return Ok(spec);
         }
         let spec = Arc::try_unwrap(spec).unwrap_or_else(|shared| (*shared).clone());
         Ok(Arc::new(with_declared_state_scheme(spec)?))
     }
+}
+
+/// The refusals [`N42ChainSpecParser`] applies to every genesis it loads.
+pub fn check_genesis(genesis: &alloy_genesis::Genesis) -> eyre::Result<()> {
+    n42_qmdb_state::validate_alloc(&genesis.alloc)?;
+    crate::refuse_unimplemented_rules(genesis)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -118,5 +134,55 @@ mod tests {
         let before: ChainSpec = genesis(None).into();
         let after = with_declared_state_scheme(before.clone()).unwrap();
         assert_eq!(before.genesis_hash(), after.genesis_hash());
+    }
+
+    fn parse_path(path: &std::path::Path) -> eyre::Result<Arc<ChainSpec>> {
+        N42ChainSpecParser::parse(path.to_str().expect("utf-8 path"))
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name)
+    }
+
+    /// Every genesis this repository ships still loads through the parser the
+    /// node and `n42 init` use (none holds a storage-only alloc entry or an
+    /// unimplemented `hotstuff` rule).
+    #[test]
+    fn every_shipped_genesis_passes_the_start_up_checks() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../chainspec/res/genesis");
+        let mut files = Vec::new();
+        for dir in [root.clone(), root.join("gov5")] {
+            for entry in std::fs::read_dir(&dir).expect("the genesis directory") {
+                let path = entry.expect("an entry").path();
+                let is_genesis = path.extension().is_some_and(|e| e == "json")
+                    && !path.file_name().is_some_and(|n| n == "n42_devnet_validators.json");
+                if is_genesis {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(files.len() >= 20, "found only {files:?}");
+        for path in files {
+            parse_path(&path).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+        }
+    }
+
+    #[test]
+    fn a_storage_only_alloc_entry_refuses_the_genesis_and_names_the_address() {
+        let err = parse_path(&fixture("genesis_alloc_storage_only.json")).expect_err("refused");
+        let message = format!("{err:#}");
+        let address: alloy_primitives::Address = "0x00000000000000000000000000000000000000aa".parse().unwrap();
+        assert!(message.contains(&address.to_string()), "{message}");
+        assert!(message.contains("nonce 0, zero balance and empty code"), "{message}");
+        // The same entry with a nonce is an ordinary account.
+        parse_path(&fixture("genesis_alloc_storage_with_nonce.json")).expect("a nonce keeps the account");
+    }
+
+    #[test]
+    fn rotate_on_timeout_refuses_the_genesis_unless_it_is_null() {
+        let err = parse_path(&fixture("genesis_rotate_on_timeout.json")).expect_err("refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("rotateOnTimeoutView = 0"), "{message}");
+        parse_path(&fixture("genesis_rotate_on_timeout_null.json")).expect("null keeps the rule off");
     }
 }

@@ -203,6 +203,50 @@ pub enum HotStuffConfigError {
     /// The chain says it is `HotStuff` but lists nobody to run it.
     #[error("genesis \"hotstuff\" block lists no validators")]
     NoValidators,
+    /// The block turns on a consensus rule this node does not implement, so
+    /// running it would split the fleet the moment the rule applies.
+    #[error(
+        "genesis \"hotstuff\" block sets {field} = {value}, a consensus rule this node does not \
+         implement; it would not follow the rest of the fleet once the rule applies. Remove the \
+         field (absent or null keeps the rule off) or run a build that implements it"
+    )]
+    Unimplemented {
+        /// The genesis key, as gov5 spells it.
+        field: &'static str,
+        /// Its value, as JSON.
+        value: String,
+    },
+}
+
+/// `hotstuff` keys that switch on a consensus rule this node does not
+/// implement. [`HotStuffGenesisConfig`] ignores keys it does not know, so a
+/// key listed here is refused by [`refuse_unimplemented_rules`] instead of
+/// being dropped in silence.
+///
+/// - `rotateOnTimeoutView` (gov5 `params.HotStuffConfig.RotateOnTimeoutView`,
+///   sync standard section 10.3): from that timeout-certificate view on, a
+///   TC moves the chain to the next leader-tenure window instead of `view + 1`.
+///   Absent or `null` is off; any view number switches it on.
+///
+/// Only listed keys are refused, not every unknown key: gov5 writes settings
+/// for subsystems this node does not have, and those must still load.
+pub const UNIMPLEMENTED_ACTIVATING_FIELDS: &[&str] = &["rotateOnTimeoutView"];
+
+/// Refuses a genesis whose `hotstuff` block sets one of
+/// [`UNIMPLEMENTED_ACTIVATING_FIELDS`] to anything but `null`. A genesis
+/// without a `hotstuff` block, or with a malformed one, is left to
+/// [`HotStuffGenesisConfig::from_genesis`].
+pub fn refuse_unimplemented_rules(genesis: &Genesis) -> Result<(), HotStuffConfigError> {
+    let Some(hotstuff) = genesis.config.extra_fields.get(HOTSTUFF_KEY).and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    for &field in UNIMPLEMENTED_ACTIVATING_FIELDS {
+        match hotstuff.get(field) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(value) => return Err(HotStuffConfigError::Unimplemented { field, value: value.to_string() }),
+        }
+    }
+    Ok(())
 }
 
 impl HotStuffGenesisConfig {
@@ -440,5 +484,36 @@ mod tests {
     fn the_two_fleets_share_a_genesis_hash() {
         assert_eq!(spec_of(FLEET7).genesis_hash(), spec_of(FLEET4).genesis_hash());
         assert_eq!(spec_of(FLEET7_BENCH).genesis_hash(), spec_of(FLEET4_BENCH).genesis_hash());
+    }
+
+    fn with_hotstuff(hotstuff: &str) -> Genesis {
+        serde_json::from_str(&format!(r#"{{"config":{{"chainId":1,"hotstuff":{hotstuff}}},"alloc":{{}}}}"#))
+            .expect("a genesis")
+    }
+
+    /// `rotateOnTimeoutView` is gov5's `*uint64`: absent or null is off, any
+    /// view switches the rule on, and this node does not implement it.
+    #[test]
+    fn rotate_on_timeout_is_refused_only_when_it_activates() {
+        for off in [r#"{"leaderTenure":8}"#, r#"{"leaderTenure":8,"rotateOnTimeoutView":null}"#] {
+            refuse_unimplemented_rules(&with_hotstuff(off)).expect(off);
+        }
+        for on in ["0", "100", "18446744073709551615"] {
+            let genesis = with_hotstuff(&format!(r#"{{"leaderTenure":8,"rotateOnTimeoutView":{on}}}"#));
+            match refuse_unimplemented_rules(&genesis) {
+                Err(HotStuffConfigError::Unimplemented { field: "rotateOnTimeoutView", value }) => {
+                    assert_eq!(value, on);
+                }
+                other => panic!("{on}: {other:?}"),
+            }
+            // The config reader itself still ignores the key, so the chain is
+            // still recognised as HotStuff by the callers that only ask that.
+            HotStuffGenesisConfig::from_genesis(&genesis).expect("still a hotstuff block");
+        }
+        // Unknown keys outside the list keep loading.
+        refuse_unimplemented_rules(&with_hotstuff(r#"{"fastPropose":true,"ethELCompat":true}"#)).expect("not listed");
+        // No hotstuff block at all: nothing to refuse.
+        let plain: Genesis = serde_json::from_str(r#"{"config":{"chainId":1},"alloc":{}}"#).unwrap();
+        refuse_unimplemented_rules(&plain).expect("no hotstuff block");
     }
 }

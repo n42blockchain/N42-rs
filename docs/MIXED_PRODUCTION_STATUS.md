@@ -1,6 +1,6 @@
 # Mixed production standard, profile 1: status per client
 
-As of 2026-11-24 (after the 05:05 EST post). Rules: `docs/MIXED_PRODUCTION_STANDARD_V1_RC.md` (v1.0-rc1).
+As of 2026-11-24 (after the 05:05 EST post). Rules: `docs/MIXED_PRODUCTION_STANDARD_V1_RC.md` (v1.0-rc2).
 
 Levels: `—` not done · `impl` implemented · `vec` the item's vector passes · `mix` a profile-1 mixed round
 passed (no cell is `mix`: no mixed round on profile 1 has run) · `?` the client's own posts do not say.
@@ -18,6 +18,11 @@ Post keys: gov5 — `g0252` (~02:52), `g0255` (~02:55), `g0307` (~03:07), `g0316
 slice 1 + V8), `g0346a` (03:46, V1), `g0346b` (03:46, slice 5), `g0407` (04:07, V3/V4), `g0409` (04:09),
 `g0442` (04:42). n42-26 — `n0415` (04:15), `n0425` (04:25), `n0505` (05:05), `AM13` (n42-26's own status post
 as quoted in the standard).
+
+> **AM24 (owner, 2026-11-24): requestsHash = `sha256("")`, standard genesis hash `0x188e9d93…90dc`.** n42-rs
+> main (17b55fd0a) carries it with gov5's regenerated V1/V3/V4/V6. Every gov5 and n42-26 `vec` cell below was
+> earned on the pre-AM24 vectors (genesis `0x6f733745…7e4f`) and holds for AM24 only once that client posts a
+> pass on the regenerated ones (gov5: its PR #6 on `feat/profile1`; n42-26: its `feat/profile1-genesis`).
 
 ## Summary
 
@@ -45,7 +50,7 @@ Alias rows (`A3 / E1` …) are one row: the second id is defined by the first.
 
 | Item | gov5 | n42-rs | n42-26 | proof / where |
 | --- | --- | --- | --- | --- |
-| A1 | vec | vec | vec | V1 genesis hash `0x6f733745…7e4f`: gov5 g0346a; n42-rs `engine-types` genesis-hash test (1661b773a), `--chain-id`/`--genesis` refused (`qmdb-reth/src/profile1.rs` FORBIDDEN_FLAGS); n42-26 n0505 "header equals V1 … byte for byte" |
+| A1 | vec | vec | vec | V1 genesis hash (`0x188e9d93…90dc` since AM24; the posts quoted were on `0x6f733745…7e4f`): gov5 g0346a; n42-rs `engine-types` genesis-hash test (1661b773a), `--chain-id`/`--genesis` refused (`qmdb-reth/src/profile1.rs` FORBIDDEN_FLAGS); n42-26 n0505 "header equals V1 … byte for byte" |
 | A2 | vec | vec | vec | V8 closed key list: gov5 g0331; n42-rs `profile1.rs` CONFIG_KEYS / HOTSTUFF_KEYS, test vs gov5 V8 (7f45b0537); n42-26 n0505 "key lists equal allowed-keys.json" |
 | A3 / E1 | vec | vec | vec | V8 `three_validators`, `unknown_validator_key`; gov5 g0331; n42-rs MIN_VALIDATORS + V8; n42-26 n0505 (all 33 refused) |
 | A4 / D1 | vec | vec | — | V3/V4 executed on Amsterdam: gov5 g0407; n42-rs `engine-types/src/profile1_vectors.rs` (23893b81d); n42-26 n0505 "Still to do: Amsterdam set (AM1)" |

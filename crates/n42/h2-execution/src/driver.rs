@@ -900,6 +900,9 @@ pub struct ExecutionDriver<E> {
     /// What the forkchoice's safe and finalized hashes are (see
     /// [`crate::settlement`]).
     settlement: crate::settlement::Settlement,
+    /// Set by [`Self::halt`]: no forkchoice and no import leaves the driver
+    /// again.
+    halted: bool,
 }
 
 /// `N42_BODY_ONCE`, read once: opt-in, and read on the validator's side,
@@ -1130,7 +1133,35 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             commit_reports: commit_tx,
             commit_reports_rx: Some(commit_rx),
             settlement: crate::settlement::Settlement::new(crate::settlement::settlement_tags()),
+            halted: false,
         }
+    }
+
+    /// Stops the driver for good on a safety halt (a conflicting commit,
+    /// sync standard 3.3): every commit forkchoice and every import asked of
+    /// it from now on is dropped, and the commits and imports it was holding
+    /// are forgotten, so nothing this node has not already committed reaches
+    /// the execution layer and nothing committed is reorged. A forkchoice or
+    /// an import already on a task finishes; its report changes nothing
+    /// more. Only a restart (after the operator's decision) undoes it.
+    pub fn halt(&mut self) {
+        if self.halted {
+            return;
+        }
+        self.halted = true;
+        self.pending_commits.clear();
+        self.commits_ahead.clear();
+        self.commits_ahead_order.clear();
+        self.commit_retry = None;
+        self.commit_pending = None;
+        self.import_retry_due.clear();
+        self.discard_prepared();
+        warn!(target: "n42.h2.el", "driver halted: no further forkchoice or import is sent to the execution layer");
+    }
+
+    /// Whether [`Self::halt`] stopped the driver.
+    pub const fn is_halted(&self) -> bool {
+        self.halted
     }
 
     /// Installs a [`PayloadNormalizer`] applied to every block this node builds.
@@ -2109,7 +2140,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Runs the imports whose pause has passed (see
     /// [`Self::schedule_import_retry`]); the loop applies what they return.
     pub async fn retry_failed_imports(&mut self) -> Vec<DriverAction> {
-        if self.import_retry_due.is_empty() {
+        if self.halted || self.import_retry_due.is_empty() {
             return Vec::new();
         }
         let now = std::time::Instant::now();
@@ -3082,6 +3113,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Follower path: executes a proposed block and, on acceptance, produces the
     /// event that releases the import-gated vote.
     async fn execute(&mut self, block_hash: B256) -> DriverAction {
+        if self.halted {
+            debug!(target: "n42.h2.el", block = ?block_hash, "driver halted; block not imported");
+            return DriverAction::Ignored;
+        }
         let timestamp = self
             .payloads
             .get(&block_hash)
@@ -3161,6 +3196,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     }
 
     async fn commit(&mut self, block_hash: B256) -> DriverAction {
+        if self.halted {
+            debug!(target: "n42.h2.el", block = ?block_hash, "driver halted; commit not sent");
+            return DriverAction::Ignored;
+        }
         self.drop_losers_of(block_hash);
         if self.is_importing(&block_hash) {
             // Still importing, or queued behind the imports in flight: the
@@ -3303,6 +3342,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Sends the pending commit's forkchoice from a task, unless one is
     /// already in flight -- in which case its report sends this one.
     fn send_next_commit(&mut self) {
+        if self.halted {
+            self.commit_pending = None;
+            return;
+        }
         if self.commit_in_flight.is_some() {
             return;
         }
@@ -3493,6 +3536,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// `finish_commit`. Returns the actions to apply now (none so far: the
     /// answer arrives as a commit report).
     pub async fn retry_failed_commit(&mut self) -> Vec<DriverAction> {
+        if self.halted {
+            return Vec::new();
+        }
         let Some(retry) = &self.commit_retry else {
             return Vec::new();
         };

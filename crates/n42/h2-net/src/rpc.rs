@@ -1000,11 +1000,76 @@ impl RangeRequest {
 
 /// What a range request comes back with: the blocks served, in order, or the
 /// peer's error.
+///
+/// A reply that ends early after at least one block -- an error chunk, a
+/// stream cut mid-chunk, or [`RANGE_REQUEST_TIMEOUT`] passing -- is the
+/// blocks received so far, as `Ok`: a short reply, which the requester asks
+/// on from (sync standard §4.3, gov5 `c1d25e7a`). Only a reply that fails
+/// before its first block is an error.
 pub type RangeReply = Result<Vec<BlockChunk>, String>;
 
+/// The whole-request deadline of a `bodies_by_range/1` request (sync
+/// standard §6.2: 30 s for v1 ranges; libp2p's default was 10 s, which a
+/// 128 MiB reply misses below 13 MB/s). The codec stops reading when it
+/// passes and keeps the blocks received so far.
+pub const RANGE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// libp2p's own timer on a range stream, past [`RANGE_REQUEST_TIMEOUT`]: the
+/// codec ends a slow reply with its prefix before libp2p drops the stream and
+/// the prefix with it. It still bounds a stream that never gets as far as
+/// reading, and the serving side.
+pub const RANGE_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(32);
+
 /// The codec.
+///
+/// libp2p clones it for each stream, so `sent_at` is the stream's own.
 #[derive(Debug, Clone, Default)]
-pub struct BodiesByRangeCodec;
+pub struct BodiesByRangeCodec {
+    /// How long a reply is read for, counted from when its request was
+    /// written. `None` reads until the stream ends (no timer, so no tokio
+    /// runtime needed).
+    read_deadline: Option<std::time::Duration>,
+    /// When this stream's request was written.
+    sent_at: Option<tokio::time::Instant>,
+}
+
+impl BodiesByRangeCodec {
+    /// A codec that stops reading a reply `deadline` after writing its
+    /// request, keeping the blocks received by then.
+    pub const fn with_read_deadline(deadline: std::time::Duration) -> Self {
+        Self { read_deadline: Some(deadline), sent_at: None }
+    }
+}
+
+/// One step of reading a range reply.
+enum RangeChunk {
+    /// A block chunk.
+    Block(BlockChunk),
+    /// An error chunk: its code and message.
+    Refused(String),
+    /// The stream closed between chunks.
+    End,
+}
+
+/// Reads the next chunk of a range reply.
+async fn read_range_chunk<T>(io: &mut T) -> io::Result<RangeChunk>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut code = [0u8; 1];
+    if io.read(&mut code).await? == 0 {
+        // The stream closing is how gov5 ends a range.
+        return Ok(RangeChunk::End);
+    }
+    if code[0] != RESPONSE_CODE_SUCCESS {
+        let message = read_framed(io).await.unwrap_or_default();
+        return Ok(RangeChunk::Refused(format!("code {}: {}", code[0], String::from_utf8_lossy(&message))));
+    }
+    let mut fork_digest = [0u8; 4];
+    io.read_exact(&mut fork_digest).await?;
+    let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
+    Ok(RangeChunk::Block(BlockChunk { fork_digest, rlp: rlp.into() }))
+}
 
 impl request_response::Codec for BodiesByRangeCodec {
     type Protocol = StreamProtocol;
@@ -1023,29 +1088,47 @@ impl request_response::Codec for BodiesByRangeCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut chunks = Vec::new();
+        let deadline = self.read_deadline.map(|after| self.sent_at.unwrap_or_else(tokio::time::Instant::now) + after);
+        let mut chunks: Vec<BlockChunk> = Vec::new();
         let mut buffered = 0usize;
         loop {
             if buffered >= MAX_RANGE_READ_BYTES {
                 // Enough held for one reply; the rest is asked for again.
                 return Ok(Ok(chunks));
             }
-            let mut code = [0u8; 1];
-            if io.read(&mut code).await? == 0 {
-                // The stream closing is how gov5 ends a range.
-                return Ok(Ok(chunks));
-            }
-            if code[0] != RESPONSE_CODE_SUCCESS {
-                let message = read_framed(io).await.unwrap_or_default();
-                return Ok(Err(format!("code {}: {}", code[0], String::from_utf8_lossy(&message))));
-            }
-            let mut fork_digest = [0u8; 4];
-            io.read_exact(&mut fork_digest).await?;
-            let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
-            buffered = buffered.saturating_add(rlp.len());
-            chunks.push(BlockChunk { fork_digest, rlp: rlp.into() });
-            if chunks.len() as u64 > MAX_RANGE_BLOCKS {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "peer served more blocks than a range allows"));
+            let next = match deadline {
+                Some(at) => tokio::time::timeout_at(at, read_range_chunk(io)).await.unwrap_or_else(|_| {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "range reply timed out"))
+                }),
+                None => read_range_chunk(io).await,
+            };
+            // After a prefix, an error chunk, a cut stream or the deadline
+            // ends the reply short: the blocks received are valid and the
+            // requester asks on from after them (sync standard §4.3, W3).
+            // Before the first block they are the failure they always were.
+            match next {
+                Ok(RangeChunk::End) => return Ok(Ok(chunks)),
+                Ok(RangeChunk::Block(chunk)) => {
+                    buffered = buffered.saturating_add(chunk.rlp.len());
+                    chunks.push(chunk);
+                    if chunks.len() as u64 > MAX_RANGE_BLOCKS {
+                        // A protocol violation, not an early end: no prefix.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "peer served more blocks than a range allows",
+                        ));
+                    }
+                }
+                Ok(RangeChunk::Refused(message)) if chunks.is_empty() => return Ok(Err(message)),
+                Ok(RangeChunk::Refused(message)) => {
+                    tracing::debug!(target: "n42.h2.net", blocks = chunks.len(), message, "range reply ended in an error chunk; keeping the blocks received");
+                    return Ok(Ok(chunks));
+                }
+                Err(err) if chunks.is_empty() => return Err(err),
+                Err(err) => {
+                    tracing::debug!(target: "n42.h2.net", blocks = chunks.len(), %err, "range reply cut short; keeping the blocks received");
+                    return Ok(Ok(chunks));
+                }
             }
         }
     }
@@ -1059,6 +1142,9 @@ impl request_response::Codec for BodiesByRangeCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
+        if self.read_deadline.is_some() {
+            self.sent_at = Some(tokio::time::Instant::now());
+        }
         let framed = frame_payload(&request.to_ssz()).map_err(to_io)?;
         io.write_all(&framed).await?;
         io.close().await
@@ -1090,12 +1176,15 @@ impl request_response::Codec for BodiesByRangeCodec {
 /// The request-response behaviour for the protocol.
 pub type BodiesByRangeBehaviour = request_response::Behaviour<BodiesByRangeCodec>;
 
-/// Serving and requesting.
+/// Serving and requesting. A request is read for [`RANGE_REQUEST_TIMEOUT`]
+/// and keeps what came by then; libp2p's timer is [`RANGE_STREAM_TIMEOUT`].
+/// The other protocols keep libp2p's 10 s (sync standard §6.2: 10 s for
+/// everything but ranges and state).
 pub fn bodies_by_range_behaviour() -> BodiesByRangeBehaviour {
     request_response::Behaviour::with_codec(
-        BodiesByRangeCodec,
+        BodiesByRangeCodec::with_read_deadline(RANGE_REQUEST_TIMEOUT),
         [(bodies_by_range_protocol(), request_response::ProtocolSupport::Full)],
-        request_response::Config::default(),
+        request_response::Config::default().with_request_timeout(RANGE_STREAM_TIMEOUT),
     )
 }
 
@@ -1126,7 +1215,7 @@ mod bodies_by_range_tests {
             BlockChunk { fork_digest: [1, 2, 3, 4], rlp: alloy_primitives::Bytes::from_static(&[0xc4, 0xc0, 0xc0, 0xc0, 0xc0]) },
             BlockChunk { fork_digest: [1, 2, 3, 4], rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc1].into() },
         ];
-        let mut codec = BodiesByRangeCodec;
+        let mut codec = BodiesByRangeCodec::default();
         let proto = bodies_by_range_protocol();
         let mut wire = Vec::new();
         block_on(codec.write_response(&proto, &mut wire, Ok(chunks.clone()))).unwrap();
@@ -1147,13 +1236,114 @@ mod bodies_by_range_tests {
 
     #[test]
     fn the_request_round_trips_through_the_codec() {
-        let mut codec = BodiesByRangeCodec;
+        let mut codec = BodiesByRangeCodec::default();
         let proto = bodies_by_range_protocol();
         let request = RangeRequest { start: 100, count: 3, step: 1 };
         let mut wire = Vec::new();
         block_on(codec.write_request(&proto, &mut wire, request)).unwrap();
         let back = block_on(codec.read_request(&proto, &mut futures::io::Cursor::new(wire))).unwrap();
         assert_eq!(back, request);
+    }
+
+    fn two_blocks() -> Vec<BlockChunk> {
+        vec![
+            BlockChunk { fork_digest: [1, 2, 3, 4], rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc0].into() },
+            BlockChunk { fork_digest: [1, 2, 3, 4], rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc1].into() },
+        ]
+    }
+
+    /// The wire of `blocks` as a server writes them, without closing.
+    fn blocks_wire(blocks: &[BlockChunk]) -> Vec<u8> {
+        blocks.iter().flat_map(|chunk| encode_block_reply(&Ok(chunk.clone())).unwrap()).collect()
+    }
+
+    /// A stream that never yields another byte (a server that stalls).
+    struct Stalled;
+
+    impl AsyncRead for Stalled {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// gov5 main and n42-26 servers end a range past their stored chain
+    /// with an error chunk after the blocks they had (spec B2): the blocks
+    /// are kept as a short reply.
+    #[test]
+    fn an_error_chunk_after_a_prefix_keeps_the_prefix() {
+        let blocks = two_blocks();
+        let mut wire = blocks_wire(&blocks);
+        wire.extend(encode_block_reply(&Err("invalid block number".into())).unwrap());
+        let mut codec = BodiesByRangeCodec::default();
+        let back = block_on(codec.read_response(&bodies_by_range_protocol(), &mut futures::io::Cursor::new(wire)));
+        assert_eq!(back.unwrap(), Ok(blocks));
+    }
+
+    #[test]
+    fn a_stream_cut_after_a_prefix_keeps_the_prefix() {
+        let blocks = two_blocks();
+        let whole = blocks_wire(&blocks);
+        let first = blocks_wire(&blocks[..1]).len();
+        let proto = bodies_by_range_protocol();
+        // Cut inside the second chunk's frame, and right after its code byte.
+        for cut in [whole.len() - 2, first + 1, first + 3] {
+            let mut codec = BodiesByRangeCodec::default();
+            let back = block_on(codec.read_response(&proto, &mut futures::io::Cursor::new(whole[..cut].to_vec())));
+            assert_eq!(back.unwrap(), Ok(blocks[..1].to_vec()), "cut at {cut}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_still_running_at_the_deadline_keeps_the_prefix() {
+        let blocks = two_blocks();
+        let proto = bodies_by_range_protocol();
+        let mut codec = BodiesByRangeCodec::with_read_deadline(std::time::Duration::from_millis(50));
+        block_on(codec.write_request(&proto, &mut Vec::new(), RangeRequest { start: 1, count: 5, step: 1 })).unwrap();
+        let mut io = futures::io::Cursor::new(blocks_wire(&blocks)).chain(Stalled);
+        let back = codec.read_response(&proto, &mut io).await;
+        assert_eq!(back.unwrap(), Ok(blocks));
+    }
+
+    /// Before the first block nothing changes: an error chunk is the
+    /// peer's refusal, a cut stream or a timeout an I/O error.
+    #[tokio::test]
+    async fn a_reply_that_fails_before_its_first_block_is_still_a_failure() {
+        let proto = bodies_by_range_protocol();
+        let refused = encode_block_reply(&Err("invalid block number".into())).unwrap();
+        let mut codec = BodiesByRangeCodec::with_read_deadline(std::time::Duration::from_secs(5));
+        let back = codec.read_response(&proto, &mut futures::io::Cursor::new(refused)).await;
+        assert_eq!(back.unwrap(), Err("code 2: invalid block number".into()));
+
+        let cut = blocks_wire(&two_blocks()[..1]);
+        let back = codec.read_response(&proto, &mut futures::io::Cursor::new(cut[..cut.len() - 1].to_vec())).await;
+        assert!(back.is_err(), "a first block cut short is no reply");
+
+        let mut codec = BodiesByRangeCodec::with_read_deadline(std::time::Duration::from_millis(50));
+        let back = codec.read_response(&proto, &mut Stalled).await;
+        assert_eq!(back.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn more_blocks_than_a_range_allows_is_still_refused_whole() {
+        let one = blocks_wire(&two_blocks()[..1]);
+        let wire: Vec<u8> = one.iter().copied().cycle().take(one.len() * (MAX_RANGE_BLOCKS as usize + 1)).collect();
+        let mut codec = BodiesByRangeCodec::default();
+        let back = block_on(codec.read_response(&bodies_by_range_protocol(), &mut futures::io::Cursor::new(wire)));
+        assert_eq!(back.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Sync standard §6.2: a v1 range request has 30 s; libp2p's timer
+    /// runs past it so the codec's deadline, which keeps the prefix, fires
+    /// first.
+    #[test]
+    fn a_range_request_has_thirty_seconds() {
+        assert_eq!(RANGE_REQUEST_TIMEOUT, std::time::Duration::from_secs(30));
+        assert!(RANGE_STREAM_TIMEOUT > RANGE_REQUEST_TIMEOUT);
+        assert_eq!(BodiesByRangeCodec::with_read_deadline(RANGE_REQUEST_TIMEOUT).read_deadline, Some(RANGE_REQUEST_TIMEOUT));
     }
 }
 

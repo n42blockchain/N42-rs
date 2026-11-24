@@ -4547,6 +4547,15 @@ impl<E: ExecutionLayer> H2Service<E> {
             if chunks.is_empty() {
                 if catch_up.probing {
                     self.finish_catch_up(events, true);
+                } else if catch_up.next > catch_up.started_at + 1 {
+                    // This pull already took blocks: an empty answer (or a
+                    // refusal, which reaches here as one) after them is
+                    // where the peer's served chain ends -- its committed
+                    // head, or a gov5 main / n42-26 server's stored one. Not
+                    // a fault (sync standard §3.5); what is left arrives by
+                    // gossip or from another peer's pull.
+                    debug!(target: "n42.h2.node", %peer, ?request, "peer served up to its head; catch-up done");
+                    self.finish_catch_up(events, true);
                 } else {
                     warn!(target: "n42.h2.node", %peer, ?request, "peer served none of the range; catch-up stopped");
                     self.finish_catch_up(events, false);

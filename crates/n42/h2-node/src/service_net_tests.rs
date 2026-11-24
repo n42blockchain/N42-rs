@@ -729,6 +729,33 @@ async fn an_empty_probe_ends_a_pull_that_already_made_progress() {
     assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 10, complete: true }]);
 }
 
+/// Sync standard B2: a server that stops at its head -- cleanly, or (gov5
+/// main, n42-26) with an error chunk the codec turns into a short reply --
+/// leaves a prefix. The pull imports it and asks on from after it; the
+/// refusal that answers that is where the peer's chain ends, and the pull
+/// finishes without blaming the peer.
+#[tokio::test]
+async fn a_pull_asks_on_after_a_prefix_and_ends_without_blame_where_the_peer_stops() {
+    let mut rig = node(1, 0, None).await;
+    let peer = PeerId::random();
+    let blocks = chain(3);
+    catching_up(&mut rig, peer, 1, 8);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 8, step: 1 }, chunks(&blocks)));
+    assert!(import(&mut rig).await.is_empty());
+    let catch_up = rig.svc.catch_up.as_ref().expect("still pulling");
+    assert_eq!((catch_up.next, catch_up.probing), (4, false), "asks on from after the prefix");
+    assert_eq!(rig.svc.imported_height, Some(3));
+
+    let request = RangeRequest { start: 4, count: 5, step: 1 };
+    rig.svc
+        .handle_transport_event(TransportEvent::RangeFetched { peer, request, reply: Err("code 2: invalid block number".into()) })
+        .expect("handled");
+    assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 3, complete: true }]);
+    assert!(rig.svc.catch_up.is_none());
+    assert_eq!(rig.svc.failed_peer, None, "not blamed");
+    assert!(!rig.svc.refused_range_peers.contains_key(&peer), "nor refused");
+}
+
 // ---------------------------------------------------------------------------
 // Fill answers
 // ---------------------------------------------------------------------------

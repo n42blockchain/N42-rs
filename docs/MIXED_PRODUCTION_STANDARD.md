@@ -642,3 +642,65 @@ Rules:
 - Blob transactions (type `0x03`) stay off in profile 1 (decision O2): they exist to give rollups
   cheap data availability on a slow L1, and no rollup posts data to N42. If N42 is ever used as
   a data availability layer they return as a profile change.
+
+## Amendments of 2026-11-24 (v0.2.1): n42-26's review and gov5's confirmation
+
+gov5 confirmed v0.2 (handoff posts of 2026-11-24 03:00 and 03:40 EST). n42-26 reviewed it and raised
+the points below; each was checked against the code and decided under the owner's delegation. Where
+an amendment contradicts the text above, the amendment holds.
+
+**AM1 (n42-26, accepted): what `amsterdamTime` means.** On Profile 1 `amsterdamTime: 0` activates
+exactly the execution changes tabled in `docs/GLAMSTERDAM_EXECUTION_PARITY.md` (the set gov5 and
+n42-rs run byte-equal today) and nothing else. It is NOT the upstream client's own bundle of that
+name: a reth-derived client must not enable any other EIP its library ties to the same field. The
+vector set V2/V3 pins the result; a client lists, in its conformance note, every EIP its library
+would have enabled and how it is switched off.
+
+**AM2 (n42-26, accepted): block size.** The only size bound is `config.hotstuff.maxBlockBytes`
+(B15). The Ethereum block-RLP size cap (EIP-7934) and any client's own smaller cap do not apply to
+production or import on a native chain. n42-26 still enforces 8 MiB at build and import
+(`native_payload.rs:227`, `:447`): CHANGE.
+
+**AM3 (n42-26, accepted; corrects B8 and gov5's reading of it): requestsHash.** B8's
+"`keccak(rlp([]))`" was a mislabel. The rule is the value gov5 and n42-rs produce today on every
+live header, the empty-trie root:
+`0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`, in every header including
+genesis, checked. Neither EIP-7685's `sha256("")` (`0xe3b0c442…`) nor the empty-ommers hash
+(`0x1dcc4de8…`) is valid. gov5: do NOT implement `0x1dcc4de8…` (your 03:40 post); only your genesis
+header changes. n42-rs REMOVE (the second spelling, `is_empty_requests_hash`). n42-26 CHANGE.
+
+**AM4 (n42-26, accepted): the seal, byte for byte.** `sealHash = keccak256(rlp(H'))` where `H'` is
+the full header (every element, `mobileRegistryRoot` included) with the last 96 bytes of
+`extraData` removed (removed only when `extraData` is longer than 96 bytes). The seal is the
+proposer's BLS signature over those 32 bytes with the H2-v4 proof-of-possession DST, placed in the
+last 96 bytes of `extraData`. Reference: gov5 `sealHash` / `Seal`, n42-rs
+`h2-consensus/src/header_profile.rs` `seal_hash` / `seal_header` / `verify_seal`; pinned by V1. On
+Profile 1 the seal IS verified on import and before the Round-1 vote; this overrides the sync
+spec's statement that the seal is not checked (that described pre-profile chains).
+
+**AM5 (n42-26, formal objection, accepted): validator-set changes.** As written, E2 leaves a staged
+set covered by no signature (`changesHash` zero, sets not on chain), so a faulty leader could make
+honest nodes activate different sets. Decision: on Profile 1 the validator set is the genesis set;
+the reconfiguration API is disabled and a node refuses a staged change. Milestones 1 and 2 run on
+the fixed set. E2 is reopened: before milestone 3 a design is agreed in which the change is carried
+in a block and bound by the votes on that block (a non-zero `changesHash` over the canonical
+encoding of the new set is the candidate), with a vector and a mixed round. Milestone 3's
+"validator added / removed" gate waits for it.
+
+**AM6 (n42-26, accepted; amends O1 and the M1' gate).** A voting member that does not propose times
+out every one of its tenures, so "voting follower" cannot pass "every client leads a full tenure".
+O1 becomes: a client is in the validator set of a mixed round only if it can lead. A client not yet
+able to lead joins as a verifying non-validator node (imports and verifies every block, same
+hashes, not in the set). M1' gate: every client IN THE SET leads at least one full tenure; every
+participating client holds the same hash at every height. n42-26 is a full producer by milestone 2.
+
+**AM7 (n42-26): stale status lines about n42-26.** Accepted in principle (W6 QC embedding, 64 MiB,
+reward parsing are reported done). n42-26 posts its corrected status per item id with file:line in
+the handoff file; the per-client status column is then updated from that post.
+
+**AM8 (gov5): `devBlockReward` encoding.** A decimal string of wei on a Profile-1 genesis; a JSON
+number is refused. All three clients.
+
+gov5's 03:40 readings of D3 (the system caller appears only if it changed), D5, C6, B3 (ommersHash
+zero in genesis too), B15, A13 and J4 are accepted as the reading of the standard. n42-rs takes D3
+(the `0xff…fe` live empty leaf goes away) and A13 on its milestone-1 list.

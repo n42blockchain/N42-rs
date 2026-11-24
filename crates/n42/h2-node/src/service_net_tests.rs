@@ -756,6 +756,109 @@ async fn a_pull_asks_on_after_a_prefix_and_ends_without_blame_where_the_peer_sto
     assert!(!rig.svc.refused_range_peers.contains_key(&peer), "nor refused");
 }
 
+/// Replaces `rig`'s engine with one restored from a persisted commit of
+/// `block_hash` at `view`, as a restart does: nothing committed live yet.
+fn restore_commit(rig: &mut Rig, keys: &[BlsSecretKey], set: &ValidatorSet, block_hash: B256, view: u64) {
+    let mut qc = n42_h2_primitives::consensus::QuorumCertificate::genesis();
+    qc.view = view;
+    qc.block_hash = block_hash;
+    let (tx, rx) = mpsc::channel::<EngineOutput>(256);
+    let mut engine = ConsensusEngine::with_recovered_state(
+        0,
+        keys[0].clone(),
+        n42_h2_consensus::EpochManager::new(set.clone()),
+        1_000,
+        4_000,
+        tx,
+        view + 1,
+        qc.clone(),
+        qc,
+        0,
+        view,
+    );
+    engine.enable_h2_v4_signing(ID);
+    rig.svc.engine = engine;
+    rig.svc.outputs = rx;
+}
+
+/// Blocks 1..=`count` in `rig`'s execution layer.
+async fn hold_chain(rig: &Rig, count: u64) -> Vec<(B256, Header, alloy_primitives::Bytes)> {
+    use n42_h2_execution::ExecutionLayer;
+    let blocks = chain(count);
+    for (_, _, body) in &blocks {
+        let payload = n42_h2_net::decode_block_rlp_raw(body, HeaderProfile::Ethereum).unwrap().execution_data();
+        within(rig.el.new_payload(payload)).await.expect("accepted");
+    }
+    blocks
+}
+
+/// What a range may carry (sync standard Q-S5): the last live commit; before
+/// one, after a restart, the restored commit's block, numbered by the
+/// execution layer once and then known; with nothing committed, genesis.
+#[tokio::test]
+async fn the_range_ceiling_is_the_committed_height_or_after_a_restart_the_restored_commit() {
+    let mut rig = node(1, 0, None).await;
+    assert_eq!(rig.svc.serve_ceiling(), ServeCeiling::Height(0), "nothing committed");
+    rig.svc.committed_height = Some(7);
+    assert_eq!(rig.svc.serve_ceiling(), ServeCeiling::Height(7));
+
+    let (keys, set) = keys(1);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let blocks = hold_chain(&rig, 4).await;
+    restore_commit(&mut rig, &keys, &set, blocks[1].0, 5);
+    assert_eq!(rig.svc.serve_ceiling(), ServeCeiling::Block(blocks[1].0), "the layer is asked for its number");
+    assert_eq!(within(rig.svc.unproven_after_restart()).await, Some(3), "blocks 3 and 4 are not committed");
+    assert_eq!(rig.svc.restored_committed, Some((blocks[1].0, 2)));
+    assert_eq!(rig.svc.serve_ceiling(), ServeCeiling::Height(2));
+    rig.svc.committed_height = Some(4);
+    assert_eq!(rig.svc.serve_ceiling(), ServeCeiling::Height(4), "a live commit takes over");
+}
+
+/// A restarted server, before its first live commit: a range is served up
+/// to the restored commit and ends cleanly; one past it is refused with
+/// gov5's server-error answer; and the status it advertises once it knows
+/// the commit's number is that height, not its execution layer's head.
+#[tokio::test]
+async fn a_restarted_server_serves_and_advertises_up_to_its_restored_commit() {
+    let (keys, set) = keys(1);
+    let mut b = node_in(&keys, &set, 0, None).await;
+    let blocks = hold_chain(&b, 4).await;
+    restore_commit(&mut b, &keys, &set, blocks[1].0, 5);
+    let mut a = node(1, 0, Some(b.addr.clone())).await;
+    let target = peer_of(&b);
+    let mut a_events = Vec::new();
+    pump(&mut a, &mut b, (false, false), &mut a_events, |a, b, _| {
+        !a.svc.transport.connected_peer_ids().is_empty() && !b.svc.transport.connected_peer_ids().is_empty()
+    })
+    .await;
+    a.svc.catch_up =
+        Some(CatchUp { peer: target, next: 1, target: 10, started_at: 0, probing: false, probe_height: 0, prev_hash: None });
+
+    a.svc.transport.request_range(target, RangeRequest { start: 1, count: 10, step: 1 });
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| !a.svc.pending_imports.is_empty()).await;
+    let served: Vec<B256> = a.svc.pending_imports[0]
+        .2
+        .iter()
+        .map(|chunk| n42_h2_net::decode_block_rlp_raw(&chunk.rlp, HeaderProfile::Ethereum).unwrap().block_hash)
+        .collect();
+    assert_eq!(served, vec![blocks[0].0, blocks[1].0], "up to the restored commit, of the four held");
+    assert_eq!(b.svc.restored_committed, Some((blocks[1].0, 2)), "the number is kept");
+
+    a.svc.pending_imports.clear();
+    a.svc.transport.request_range(target, RangeRequest { start: 3, count: 2, step: 1 });
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| !a.svc.pending_imports.is_empty()).await;
+    assert!(a.svc.pending_imports[0].2.is_empty(), "past the commit: refused");
+
+    // A node connecting now reads the restored commit's height.
+    let mut c = node(1, 0, Some(b.addr.clone())).await;
+    let mut c_events = Vec::new();
+    pump(&mut c, &mut b, (false, false), &mut c_events, |c, _, _| {
+        c.svc.pending_status.iter().any(|(peer, _)| *peer == target)
+    })
+    .await;
+    assert!(c.svc.pending_status.contains(&(target, 2)), "{:?}", c.svc.pending_status);
+}
+
 // ---------------------------------------------------------------------------
 // Fill answers
 // ---------------------------------------------------------------------------
@@ -944,12 +1047,15 @@ async fn a_peer_whose_status_names_another_chain_is_disconnected() {
 
 #[tokio::test]
 async fn a_named_direct_body_pulls_a_parent_missed_before_the_peer_connected() {
-    let (mut a, b) = pair(0).await;
+    let (mut a, mut b) = pair(0).await;
     let blocks = chain(2);
     for (_, _, body) in &blocks {
         let payload = n42_h2_net::decode_block_rlp_raw(body, HeaderProfile::Ethereum).unwrap().execution_data();
         b.el.new_payload(payload).await.unwrap();
     }
+    // The fleet committed both before this node connected: a range serves
+    // committed blocks only.
+    b.svc.committed_height = Some(2);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
@@ -965,7 +1071,6 @@ async fn a_named_direct_body_pulls_a_parent_missed_before_the_peer_connected() {
     within(a.svc.consider_catch_up(&mut events)).await;
     let pull = a.svc.catch_up.as_ref().unwrap();
     assert_eq!((pull.next, pull.target), (1, 2), "pull includes the absent parent");
-    let mut b = b;
     pump(&mut a, &mut b, (true, true), &mut events, |a, _, _| a.svc.driver.head() == blocks[1].0 && a.svc.catch_up.is_none()).await;
     assert!(a.el.block_by_hash(blocks[0].0).await.unwrap().is_some());
 }
@@ -977,6 +1082,7 @@ async fn a_fetched_certified_child_pulls_its_missing_ancestry() {
     for (_, _, body) in &blocks {
         b.el.new_payload(n42_h2_net::decode_block_rlp_raw(body, HeaderProfile::Ethereum).unwrap().execution_data()).await.unwrap();
     }
+    b.svc.committed_height = Some(2);
     a.svc.handle_transport_event(TransportEvent::BlockFetched {
         peer: peer_of(&b), hash: blocks[1].0, reply: Ok(chunk(&blocks[1].2)),
     }).unwrap();
@@ -1102,6 +1208,7 @@ async fn a_range_is_served_off_the_loop_and_its_slots_are_held_until_the_answer_
         use n42_h2_execution::ExecutionLayer;
         within(b.el.new_payload(built.execution_data)).await.expect("accepted");
     }
+    b.svc.committed_height = Some(3);
     let target = peer_of(&b);
     a.svc.transport.request_range(target, RangeRequest { start: 2, count: 10, step: 1 });
     let mut a_events = Vec::new();
@@ -1115,7 +1222,11 @@ async fn a_range_is_served_off_the_loop_and_its_slots_are_held_until_the_answer_
     // work runs off its loop, and each slot -- with its reply's bytes -- is
     // held until libp2p has sent the answer, not only until the work is done
     // (audit 2026-10 B-4).
+    // `a` pulls from `b`, so the refusals of these requests past `b`'s
+    // committed height reach its import queue (as empty replies).
     a.svc.pending_imports.clear();
+    a.svc.catch_up =
+        Some(CatchUp { peer: target, next: 100, target: 103, started_at: 99, probing: false, probe_height: 0, prev_hash: None });
     let before = b.seen.len();
     for start in 100..104 {
         a.svc.transport.request_range(target, RangeRequest { start, count: 1, step: 1 });
@@ -1142,6 +1253,7 @@ async fn a_fifth_range_request_from_one_peer_is_refused_with_the_server_error_co
         use n42_h2_execution::ExecutionLayer;
         within(b.el.new_payload(built.execution_data)).await.expect("accepted");
     }
+    b.svc.committed_height = Some(3);
     let target = peer_of(&b);
     // `a` pulls from `b`, so a refusal reaches its import queue (as an empty
     // reply) rather than only a log line.
@@ -1182,6 +1294,7 @@ async fn a_member_behind_its_peer_pulls_the_gap_and_finishes_level() {
             within(b.el.new_payload(decoded.execution_data())).await.expect("accepted");
         }
     }
+    b.svc.committed_height = Some(b_height);
     let mut a = node(1, 0, Some(b.addr.clone())).await;
     let mut a_events = Vec::new();
     pump(&mut a, &mut b, (true, true), &mut a_events, |_, _, events| {

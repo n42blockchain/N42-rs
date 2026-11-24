@@ -52,24 +52,61 @@ pub const DEFAULT_MAX_GOSSIP_SIZE: usize = 1 << 20;
 ///
 /// Read once. A cap that changed under a running node would let it publish a
 /// block it would then refuse to accept back.
+///
+/// On a chain that sets its own block size ([`set_max_block_bytes`], the
+/// mixed production standard's `maxBlockBytes`, B15) that bound is the cap
+/// and the environment is not read.
 pub fn max_gossip_size() -> usize {
-    *GOSSIP_SIZE.get_or_init(|| gossip_size_from(std::env::var("N42_MAX_GOSSIP_MB").ok().as_deref()))
+    block_bytes_or(MAX_BLOCK_BYTES.get().copied(), || {
+        *GOSSIP_SIZE.get_or_init(|| gossip_size_from(std::env::var("N42_MAX_GOSSIP_MB").ok().as_deref()))
+    })
 }
 
-static GOSSIP_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// The chain's own block size bound, when one was set.
+static MAX_BLOCK_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Fixes [`max_gossip_size`] to `bytes` before anything reads it: a
-/// profile-1 chain takes the bound from its genesis (`maxBlockBytes`,
-/// standard B15) and refuses `N42_MAX_GOSSIP_MB`. Returns the size already
-/// in force when it was read (or set) first and differs.
-pub fn set_max_gossip_size(bytes: usize) -> Result<(), usize> {
-    let size = *GOSSIP_SIZE.get_or_init(|| bytes);
-    if size == bytes {
-        Ok(())
-    } else {
-        Err(size)
+/// Sets the chain's block size bound (profile 1's `maxBlockBytes`, B15) --
+/// the one setter for every carrier's bound: the largest decoded block RLP
+/// this node publishes or accepts on gossip ([`max_gossip_size`]) and in a
+/// `block_by_hash`, `block_push` or range chunk ([`max_block_chunk`]). A
+/// profile-1 node sets it from its genesis before the transport is built
+/// (`N42_MAX_GOSSIP_MB` is refused there). Unset, every carrier keeps its own
+/// default (the gossip cap from `N42_MAX_GOSSIP_MB`, the chunk constant
+/// [`crate::rpc::MAX_BLOCK_CHUNK`]).
+///
+/// A cap that changed under a running node would let it publish a block it
+/// would then refuse: setting the same value again is fine; another value,
+/// or any value after the gossip cap was already read from the environment
+/// and differs, is refused with the size in force.
+pub fn set_max_block_bytes(bytes: u64) -> Result<(), u64> {
+    let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+    if let Some(read) = GOSSIP_SIZE.get()
+        && *read != bytes
+        && MAX_BLOCK_BYTES.get().is_none()
+    {
+        return Err(*read as u64);
+    }
+    match MAX_BLOCK_BYTES.get_or_init(|| bytes) {
+        existing if *existing == bytes => Ok(()),
+        existing => Err(*existing as u64),
     }
 }
+
+/// The bound on one block chunk of `block_by_hash`, `block_push` and the
+/// range protocols: the chain's block size when set, gov5's
+/// `MaxBlockChunkSize` otherwise.
+pub fn max_block_chunk() -> u64 {
+    block_bytes_or(MAX_BLOCK_BYTES.get().copied(), || crate::rpc::MAX_BLOCK_CHUNK as usize) as u64
+}
+
+/// `chain` when the chain sets a bound, the carrier's `default` otherwise.
+fn block_bytes_or(chain: Option<usize>, default: impl FnOnce() -> usize) -> usize {
+    chain.unwrap_or_else(default)
+}
+
+/// The gossip cap read from the environment, on a chain without its own
+/// bound.
+static GOSSIP_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// The cap `N42_MAX_GOSSIP_MB` names, in bytes. Anything unset, unparseable or
 /// zero leaves the default: a misread variable must not silently shrink the cap
@@ -192,6 +229,9 @@ mod tests {
         // Go: snappy.MaxEncodedLen(1<<20) == 32 + 1048576 + 174762
         assert_eq!(max_gossip_wire_size(), 32 + 1_048_576 + 174_762);
         assert_eq!(max_gossip_wire_size(), 1_223_370);
+        // B15: a chain's bound replaces both defaults; none leaves them.
+        assert_eq!(block_bytes_or(None, || 7), 7);
+        assert_eq!(block_bytes_or(Some(64 << 20), || 7), 64 << 20);
     }
 
     #[test]

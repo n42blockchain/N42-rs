@@ -251,10 +251,10 @@ mod tests {
             wire
         };
         let wire = padded(2);
-        let read = read_framed_limit(&mut wire.as_slice(), MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await;
+        let read = read_framed_limit(&mut wire.as_slice(), block_wire_bytes(MAX_BLOCK_CHUNK), MAX_BLOCK_CHUNK).await;
         assert_eq!(read.expect("two padding chunks are fine"), payload);
         let wire = padded(10_000);
-        let err = read_framed_limit(&mut wire.as_slice(), MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK)
+        let err = read_framed_limit(&mut wire.as_slice(), block_wire_bytes(MAX_BLOCK_CHUNK), MAX_BLOCK_CHUNK)
             .await
             .expect_err("a run of padding");
         assert!(err.to_string().contains("skippable"), "{err}");
@@ -394,8 +394,11 @@ pub const RESPONSE_CODE_INVALID_REQUEST: u8 = 1;
 pub const RESPONSE_CODE_SERVER_ERROR: u8 = 2;
 /// gov5 `encoder.MaxBlockChunkSize`.
 pub const MAX_BLOCK_CHUNK: u64 = 64 << 20;
-/// Bound on the compressed chunk as it arrives.
-const MAX_BLOCK_WIRE_BYTES: usize = (MAX_BLOCK_CHUNK as usize) + (MAX_BLOCK_CHUNK as usize) / 6 + 32;
+/// Bound on the compressed chunk as it arrives, for a decoded bound of
+/// `chunk` (snappy's worst case).
+const fn block_wire_bytes(chunk: u64) -> usize {
+    (chunk as usize) + (chunk as usize) / 6 + 32
+}
 
 /// A served block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -450,7 +453,7 @@ impl request_response::Codec for BlockByHashCodec {
         }
         let mut fork_digest = [0u8; 4];
         io.read_exact(&mut fork_digest).await?;
-        let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
+        let rlp = read_framed_limit(io, block_wire_bytes(crate::config::max_block_chunk()), crate::config::max_block_chunk()).await?;
         Ok(Ok(BlockChunk { fork_digest, rlp: rlp.into() }))
     }
 
@@ -776,7 +779,7 @@ impl request_response::Codec for BlockPushCodec {
     {
         let mut fork_digest = [0u8; 4];
         io.read_exact(&mut fork_digest).await?;
-        let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
+        let rlp = read_framed_limit(io, block_wire_bytes(crate::config::max_block_chunk()), crate::config::max_block_chunk()).await?;
         Ok(BlockChunk { fork_digest, rlp: rlp.into() })
     }
 
@@ -1067,7 +1070,7 @@ where
     }
     let mut fork_digest = [0u8; 4];
     io.read_exact(&mut fork_digest).await?;
-    let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
+    let rlp = read_framed_limit(io, block_wire_bytes(crate::config::max_block_chunk()), crate::config::max_block_chunk()).await?;
     Ok(RangeChunk::Block(BlockChunk { fork_digest, rlp: rlp.into() }))
 }
 

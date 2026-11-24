@@ -24,6 +24,8 @@ alloy-genesis.workspace = true
 n42-qmdb-state.workspace = true
 alloy-primitives = { workspace = true, features = ["rlp"] }
 alloy-consensus.workspace = true
+# The profile-1 genesis hash (N42): the Ethereum header's RLP plus element 24.
+alloy-rlp.workspace = true
 
 # misc
 auto_impl.workspace = true

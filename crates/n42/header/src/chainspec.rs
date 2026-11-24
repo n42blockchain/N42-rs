@@ -33,9 +33,18 @@ pub struct N42ChainSpec {
 }
 
 impl N42ChainSpec {
-    /// Wraps `inner`. The genesis header carries no registry root.
+    /// Wraps `inner`. The genesis header carries no registry root, except on
+    /// a profile-1 chain, where it carries a zero one (gov5's genesis, vector
+    /// V1); `inner`'s genesis hash already covers it
+    /// ([`reth_chainspec::qmdb::sealed_genesis_header`]).
     pub fn new(inner: Arc<ChainSpec>) -> Self {
-        let genesis_header = crate::seal_from_alloy(inner.sealed_genesis_header());
+        let mut genesis_header = crate::seal_from_alloy(inner.sealed_genesis_header());
+        if reth_chainspec::qmdb::is_profile1(inner.genesis()) {
+            let (mut header, hash) = genesis_header.split();
+            header.mobile_registry_root = Some(alloy_primitives::B256::ZERO);
+            debug_assert_eq!(header.hash_slow(), hash, "the profile-1 genesis hash covers the zero registry root");
+            genesis_header = SealedHeader::new(header, hash);
+        }
         Self { inner, genesis_header }
     }
 

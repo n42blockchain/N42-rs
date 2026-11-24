@@ -189,10 +189,7 @@ fn make_chain_spec(
     }
     let hardforks = N42_HARDFORKS.clone();
     //let genesis_hash = alloy_primitives::keccak256(alloy_rlp::encode(genesis.header()));
-    let genesis_header = SealedHeader::new_unhashed(
-        crate::qmdb::genesis_header(&genesis, &hardforks),
-        //genesis_hash,
-    );
+    let genesis_header = crate::qmdb::sealed_genesis_header(&genesis, &hardforks);
     let mut spec = ChainSpec {
         chain,
         genesis,
@@ -1088,9 +1085,7 @@ impl From<Genesis> for ChainSpec {
 
         Self {
             chain: genesis.config.chain_id.into(),
-            genesis_header: SealedHeader::new_unhashed(crate::qmdb::genesis_header(
-                &genesis, &hardforks,
-            )),
+            genesis_header: crate::qmdb::sealed_genesis_header(&genesis, &hardforks),
             genesis,
             hardforks,
             paris_block_and_final_difficulty,

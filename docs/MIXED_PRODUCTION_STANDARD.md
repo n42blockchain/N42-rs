@@ -803,3 +803,50 @@ gov5 (AM16) and n42-rs (AM15) all three clients agree to the standard as amended
 remaining open items are named in the text: the slot-dependent genesis values (AM17), E2
 validator-set changes (AM5), B11 (AM12), the 100-validator review and round (AM17), and n42-26's
 milestone-1 entry form (AM6: verifying non-validator node first, unless its owner says otherwise).
+
+### Amendments AM19-AM21: check against the papers and design documents (2026-11-24)
+
+`docs/MIXED_PRODUCTION_STANDARD_VS_PAPERS.md` checks v0.3 against the whitepaper and the design
+documents of the three repositories (33 findings). The whitepaper is about the decision network and
+fixes no protocol parameter; the HotStuff-2 and QMDB papers are not on this host, so those checks
+rest on the local review documents. The 8-second slot is n42-26's block interval, which the owner
+has since made Profile 1's (AM17).
+
+**AM19: safety under deferred execution (accepted; consensus rules, all clients).**
+- A13 / E6, Round-1 vote: static header validity is NOT enough. A node votes in Round 1 only if
+  the block also passes the deferred-execution proposal check of
+  `docs/PHASE_D_DEFERRED_EXECUTION.md` (the header's carried execution fields match this node's
+  own execution of the ancestor they describe, and the block's transactions pass the includability
+  check against the state they will run on). Reason: a block that gathers a PrepareQC and then
+  cannot be imported locks honest nodes on a block nobody can commit. A block that passes the
+  check MUST be importable; a case where it is not is a bug to be fixed, never a rule.
+- "Own import" (CommitVote gate) means this node's own independent execution of the block, not
+  applying a diff or a result received from the leader.
+- E14: a CommitQC on block N finalises N's ORDER. N's EXECUTION is certified only when a committed
+  descendant carries N's execution fields (depth 1: the commit of N+1). `safe` = the highest block
+  whose execution is certified; `finalized` = certified and persisted by this node; `latest` = the
+  highest committed block. (n42-rs `N42_SETTLEMENT_TAGS=split`.)
+- E-rules stated explicitly, as gov5's `hotstuff2-spec` has them: a node locks on the block of the
+  highest PrepareQC it has seen and votes only for proposals extending its lock unless the
+  proposal's justification is higher; a leader entering a view by a timeout certificate proposes on
+  the highest QC the certificate carries. V6 covers both.
+
+**AM20: stated limits and pins of Profile 1 (accepted).**
+- D6: one unsharded QMDB tree; compaction and any storage maintenance MUST be root-neutral.
+- Not in Profile 1, said plainly: state proofs as a consensus object, an LtHash summary in the
+  header, post-quantum consensus or phone signatures, phone rewards, staking and slashing, dynamic
+  validator sets (AM5). Each is a later profile change. The whitepaper's throughput figure belongs
+  to the performance line, not to Profile 1 (AM11).
+- A slow but live leader keeps its tenure; only a timeout rotates it (AM17 re-derives the tenure).
+
+**AM21: two proposals that change a proven header behaviour (need gov5's answer before they hold).**
+- I2 / B11, phones must never delay a block (gov5 mobile-attestation design; n42-26 system
+  architecture): a validator without a running mobileverify service MUST still be able to lead.
+  Proposed rule: such a leader repeats its parent's `mobileRegistryRoot` (valid under AM12, since
+  followers do not re-derive the root). Collection windows are defined against the 8-second slot.
+- A19, the committee pool (200,000 derived keys, 512 signers per block): every key comes from a
+  public seed, so the per-block evidence carries no security; gov5's own comment says the pool
+  exists so a replayed chain stays byte-identical, which is an old-data reason (P5). Proposed:
+  drop it from Profile 1 (headers carry a zero parent-beacon-root link), or keep it with the
+  statement that it is a load generator with no security meaning. gov5 owns the mechanism and
+  answers; until then A19 stands as written.

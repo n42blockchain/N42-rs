@@ -212,8 +212,8 @@ EIP-8037/2780 switches n42-rs uses, and V3's `genesisQmdbStateRoot` matches afte
 Items: A10/O4 (header N carries N-1's state root, receipts root, bloom, gasUsed), B13, AM19 (Round-1 vote only
 after the deferred check, includability against the state the block runs on, and the parent's import; Commit
 vote only after OWN execution), E14 (latest/safe/finalized split), F7.
-Vectors: V1 block 1 and 2 headers carry deferred fields (block 2's fields describe block 1 — from the V1
-README; the cases are in `headers`), V3 blocks (consecutive executed blocks), V5 (gov5 has not published it;
+Vectors: NOT V1 — its blocks 1 and 2 are idle and carry genesis's own deferred fields (V1 README: "their
+checks belong to V5"; corrected 2026-11-24 after n42-26's 07:10 post), V3 blocks (consecutive executed blocks), V5 (gov5 has not published it;
 announced for the equal-timestamp pair and an EIP-8037 state-gas block). No vector exercises the vote gate end
 to end: the proof is step 5.
 

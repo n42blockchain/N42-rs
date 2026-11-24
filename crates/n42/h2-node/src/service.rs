@@ -560,6 +560,8 @@ pub struct H2Service<E> {
     pending_status: Vec<(PeerId, u64)>,
     /// A catch-up in progress, if any.
     catch_up: Option<CatchUp>,
+    /// The timing of the last catch-up that ended (for tests and reports).
+    last_catch_up_times: Option<crate::sync_pipeline::CatchUpTimes>,
     /// Range replies to import on the next drain.
     pending_imports: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>,
     /// Block requests the store could not answer, for the execution layer
@@ -714,6 +716,10 @@ struct CatchUp {
     shadow: AnchorBuffer<()>,
     /// The highest height this pull executed (or found already imported).
     executed: u64,
+    /// Where the pull's time went (logged when it ends).
+    times: crate::sync_pipeline::CatchUpTimes,
+    /// When each range request in flight was sent, by peer and start.
+    sent: std::collections::HashMap<(PeerId, u64), std::time::Instant>,
 }
 
 impl CatchUp {
@@ -730,6 +736,8 @@ impl CatchUp {
             anchored: AnchorBuffer::default(),
             shadow: AnchorBuffer::default(),
             executed: started_at,
+            times: crate::sync_pipeline::CatchUpTimes::start(),
+            sent: std::collections::HashMap::new(),
         }
     }
 }
@@ -1668,6 +1676,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_outbox: Vec::new(),
             pending_status: Vec::new(),
             catch_up: None,
+            last_catch_up_times: None,
             pending_imports: Vec::new(),
             pending_block_requests: Vec::new(),
             serve_slots: ServeSlots::shared(MAX_SERVES_PER_PEER, MAX_SERVES_IN_FLIGHT),
@@ -2935,7 +2944,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.transport.respond_range_error(channel, "server busy".to_owned());
                 }
             }
-            TransportEvent::RangeFetched { peer, request, reply } => match reply {
+            TransportEvent::RangeFetched { peer, request, reply } => {
+              if let Some(c) = self.catch_up.as_mut()
+                  && let Some(sent) = c.sent.remove(&(peer, request.start))
+              {
+                  c.times.note_reply(sent.elapsed());
+                  if let Ok(chunks) = &reply {
+                      c.times.bytes += chunks.iter().map(|chunk| chunk.rlp.len() as u64).sum::<u64>();
+                  }
+              }
+              match reply {
                 Ok(chunks) => self.pending_imports.push((peer, request, chunks)),
                 Err(reason) => {
                     if self.catch_up.as_ref().is_some_and(|c| c.peer == peer) {
@@ -2948,7 +2966,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                         warn!(target: "n42.h2.node", %peer, ?request, reason, "range request refused");
                     }
                 }
-            },
+              }
+            }
             TransportEvent::StatusExchanged {
                 peer,
                 height,
@@ -4575,10 +4594,12 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     fn request_next_range(&mut self) {
-        let Some(catch_up) = &self.catch_up else {
+        let Some(catch_up) = self.catch_up.as_mut() else {
             return;
         };
         let count = (catch_up.target - catch_up.next + 1).min(MAX_RANGE_BLOCKS);
+        catch_up.times.requests += 1;
+        catch_up.sent.insert((catch_up.peer, catch_up.next), std::time::Instant::now());
         self.transport.request_range(
             catch_up.peer,
             RangeRequest {
@@ -4637,6 +4658,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     break;
                 };
                 budget -= 1;
+                let screened_at = std::time::Instant::now();
                 let block = match decode_block_rlp_raw(&chunk.rlp, self.header_profile) {
                     Ok(block) => block,
                     Err(err) => {
@@ -4655,8 +4677,15 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let number = block.header.number;
                 self.note_peer_height(peer, number);
                 if enforce {
+                    // `buffer_pulled` releases what an anchor covers; the
+                    // execution inside it is timed apart and taken out.
+                    let executing_before = self.catch_up.as_ref().map(|c| c.times.new_payload + c.times.forkchoice);
                     if !self.buffer_pulled(peer, block, chunk.rlp, events).await {
                         return;
+                    }
+                    if let (Some(c), Some(before)) = (self.catch_up.as_mut(), executing_before) {
+                        let executing = (c.times.new_payload + c.times.forkchoice).saturating_sub(before);
+                        c.times.verify += screened_at.elapsed().saturating_sub(executing);
                     }
                     continue;
                 }
@@ -4698,7 +4727,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return;
                 }
                 self.observe_pulled(peer, &block.header, hash, chunk.rlp.len());
-                match self.driver.import_pulled(block.execution_data()).await {
+                if let Some(c) = self.catch_up.as_mut() {
+                    c.times.verify += screened_at.elapsed();
+                }
+                match self.import_pulled_timed(block.execution_data()).await {
                     Ok(_) => {
                         // A verified header QC proves the chain up to the
                         // block it names; this block, above it, is still
@@ -4859,7 +4891,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             };
             let (block, rlp) = ready.item;
             if !self.imported.contains(&ready.hash) {
-                if let Err(err) = self.driver.import_pulled(block.execution_data()).await {
+                if let Err(err) = self.import_pulled_timed(block.execution_data()).await {
                     warn!(target: "n42.h2.node", number = ready.number, %err, "could not import an anchored pulled block; catch-up stopped");
                     self.finish_catch_up(events, false);
                     return false;
@@ -4873,6 +4905,32 @@ impl<E: ExecutionLayer> H2Service<E> {
                 c.executed = ready.number;
             }
         }
+    }
+
+    /// The serial import of one pulled block -- `newPayload`, then the
+    /// forkchoice that makes it the head -- each timed into the pull's
+    /// [`crate::sync_pipeline::CatchUpTimes`].
+    async fn import_pulled_timed(&mut self, payload: alloy_rpc_types_engine::ExecutionData) -> Result<(), n42_h2_execution::ElError> {
+        let block_hash = payload.block_hash();
+        self.driver.note_pulled(&payload);
+        let at = std::time::Instant::now();
+        let el = self.driver.execution_layer_arc();
+        let executed = ExecutionDriver::pulled_new_payload(&*el, payload).await;
+        let new_payload = at.elapsed();
+        let at = std::time::Instant::now();
+        let headed = match executed {
+            Ok(()) => self.driver.head_to_pulled(block_hash).await,
+            Err(err) => Err(err),
+        };
+        if let Some(c) = self.catch_up.as_mut() {
+            c.times.new_payload += new_payload;
+            if headed.is_ok() {
+                c.times.forkchoice += at.elapsed();
+                c.times.forkchoices += 1;
+                c.times.executed += 1;
+            }
+        }
+        headed
     }
 
     /// Under `N42_SYNC_ANCHOR=observe`: the anchored import's bookkeeping
@@ -5208,6 +5266,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             *known = (*known).min(pulled.max(catch_up.started_at));
         }
         info!(target: "n42.h2.node", from = catch_up.started_at, height, target = catch_up.target, complete, "catch-up finished");
+        catch_up.times.log("serial", complete);
+        self.last_catch_up_times = Some(catch_up.times);
         events.push(ServiceEvent::Synced { height, complete });
     }
 

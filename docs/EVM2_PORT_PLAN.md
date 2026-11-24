@@ -263,3 +263,17 @@ go in now regardless, because the current text misleads n42-26 and gov5.
    about 10% between single rounds is invisible (CLAUDE.md).
 6. **Stale-document risk.** Three documents and the root manifest describe a revm-based n42-rs.
    Until S0 lands, peers plan against the wrong client (n42-26 already has).
+
+## Decision 2026-11-24: S1 uses n42-26's narrower switch, not `set_spec_id(OSAKA)`
+
+n42-26 landed the gate first (branch `feat/evm2-no-8282-native`, c322887 vendored evm2 + 170158c gate):
+a vendored evm2 66687c18 under `vendor/dependency-repairs/evm2-66687c18` (`N42-PATCH.diff`,
+`N42-PROVENANCE.md`) adds `post_execution_system_call_state_changes_with_builder_requests(.., builder_requests)`
+(gated `builder_requests && spec_id.enables(AMSTERDAM)`, execution.rs:449) and an
+`EthBlockExecutor::set_eip8282_builder_requests` switch (default true), set false for `is_n42_native` genesis
+in the executor factory, so ONLY the two 8282 calls go off. n42-rs takes the same patch (same diff, same
+predicate) instead of lowering the spec id at finish: identical behaviour in both Rust clients even if evm2
+later adds other Amsterdam end-of-block work. Cost: one more vendored patch target (+1-2 days, already in the
+estimate's range). Tests mirror n42-26's (crates/n42-node/tests/profile1_vectors.rs:474-660): code in the alloc
+and a mid-chain deploy -> no call, no storage change, roots/requests equal the empty case; a non-native
+Amsterdam chain still makes both calls; forcing the switch on makes the native tests fail.

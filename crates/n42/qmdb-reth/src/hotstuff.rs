@@ -91,6 +91,16 @@ pub struct HotStuffGenesisConfig {
     /// the same way; its Round 1 stays import-gated.
     #[serde(default)]
     pub two_phase_vote_gate: bool,
+    /// gov5's `rotateOnTimeoutView` (`params.HotStuffConfig`, branch
+    /// `feat/hotstuff-rotate-on-timeout`): a timeout certificate for a view
+    /// at or above this one moves the chain to the first view of the next
+    /// leader-tenure window instead of `view + 1`, so a dead leader loses the
+    /// rest of its tenure (N42-SYNC-SPEC section 10). Absent (or `null`) is
+    /// the classic view change; 0 applies from the first view. Consensus-
+    /// critical: every member must carry the same value, and no environment
+    /// variable changes it.
+    #[serde(default)]
+    pub rotate_on_timeout_view: Option<u64>,
 }
 
 /// `hotstuff.committeePool` in the genesis.
@@ -290,6 +300,19 @@ mod tests {
         let off: HotStuffGenesisConfig = serde_json::from_str("{}").unwrap();
         assert!(!off.two_phase_vote_gate);
         assert!(!HotStuffGenesisConfig::from_genesis(&N42_DEVNET.genesis).unwrap().two_phase_vote_gate);
+    }
+
+    /// gov5's `rotateOnTimeoutView`: absent or null is off, a number is the
+    /// first TC view the rule applies to (0 included).
+    #[test]
+    fn the_rotate_on_timeout_view_is_read() {
+        let parse = |json: &str| serde_json::from_str::<HotStuffGenesisConfig>(json).unwrap().rotate_on_timeout_view;
+        assert_eq!(parse("{}"), None);
+        assert_eq!(parse(r#"{"rotateOnTimeoutView":null}"#), None);
+        assert_eq!(parse(r#"{"rotateOnTimeoutView":0}"#), Some(0));
+        assert_eq!(parse(r#"{"rotateOnTimeoutView":100}"#), Some(100));
+        assert!(serde_json::from_str::<HotStuffGenesisConfig>(r#"{"rotateOnTimeoutView":-1}"#).is_err());
+        assert_eq!(HotStuffGenesisConfig::from_genesis(&N42_DEVNET.genesis).unwrap().rotate_on_timeout_view, None);
     }
 
     #[test]

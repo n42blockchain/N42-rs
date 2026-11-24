@@ -281,6 +281,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let leader_tenure = hotstuff_config
         .as_ref()
         .map_or(1, |config| config.leader_tenure.max(1));
+    // Also a chain rule, and only ever from the genesis (no environment
+    // override): the first TC view rotate-on-timeout applies to, or none.
+    let rotate_on_timeout_view = hotstuff_config
+        .as_ref()
+        .and_then(|config| config.rotate_on_timeout_view);
     if validators.is_empty() {
         return Err("validator list is empty".into());
     }
@@ -390,6 +395,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if leader_tenure > 1 {
             println!("leader tenure: {leader_tenure} views, so a leader builds its next block while the fleet imports this one");
         }
+        if let Some(from) = rotate_on_timeout_view {
+            println!("rotate on TO : from TC view {from} (a timeout hands the rest of the tenure to the next leader)");
+        }
 
         // gov5's phone surface, its epoch committer and its gossip relay.
         let (mobile, mobile_gossip) = if let Some(http) = mobile_http {
@@ -494,6 +502,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("signing      : H2-v4");
         }
         engine.set_leader_tenure(leader_tenure);
+        engine.set_rotate_on_timeout(
+            rotate_on_timeout_view,
+            hotstuff_config.as_ref().map_or(0, |config| config.epoch_length),
+        );
         if hotstuff_config.as_ref().is_some_and(|config| config.two_phase_vote_gate) {
             engine.set_two_phase_vote_gate(true);
             println!("vote gate    : two-phase (commit vote waits for the import)");

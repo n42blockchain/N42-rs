@@ -2976,9 +2976,12 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Feeds a decoded consensus message to the engine.
     fn accept_envelope(&mut self, envelope: &H2V4Envelope) {
         // gov5's SyncInfo TC, before the message itself as gov5 orders it;
-        // translated only when it is ahead of this node (R2-C1).
+        // translated only when the view it leads to is ahead of this node
+        // (R2-C1). Under rotate-on-timeout a TC for a view this node already
+        // left by a QC can still move it (spec section 10.4 S11); with the
+        // rule off this is the old `tc.view >= current_view`.
         if let Some(tc) = wire_bridge::embedded_tc(envelope)
-            && tc.view >= self.engine.current_view()
+            && self.engine.view_after_tc(tc.view) > self.engine.current_view()
         {
             match wire_bridge::tc_to_engine(tc, self.validator_count) {
                 Ok(tc) => {

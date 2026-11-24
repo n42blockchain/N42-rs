@@ -1816,6 +1816,7 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
         receipts_root: h.receipts_root,
         logs_bloom: h.logs_bloom,
         gas_used: h.gas_used,
+        requests_hash: n42_engine_types::executed_fields::NO_REQUESTS_HASH,
     };
     let key = hex::encode(accounts.secret_key("A").to_secret_bytes());
     let mut nonce = 0u64;
@@ -2115,6 +2116,7 @@ async fn deferred_chain(run: DeferredChainRun) -> eyre::Result<serde_json::Value
         receipts_root: h.receipts_root,
         logs_bloom: h.logs_bloom,
         gas_used: h.gas_used,
+        requests_hash: n42_engine_types::executed_fields::NO_REQUESTS_HASH,
     };
     let send = |signer: &PrivateKeySigner, nonce: u64| -> eyre::Result<n42_engine_types::N42PooledTransaction> {
         let tx = alloy_consensus::TxEip1559 {

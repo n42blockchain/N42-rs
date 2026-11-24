@@ -2166,6 +2166,7 @@ mod tests {
                 receipts_root: B256::with_last_byte(2),
                 logs_bloom: Default::default(),
                 gas_used: 0,
+                requests_hash: crate::executed_fields::NO_REQUESTS_HASH,
             },
         );
         let mut client = Scripted::new(MockEthProvider::default());
@@ -2198,6 +2199,7 @@ mod tests {
                 receipts_root: B256::with_last_byte(4),
                 logs_bloom: Default::default(),
                 gas_used: 0,
+                requests_hash: crate::executed_fields::NO_REQUESTS_HASH,
             },
         );
         let mut client = Scripted::new(MockEthProvider::default());

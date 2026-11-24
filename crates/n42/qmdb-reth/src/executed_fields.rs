@@ -16,6 +16,15 @@
 //! was executed milliseconds ago on this node and its receipts may not be
 //! persisted yet; the database is the fallback a restart needs (`seed`).
 //!
+//! On a profile-1 chain (`docs/MIXED_PRODUCTION_STANDARD.md` AM25) the
+//! EIP-7685 `requestsHash` is a deferred field too: header N carries the
+//! requests hash of block N-1's execution. It rides with the receipt side
+//! ([`remember_receipts_with_requests`]). On every other chain the requests
+//! hash is not deferred (each header carries its own, checked after
+//! execution) and [`ExecutedFields::requests_hash`] is the neutral
+//! [`NO_REQUESTS_HASH`] on both sides of every comparison, so nothing there
+//! changes.
+//!
 //! The state root and the receipt side arrive separately (the QMDB root from
 //! the forest, the receipts from the post-execution check), so an entry is
 //! complete only once both are in.
@@ -35,18 +44,27 @@ pub struct ExecutedFields {
     pub logs_bloom: Bloom,
     /// Gas used by the block.
     pub gas_used: u64,
+    /// On a profile-1 chain (AM25), the EIP-7685 requests hash of the
+    /// block's execution; [`NO_REQUESTS_HASH`] on every other chain, where
+    /// the requests hash is not a deferred field.
+    pub requests_hash: B256,
 }
+
+/// EIP-7685's hash of no requests, `sha256("")`: what a block that produced
+/// no requests carries, and the neutral value of
+/// [`ExecutedFields::requests_hash`] off profile 1.
+pub const NO_REQUESTS_HASH: B256 = alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct Partial {
     state_root: Option<B256>,
-    receipts: Option<(B256, Bloom, u64)>,
+    receipts: Option<(B256, Bloom, u64, B256)>,
 }
 
 impl Partial {
     fn complete(&self) -> Option<ExecutedFields> {
-        let (receipts_root, logs_bloom, gas_used) = self.receipts?;
-        Some(ExecutedFields { state_root: self.state_root?, receipts_root, logs_bloom, gas_used })
+        let (receipts_root, logs_bloom, gas_used, requests_hash) = self.receipts?;
+        Some(ExecutedFields { state_root: self.state_root?, receipts_root, logs_bloom, gas_used, requests_hash })
     }
 }
 
@@ -110,9 +128,19 @@ pub fn remember_state_root(block_hash: B256, state_root: B256) {
     with_registry(|registry| entry_mut(registry, block_hash).state_root = Some(state_root));
 }
 
-/// Records the receipt side of a block's execution.
+/// Records the receipt side of a block's execution, with the neutral
+/// requests hash (a chain whose requests hash is not deferred).
 pub fn remember_receipts(block_hash: B256, receipts_root: B256, logs_bloom: Bloom, gas_used: u64) {
-    with_registry(|registry| entry_mut(registry, block_hash).receipts = Some((receipts_root, logs_bloom, gas_used)));
+    remember_receipts_with_requests(block_hash, receipts_root, logs_bloom, gas_used, NO_REQUESTS_HASH);
+}
+
+/// Records the receipt side of a block's execution with its requests hash:
+/// on a profile-1 chain the EIP-7685 hash of the requests the execution
+/// produced (AM25), [`NO_REQUESTS_HASH`] elsewhere.
+pub fn remember_receipts_with_requests(block_hash: B256, receipts_root: B256, logs_bloom: Bloom, gas_used: u64, requests_hash: B256) {
+    with_registry(|registry| {
+        entry_mut(registry, block_hash).receipts = Some((receipts_root, logs_bloom, gas_used, requests_hash));
+    });
 }
 
 /// Records a block's whole result at once.
@@ -120,7 +148,7 @@ pub fn remember(block_hash: B256, fields: ExecutedFields) {
     with_registry(|registry| {
         let entry = entry_mut(registry, block_hash);
         entry.state_root = Some(fields.state_root);
-        entry.receipts = Some((fields.receipts_root, fields.logs_bloom, fields.gas_used));
+        entry.receipts = Some((fields.receipts_root, fields.logs_bloom, fields.gas_used, fields.requests_hash));
     });
 }
 
@@ -147,13 +175,24 @@ pub fn set_historical_reader(reader: impl Fn(&B256) -> Option<ExecutedFields> + 
 /// The caller must obtain all headers from one canonical database snapshot and
 /// enforce the chain's deferred fork/depth at the carrying header.
 pub fn fields_from_descendants(ancestor: &alloy_consensus::Header, descendants: &[alloy_consensus::Header], depth: u8) -> Option<ExecutedFields> {
+    fields_from_descendants_deferring_requests(ancestor, descendants, depth, false)
+}
+
+/// [`fields_from_descendants`], reading the carried requests hash too when
+/// `requests_deferred` (a profile-1 chain, AM25).
+pub fn fields_from_descendants_deferring_requests(
+    ancestor: &alloy_consensus::Header,
+    descendants: &[alloy_consensus::Header],
+    depth: u8,
+    requests_deferred: bool,
+) -> Option<ExecutedFields> {
     if !(1..=2).contains(&depth) || descendants.len() != usize::from(depth) { return None; }
     let mut parent = ancestor;
     for child in descendants {
         if child.number != parent.number.checked_add(1)? || child.parent_hash != parent.hash_slow() { return None; }
         parent = child;
     }
-    Some(fields_from_child_header(parent))
+    Some(fields_from_child_header_deferring_requests(parent, requests_deferred))
 }
 
 /// Notes that the block consensus sealed as `sealed` is the one this node's
@@ -241,6 +280,7 @@ pub fn seed_from_header(block_hash: B256, header: &alloy_consensus::Header) {
             receipts_root: header.receipts_root,
             logs_bloom: header.logs_bloom,
             gas_used: header.gas_used,
+            requests_hash: NO_REQUESTS_HASH,
         },
     );
 }
@@ -249,12 +289,29 @@ pub fn seed_from_header(block_hash: B256, header: &alloy_consensus::Header) {
 /// header. The name is historical: the fields are those of the header's
 /// depth-D ancestor (`deferredExecutionDepth`, `docs/DEFERRED_DEPTH_2_DESIGN.md`),
 /// the parent at depth 1 and the parent's parent at depth 2.
+///
+/// The requests hash is the neutral [`NO_REQUESTS_HASH`]: off profile 1 it is
+/// not a deferred field. A profile-1 caller uses
+/// [`fields_from_child_header_deferring_requests`].
 pub const fn fields_from_child_header(child: &alloy_consensus::Header) -> ExecutedFields {
+    fields_from_child_header_deferring_requests(child, false)
+}
+
+/// [`fields_from_child_header`], with the header's requests hash among the
+/// carried fields when `requests_deferred` (a profile-1 chain, AM25: header N
+/// carries block N-1's EIP-7685 requests hash). A header without one reads
+/// as carrying the hash of no requests; the header rules refuse it anyway.
+pub const fn fields_from_child_header_deferring_requests(child: &alloy_consensus::Header, requests_deferred: bool) -> ExecutedFields {
+    let requests_hash = match (requests_deferred, child.requests_hash) {
+        (true, Some(hash)) => hash,
+        _ => NO_REQUESTS_HASH,
+    };
     ExecutedFields {
         state_root: child.state_root,
         receipts_root: child.receipts_root,
         logs_bloom: child.logs_bloom,
         gas_used: child.gas_used,
+        requests_hash,
     }
 }
 
@@ -293,7 +350,7 @@ mod tests {
     fn historical_reads_do_not_evict_live_fields_or_replace_cached_aliases() {
         let _serial = serialized();
         let hot = alloy_primitives::keccak256(b"hot deferred historical resolver test");
-        let live = ExecutedFields { state_root: B256::repeat_byte(9), receipts_root: B256::repeat_byte(8), logs_bloom: Bloom::default(), gas_used: 1 };
+        let live = ExecutedFields { state_root: B256::repeat_byte(9), receipts_root: B256::repeat_byte(8), logs_bloom: Bloom::default(), gas_used: 1, requests_hash: NO_REQUESTS_HASH };
         remember(hot, live);
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = calls.clone();
@@ -323,12 +380,12 @@ mod tests {
         remember_receipts(h(1), h(0xB1), Bloom::default(), 21_000);
         assert_eq!(
             get(&h(1)),
-            Some(ExecutedFields { state_root: h(0xA1), receipts_root: h(0xB1), logs_bloom: Bloom::default(), gas_used: 21_000 })
+            Some(ExecutedFields { state_root: h(0xA1), receipts_root: h(0xB1), logs_bloom: Bloom::default(), gas_used: 21_000, requests_hash: NO_REQUESTS_HASH })
         );
         for i in 0..(KEEP as u32 + 8) {
             let mut bytes = [0u8; 32];
             bytes[..4].copy_from_slice(&(i + 100).to_le_bytes());
-            remember(B256::from(bytes), ExecutedFields { state_root: h(2), receipts_root: h(3), logs_bloom: Bloom::default(), gas_used: 1 });
+            remember(B256::from(bytes), ExecutedFields { state_root: h(2), receipts_root: h(3), logs_bloom: Bloom::default(), gas_used: 1, requests_hash: NO_REQUESTS_HASH });
         }
         assert_eq!(get(&h(1)), None, "the oldest entries are evicted");
     }
@@ -337,7 +394,7 @@ mod tests {
     fn a_sealed_hash_noted_as_an_alias_finds_the_builders_entry() {
         let _serial = serialized();
         let h = |b: u8| B256::repeat_byte(b);
-        let fields = ExecutedFields { state_root: h(0xC1), receipts_root: h(0xC2), logs_bloom: Bloom::default(), gas_used: 7 };
+        let fields = ExecutedFields { state_root: h(0xC1), receipts_root: h(0xC2), logs_bloom: Bloom::default(), gas_used: 7, requests_hash: NO_REQUESTS_HASH };
         // Filed under the builder's hash only, as a leader's own block is.
         remember(h(0x31), fields);
         assert_eq!(get(&h(0x32)), None, "nothing under the sealed hash yet");

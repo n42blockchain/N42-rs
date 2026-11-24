@@ -560,6 +560,8 @@ pub struct H2Service<E> {
     pending_status: Vec<(PeerId, u64)>,
     /// A catch-up in progress, if any.
     catch_up: Option<CatchUp>,
+    /// The timing of the last catch-up that ended (for tests and reports).
+    last_catch_up_times: Option<crate::sync_pipeline::CatchUpTimes>,
     /// Range replies to import on the next drain.
     pending_imports: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>,
     /// Block requests the store could not answer, for the execution layer
@@ -585,6 +587,27 @@ pub struct H2Service<E> {
     /// How the catch-up treats blocks no verified anchor covers
     /// (`N42_SYNC_ANCHOR`, see [`crate::sync_anchor`]).
     sync_anchor_mode: SyncAnchorMode,
+    /// `N42_SYNC_PIPELINE`: pulls run as a pipeline (ranges in flight across
+    /// peers, execution on [`crate::sync_pipeline::PulledImporter`]). Turned
+    /// off for the rest of the run by the stall watchdog.
+    sync_pipeline: bool,
+    /// `N42_SYNC_STALL_SECS`: how long the executed head may stand still
+    /// while pulled blocks wait for execution before the pipeline is given up.
+    sync_stall: Duration,
+    /// The importer of pulled blocks, spawned with the first pipelined pull.
+    pulled_importer: Option<crate::sync_pipeline::PulledImporter>,
+    /// Where the importer reports.
+    pulled_reports: Option<tokio::sync::mpsc::UnboundedReceiver<crate::sync_pipeline::ImportBatch>>,
+    /// Pulled blocks sent to the importer and not yet reported, in order.
+    in_import: std::collections::VecDeque<InImport>,
+    /// The importer generation: bumped when a pull's imports are abandoned,
+    /// so their late reports are ignored.
+    import_generation: u64,
+    /// When the executed head last moved while a pipelined pull ran.
+    pull_progress_at: Option<std::time::Instant>,
+    /// Live/Range mode (sync standard §3.4.7): `Some` while in Range mode,
+    /// counting consecutive commits seen with the gap at most 2.
+    range_mode: Option<u8>,
     /// Under `observe`: pulled blocks executed that `enforce` would have held
     /// unexecuted, and pulls it would have ended.
     sync_anchor_would_refuse: u64,
@@ -714,6 +737,29 @@ struct CatchUp {
     shadow: AnchorBuffer<()>,
     /// The highest height this pull executed (or found already imported).
     executed: u64,
+    /// Where the pull's time went (logged when it ends).
+    times: crate::sync_pipeline::CatchUpTimes,
+    /// When each range request in flight was sent, by peer and start.
+    sent: std::collections::HashMap<(PeerId, u64), std::time::Instant>,
+    /// A pipelined pull's scheduler (`N42_SYNC_PIPELINE`); `None` for the
+    /// serial pull, one range of one peer at a time.
+    sched: Option<crate::sync_pipeline::RangeScheduler>,
+    /// A pipelined pull whose ranges are all served, waiting for its last
+    /// imports to be reported before it ends: whether it is complete.
+    end: Option<bool>,
+}
+
+/// A pulled block sent to the importer, kept on the loop for the
+/// bookkeeping its report completes.
+#[derive(Debug)]
+struct InImport {
+    number: u64,
+    hash: B256,
+    header: Header,
+    rlp: Bytes,
+    /// Off/observe: what the header's certificate proved (the unproven
+    /// bookkeeping); `None` under the anchor rule.
+    proven: Option<Option<u64>>,
 }
 
 impl CatchUp {
@@ -730,6 +776,10 @@ impl CatchUp {
             anchored: AnchorBuffer::default(),
             shadow: AnchorBuffer::default(),
             executed: started_at,
+            times: crate::sync_pipeline::CatchUpTimes::start(),
+            sent: std::collections::HashMap::new(),
+            sched: None,
+            end: None,
         }
     }
 }
@@ -967,6 +1017,14 @@ const HELD_TOO_LONG: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_IMPORTED: usize = 8192;
 /// Between the end of one catch-up and the start of the next.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(3);
+
+/// The pause between pulls in Range mode (sync standard §3.4.7): the gap is
+/// known to be open, so the next pull starts almost at once.
+const CATCH_UP_RETRY_IN_RANGE: Duration = Duration::from_millis(250);
+
+/// How often an idle loop looks at a pipelined pull's deadlines and stall
+/// watchdog.
+const PULL_TICK: Duration = Duration::from_millis(250);
 /// The committed QC this node embeds in the headers it seals, in gov5's
 /// encoding (empty: none yet).
 ///
@@ -1668,6 +1726,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_outbox: Vec::new(),
             pending_status: Vec::new(),
             catch_up: None,
+            last_catch_up_times: None,
             pending_imports: Vec::new(),
             pending_block_requests: Vec::new(),
             serve_slots: ServeSlots::shared(MAX_SERVES_PER_PEER, MAX_SERVES_IN_FLIGHT),
@@ -1677,6 +1736,14 @@ impl<E: ExecutionLayer> H2Service<E> {
             verified_header_qcs: std::cell::RefCell::default(),
             sync_anchor_qcs: std::cell::RefCell::default(),
             sync_anchor_mode: SyncAnchorMode::from_env(),
+            sync_pipeline: crate::sync_pipeline::pipeline_from_env(),
+            sync_stall: crate::sync_pipeline::stall_from_env(),
+            pulled_importer: None,
+            pulled_reports: None,
+            in_import: std::collections::VecDeque::new(),
+            import_generation: 0,
+            pull_progress_at: None,
+            range_mode: None,
             sync_anchor_would_refuse: 0,
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
@@ -1854,6 +1921,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 warn!(target: "n42.h2.node", view = qc.view, %err, "the committed QC does not encode; headers keep the previous one");
             }
         }
+    }
+
+    /// Turns the pipelined catch-up on or off, in place of
+    /// `N42_SYNC_PIPELINE` (see [`crate::sync_pipeline`]).
+    pub const fn with_sync_pipeline(mut self, on: bool) -> Self {
+        self.sync_pipeline = on;
+        self
+    }
+
+    /// Sets the stall watchdog's period (see `N42_SYNC_STALL_SECS`).
+    pub const fn with_sync_stall(mut self, stall: Duration) -> Self {
+        self.sync_stall = stall;
+        self
     }
 
     /// Sets how the range catch-up treats pulled blocks no verified anchor
@@ -2103,7 +2183,7 @@ impl<E: ExecutionLayer> H2Service<E> {
 
         // A range reply half imported is finished the same way: the swarm
         // gets one poll and the step returns to import the next batch.
-        if still_advancing || !self.pending_imports.is_empty() {
+        if still_advancing || self.pull_has_work() {
             // The bound stopped a leader that was still making progress.
             // Blocking now would trade the rest of its views for a timeout, so
             // look at the network without waiting and come straight back —
@@ -2154,8 +2234,28 @@ impl<E: ExecutionLayer> H2Service<E> {
         let own_import_ends = self.own_import_ends.as_mut();
         let foreign_imports = self.foreign_imports.as_mut();
         let commit_reports = self.commit_reports.as_mut();
+        let pulled_reports = self.pulled_reports.as_mut();
+        let pull_ticks = !self.in_import.is_empty() || self.catch_up.as_ref().is_some_and(|c| c.sched.is_some());
 
         tokio::select! {
+            batch = async {
+                match pulled_reports {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // The pulled blocks' importer reported a run: the head moves
+                // once for it, and the pull screens and releases more.
+                if let Some(batch) = batch {
+                    let at = std::time::Instant::now();
+                    self.drain_pulled_imports(&mut events, Some(batch)).await;
+                    self.loop_spend.note("pulled_report", at);
+                }
+            }
+            () = tokio::time::sleep(PULL_TICK), if pull_ticks => {
+                // A pipelined pull's deadlines and stall watchdog are looked
+                // at in the drain below, also when nothing else happens.
+            }
             commit = async {
                 match commit_reports {
                     Some(rx) => rx.recv().await,
@@ -2935,7 +3035,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.transport.respond_range_error(channel, "server busy".to_owned());
                 }
             }
-            TransportEvent::RangeFetched { peer, request, reply } => match reply {
+            TransportEvent::RangeFetched { peer, request, reply } => {
+              if let Some(c) = self.catch_up.as_mut()
+                  && let Some(sent) = c.sent.remove(&(peer, request.start))
+              {
+                  c.times.note_reply(sent.elapsed());
+                  if let Ok(chunks) = &reply {
+                      c.times.bytes += chunks.iter().map(|chunk| chunk.rlp.len() as u64).sum::<u64>();
+                  }
+              }
+              if self.catch_up.as_ref().is_some_and(|c| c.sched.is_some()) {
+                  self.pipeline_reply(peer, request, reply);
+              } else {
+              match reply {
                 Ok(chunks) => self.pending_imports.push((peer, request, chunks)),
                 Err(reason) => {
                     if self.catch_up.as_ref().is_some_and(|c| c.peer == peer) {
@@ -2948,7 +3060,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                         warn!(target: "n42.h2.node", %peer, ?request, reason, "range request refused");
                     }
                 }
-            },
+              }
+              }
+            }
             TransportEvent::StatusExchanged {
                 peer,
                 height,
@@ -3098,6 +3212,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         for action in self.driver.retry_failed_imports().await {
             self.apply_driver_action(action, events)?;
         }
+        self.drain_pulled_imports(events, None).await;
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
         // Only blocks taken elided are queued. The first request for one
@@ -3338,6 +3453,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if let Some(number) = self.block_numbers.get(&block_hash).copied() {
                     self.transport.set_advertised_height(number);
                     self.committed_height = Some(self.committed_height.map_or(number, |height| height.max(number)));
+                    self.note_range_mode_commit();
                     // A commit at or past the unproven run puts the head on
                     // the chain consensus decided.
                     if self.unproven_from.is_some_and(|from| number >= from) {
@@ -4494,7 +4610,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.note_peer_height(peer, height);
         }
         self.request_missing_held_parent(events);
+        // A pull's last imports are reported before another starts: the
+        // next one reads the execution layer's height.
         if self.catch_up.is_some()
+            || !self.in_import.is_empty()
             || self
                 .catch_up_retry_after
                 .is_some_and(|after| std::time::Instant::now() < after)
@@ -4567,7 +4686,19 @@ impl<E: ExecutionLayer> H2Service<E> {
         let height = capped_catch_up_target(advertised, latest, far_ahead_limit());
         info!(target: "n42.h2.node", %peer, from = latest, to = height, advertised, "behind a peer; pulling the gap by range");
         self.catch_up = Some(CatchUp::new(peer, latest, height));
-        self.request_next_range();
+        if self.sync_pipeline {
+            if let Some(c) = self.catch_up.as_mut() {
+                c.sched = Some(crate::sync_pipeline::RangeScheduler::new(latest + 1));
+            }
+            self.pull_progress_at = Some(std::time::Instant::now());
+            if self.range_mode.is_none() {
+                info!(target: "n42.h2.node", from = latest, to = height, "sync mode: range");
+                self.range_mode = Some(0);
+            }
+            self.pipeline_assign();
+        } else {
+            self.request_next_range();
+        }
         events.push(ServiceEvent::Syncing {
             from: latest,
             to: height,
@@ -4575,10 +4706,12 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     fn request_next_range(&mut self) {
-        let Some(catch_up) = &self.catch_up else {
+        let Some(catch_up) = self.catch_up.as_mut() else {
             return;
         };
         let count = (catch_up.target - catch_up.next + 1).min(MAX_RANGE_BLOCKS);
+        catch_up.times.requests += 1;
+        catch_up.sent.insert((catch_up.peer, catch_up.next), std::time::Instant::now());
         self.transport.request_range(
             catch_up.peer,
             RangeRequest {
@@ -4599,6 +4732,10 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// authenticates are executed, in order (see [`Self::buffer_pulled`]).
     async fn import_ranges(&mut self, events: &mut Vec<ServiceEvent>) {
         let enforce = self.sync_anchor_mode == SyncAnchorMode::Enforce;
+        let pipelined = self.catch_up.as_ref().is_some_and(|c| c.sched.is_some());
+        if pipelined {
+            self.pipeline_tick(events);
+        }
         // Pulled blocks a live commit anchored since the last step.
         if enforce && self.catch_up.is_some() && !self.release_anchored(events).await {
             return;
@@ -4609,7 +4746,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             let Some(catch_up) = self.catch_up.as_ref() else {
                 continue;
             };
-            if catch_up.peer != peer || request.start != catch_up.next {
+            if (!pipelined && catch_up.peer != peer) || request.start != catch_up.next {
                 debug!(target: "n42.h2.node", %peer, ?request, "range reply not part of the catch-up; dropped");
                 continue;
             }
@@ -4632,11 +4769,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                 continue;
             }
             let mut chunks = std::collections::VecDeque::from(chunks);
-            while budget > 0 {
+            // Pipelined, the importer's queue bounds the screening too:
+            // what does not fit waits here, in order.
+            while budget > 0 && (!pipelined || self.import_room()) {
                 let Some(chunk) = chunks.pop_front() else {
                     break;
                 };
                 budget -= 1;
+                let screened_at = std::time::Instant::now();
                 let block = match decode_block_rlp_raw(&chunk.rlp, self.header_profile) {
                     Ok(block) => block,
                     Err(err) => {
@@ -4655,8 +4795,15 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let number = block.header.number;
                 self.note_peer_height(peer, number);
                 if enforce {
+                    // `buffer_pulled` releases what an anchor covers; the
+                    // execution inside it is timed apart and taken out.
+                    let executing_before = self.catch_up.as_ref().map(|c| c.times.new_payload + c.times.forkchoice);
                     if !self.buffer_pulled(peer, block, chunk.rlp, events).await {
                         return;
+                    }
+                    if let (Some(c), Some(before)) = (self.catch_up.as_mut(), executing_before) {
+                        let executing = (c.times.new_payload + c.times.forkchoice).saturating_sub(before);
+                        c.times.verify += screened_at.elapsed().saturating_sub(executing);
                     }
                     continue;
                 }
@@ -4698,7 +4845,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return;
                 }
                 self.observe_pulled(peer, &block.header, hash, chunk.rlp.len());
-                match self.driver.import_pulled(block.execution_data()).await {
+                if let Some(c) = self.catch_up.as_mut() {
+                    c.times.verify += screened_at.elapsed();
+                }
+                if pipelined {
+                    let payload = block.execution_data();
+                    self.dispatch_pulled(number, hash, block.header, payload, chunk.rlp, Some(proven));
+                    if let Some(c) = self.catch_up.as_mut() {
+                        c.next += 1;
+                        c.prev_hash = Some(hash);
+                    }
+                    continue;
+                }
+                match self.import_pulled_timed(block.execution_data()).await {
                     Ok(_) => {
                         // A verified header QC proves the chain up to the
                         // block it names; this block, above it, is still
@@ -4744,6 +4903,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.pending_imports = pending;
                 return;
             }
+            if catch_up.sched.is_some() {
+                // The scheduler asks for what comes next.
+                continue;
+            }
             let window_filled = catch_up.next > catch_up.target;
             if window_filled {
                 // The status's target is reached, or a probe window came back
@@ -4768,6 +4931,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // the peer's head by itself: ask on from where it got to.
                 self.request_next_range();
             }
+        }
+        if pipelined {
+            self.pipeline_assign();
         }
     }
 
@@ -4851,15 +5017,30 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// there is no pull).
     async fn release_anchored(&mut self, events: &mut Vec<ServiceEvent>) -> bool {
         loop {
+            let room = self.import_room();
             let Some(c) = self.catch_up.as_mut() else {
                 return false;
             };
+            let pipelined = c.sched.is_some();
+            if pipelined && !room {
+                // Released as the importer reports.
+                return true;
+            }
             let Some(ready) = c.anchored.pop_ready() else {
                 return true;
             };
             let (block, rlp) = ready.item;
+            if pipelined {
+                if self.imported.contains(&ready.hash) && self.in_import.is_empty() {
+                    c.executed = ready.number;
+                } else {
+                    let payload = block.execution_data();
+                    self.dispatch_pulled(ready.number, ready.hash, block.header, payload, rlp, None);
+                }
+                continue;
+            }
             if !self.imported.contains(&ready.hash) {
-                if let Err(err) = self.driver.import_pulled(block.execution_data()).await {
+                if let Err(err) = self.import_pulled_timed(block.execution_data()).await {
                     warn!(target: "n42.h2.node", number = ready.number, %err, "could not import an anchored pulled block; catch-up stopped");
                     self.finish_catch_up(events, false);
                     return false;
@@ -4873,6 +5054,328 @@ impl<E: ExecutionLayer> H2Service<E> {
                 c.executed = ready.number;
             }
         }
+    }
+
+    /// The candidates of a pipelined pull: every peer with a known height
+    /// that has not served a block that failed its check in this gap.
+    fn pipeline_peers(&self) -> Vec<(PeerId, u64)> {
+        self.peer_heights
+            .iter()
+            .filter(|(peer, _)| !self.refused_range_peers.contains_key(*peer))
+            .map(|(peer, height)| (*peer, *height))
+            .collect()
+    }
+
+    /// Sends the range requests the scheduler hands out now.
+    fn pipeline_assign(&mut self) {
+        let peers = self.pipeline_peers();
+        let Some(c) = self.catch_up.as_mut() else {
+            return;
+        };
+        let deliver = c.next;
+        let Some(sched) = c.sched.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        for (peer, request) in sched.assign(deliver, &peers, now) {
+            debug!(target: "n42.h2.node", %peer, ?request, rate = ?sched.rate(&peer), "pipelined range requested");
+            c.times.requests += 1;
+            c.sent.insert((peer, request.start), now);
+            self.transport.request_range(peer, request);
+        }
+    }
+
+    /// A range reply (or refusal) of a pipelined pull, into the reorder
+    /// buffer.
+    fn pipeline_reply(&mut self, peer: PeerId, request: RangeRequest, reply: Result<Vec<BlockChunk>, String>) {
+        let idle = self.in_import.is_empty();
+        let Some(sched) = self.catch_up.as_mut().and_then(|c| c.sched.as_mut()) else {
+            return;
+        };
+        let was_empty = sched.buffered() == 0;
+        let chunks = reply.unwrap_or_else(|reason| {
+            debug!(target: "n42.h2.node", %peer, ?request, reason, "pipelined range refused");
+            Vec::new()
+        });
+        match sched.on_reply(peer, &request, chunks, std::time::Instant::now()) {
+            crate::sync_pipeline::ReplyOutcome::Buffered(_) => {
+                // Pulled blocks now wait: the stall watchdog counts from
+                // here when nothing waited before.
+                if was_empty && idle {
+                    self.pull_progress_at = Some(std::time::Instant::now());
+                }
+            }
+            crate::sync_pipeline::ReplyOutcome::Empty => {
+                debug!(target: "n42.h2.node", %peer, ?request, "peer served nothing from the range's start; not asked past it again in this pull");
+            }
+            crate::sync_pipeline::ReplyOutcome::Stale => {
+                debug!(target: "n42.h2.node", %peer, ?request, "range reply not in flight (reassigned or after the pull); dropped");
+            }
+        }
+    }
+
+    /// A pipelined pull's housekeeping, once per drain: ranges past their
+    /// deadline reassigned, the end of the pull, buffered replies handed to
+    /// the screening in height order, and the next requests.
+    fn pipeline_tick(&mut self, events: &mut Vec<ServiceEvent>) {
+        let peers = self.pipeline_peers();
+        let pending_empty = self.pending_imports.is_empty();
+        let in_import_empty = self.in_import.is_empty();
+        let Some(c) = self.catch_up.as_mut() else {
+            return;
+        };
+        let Some(sched) = c.sched.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        for (peer, start, count) in sched.on_deadlines(now) {
+            info!(target: "n42.h2.node", %peer, start, count, "pipelined range missed its deadline; reassigned, the peer backs off");
+        }
+        if c.end.is_none() && pending_empty && sched.exhausted(&peers) {
+            // Every peer is served up to where it can go. An empty answer
+            // after blocks were taken is where the peers' served chain ends
+            // (sync standard §3.5); none at all is a failed pull.
+            let complete = c.next > c.started_at + 1;
+            if !complete {
+                warn!(target: "n42.h2.node", from = c.started_at + 1, "no peer served any of the range; catch-up stopped");
+            }
+            if in_import_empty {
+                self.finish_catch_up(events, complete);
+            } else {
+                c.end = Some(complete);
+            }
+            return;
+        }
+        if pending_empty {
+            let mut deliver = c.next;
+            while let Some((peer, request, chunks)) = sched.pop_ready(deliver) {
+                deliver = request.start + chunks.len() as u64;
+                self.pending_imports.push((peer, request, chunks));
+            }
+        }
+        self.pipeline_assign();
+    }
+
+    /// Whether the importer can take another pulled block (always, before it
+    /// is spawned).
+    fn import_room(&self) -> bool {
+        self.pulled_importer.as_ref().is_none_or(|importer| importer.capacity() > 0)
+    }
+
+    /// Whether a pull has screening it can do now: the step's fast path
+    /// comes straight back for it.
+    fn pull_has_work(&self) -> bool {
+        let Some(c) = self.catch_up.as_ref() else {
+            return !self.pending_imports.is_empty();
+        };
+        if c.sched.is_none() {
+            return !self.pending_imports.is_empty();
+        }
+        self.import_room()
+            && (!self.pending_imports.is_empty() || c.sched.as_ref().is_some_and(|s| s.has_ready(c.next)))
+    }
+
+    /// Sends a screened (and, under the anchor rule, authenticated) pulled
+    /// block to the importer, spawning it on first use. The settlement
+    /// bookkeeping is noted here, in height order, for the forkchoice its
+    /// report brings.
+    fn dispatch_pulled(
+        &mut self,
+        number: u64,
+        hash: B256,
+        header: Header,
+        payload: alloy_rpc_types_engine::ExecutionData,
+        rlp: Bytes,
+        proven: Option<Option<u64>>,
+    ) {
+        if self.pulled_importer.is_none() {
+            let (importer, reports) = crate::sync_pipeline::PulledImporter::spawn(self.driver.execution_layer_arc());
+            self.pulled_importer = Some(importer);
+            self.pulled_reports = Some(reports);
+        }
+        self.driver.note_pulled(&payload);
+        let job = crate::sync_pipeline::ImportJob { generation: self.import_generation, number, hash, payload };
+        let Some(importer) = self.pulled_importer.as_ref() else {
+            return;
+        };
+        if importer.try_send(job).is_err() {
+            // The caller checked for room; a closed queue is an importer
+            // that died, which the stall watchdog turns into a fallback.
+            warn!(target: "n42.h2.node", number, "the pulled-block importer did not take a block");
+            return;
+        }
+        if self.in_import.is_empty() {
+            self.pull_progress_at = Some(std::time::Instant::now());
+        }
+        self.in_import.push_back(InImport { number, hash, header, rlp, proven });
+    }
+
+    /// Applies the importer's reports: the bookkeeping of every executed
+    /// block, one forkchoice for the highest, the end of a pull that waited
+    /// for them -- and the stall watchdog: when the executed head has not
+    /// moved for [`Self::sync_stall`] while pulled blocks wait, the pipeline
+    /// is given up for the serial pull.
+    pub(crate) async fn drain_pulled_imports(
+        &mut self,
+        events: &mut Vec<ServiceEvent>,
+        first: Option<crate::sync_pipeline::ImportBatch>,
+    ) {
+        let mut batches: Vec<_> = first.into_iter().collect();
+        if let Some(rx) = self.pulled_reports.as_mut() {
+            while let Ok(batch) = rx.try_recv() {
+                batches.push(batch);
+            }
+        }
+        let mut head = None;
+        for batch in batches {
+            if batch.generation != self.import_generation {
+                continue;
+            }
+            if let Some(c) = self.catch_up.as_mut() {
+                c.times.new_payload += batch.new_payload;
+            }
+            for (number, hash) in batch.done {
+                let Some(sent) = self.in_import.pop_front() else {
+                    break;
+                };
+                if sent.hash != hash {
+                    warn!(target: "n42.h2.node", number, reported = %hash, sent = %sent.hash, sent_number = sent.number, "the importer reported another block than was sent; the pull's imports are abandoned");
+                    self.abandon_pulled_imports();
+                    self.finish_catch_up(events, false);
+                    return;
+                }
+                if let Some(proven) = sent.proven {
+                    let from = match proven {
+                        Some(certified) => self.unproven_from.filter(|from| *from > certified).unwrap_or(certified + 1),
+                        None => self.unproven_from.unwrap_or(number),
+                    };
+                    self.unproven_from = Some(from.min(number));
+                }
+                self.remember_imported(hash);
+                self.note_imported(number);
+                self.remember_block(hash, &sent.header);
+                self.remember_body(hash, sent.rlp);
+                if let Some(c) = self.catch_up.as_mut() {
+                    c.executed = c.executed.max(number);
+                    c.times.executed += 1;
+                }
+                self.pull_progress_at = Some(std::time::Instant::now());
+                head = Some((number, hash));
+            }
+            if let Some((number, hash, err)) = batch.failed {
+                warn!(target: "n42.h2.node", number, %hash, %err, "could not import a pulled block; catch-up stopped");
+                self.abandon_pulled_imports();
+                self.finish_catch_up(events, false);
+                break;
+            }
+        }
+        // The head moves forward only: a live import or commit that got
+        // past the batch meanwhile keeps its head.
+        let current = self.block_numbers.get(&self.driver.head()).copied();
+        if let Some((_, head)) = head.filter(|(number, _)| current.is_none_or(|current| *number > current)) {
+            let at = std::time::Instant::now();
+            let headed = self.driver.head_to_pulled(head).await;
+            if let Some(c) = self.catch_up.as_mut() {
+                c.times.forkchoice += at.elapsed();
+                c.times.forkchoices += 1;
+            }
+            if let Err(err) = headed {
+                warn!(target: "n42.h2.node", %head, %err, "forkchoice to a pulled block failed; catch-up stopped");
+                self.abandon_pulled_imports();
+                self.finish_catch_up(events, false);
+            }
+        }
+        if self.in_import.is_empty()
+            && let Some(complete) = self.catch_up.as_ref().and_then(|c| c.end)
+        {
+            self.finish_catch_up(events, complete);
+        }
+        self.watch_pull_stall(events);
+    }
+
+    /// The stall watchdog (the livelock gov5's run 98 showed): progress is
+    /// the executed head moving, nothing else. When pulled blocks wait --
+    /// with the importer, in the reorder buffer, or screened replies queued
+    /// -- and the head has not moved for [`Self::sync_stall`], the pipeline
+    /// is turned off for the rest of the run, its imports abandoned, the
+    /// pull ended, and the next pull runs serially. The live path never
+    /// waits on the pull either way.
+    fn watch_pull_stall(&mut self, events: &mut Vec<ServiceEvent>) {
+        let pipelined = self.catch_up.as_ref().is_some_and(|c| c.sched.is_some());
+        let waiting = !self.in_import.is_empty()
+            || (pipelined
+                && (!self.pending_imports.is_empty()
+                    || self.catch_up.as_ref().and_then(|c| c.sched.as_ref()).is_some_and(|s| s.buffered() > 0)));
+        let Some(since) = self.pull_progress_at else {
+            return;
+        };
+        if !waiting || since.elapsed() < self.sync_stall {
+            return;
+        }
+        warn!(
+            target: "n42.h2.node",
+            stalled_ms = since.elapsed().as_millis() as u64,
+            in_import = self.in_import.len(),
+            executed = ?self.imported_height,
+            "sync pipeline: the executed head has not moved while pulled blocks wait; falling back to the serial pull for the rest of this run"
+        );
+        self.sync_pipeline = false;
+        self.abandon_pulled_imports();
+        self.pulled_importer = None;
+        self.pulled_reports = None;
+        self.pending_imports.clear();
+        self.finish_catch_up(events, false);
+    }
+
+    /// Forgets the pulled blocks sent to the importer and not reported:
+    /// their late reports are ignored (a new generation).
+    fn abandon_pulled_imports(&mut self) {
+        self.in_import.clear();
+        self.import_generation += 1;
+    }
+
+    /// A live commit in Range mode: three consecutive commits with the gap
+    /// to the peers at most 2 return the node to Live mode (sync standard
+    /// §3.4.7).
+    fn note_range_mode_commit(&mut self) {
+        let Some(near) = self.range_mode else {
+            return;
+        };
+        let best = self.peer_heights.values().copied().max().unwrap_or(0);
+        let tip = self.imported_height.unwrap_or(0);
+        let near = if best.saturating_sub(tip) <= 2 { near.saturating_add(1) } else { 0 };
+        if near >= 3 && self.catch_up.is_none() {
+            info!(target: "n42.h2.node", tip, best, "sync mode: live");
+            self.range_mode = None;
+        } else {
+            self.range_mode = Some(near);
+        }
+    }
+
+    /// The serial import of one pulled block -- `newPayload`, then the
+    /// forkchoice that makes it the head -- each timed into the pull's
+    /// [`crate::sync_pipeline::CatchUpTimes`].
+    async fn import_pulled_timed(&mut self, payload: alloy_rpc_types_engine::ExecutionData) -> Result<(), n42_h2_execution::ElError> {
+        let block_hash = payload.block_hash();
+        self.driver.note_pulled(&payload);
+        let at = std::time::Instant::now();
+        let el = self.driver.execution_layer_arc();
+        let executed = ExecutionDriver::pulled_new_payload(&*el, payload).await;
+        let new_payload = at.elapsed();
+        let at = std::time::Instant::now();
+        let headed = match executed {
+            Ok(()) => self.driver.head_to_pulled(block_hash).await,
+            Err(err) => Err(err),
+        };
+        if let Some(c) = self.catch_up.as_mut() {
+            c.times.new_payload += new_payload;
+            if headed.is_ok() {
+                c.times.forkchoice += at.elapsed();
+                c.times.forkchoices += 1;
+                c.times.executed += 1;
+            }
+        }
+        headed
     }
 
     /// Under `N42_SYNC_ANCHOR=observe`: the anchored import's bookkeeping
@@ -5173,6 +5676,11 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some(catch_up) = self.catch_up.take() else {
             return;
         };
+        if catch_up.sched.is_some() {
+            // Replies still in flight are dropped as not part of a pull;
+            // queued ones go with the pull.
+            self.pending_imports.clear();
+        }
         let pulled = catch_up.next.saturating_sub(1);
         // What this pull executed: under the anchor rule the unanchored tail
         // is not, and it is dropped with the pull -- the live path or the
@@ -5204,10 +5712,25 @@ impl<E: ExecutionLayer> H2Service<E> {
         // What the peer actually served replaces what it advertised, so a
         // height it cannot back stops starting a pull every retry; blocks it
         // gossips later raise it again.
-        if let Some(known) = self.peer_heights.get_mut(&catch_up.peer) {
+        if let Some(sched) = catch_up.sched.as_ref() {
+            // Pipelined, each peer that served nothing from a height is
+            // known up to below it; the others keep what they advertised.
+            for (peer, known) in &mut self.peer_heights {
+                if let Some(from) = sched.exhausted_from(peer) {
+                    *known = (*known).min(from.saturating_sub(1).max(catch_up.started_at));
+                }
+            }
+        } else if let Some(known) = self.peer_heights.get_mut(&catch_up.peer) {
             *known = (*known).min(pulled.max(catch_up.started_at));
         }
         info!(target: "n42.h2.node", from = catch_up.started_at, height, target = catch_up.target, complete, "catch-up finished");
+        catch_up.times.log(if catch_up.sched.is_some() { "pipeline" } else { "serial" }, complete);
+        self.last_catch_up_times = Some(catch_up.times);
+        // Range mode (sync standard §3.4.7): a pull that reached its peers'
+        // heads is followed at once by the next while the gap stays open.
+        if complete && self.range_mode.is_some() && height > catch_up.started_at {
+            self.catch_up_retry_after = Some(std::time::Instant::now() + CATCH_UP_RETRY_IN_RANGE);
+        }
         events.push(ServiceEvent::Synced { height, complete });
     }
 

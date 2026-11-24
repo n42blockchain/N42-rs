@@ -1582,3 +1582,6 @@ async fn layout_claims_per_block_are_one_per_peer_distinct_and_bounded() {
     rig.svc.forget_compact_body(hash);
     assert!(!rig.svc.compact_claims.contains_key(&hash));
 }
+
+#[path = "service_sync_tests.rs"]
+mod sync_tests;

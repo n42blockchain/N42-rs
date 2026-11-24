@@ -2976,28 +2976,49 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// catch-up that skips a block leaves every later one without a parent.
     pub async fn import_pulled(&mut self, payload: ExecutionData) -> Result<B256, ElError> {
         let block_hash = payload.block_hash();
-        let split = self.settlement.mode() == crate::settlement::SettlementTags::Split;
-        if split {
+        self.note_pulled(&payload);
+        Self::pulled_new_payload(&*self.el, payload).await?;
+        self.head_to_pulled(block_hash).await?;
+        Ok(block_hash)
+    }
+
+    /// The settlement bookkeeping of a pulled block (split mode), which the
+    /// forkchoice of [`Self::head_to_pulled`] reads its tags from. Every
+    /// pulled block below the head that forkchoice names must be noted
+    /// first, in height order.
+    pub fn note_pulled(&mut self, payload: &ExecutionData) {
+        if self.settlement.mode() == crate::settlement::SettlementTags::Split {
             self.settlement.note(
-                block_hash,
+                payload.block_hash(),
                 payload.payload.block_number(),
                 payload.payload.parent_hash(),
                 payload.payload.timestamp(),
             );
         }
-        let status = self
-            .el
-            .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, payload)
-            .await?;
+    }
+
+    /// The `newPayload` of a pulled block alone, on the historical path:
+    /// any verdict but VALID is an error. Holds no driver state, so a task
+    /// off the consensus loop can run it on the shared execution layer
+    /// ([`Self::execution_layer_arc`]); the caller keeps pulled blocks in
+    /// height order and moves the head afterwards on the loop
+    /// ([`Self::head_to_pulled`]).
+    pub async fn pulled_new_payload(el: &E, payload: ExecutionData) -> Result<(), ElError> {
+        let block_hash = payload.block_hash();
+        let status = el.new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, payload).await?;
         match status.status {
-            PayloadStatusEnum::Valid => {}
+            PayloadStatusEnum::Valid => Ok(()),
             PayloadStatusEnum::Invalid { validation_error } => {
-                return Err(ElError::new(format!("execution layer rejected block {block_hash}: {validation_error}")));
+                Err(ElError::new(format!("execution layer rejected block {block_hash}: {validation_error}")))
             }
-            other => {
-                return Err(ElError::new(format!("execution layer did not accept block {block_hash}: {other:?}")));
-            }
+            other => Err(ElError::new(format!("execution layer did not accept block {block_hash}: {other:?}"))),
         }
+    }
+
+    /// Makes an executed pulled block the head (head only: see
+    /// [`Self::import_pulled`]). One call after a run of pulled blocks
+    /// covers all of them: the forkchoice names the highest.
+    pub async fn head_to_pulled(&mut self, block_hash: B256) -> Result<(), ElError> {
         // A pulled block is neither committed nor certified here, so it
         // moves neither tag in either mode: split carries the tags the
         // driver has, when they are on the pulled block's chain; legacy
@@ -3012,7 +3033,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             return Err(ElError::new(format!("forkchoice to {block_hash} refused: {validation_error}")));
         }
         self.head = block_hash;
-        Ok(block_hash)
+        Ok(())
     }
 
     /// Handles one consensus output.

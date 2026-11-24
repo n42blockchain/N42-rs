@@ -84,6 +84,13 @@ Effects are for N42's shapes:
 
 ## 3. Gaps and where they are fixed
 
+> **Note for the evm2 port (2026-11-24, from n42-26):** n42-rs skips these calls only because alloy-evm 0.39
+> gates them on the CHAIN SPEC (`system_calls/mod.rs:86`, `is_amsterdam_active_at_timestamp`) and reth's
+> Amsterdam is off on native chains. evm2 (rev 66687c18) gates them on the SPEC ID
+> (`block/ethereum/execution.rs:422`, `spec_id.enables(AMSTERDAM)`) with no hook, so once the N42 EVM layer
+> moves to evm2 the calls run on native chains (no-ops while both addresses are empty, but not off). The
+> port must gate them explicitly; n42-26 hit this first.
+
 **G1 — EIP-8282 end-of-block calls (blocking; gov5 finding).** gov5 runs the builder
 deposit and exit request calls at every Amsterdam block, native chains included, and
 declares the block invalid when either contract has no code. None of the bundled native

@@ -12,8 +12,9 @@
 //! executor, post-execution, which files the receipt half of the block's
 //! result), its QMDB root computed as the node's root phase does and filed
 //! beside it. The block's own result is compared with gov5's `executed`
-//! (stateRoot, receiptsRoot, logsBloom, gasUsed = the EIP-8037 block figure)
-//! and with what the next header carries. Every block also passes B4's vote
+//! (stateRoot, receiptsRoot, logsBloom, gasUsed = the EIP-8037 block figure,
+//! and since AM25 the EIP-7685 requests and their requestsHash, a deferred
+//! field) and with what the next header carries. Every block also passes B4's vote
 //! bound at `now = time`.
 //!
 //! Each refusal is then judged on top of that chain: gov5's `import` is this
@@ -64,7 +65,13 @@ fn executed(block: &Value) -> crate::executed_fields::ExecutedFields {
         receipts_root: b256(&e["receiptsRoot"]),
         logs_bloom: Bloom::from_slice(&hex(&e["logsBloom"])),
         gas_used: e["gasUsed"].as_u64().expect("gasUsed"),
+        requests_hash: b256(&e["requestsHash"]),
     }
+}
+
+/// gov5's `executed.requests` of one block (EIP-7685 `type || data`).
+fn executed_requests(block: &Value) -> Vec<Vec<u8>> {
+    block["executed"]["requests"].as_array().expect("executed.requests").iter().map(hex).collect()
 }
 
 /// What this node made of one V5 block.
@@ -76,6 +83,8 @@ struct Ran {
     theirs: crate::executed_fields::ExecutedFields,
     /// The last receipt's cumulative gas (post-refund, state gas included).
     receipts_gas: u64,
+    /// The EIP-7685 requests this node's execution produced, `type || data`.
+    requests: Vec<Vec<u8>>,
 }
 
 /// The V5 chain imported on this node: the consensus, and every block.
@@ -167,6 +176,7 @@ fn run_chain() -> Chain {
             receipts_root,
             logs_bloom,
             gas_used: output.result.gas_used,
+            requests_hash: crate::hotstuff_consensus::executed_requests_hash(&spec.genesis, &output.result.requests),
         };
         assert_eq!(crate::executed_fields::get(&header.hash()), Some(ours), "{name}: the filed result");
         blocks.push(Ran {
@@ -175,6 +185,7 @@ fn run_chain() -> Chain {
             ours,
             theirs: executed(block),
             receipts_gas: output.result.receipts.last().map(|r| r.cumulative_gas_used).unwrap_or_default(),
+            requests: output.result.requests.iter().map(|r| r.to_vec()).collect(),
         });
         parent = header;
     }
@@ -189,7 +200,7 @@ fn run_chain() -> Chain {
 #[test]
 fn v5_blocks_execute_to_gov5s_results_and_are_accepted() {
     let chain = run_chain();
-    assert_eq!(chain.blocks.len(), 6, "six blocks");
+    assert_eq!(chain.blocks.len(), 8, "eight blocks");
     let mut differences = Vec::new();
     for (i, block) in chain.blocks.iter().enumerate() {
         let receipts_gas = v5()["blocks"][i]["executed"]["receiptsCumulativeGasUsed"].as_u64().unwrap_or_default();
@@ -206,16 +217,30 @@ fn v5_blocks_execute_to_gov5s_results_and_are_accepted() {
         if block.ours != block.theirs {
             differences.push(format!("{}: ours {:?}\n  gov5 {:?}", block.name, block.ours, block.theirs));
         }
+        if block.requests != executed_requests(&v5()["blocks"][i]) {
+            differences.push(format!(
+                "{}: requests ours {:?}\n  gov5 {:?}",
+                block.name,
+                block.requests.iter().map(alloy_primitives::hex::encode_prefixed).collect::<Vec<_>>(),
+                v5()["blocks"][i]["executed"]["requests"]
+            ));
+        }
         if block.receipts_gas != receipts_gas {
             differences.push(format!("{}: receipts gas ours {} gov5 {receipts_gas}", block.name, block.receipts_gas));
         }
         // The next header carries this block's result (A10, k = 1).
         if let Some(next) = chain.blocks.get(i + 1) {
-            let carried = crate::executed_fields::fields_from_child_header(next.header.header());
+            let carried = crate::executed_fields::fields_from_child_header_deferring_requests(next.header.header(), true);
             assert_eq!(carried, block.theirs, "{}: the next header carries gov5's executed", block.name);
         }
     }
     assert!(differences.is_empty(), "V5 executed differs:\n{}", differences.join("\n"));
+
+    // AM25: block 7 produces a withdrawal and a consolidation request and is
+    // valid; block 8 carries their hash.
+    assert_eq!(chain.blocks[6].requests.iter().map(|r| r[0]).collect::<Vec<_>>(), vec![0x01, 0x02], "block 7's requests");
+    assert_eq!(chain.blocks[7].header.requests_hash, Some(chain.blocks[6].ours.requests_hash), "block 8 carries block 7's requests hash");
+    assert_ne!(chain.blocks[6].ours.requests_hash, alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
 
     // B4: blocks 1 and 2 share a timestamp.
     assert_eq!(chain.blocks[0].header.timestamp, chain.blocks[1].header.timestamp);
@@ -235,8 +260,9 @@ enum Stage {
     /// `validate_header_against_parent`, a rule other than the deferred
     /// fields (the link, B4, B13, B14, the committee link).
     ImportParent(String),
-    /// `validate_header_against_parent`'s deferred fields check.
-    Deferred { got: u64, expected: u64 },
+    /// `validate_header_against_parent`'s deferred fields check: the gas
+    /// figures and requests hashes carried and executed.
+    Deferred { got: u64, expected: u64, got_requests: B256, expected_requests: B256 },
     /// Accepted on import, refused by B4's vote bound at `nowUnix`.
     Vote(String),
     /// Accepted.
@@ -253,7 +279,12 @@ fn judge(chain: &Chain, refusal: &Value) -> Stage {
     if let Err(err) = chain.consensus.validate_header_against_parent(&header, parent) {
         if let ConsensusError::Other(inner) = &err {
             if let Some(DeferredExecutionError::Mismatch { got, expected, .. }) = inner.downcast_ref::<DeferredExecutionError>() {
-                return Stage::Deferred { got: got.gas_used, expected: expected.gas_used };
+                return Stage::Deferred {
+                    got: got.gas_used,
+                    expected: expected.gas_used,
+                    got_requests: got.requests_hash,
+                    expected_requests: expected.requests_hash,
+                };
             }
         }
         return Stage::ImportParent(format!("{err}"));
@@ -278,7 +309,7 @@ fn judge(chain: &Chain, refusal: &Value) -> Stage {
 fn v5_refusals_are_refused_at_gov5s_stage() {
     let chain = run_chain();
     let refusals = v5()["refusals"].as_array().expect("refusals");
-    assert_eq!(refusals.len(), 11);
+    assert_eq!(refusals.len(), 15);
     let mut differences = Vec::new();
     for refusal in refusals {
         let name = refusal["name"].as_str().expect("name");
@@ -288,10 +319,17 @@ fn v5_refusals_are_refused_at_gov5s_stage() {
         println!("{rule:4} {check:8} {name:45} -> {stage:?}");
         let same_class = match (check, &stage) {
             ("import", Stage::ImportHeader(_) | Stage::ImportParent(_)) => true,
-            ("deferred", Stage::Deferred { got, expected }) => {
-                // gov5: "header N carries parent gas used <got>, this node executed <expected>".
+            ("deferred", Stage::Deferred { got, expected, got_requests, expected_requests }) => {
                 let message = refusal["gov5Message"].as_str().unwrap_or_default();
-                message.contains(&format!("carries parent gas used {got}, this node executed {expected}"))
+                if refusal["expectedError"] == "ErrDeferredRequestsHash" {
+                    // gov5: "requestsHash is not the parent's executed EIP-7685
+                    // requests hash: header N carries <got>, this node executed <expected>".
+                    got_requests != expected_requests
+                        && message.contains(&format!("carries {got_requests}, this node executed {expected_requests}"))
+                } else {
+                    // gov5: "header N carries parent gas used <got>, this node executed <expected>".
+                    message.contains(&format!("carries parent gas used {got}, this node executed {expected}"))
+                }
             }
             // Same verdict at an earlier stage: acceptable, printed above.
             ("deferred", Stage::ImportHeader(_) | Stage::ImportParent(_)) => true,

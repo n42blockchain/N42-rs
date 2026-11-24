@@ -160,7 +160,7 @@ cmd_status() {
     local d; d=$(mdir "$i")
     local led tmo ref halt alive
     led=$(strip "$d/v.log" 2>/dev/null | /usr/bin/grep -ac 'built a block to propose')
-    tmo=$(strip "$d/v.log" 2>/dev/null | /usr/bin/grep -ac 'view timed out')
+    tmo=$(strip "$d/v.log" 2>/dev/null | /usr/bin/grep -ac 'n42.h2.node: view timed out')
     ref=$(cat "$d/v.log" "$d/el.log" 2>/dev/null | strip | /usr/bin/grep -aE "$REFUSAL_RE" | /usr/bin/grep -avEc "$BENIGN_RE")
     halt=no; [ -e "$d/consensus/safety-halt.json" ] && halt=YES
     alive=$(member_alive "$i")
@@ -206,10 +206,10 @@ for ln in sys.stdin:
     ms = calendar.timegm(__import__("time").strptime(t, "%Y-%m-%d %H:%M:%S")) * 1000 + int(float(m.group(3) or 0) * 1000)
     if "built a block to propose" in ln and v:
         print(json.dumps({"msg": "hotstuff: view changed", "isLeader": True, "view": int(v.group(1)), "tMs": ms, "time": t}))
-    elif "view timed out" in ln:
+    elif "n42.h2.node: view timed out" in ln:
         print(json.dumps({"msg": "view timed out", "view": int(v.group(1)) if v else None, "tMs": ms, "time": t}))
-' > "$P1_DIR/log-node$i/n42-rs-views.log"
-    echo "member $i: $(wc -l < "$P1_DIR/headers-node$i.tsv") headers -> $P1_DIR/headers-node$i.tsv; $(/usr/bin/grep -c isLeader "$P1_DIR/log-node$i/n42-rs-views.log") views led -> $P1_DIR/log-node$i/n42-rs-views.log"
+' > "$P1_DIR/log-node$i/n42.log"
+    echo "member $i: $(wc -l < "$P1_DIR/headers-node$i.tsv") headers -> $P1_DIR/headers-node$i.tsv; $(/usr/bin/grep -c isLeader "$P1_DIR/log-node$i/n42.log") views led -> $P1_DIR/log-node$i/n42.log"
   done
 }
 

@@ -20,7 +20,7 @@ use n42_header::{N42ChainSpec, N42Header};
 use reth_chainspec::EthChainSpec as _;
 use reth_cli::chainspec::ChainSpecParser as _;
 use reth_codecs::Compact as _;
-use reth_payload_primitives::{ExecutionPayload as _, PayloadTypes as _};
+use reth_payload_primitives::PayloadTypes as _;
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};

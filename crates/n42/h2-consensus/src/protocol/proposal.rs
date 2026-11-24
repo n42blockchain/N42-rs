@@ -791,7 +791,12 @@ impl ConsensusEngine {
     /// refuses exactly this (`extendsJustify`); it wedges instead when a
     /// Rust quorum does not.
     ///
-    /// A genesis justify (no block) passes. An unknown parent abstains: gov5's
+    /// A genesis justify (no block) certifies the genesis block: under
+    /// profile 1 the proposal has to be its child (E6; gov5 refuses "block
+    /// justified by the genesis QC does not extend genesis"), so a block on an
+    /// uncertified block 1 -- one the fleet refused -- is not voted for. Off
+    /// profile 1, or with the genesis block not named, it passes as before.
+    /// An unknown parent abstains: gov5's
     /// rule passes it too, but gov5 only reaches the rule with the parent
     /// known (`tryHeaderVote` needs its `importedParents` entry), so neither
     /// client votes on a parent it cannot judge (audit 2026-10 A-2). The
@@ -801,9 +806,13 @@ impl ConsensusEngine {
         let Some(pending) = self.pending_proposal.as_ref() else {
             return true;
         };
-        if pending.justify_block == B256::ZERO {
+        let justify_block = if pending.justify_block != B256::ZERO {
+            pending.justify_block
+        } else if self.vote_rules.genesis_justify_extends_genesis() && self.genesis_block != B256::ZERO {
+            self.genesis_block
+        } else {
             return true;
-        }
+        };
         let Some(parent) = self.imported_parents.get(&block_hash).copied() else {
             tracing::debug!(target: "n42::interop::h2v4",
                 view = pending.view, %block_hash,
@@ -816,9 +825,9 @@ impl ConsensusEngine {
         if parent == B256::ZERO {
             return true;
         }
-        if parent != pending.justify_block {
+        if parent != justify_block {
             tracing::warn!(target: "n42::interop::h2v4",
-                view = pending.view, %block_hash, %parent, justify_block = %pending.justify_block,
+                view = pending.view, %block_hash, %parent, %justify_block,
                 "import-gated vote REFUSED: proposal does not extend its justify QC's block"
             );
             return false;

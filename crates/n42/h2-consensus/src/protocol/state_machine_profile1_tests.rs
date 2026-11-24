@@ -333,3 +333,78 @@ fn after_a_tc_the_leader_proposes_on_the_highest_qc() {
     e.process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xC3), None)).expect("the block");
     assert_eq!(proposed_justify(&outputs(&mut rx)), Some((1, x)), "its own, higher lock");
 }
+
+/// The first mixed profile-1 round (p1mixed-2): view 2's block 1 was refused
+/// by everyone, a TC moved the fleet to view 3, and view 3's leader proposed
+/// a block on that uncertified block 1 with the genesis QC as justify. Under
+/// profile 1 a proposal justified by the genesis QC has to be a child of
+/// genesis: the block on block 1 gets no vote, a child of genesis does.
+#[test]
+fn profile1_refuses_a_genesis_justified_block_that_does_not_extend_genesis() {
+    let genesis = B256::repeat_byte(0x44);
+    let uncertified = B256::repeat_byte(0xD1);
+    let me = follower_of(&[3]);
+    for (on_block_1, votes) in [(true, 0), (false, 1)] {
+        let block = B256::repeat_byte(0xD3);
+        let (mut e, sks, _, mut rx) = engine(me, true, VoteRules::PROFILE1);
+        e.set_genesis_block(genesis);
+        e.advance_to_view(3).expect("view 3");
+        propose(&mut e, &sks, 3, block, QuorumCertificate::genesis()).expect("the proposal");
+        e.remember_parent(block, if on_block_1 { uncertified } else { genesis });
+        e.process_event(ConsensusEvent::BlockChecked(block)).expect("the check");
+        e.process_event(ConsensusEvent::BlockImported(block)).expect("the import");
+        assert_eq!(votes_for(&outputs(&mut rx), block), votes, "parent block 1: {on_block_1}");
+    }
+
+    // Today's rules keep passing a genesis justify (gov5 gates the rule on
+    // profile 1 too).
+    let block = B256::repeat_byte(0xD4);
+    let (mut e, sks, _, mut rx) = engine(me, true, VoteRules::TODAY);
+    e.set_genesis_block(genesis);
+    e.advance_to_view(3).expect("view 3");
+    propose(&mut e, &sks, 3, block, QuorumCertificate::genesis()).expect("the proposal");
+    e.remember_parent(block, uncertified);
+    e.process_event(ConsensusEvent::BlockImported(block)).expect("the import");
+    assert_eq!(votes_for(&outputs(&mut rx), block), 1, "today: a genesis justify passes");
+}
+
+/// The leader's side of the same round: after a TC whose high QCs are all
+/// genesis, the next proposal extends the genesis block -- whatever block 1
+/// the node imported meanwhile -- and is justified by the genesis QC; once a
+/// QC forms the parent is the block it certifies.
+#[test]
+fn after_a_genesis_tc_the_leader_builds_on_genesis() {
+    let genesis = B256::repeat_byte(0x44);
+    let (probe, ..) = engine(0, true, VoteRules::TODAY);
+    let me = probe.leader_index_for_view(probe.view_after_tc(2));
+    let others: Vec<u32> = (0..4).filter(|i| *i != me).collect();
+    let (mut e, sks, vs, mut rx) = engine(me, true, VoteRules::PROFILE1);
+    e.set_genesis_block(genesis);
+    e.advance_to_view(2).expect("view 2");
+    // Block 1 of view 2 imported here (the leader's own execution layer
+    // holds it), never certified.
+    let uncertified = B256::repeat_byte(0xD1);
+    e.remember_parent(uncertified, genesis);
+    e.process_event(ConsensusEvent::BlockImported(uncertified)).expect("the import");
+    for sender in &others {
+        e.process_event(timeout(&e, &sks, 2, *sender, QuorumCertificate::genesis())).expect("a timeout");
+    }
+    assert_eq!(e.current_view(), probe.view_after_tc(2), "the TC moved the leader on");
+    assert_eq!(e.proposal_parent(), genesis, "the genesis QC certifies genesis, not block 1");
+    let _ = outputs(&mut rx);
+    e.process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xD3), None)).expect("the block");
+    assert_eq!(proposed_justify(&outputs(&mut rx)), Some((0, B256::ZERO)), "justified by the genesis QC");
+
+    // A certified block moves the parent to it.
+    let x = B256::repeat_byte(0xD5);
+    let (mut e, sks, vs, _rx) = engine(follower_of(&[1]), true, VoteRules::PROFILE1);
+    e.set_genesis_block(genesis);
+    let qc = prepare_qc(&e, &sks, &vs, 1, x);
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: x, qc })))
+        .expect("the PrepareQC");
+    assert_eq!(e.proposal_parent(), x, "the block the QC certifies");
+
+    // Without a named genesis block the engine names none.
+    let (e, ..) = engine(me, true, VoteRules::PROFILE1);
+    assert_eq!(e.proposal_parent(), B256::ZERO);
+}

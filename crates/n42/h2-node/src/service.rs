@@ -4626,6 +4626,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         for (peer, height) in std::mem::take(&mut self.pending_status) {
             self.note_peer_height(peer, height);
         }
+        // At start-up, on the first drain: the commit restored from the
+        // consensus store is this node's committed head until a live one
+        // lands -- served, advertised and the base of a pull at once.
+        if !self.unproven_checked {
+            self.unproven_checked = true;
+            if let Some(from) = self.unproven_after_restart().await {
+                self.unproven_from = Some(self.unproven_from.map_or(from, |known| known.min(from)));
+            }
+        }
         self.request_missing_held_parent(events);
         // A pull's last imports are reported before another starts: the
         // next one reads the execution layer's height.
@@ -4666,14 +4675,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         let held = self
             .imported_height
             .map(|tip| self.unproven_from.map_or(tip, |from| tip.min(from.saturating_sub(1))));
-        if self.unproven_checked && held.is_some_and(|held| height <= held) {
+        if held.is_some_and(|held| height <= held) {
             return;
-        }
-        if !self.unproven_checked {
-            self.unproven_checked = true;
-            if let Some(from) = self.unproven_after_restart().await {
-                self.unproven_from = Some(self.unproven_from.map_or(from, |known| known.min(from)));
-            }
         }
         let latest = match self.driver.execution_layer().latest_block_number().await {
             Ok(Some(latest)) => latest,
@@ -5776,9 +5779,10 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
-    /// Records the restored commit's number, and advertises it while no live
-    /// commit has: the status height is the committed head (sync standard
-    /// §4.1).
+    /// Records the restored commit's number, and while no live commit has
+    /// landed takes it as the committed height: advertised (the status
+    /// height is the committed head, sync standard §4.1), served, and the
+    /// certified base a pull starts on and is checked against (§3.3).
     fn learn_restored_commit(&mut self, restored: (B256, u64)) {
         if self.restored_committed == Some(restored) {
             return;
@@ -5786,6 +5790,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.restored_committed = Some(restored);
         if self.committed_height.is_none() {
             self.transport.set_advertised_height(restored.1);
+            self.committed_height = Some(restored.1);
+        }
+        let qc = self.engine.last_committed_qc().clone();
+        if qc.block_hash == restored.0
+            && let Err(halt) = self.sync_safety.note_committed(Some(restored.1), &qc)
+        {
+            // Only an anchor recorded before the restored commit's number
+            // was known can contradict it; there is no pull to end yet.
+            let mut events = Vec::new();
+            self.halt_sync(halt, &mut events);
         }
     }
 

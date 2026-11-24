@@ -1108,6 +1108,51 @@ async fn a_restarted_server_serves_and_advertises_up_to_its_restored_commit() {
     assert!(c.svc.pending_status.contains(&(target, 2)), "{:?}", c.svc.pending_status);
 }
 
+/// A restart with no live commit yet: the commit restored from the store
+/// is the committed height at start-up -- before any range is asked of
+/// the node, a peer connecting reads it as the status height and a range
+/// is served up to it -- and the node's own catch-up starts on it and
+/// checks the chain it pulls against it: an anchored chain whose block 3
+/// names another block 2 than the restored commit halts the importer.
+#[tokio::test]
+async fn a_restarted_node_takes_its_restored_commit_as_the_committed_height_at_once() {
+    let (keys, set) = keys(1);
+    let mut b = node_in(&keys, &set, 0, None).await;
+    let held = hold_chain(&b, 4).await;
+    restore_commit(&mut b, &keys, &set, held[1].0, 5);
+    let mut ignored = Vec::new();
+    within(b.svc.drain_outputs(&mut ignored)).await.expect("drains");
+    assert_eq!(b.svc.committed_height, Some(2), "at start-up, not on the first range request");
+    assert_eq!(b.svc.serve_ceiling(), ServeCeiling::Height(2));
+    assert_eq!(b.svc.unproven_from, Some(3), "blocks 3 and 4 are not committed");
+    assert_eq!(b.svc.certified_head(), Some((2, held[1].0)));
+
+    let target = peer_of(&b);
+    let mut c = node(1, 0, Some(b.addr.clone())).await;
+    let mut c_events = Vec::new();
+    pump(&mut c, &mut b, (false, false), &mut c_events, |c, _, _| {
+        c.svc.pending_status.iter().any(|(peer, _)| *peer == target)
+    })
+    .await;
+    assert!(c.svc.pending_status.contains(&(target, 2)), "advertised at once: {:?}", c.svc.pending_status);
+
+    // Its own catch-up: from the restored commit, against it.
+    let peer = PeerId::random();
+    let theirs = anchored_chain(&b, 6);
+    b.svc.note_peer_height(peer, 6);
+    let mut events = Vec::new();
+    within(b.svc.consider_catch_up(&mut events)).await;
+    let pull = b.svc.catch_up.as_ref().expect("a pull");
+    assert_eq!((pull.started_at, pull.next), (2, 3), "the restored commit is the base");
+    b.svc.pending_imports.push((peer, RangeRequest { start: 3, count: 4, step: 1 }, chunks(&theirs[2..])));
+    import(&mut b).await;
+    let halt = b.svc.sync_halt().expect("the pulled chain does not join the restored commit");
+    assert_eq!(halt.kind, crate::sync_safety::HaltKind::Conflict);
+    assert_eq!((halt.first.hash, halt.first.qc.view), (held[1].0, 5));
+    assert_eq!(halt.second.hash, theirs[1].0);
+    assert!(executed(&b).iter().all(|h| theirs.iter().all(|t| t.0 != *h)), "none of it executed");
+}
+
 // ---------------------------------------------------------------------------
 // Fill answers
 // ---------------------------------------------------------------------------

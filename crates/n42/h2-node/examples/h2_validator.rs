@@ -518,6 +518,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("signing      : H2-v4");
         }
         engine.set_leader_tenure(leader_tenure);
+        // Profile 1 (AM5): the validator set is the genesis set; every
+        // reconfiguration entry point of the engine refuses.
+        if hotstuff_config.as_ref().is_some_and(|config| config.profile1().is_some()) {
+            engine.epoch_manager_mut().set_fixed_validator_set(true);
+            println!("validators   : fixed to the genesis set (profile 1)");
+        }
         engine.set_rotate_on_timeout(
             rotate_on_timeout_view,
             hotstuff_config.as_ref().map_or(0, |config| config.epoch_length),

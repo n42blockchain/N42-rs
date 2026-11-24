@@ -475,6 +475,41 @@ mod tests {
         assert_eq!(back.hash_slow(), h.hash_slow());
     }
 
+    /// gov5's first profile-1 decoder read blobGasUsed, excessBlobGas and
+    /// slotNumber written as present zero (0x80) as absent. Here they must
+    /// decode as `Some(0)` and re-encode to the same bytes and hash: the
+    /// V1 genesis header carries all three as zero, plus a zero
+    /// mobileRegistryRoot.
+    #[test]
+    fn present_zero_blob_fields_and_slot_decode_as_present_zero() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../h2-consensus/testdata/profile1/header_profile_v1.json");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("V1 fixture")).expect("json");
+        let genesis = &fixture["genesis"];
+        let rlp = hex::decode(genesis["rlp"].as_str().expect("rlp").trim_start_matches("0x")).expect("hex");
+        let want: B256 = genesis["hash"].as_str().expect("hash").parse().expect("hash");
+        let h = N42Header::decode(&mut rlp.as_slice()).expect("decodes");
+        assert_eq!(h.blob_gas_used, Some(0));
+        assert_eq!(h.excess_blob_gas, Some(0));
+        assert_eq!(h.slot_number, Some(0));
+        assert_eq!(h.block_access_list_hash, None, "element 22 is the gap");
+        assert_eq!(h.mobile_registry_root, Some(B256::ZERO));
+        assert_eq!(alloy_rlp::encode(&h), rlp, "re-encodes byte for byte");
+        assert_eq!(h.hash_slow(), want);
+
+        // The same three present zero on a header built here, with and
+        // without the trailing root.
+        for root in [Some(B256::ZERO), None] {
+            let h = N42Header {
+                inner: Header { slot_number: Some(0), blob_gas_used: Some(0), excess_blob_gas: Some(0), ..sample() },
+                mobile_registry_root: root,
+            };
+            let back = roundtrip(&h);
+            assert_eq!(back, h);
+            assert_eq!(back.hash_slow(), h.hash_slow());
+        }
+    }
+
     #[test]
     fn a_25th_element_is_refused() {
         let h = N42Header {

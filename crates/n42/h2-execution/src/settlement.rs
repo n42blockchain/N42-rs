@@ -156,6 +156,10 @@ pub(crate) struct Settlement {
     lineage: Lineage,
     persisted: Option<PersistedSource>,
     said_not_reported: bool,
+    /// Profile 1: `finalized` is certified *and persisted here*, so an
+    /// execution layer that reports no persisted height holds it rather than
+    /// letting it follow `safe`.
+    needs_reported_persistence: bool,
 }
 
 impl std::fmt::Debug for Settlement {
@@ -172,7 +176,20 @@ impl std::fmt::Debug for Settlement {
 
 impl Settlement {
     pub(crate) fn new(mode: SettlementTags) -> Self {
-        Self { mode, safe: None, finalized: None, lineage: Lineage::new(), persisted: None, said_not_reported: false }
+        Self {
+            mode,
+            safe: None,
+            finalized: None,
+            lineage: Lineage::new(),
+            persisted: None,
+            said_not_reported: false,
+            needs_reported_persistence: false,
+        }
+    }
+
+    /// See the field.
+    pub(crate) fn set_needs_reported_persistence(&mut self, on: bool) {
+        self.needs_reported_persistence = on;
     }
 
     pub(crate) const fn mode(&self) -> SettlementTags {
@@ -269,6 +286,13 @@ impl Settlement {
         let ceiling = match self.persisted.as_ref().map_or(PersistedHeight::NotReported, |read| read()) {
             PersistedHeight::Known(persisted) => safe.number.min(persisted),
             PersistedHeight::Unknown => return,
+            PersistedHeight::NotReported if self.needs_reported_persistence => {
+                if !self.said_not_reported {
+                    self.said_not_reported = true;
+                    warn!(target: "n42.h2.el", "the execution layer does not report its persisted block; finalized holds (profile 1)");
+                }
+                return;
+            }
             PersistedHeight::NotReported => {
                 if !self.said_not_reported {
                     self.said_not_reported = true;
@@ -380,6 +404,23 @@ mod tests {
         s.set_persisted(Arc::new(|| PersistedHeight::NotReported));
         s.advance(h(3), |_| true);
         assert_eq!(s.finalized(), Some(Tag { number: 2, hash: h(2) }));
+    }
+
+    /// Profile 1 (E14, AM19): `finalized` = certified and persisted here, so
+    /// an execution layer that reports no persisted height holds it where
+    /// today it follows `safe`; a reported one moves it as before.
+    #[test]
+    fn under_profile1_an_unreported_persisted_height_holds_finalized() {
+        let mut s = Settlement::new(SettlementTags::Split);
+        s.set_needs_reported_persistence(true);
+        s.set_persisted(Arc::new(|| PersistedHeight::NotReported));
+        chain(&mut s, 3);
+        s.advance(h(3), |_| true);
+        assert_eq!(s.safe().map(|t| t.number), Some(2));
+        assert_eq!(s.finalized(), None);
+        s.set_persisted(persisted(1));
+        s.advance(h(3), |_| true);
+        assert_eq!(s.finalized(), Some(Tag { number: 1, hash: h(1) }));
     }
 
     #[test]

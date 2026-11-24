@@ -785,6 +785,10 @@ pub struct ExecutionDriver<E> {
     in_flight_cap: usize,
     /// `N42_VOTE_BEFORE_SLOT` ([`vote_before_slot`]).
     vote_before_slot: bool,
+    /// The profile-1 vote rules ([`n42_h2_consensus::VoteRules`]): under
+    /// profile 1 `vote_before_slot` stays off and the settlement tags stay
+    /// `split`.
+    vote_rules: n42_h2_consensus::VoteRules,
     /// `N42_CHECK_BEFORE_SLOT` ([`check_before_slot`]).
     check_before_slot: bool,
     /// Blocks the check-ahead may queue past the in-flight cap
@@ -1091,6 +1095,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             queued_at: HashMap::new(),
             in_flight_cap: deferred_in_flight(),
             vote_before_slot: vote_before_slot(),
+            vote_rules: n42_h2_consensus::VoteRules::TODAY,
             check_before_slot: check_before_slot(),
             check_ahead_queue: check_ahead_queue(),
             released_checks: std::collections::VecDeque::new(),
@@ -1192,8 +1197,35 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Picks the settlement tags mode; the default is
     /// [`crate::settlement::settlement_tags`] (`N42_SETTLEMENT_TAGS`). This is
     /// how a test picks it without the process environment.
+    ///
+    /// Under profile 1 ([`Self::set_vote_rules`]) `legacy` is refused: the
+    /// mode stays `split` (E14, AM19).
     pub fn set_settlement_tags(&mut self, mode: crate::settlement::SettlementTags) {
+        if mode == crate::settlement::SettlementTags::Legacy && !self.vote_rules.legacy_settlement_allowed() {
+            warn!(target: "n42.h2.el", "legacy settlement tags are not available on a profile-1 chain; keeping split");
+            return;
+        }
         self.settlement.set_mode(mode);
+    }
+
+    /// Sets the vote rules ([`n42_h2_consensus::VoteRules`]); once, before the
+    /// driver runs. Profile 1 turns `N42_VOTE_BEFORE_SLOT` off, puts the
+    /// settlement tags on `split` whatever the environment said, and holds
+    /// `finalized` until the execution layer reports a persisted height.
+    pub fn set_vote_rules(&mut self, rules: n42_h2_consensus::VoteRules) {
+        self.vote_rules = rules;
+        if !rules.vote_before_slot_allowed() {
+            self.vote_before_slot = false;
+        }
+        if !rules.legacy_settlement_allowed() {
+            self.settlement.set_mode(crate::settlement::SettlementTags::Split);
+        }
+        self.settlement.set_needs_reported_persistence(rules.finalized_needs_reported_persistence());
+    }
+
+    /// The vote rules in force; see [`Self::set_vote_rules`].
+    pub const fn vote_rules(&self) -> n42_h2_consensus::VoteRules {
+        self.vote_rules
     }
 
     /// The settlement tags mode in use.
@@ -2213,8 +2245,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// which the check reads, would not exist yet), and fewer than
     /// [`FOLLOWER_LAG_CAP`] imports are in flight or held. Otherwise the
     /// block waits for its slot, vote and all, as without the switch.
+    ///
+    /// Never on under profile 1 ([`Self::set_vote_rules`]).
     pub fn set_vote_before_slot(&mut self, on: bool) {
-        self.vote_before_slot = on;
+        self.vote_before_slot = on && self.vote_rules.vote_before_slot_allowed();
     }
 
     /// `N42_CHECK_BEFORE_SLOT` (see [`check_before_slot`], whose value is the

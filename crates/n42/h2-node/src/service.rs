@@ -6178,6 +6178,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// the embedded QC (B1, E13). A profile-1 block whose header this node
     /// does not hold is refused: its rules cannot have been checked.
     fn vote_refusal(&self, block_hash: &B256) -> Option<String> {
+        // A node halted on a conflicting commit votes on no road
+        // (crate::safety_halt); the engine is halted too, this says why.
+        if self.safety_halt.is_some() {
+            return Some("safety halt: proof of a conflicting commit".to_owned());
+        }
         if let Some(reason) = self.header_qc_refusal(block_hash) {
             return Some(reason);
         }
@@ -7202,20 +7207,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.block_timestamps.insert(block_hash, header.timestamp).is_none() {
             self.block_numbers.insert(block_hash, header.number);
             self.block_headers.insert(block_hash, header.clone());
-            // gov5's header vote under its two-phase gate (audit 2026-10
-            // R2-C9): the header releases Round 1, once its QC passes the
-            // check every vote of this node passes (R3-C2).
-            if self.engine.two_phase_vote_gate() {
-                if let Some(reason) = self.vote_refusal(&block_hash) {
-                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no header vote");
-                } else if let Err(err) = self.engine.header_known(block_hash, header.parent_hash) {
-                    report_engine_error(&err, "header vote", &mut self.fatal);
-                }
-            }
-            self.block_seen.insert(block_hash, std::time::Instant::now());
-            self.timestamp_order.push(block_hash);
             // A commit decided before this header was held is checked now,
-            // before anything imports the block.
+            // before anything votes for or imports the block.
             if let Some(qc) = self.unchecked_commits.remove(&block_hash)
                 && self.safety_halt.is_none()
             {
@@ -7226,6 +7219,18 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.enter_safety_halt(&halt, "live-commit", Some(height));
                 }
             }
+            // gov5's header vote under its two-phase gate (audit 2026-10
+            // R2-C9): the header releases Round 1, once its QC passes the
+            // check every vote of this node passes (R3-C2).
+            if self.engine.two_phase_vote_gate() && self.safety_halt.is_none() {
+                if let Some(reason) = self.vote_refusal(&block_hash) {
+                    warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no header vote");
+                } else if let Err(err) = self.engine.header_known(block_hash, header.parent_hash) {
+                    report_engine_error(&err, "header vote", &mut self.fatal);
+                }
+            }
+            self.block_seen.insert(block_hash, std::time::Instant::now());
+            self.timestamp_order.push(block_hash);
             while self.timestamp_order.len() > REMEMBERED_TIMESTAMPS {
                 let oldest = self.timestamp_order.remove(0);
                 self.block_timestamps.remove(&oldest);

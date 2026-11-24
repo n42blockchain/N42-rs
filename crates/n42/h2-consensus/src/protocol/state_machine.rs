@@ -250,6 +250,25 @@ impl AuthenticatedVoteProof {
     }
 }
 
+/// What the sync importer may make of a QC embedded in a pulled header
+/// ([`ConsensusEngine::verify_sync_anchor_qc`], sync standard §3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncQcVerdict {
+    /// A commit-domain QC that verified against the set of its exact view:
+    /// its block hash is a verified anchor.
+    Anchor(Box<QuorumCertificate>),
+    /// The view-0 genesis sentinel: certifies nothing. Not a fault.
+    Genesis,
+    /// Verifies only in the prepare (vote) domain: not an anchor, not a fault.
+    PrepareDomain,
+    /// No validator set is known for the QC's view: fails closed (not an
+    /// anchor), without blaming the peer that served it.
+    UnknownSet,
+    /// Decodes but does not verify against a known set (bitmap length,
+    /// quorum, signature in either domain): a provable fault of its server.
+    Invalid(String),
+}
+
 /// Actions the consensus engine requests from the outer node.
 #[derive(Debug)]
 pub enum EngineOutput {
@@ -2162,6 +2181,45 @@ impl ConsensusEngine {
         Ok(Some(qc))
     }
 
+    /// Verifies a header-embedded QC for the sync importer (sync standard
+    /// §3.3): is it a verified anchor?
+    ///
+    /// Stricter than [`Self::verify_header_qc`], which the live proposal path
+    /// keeps:
+    /// - the commit domain only, signed over a zero changes hash: a QC that
+    ///   verifies only in the prepare domain is not an anchor (and not a
+    ///   fault); one signed over a non-zero changes hash cannot be checked by
+    ///   sync and is refused like any QC that does not verify;
+    /// - the set authorized for the certificate's exact view, never another:
+    ///   no set known is [`SyncQcVerdict::UnknownSet`], which fails closed;
+    /// - no trust in the locked QC (it may be a prepare QC). The engine's own
+    ///   last committed QC is trusted: it is commit-domain by construction.
+    pub fn verify_sync_anchor_qc(&self, wire: &n42_h2_wire::h2_wire::H2QuorumCertificate) -> SyncQcVerdict {
+        if wire.view == 0 {
+            return SyncQcVerdict::Genesis;
+        }
+        let Some(set) = self.epoch_manager.known_validator_set_for_view(wire.view) else {
+            return SyncQcVerdict::UnknownSet;
+        };
+        let qc = match crate::wire_bridge::qc_to_engine(wire, set.len() as usize, "header QC") {
+            Ok(qc) => qc,
+            Err(err) => return SyncQcVerdict::Invalid(err.to_string()),
+        };
+        if &qc == self.round_state.last_committed_qc() {
+            return SyncQcVerdict::Anchor(Box::new(qc));
+        }
+        match super::quorum::verify_commit_qc_with_profile(&qc, set, &B256::ZERO, self.signing_profile) {
+            Ok(()) => SyncQcVerdict::Anchor(Box::new(qc)),
+            Err(commit_err) => {
+                if super::quorum::verify_qc_with_profile(&qc, set, self.signing_profile).is_ok() {
+                    SyncQcVerdict::PrepareDomain
+                } else {
+                    SyncQcVerdict::Invalid(commit_err.to_string())
+                }
+            }
+        }
+    }
+
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
         let mut overflow = self
             .output_overflow
@@ -2553,6 +2611,44 @@ mod tests {
 
         let sentinel = crate::wire_bridge::qc_to_wire(&QuorumCertificate::genesis()).unwrap();
         assert_eq!(engine.verify_header_qc(&sentinel).unwrap().map(|qc| qc.view), Some(0));
+    }
+
+    /// Sync standard §3.3: a sync anchor is a commit-domain QC under the set
+    /// of its exact view. A prepare QC is not an anchor; an unknown set fails
+    /// closed (the live-path check leaves it unchecked); a bad signature, a
+    /// short quorum or a non-zero changes hash do not verify.
+    #[test]
+    fn a_sync_anchor_is_a_commit_domain_qc_under_a_known_set_only() {
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        engine.epoch_manager = EpochManager::with_epoch_length(vs.clone(), 10);
+        let hash = B256::repeat_byte(0x41);
+        let wire = |qc: &QuorumCertificate| crate::wire_bridge::qc_to_wire(qc).unwrap();
+
+        let good = build_test_commit_qc(3, hash, &sks, &vs, &[0, 1, 2]);
+        assert_eq!(engine.verify_sync_anchor_qc(&wire(&good)), SyncQcVerdict::Anchor(Box::new(good.clone())));
+
+        let prepare = build_test_prepare_qc(3, hash, &sks, &vs, &[0, 1, 2]);
+        assert_eq!(engine.verify_sync_anchor_qc(&wire(&prepare)), SyncQcVerdict::PrepareDomain);
+        assert!(engine.verify_header_qc(&wire(&prepare)).unwrap().is_some(), "the live path still takes it");
+
+        let forged = n42_h2_wire::h2_wire::H2QuorumCertificate { block_hash: B256::repeat_byte(0x42), ..wire(&good) };
+        assert!(matches!(engine.verify_sync_anchor_qc(&forged), SyncQcVerdict::Invalid(_)), "bad signature");
+
+        let mut short = good.clone();
+        short.signers.set(2, false);
+        assert!(matches!(engine.verify_sync_anchor_qc(&wire(&short)), SyncQcVerdict::Invalid(_)), "no quorum");
+
+        let changes = build_test_commit_qc_with_changes(3, hash, &sks, &vs, &[0, 1, 2], &B256::repeat_byte(9));
+        assert!(matches!(engine.verify_sync_anchor_qc(&wire(&changes)), SyncQcVerdict::Invalid(_)), "changes hash");
+
+        // Epoch 2 (views 21..=30): no set known. A correctly signed commit QC
+        // is still no anchor, where the live path leaves it unchecked.
+        let unknown = build_test_commit_qc(25, hash, &sks, &vs, &[0, 1, 2]);
+        assert_eq!(engine.verify_sync_anchor_qc(&wire(&unknown)), SyncQcVerdict::UnknownSet);
+        assert!(engine.verify_header_qc(&wire(&unknown)).unwrap().is_none());
+
+        let sentinel = wire(&QuorumCertificate::genesis());
+        assert_eq!(engine.verify_sync_anchor_qc(&sentinel), SyncQcVerdict::Genesis);
     }
 
     #[test]

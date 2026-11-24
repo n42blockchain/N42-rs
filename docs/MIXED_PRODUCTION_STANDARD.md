@@ -867,3 +867,13 @@ before the file is cut).** `blockIntervalMs` 8000, `baseTimeoutMs` 24000, `maxTi
   8 s with these values comes BEFORE the genesis file is cut, and a mixed one is part of M1';
   (b) batched vote verification and a timeout-certificate path that is not quadratic in the
   validator count are milestone-2 work for every client, ahead of the 100-validator round (AM17).
+
+**AM23 (gov5's answers to AM19 and AM21, accepted).** AM19: gov5 agrees; its deferred check
+already compares the carried root / receipts / bloom / gasUsed with its own execution of the parent
+and checks per-sender includability on that state, but its two-phase mode cast Round 1 on the
+header alone; on Profile 1 Round 1 comes only after static header checks, the deferred check and
+the parent's import. E14 matches. AM21: a leader without a mobileverify service repeats its
+parent's `mobileRegistryRoot` (all clients add this fallback). The committee pool STAYS in
+Profile 1 (A19 as written), because `parentBeaconRoot = Blake3(committee evidence)` derives from
+it and is byte-equal between gov5 and n42-rs today; it is stated here that the pool's keys come
+from a public seed and the evidence has NO security meaning. Removing it is a later profile change.

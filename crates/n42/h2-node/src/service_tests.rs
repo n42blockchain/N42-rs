@@ -26,6 +26,8 @@ struct Rig {
     addr: libp2p::Multiaddr,
     /// The kind of every transport event a pump handed to the service.
     seen: Vec<&'static str>,
+    /// The validator keys of the rig's set, to sign certificates with.
+    keys: Vec<BlsSecretKey>,
 }
 
 fn keys(count: usize) -> (Vec<BlsSecretKey>, ValidatorSet) {
@@ -97,7 +99,7 @@ async fn node_in_with_vote_log(
     let el = MockExecutionLayer::new();
     let driver = ExecutionDriver::new(el.clone(), ID.genesis_hash);
     let svc = H2Service::new(transport, engine, driver, rx, keys.len());
-    Rig { svc, el, addr, seen: Vec::new() }
+    Rig { svc, el, addr, seen: Vec::new(), keys: keys.to_vec() }
 }
 
 /// A block of the mock's shape and the gov5 RLP it travels as.
@@ -859,7 +861,7 @@ async fn a_range_reply_is_queued_and_a_refusal_is_handed_on_only_to_the_running_
     assert!(rig.svc.pending_imports.is_empty());
 
     // With this peer's catch-up running it becomes an empty reply for the import loop.
-    rig.svc.catch_up = Some(CatchUp { peer, next: 4, target: 20, started_at: 3, probing: false, probe_height: 0, prev_hash: None });
+    rig.svc.catch_up = Some(CatchUp::new(peer, 3, 20));
     rig.svc
         .handle_transport_event(TransportEvent::RangeFetched { peer, request, reply: Err("nope".into()) })
         .expect("ok");

@@ -28,9 +28,32 @@ fn chunks(blocks: &[(B256, Header, alloy_primitives::Bytes)]) -> Vec<BlockChunk>
     blocks.iter().map(|(_, _, rlp)| chunk(rlp)).collect()
 }
 
+/// `count` blocks numbered from 1 as a leader under gov5's profile seals
+/// them: block `n` at view `n` embeds the commit QC of its parent (view
+/// `n - 1`), signed by every key of `rig`'s set; the first embeds none. Each
+/// block but the last is anchored by the header above it (depth 1).
+fn anchored_chain(rig: &Rig, count: u64) -> Vec<(B256, Header, alloy_primitives::Bytes)> {
+    let signers: Vec<usize> = (0..rig.keys.len()).collect();
+    let mut parent = B256::ZERO;
+    let mut blocks = Vec::new();
+    for number in 1..=count {
+        let qc =
+            if number == 1 { Vec::new() } else { header_qc(&rig.svc, &rig.keys, &signers, number - 1, parent, parent) };
+        let block = block_with_extra(number, parent, number, qc);
+        parent = block.0;
+        blocks.push(block);
+    }
+    blocks
+}
+
+/// The blocks the execution layer was handed by `newPayload`, in order.
+fn executed(rig: &Rig) -> Vec<B256> {
+    rig.el.calls().iter().filter_map(|c| if let ElCall::NewPayload(h) = c { Some(*h) } else { None }).collect()
+}
+
 fn catching_up(rig: &mut Rig, peer: PeerId, next: u64, target: u64) {
     rig.svc.catch_up =
-        Some(CatchUp { peer, next, target, started_at: next - 1, probing: false, probe_height: 0, prev_hash: None });
+        Some(CatchUp::new(peer, next - 1, target));
 }
 
 async fn import(rig: &mut Rig) -> Vec<ServiceEvent> {
@@ -114,48 +137,80 @@ async fn the_peer_whose_pull_failed_last_is_passed_over_for_another() {
 // Importing what came back
 // ---------------------------------------------------------------------------
 
+/// A range is executed in order as far as its headers anchor it: each
+/// header embeds the commit QC of its parent, so the top block waits for the
+/// header above it (sync standard §3.4.5-6) and is never executed by a pull
+/// that ends without one.
 #[tokio::test]
 async fn a_range_reply_is_imported_in_order_then_the_pull_probes_past_the_target() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    let blocks = chain(3);
+    let blocks = anchored_chain(&rig, 3);
     catching_up(&mut rig, peer, 1, 3);
     rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 3, step: 1 }, chunks(&blocks)));
     let events = import(&mut rig).await;
 
     assert!(events.is_empty(), "the target was reached but the peer may have more");
-    for (hash, header, _) in &blocks {
+    for (hash, header, _) in &blocks[..2] {
         assert!(rig.svc.imported.contains(hash));
         assert!(rig.svc.body_store.contains_key(hash), "pulled bodies are servable");
         assert_eq!(rig.svc.block_headers[hash].number, header.number);
     }
-    assert_eq!(rig.svc.imported_height, Some(3));
-    assert_eq!(rig.svc.driver.head(), blocks[2].0, "each import became the head");
-    let calls = rig.el.calls();
-    let imported: Vec<B256> = calls.iter().filter_map(|c| if let ElCall::NewPayload(h) = c { Some(*h) } else { None }).collect();
-    assert_eq!(imported, blocks.iter().map(|b| b.0).collect::<Vec<_>>(), "in block order");
+    assert!(!rig.svc.imported.contains(&blocks[2].0), "the top block has no anchor yet");
+    assert_eq!(rig.svc.imported_height, Some(2));
+    assert_eq!(rig.svc.driver.head(), blocks[1].0, "each import became the head");
+    assert_eq!(executed(&rig), vec![blocks[0].0, blocks[1].0], "in block order");
     let catch_up = rig.svc.catch_up.as_ref().expect("still pulling");
     assert!(catch_up.probing);
     assert_eq!((catch_up.next, catch_up.target), (4, 4 + MAX_RANGE_BLOCKS - 1));
 
-    // The probe comes back empty: that was the peer's head.
+    // The probe comes back empty: that was the peer's head. Its top block
+    // stays unexecuted: the live path or the next pull brings it.
     rig.svc.pending_imports.push((peer, RangeRequest { start: 4, count: MAX_RANGE_BLOCKS, step: 1 }, Vec::new()));
     let events = import(&mut rig).await;
-    assert_eq!(events, vec![ServiceEvent::Synced { height: 3, complete: true }]);
+    assert_eq!(events, vec![ServiceEvent::Synced { height: 2, complete: true }]);
     assert!(rig.svc.catch_up.is_none());
     assert!(rig.svc.catch_up_retry_after.is_some());
     assert_eq!(rig.svc.failed_peer, None, "a complete pull clears the blame");
+    assert_eq!(executed(&rig).len(), 2);
 }
 
-/// Audit 2026-10 round 2 (R2-I2): a peer's status height is not certified,
-/// and a peer that serves full windows of blocks it made up keeps a probe
-/// going for ever, moving the execution layer's head onto its chain. Past
-/// [`MAX_UNPROVEN_PAST_COMMITTED`] blocks above what consensus committed, a
-/// pulled block nothing proves ends the pull and the peer is refused for the
-/// gap; below it (or with nothing committed yet) the pull runs as before.
+/// Sync standard §3.4.6 (replaces audit 2026-10 R2-I2's cap past the
+/// committed height): a range no verified anchor covers is never executed.
+/// Past the unanchored-tail bound of 64 blocks the tail is dropped and the
+/// pull ends with a reason; the peer is not refused (§3.5), whether or not
+/// anything is committed.
 #[tokio::test]
-async fn a_pull_far_past_the_committed_height_stops_at_the_first_unproven_block() {
+async fn an_unanchored_tail_past_the_bound_ends_the_pull_with_nothing_executed() {
+    for committed in [None, Some(0)] {
+        let mut rig = node(1, 0, None).await;
+        let peer = PeerId::random();
+        let total = crate::sync_anchor::MAX_TAIL_BLOCKS as u64 + 6;
+        let blocks = chain(total);
+        rig.svc.committed_height = committed;
+        catching_up(&mut rig, peer, 1, total);
+        rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: total, step: 1 }, chunks(&blocks)));
+        let mut events = Vec::new();
+        for _ in 0..total.div_ceil(PULLED_BLOCKS_PER_STEP as u64) {
+            events.extend(import(&mut rig).await);
+        }
+        assert!(executed(&rig).is_empty(), "nothing anchored, nothing executed");
+        assert!(rig.svc.imported.is_empty());
+        assert!(rig.svc.catch_up.is_none(), "the pull ended at the bound");
+        assert!(rig.svc.pending_imports.is_empty(), "the rest of the reply is dropped");
+        assert!(!rig.svc.refused_range_peers.contains_key(&peer), "an unanchored tail is not a fault");
+        assert_eq!(rig.svc.failed_peer, Some(peer), "the next pull asks another peer first");
+        assert_eq!(events, vec![ServiceEvent::Synced { height: 0, complete: false }]);
+    }
+}
+
+/// `N42_SYNC_ANCHOR=observe` imports as before the anchor rule -- the
+/// unproven cap past the committed height of audit 2026-10 R2-I2 included --
+/// and counts what `enforce` would have refused.
+#[tokio::test]
+async fn under_observe_a_pull_far_past_the_committed_height_stops_at_the_first_unproven_block() {
     let mut rig = node(1, 0, None).await;
+    rig.svc.sync_anchor_mode = SyncAnchorMode::Observe;
     let peer = PeerId::random();
     let total = MAX_UNPROVEN_PAST_COMMITTED + 6;
     let blocks = chain(total);
@@ -170,6 +225,7 @@ async fn a_pull_far_past_the_committed_height_stops_at_the_first_unproven_block(
     assert!(rig.svc.catch_up.is_none(), "the pull ended");
     assert!(rig.svc.refused_range_peers.contains_key(&peer), "and the peer is not asked for the gap again");
     assert!(events.contains(&ServiceEvent::Synced { height: MAX_UNPROVEN_PAST_COMMITTED, complete: false }), "{events:?}");
+    assert_eq!(rig.svc.sync_anchor_would_refuse, MAX_UNPROVEN_PAST_COMMITTED, "every executed block was unanchored");
 }
 
 #[tokio::test]
@@ -189,14 +245,16 @@ async fn a_short_reply_before_the_target_asks_for_the_rest() {
 async fn a_reply_over_the_per_step_budget_is_finished_on_the_next_call() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    let blocks = chain(PULLED_BLOCKS_PER_STEP as u64 + 8);
+    let blocks = anchored_chain(&rig, PULLED_BLOCKS_PER_STEP as u64 + 8);
     let total = blocks.len() as u64;
     catching_up(&mut rig, peer, 1, total);
     rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: total, step: 1 }, chunks(&blocks)));
 
     let events = import(&mut rig).await;
     assert!(events.is_empty());
-    assert_eq!(rig.svc.imported.len(), PULLED_BLOCKS_PER_STEP, "one step's budget");
+    // One step's budget of blocks screened; the last waits for the header
+    // above it, which is in the rest.
+    assert_eq!(rig.svc.imported.len(), PULLED_BLOCKS_PER_STEP - 1, "one step's budget");
     assert_eq!(rig.svc.pending_imports.len(), 1, "the rest waits");
     let (_, rest, remaining) = &rig.svc.pending_imports[0];
     assert_eq!((rest.start, rest.count), (PULLED_BLOCKS_PER_STEP as u64 + 1, 8));
@@ -204,7 +262,7 @@ async fn a_reply_over_the_per_step_budget_is_finished_on_the_next_call() {
 
     let events = import(&mut rig).await;
     assert!(events.is_empty());
-    assert_eq!(rig.svc.imported.len() as u64, total);
+    assert_eq!(rig.svc.imported.len() as u64, total - 1);
     assert!(rig.svc.pending_imports.is_empty());
     assert!(rig.svc.catch_up.as_ref().is_some_and(|c| c.probing), "now probing past the target");
 }
@@ -213,15 +271,13 @@ async fn a_reply_over_the_per_step_budget_is_finished_on_the_next_call() {
 async fn blocks_gossip_already_imported_are_skipped_not_imported_twice() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    let blocks = chain(2);
+    let blocks = anchored_chain(&rig, 3);
     rig.svc.remember_imported(blocks[0].0);
-    catching_up(&mut rig, peer, 1, 2);
-    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 2, step: 1 }, chunks(&blocks)));
+    catching_up(&mut rig, peer, 1, 3);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 3, step: 1 }, chunks(&blocks)));
     import(&mut rig).await;
-    let imported: Vec<B256> =
-        rig.el.calls().iter().filter_map(|c| if let ElCall::NewPayload(h) = c { Some(*h) } else { None }).collect();
-    assert_eq!(imported, vec![blocks[1].0], "only the second block went to the execution layer");
-    assert!(rig.svc.catch_up.as_ref().is_some_and(|c| c.next == 3), "but the pull moved past both");
+    assert_eq!(executed(&rig), vec![blocks[1].0], "only the second block went to the execution layer");
+    assert!(rig.svc.catch_up.as_ref().is_some_and(|c| c.next == 4 && c.executed == 2), "but the pull moved past both");
 }
 
 #[tokio::test]
@@ -275,6 +331,7 @@ async fn a_pull_stops_and_blames_the_peer_when_its_reply_is_unusable() {
 
     // The execution layer refuses a block part-way: what was imported counts.
     let mut rig = node(1, 0, None).await;
+    let blocks = anchored_chain(&rig, 3);
     catching_up(&mut rig, peer, 1, 3);
     rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 3, step: 1 }, chunks(&blocks)));
     rig.el.set_behaviour(MockBehaviour { new_payload_error: Some("db closed".to_owned()), ..Default::default() });
@@ -293,9 +350,28 @@ fn header_qc(
     named: B256,
     signed: B256,
 ) -> Vec<u8> {
+    let message = svc.engine.signing_profile().commit_message(view, signed, B256::ZERO);
+    qc_signed_over(svc, keys, signers, view, named, &message)
+}
+
+/// The same certificate signed in the prepare (vote) domain: what a
+/// proposal's justify QC is, and not a sync anchor.
+fn prepare_qc(svc: &H2Service<MockExecutionLayer>, keys: &[BlsSecretKey], signers: &[usize], view: u64, named: B256) -> Vec<u8> {
+    let message = svc.engine.signing_profile().vote_message(view, named);
+    qc_signed_over(svc, keys, signers, view, named, &message)
+}
+
+/// gov5's `HotStuffQC` bytes naming `(view, named)`, signed over `message`.
+fn qc_signed_over(
+    svc: &H2Service<MockExecutionLayer>,
+    keys: &[BlsSecretKey],
+    signers: &[usize],
+    view: u64,
+    named: B256,
+    message: &[u8],
+) -> Vec<u8> {
     let profile = svc.engine.signing_profile();
-    let message = profile.vote_message(view, signed);
-    let signatures: Vec<_> = signers.iter().map(|&i| profile.sign(&keys[i], &message)).collect();
+    let signatures: Vec<_> = signers.iter().map(|&i| profile.sign(&keys[i], message)).collect();
     let refs: Vec<_> = signatures.iter().collect();
     let aggregate = n42_h2_primitives::bls::AggregateSignature::aggregate(&refs).expect("aggregate");
     let mut bitmap = (keys.len() as u16).to_le_bytes().to_vec();
@@ -326,10 +402,11 @@ fn block_with_extra(number: u64, parent: B256, view: u64, qc: Vec<u8>) -> (B256,
 }
 
 /// Section 6.6 of `docs/MATURITY_HARDENING_2026_10.md`: a pulled range
-/// whose third block carries a forged parent QC. The two blocks before it
-/// are imported; it and the one after are not; the peer is refused for the
-/// gap and not asked again even when it is the only peer, and another peer
-/// is asked instead.
+/// whose third block carries a forged parent QC. The block the second
+/// header anchors is executed; the second, whose anchor would be the forged
+/// QC, and everything after are not; the peer is refused for the gap and not
+/// asked again even when it is the only peer, and another peer is asked
+/// instead.
 #[tokio::test]
 async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_not_asked_again() {
     let (keys, set) = keys(4);
@@ -353,11 +430,9 @@ async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_n
     rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&blocks)));
     let events = import(&mut rig).await;
 
-    assert_eq!(events, vec![ServiceEvent::Synced { height: 2, complete: false }]);
-    let imported: Vec<B256> =
-        rig.el.calls().iter().filter_map(|c| if let ElCall::NewPayload(h) = c { Some(*h) } else { None }).collect();
-    assert_eq!(imported, vec![blocks[0].0, blocks[1].0], "the blocks before the forged QC, and only those");
-    assert!(!rig.svc.imported.contains(&blocks[2].0) && !rig.svc.imported.contains(&blocks[3].0));
+    assert_eq!(events, vec![ServiceEvent::Synced { height: 1, complete: false }]);
+    assert_eq!(executed(&rig), vec![blocks[0].0], "the block an honest header anchored, and only that");
+    assert!(blocks[1..].iter().all(|(hash, ..)| !rig.svc.imported.contains(hash)));
     assert_eq!(rig.svc.refused_range_peers.get(&peer), Some(&3));
     assert!(rig.svc.catch_up.is_none());
 
@@ -369,13 +444,11 @@ async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_n
     assert!(rig.svc.catch_up.is_none(), "the refused peer is not re-asked for the gap");
     assert!(rig.el.calls().iter().all(|c| !matches!(c, ElCall::NewPayload(h) if *h == blocks[2].0)));
 
-    // Another peer is.
+    // Another peer is, from above what was executed.
     let other = PeerId::random();
     rig.svc.note_peer_height(other, 10);
     within(rig.svc.consider_catch_up(&mut events)).await;
     let catch_up = rig.svc.catch_up.as_ref().expect("a pull from the other peer");
-    // From block 2: its QC proves block 1, not block 2 itself (audit 2026-10
-    // A-7). Block 2 comes back as held and is skipped.
     assert_eq!((catch_up.peer, catch_up.next), (other, 2));
 }
 
@@ -551,13 +624,7 @@ async fn a_body_sealed_by_its_views_leader_is_imported_after_a_peers_made_up_one
 async fn a_step_on_the_fast_path_still_stops_on_a_local_fault() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    let mut blocks: Vec<(B256, Header, alloy_primitives::Bytes)> = Vec::new();
-    let mut parent = B256::ZERO;
-    for number in 1..=(PULLED_BLOCKS_PER_STEP as u64 * 6) {
-        let block = block_with_extra(number, parent, number, Vec::new());
-        parent = block.0;
-        blocks.push(block);
-    }
+    let blocks = anchored_chain(&rig, PULLED_BLOCKS_PER_STEP as u64 * 6);
     let count = blocks.len() as u64;
     catching_up(&mut rig, peer, 1, count);
     rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count, step: 1 }, chunks(&blocks)));
@@ -567,12 +634,12 @@ async fn a_step_on_the_fast_path_still_stops_on_a_local_fault() {
     assert!(!rig.svc.pending_imports.is_empty(), "the step took the fast path");
 }
 
-/// Audit 2026-10 A-7: a header QC proves the block it names and the chain
-/// below it, not the block that carries it. A range server that copies one
-/// real QC into blocks it made up above the certified one gets them past the
-/// header check (gov5 accepts them too); they stay unproven for catch-up, and
-/// a pulled block is never committed, safe or finalized -- the one defence
-/// against such a chain is that only a commit settles a block.
+/// Audit 2026-10 A-7 and sync standard §3.3: a header QC proves the block it
+/// names and the chain below it, not the block that carries it. A range
+/// server that copies one real QC into blocks it made up above the certified
+/// one gets nothing of them executed: they are never anchored. Only the
+/// certified chain reaches the execution layer, and it is never committed,
+/// safe or finalized by the pull.
 #[tokio::test]
 async fn a_header_qc_proves_the_chain_up_to_the_block_it_names_not_the_block_carrying_it() {
     let (keys, set) = keys(4);
@@ -601,8 +668,9 @@ async fn a_header_qc_proves_the_chain_up_to_the_block_it_names_not_the_block_car
     rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&blocks)));
     import(&mut rig).await;
 
-    assert!(blocks.iter().all(|(hash, ..)| rig.svc.imported.contains(hash)), "every block passes the header check");
-    assert_eq!(rig.svc.unproven_from, Some(3), "only blocks 1 and 2 are certified");
+    assert_eq!(executed(&rig), vec![blocks[0].0, blocks[1].0], "only blocks 1 and 2 are certified");
+    assert!(!rig.svc.imported.contains(&blocks[2].0) && !rig.svc.imported.contains(&blocks[3].0));
+    assert_eq!(rig.svc.unproven_from, None, "nothing unproven was executed");
     assert_eq!(rig.svc.engine.last_committed_qc().view, 0, "a pulled block is not committed");
     for call in rig.el.calls() {
         if let ElCall::ForkchoiceUpdated(state) = call {
@@ -640,24 +708,16 @@ async fn a_pulled_block_whose_qc_names_an_unknown_epoch_is_checked_by_its_parent
     // The parent link is checked either way.
     let unknown = header_qc(&rig.svc, &keys, &quorum, 25, parent, parent);
     let (_, header, _) = block_with_extra(2, B256::repeat_byte(0x09), 30, unknown);
-    rig.svc.catch_up = Some(CatchUp {
-        peer: PeerId::random(),
-        next: 2,
-        target: 4,
-        started_at: 0,
-        probing: false,
-        probe_height: 0,
-        prev_hash: Some(B256::repeat_byte(0x01)),
-    });
+    rig.svc.catch_up =
+        Some(CatchUp { next: 2, prev_hash: Some(B256::repeat_byte(0x01)), ..CatchUp::new(PeerId::random(), 0, 4) });
     assert!(rig.svc.check_pulled_block(&header).is_err(), "a block that does not extend the last one");
 }
 
-/// Audit 2026-10 B-1: a range server that answers a node behind it with a
-/// chain whose headers carry no certificate it can check (here none at all)
-/// gets that chain imported on its parent links alone, and the execution
-/// layer's head moves to it. That head must not then stand for "caught up":
-/// an honest peer at the same height still has to be pulled from, or the
-/// node never leaves the forged chain -- a restart reads the same head.
+/// Audit 2026-10 B-1 and sync standard §3.4.6: a range server whose chain
+/// carries no certificate at all (a forged chain, or a stretch of a producer
+/// that embeds none) gets none of it executed under `enforce`: the pull ends
+/// at its head with the blocks held and dropped, no blame. An honest peer at
+/// the same height is still pulled from.
 #[tokio::test]
 async fn an_uncertified_pulled_chain_does_not_stop_a_pull_from_an_honest_peer() {
     let mut rig = node(1, 0, None).await;
@@ -666,20 +726,45 @@ async fn an_uncertified_pulled_chain_does_not_stop_a_pull_from_an_honest_peer() 
     catching_up(&mut rig, forger, 1, 4);
     rig.svc.pending_imports.push((forger, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&forged)));
     import(&mut rig).await;
-    assert!(
-        rig.el.calls().iter().any(|c| matches!(c, ElCall::NewPayload(h) if *h == forged[3].0)),
-        "the uncertified chain reached the execution layer"
-    );
+    rig.svc.pending_imports.push((forger, RangeRequest { start: 5, count: MAX_RANGE_BLOCKS, step: 1 }, Vec::new()));
+    assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 0, complete: true }]);
+    assert!(executed(&rig).is_empty(), "the uncertified chain did not reach the execution layer");
+    assert!(!rig.svc.refused_range_peers.contains_key(&forger), "not blamed: it may be an honest legacy server");
 
     let honest = PeerId::random();
-    rig.svc.catch_up = None;
     rig.svc.catch_up_retry_after = None;
     rig.svc.peer_heights.remove(&forger);
     rig.svc.note_peer_height(honest, 4);
     let mut events = Vec::new();
     within(rig.svc.consider_catch_up(&mut events)).await;
     let catch_up = rig.svc.catch_up.as_ref().expect("the honest peer is pulled from");
-    assert_eq!(catch_up.peer, honest);
+    assert_eq!((catch_up.peer, catch_up.next), (honest, 1));
+}
+
+/// The same chain under `N42_SYNC_ANCHOR=observe`: imported as before the
+/// rule, and every block `enforce` would have held is counted and logged.
+#[tokio::test]
+async fn under_observe_an_uncertified_chain_is_imported_and_logged() {
+    let mut rig = node(1, 0, None).await;
+    rig.svc.sync_anchor_mode = SyncAnchorMode::Observe;
+    let peer = PeerId::random();
+    let blocks = chain(4);
+    catching_up(&mut rig, peer, 1, 4);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&blocks)));
+    import(&mut rig).await;
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 5, count: MAX_RANGE_BLOCKS, step: 1 }, Vec::new()));
+    assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 4, complete: true }]);
+    assert_eq!(executed(&rig), blocks.iter().map(|b| b.0).collect::<Vec<_>>(), "imported as before");
+    assert_eq!(rig.svc.sync_anchor_would_refuse, 4, "enforce would have executed none of them");
+
+    // `off`: the same import, nothing counted.
+    let mut rig = node(1, 0, None).await;
+    rig.svc.sync_anchor_mode = SyncAnchorMode::Off;
+    catching_up(&mut rig, peer, 1, 4);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&blocks)));
+    import(&mut rig).await;
+    assert_eq!(executed(&rig).len(), 4);
+    assert_eq!(rig.svc.sync_anchor_would_refuse, 0);
 }
 
 /// A block that does not extend the one pulled before it is refused before
@@ -688,14 +773,95 @@ async fn an_uncertified_pulled_chain_does_not_stop_a_pull_from_an_honest_peer() 
 async fn a_pulled_block_that_does_not_extend_the_previous_one_is_refused() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    let first = block(1, B256::ZERO);
-    let stray = block(2, B256::repeat_byte(0x09));
-    catching_up(&mut rig, peer, 1, 2);
-    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 2, step: 1 }, chunks(&[first.clone(), stray])));
+    let mut blocks = anchored_chain(&rig, 2);
+    blocks.push(block(3, B256::repeat_byte(0x09)));
+    catching_up(&mut rig, peer, 1, 3);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 3, step: 1 }, chunks(&blocks)));
     assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 1, complete: false }]);
-    assert!(rig.svc.imported.contains(&first.0));
-    assert_eq!(rig.svc.imported.len(), 1);
-    assert_eq!(rig.svc.refused_range_peers.get(&peer), Some(&2));
+    assert_eq!(executed(&rig), vec![blocks[0].0]);
+    assert_eq!(rig.svc.refused_range_peers.get(&peer), Some(&3));
+}
+
+/// Sync standard §3.4: a peer that serves a made-up block in the middle of
+/// an honest range, followed by a block that carries a real commit QC copied
+/// from the honest chain. The QCs name honest blocks, so the made-up ones are
+/// never anchored: nothing from the forged block up reaches the execution
+/// layer, while the honest prefix below it does.
+#[tokio::test]
+async fn a_forged_block_mid_range_never_reaches_the_execution_layer() {
+    let (keys, set) = keys(4);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    let peer = PeerId::random();
+    let real = anchored_chain(&rig, 6);
+    let qc_of = |header: &Header| n42_h2_consensus::HeaderExtra::decode(&header.extra_data).expect("extra").qc;
+    // Block 4 made up on the real block 3 (another view, so another hash),
+    // carrying real block 4's QC; block 5 on top of it with real block 5's.
+    let forged4 = block_with_extra(4, real[2].0, 9, qc_of(&real[3].1));
+    let forged5 = block_with_extra(5, forged4.0, 10, qc_of(&real[4].1));
+    assert_ne!(forged4.0, real[3].0);
+    let served = vec![real[0].clone(), real[1].clone(), real[2].clone(), forged4.clone(), forged5.clone()];
+    catching_up(&mut rig, peer, 1, 5);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 5, step: 1 }, chunks(&served)));
+    assert!(import(&mut rig).await.is_empty());
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 6, count: MAX_RANGE_BLOCKS, step: 1 }, Vec::new()));
+    assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 3, complete: true }]);
+    assert_eq!(executed(&rig), vec![real[0].0, real[1].0, real[2].0], "the honest prefix, and only that");
+    assert!(!rig.svc.imported.contains(&forged4.0) && !rig.svc.imported.contains(&forged5.0));
+}
+
+/// An anchor that arrives in a later range authenticates a block buffered
+/// from an earlier one: the top of the first reply is executed once the
+/// header above it comes in the next.
+#[tokio::test]
+async fn an_anchor_in_a_later_range_releases_a_block_buffered_from_an_earlier_one() {
+    let mut rig = node(1, 0, None).await;
+    let peer = PeerId::random();
+    let blocks = anchored_chain(&rig, 5);
+    catching_up(&mut rig, peer, 1, 5);
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 5, step: 1 }, chunks(&blocks[..3])));
+    assert!(import(&mut rig).await.is_empty());
+    assert_eq!(executed(&rig), vec![blocks[0].0, blocks[1].0]);
+    assert_eq!(rig.svc.catch_up.as_ref().map(|c| c.next), Some(4), "asks on");
+
+    rig.svc.pending_imports.push((peer, RangeRequest { start: 4, count: 2, step: 1 }, chunks(&blocks[3..])));
+    import(&mut rig).await;
+    assert_eq!(executed(&rig), blocks[..4].iter().map(|b| b.0).collect::<Vec<_>>(), "block 3 released by block 4's QC");
+}
+
+/// Sync standard §3.3: a header QC is an anchor only in the commit domain
+/// and only under the set of its exact view. A prepare-domain QC, or a
+/// commit QC whose set this node does not know (fails closed), anchors
+/// nothing -- and neither is the peer's fault.
+#[tokio::test]
+async fn a_prepare_qc_or_a_qc_of_an_unknown_set_anchors_nothing_and_blames_no_one() {
+    let (keys, set) = keys(4);
+    let quorum = [0, 1, 2];
+    for case in ["prepare", "unknown set"] {
+        let mut rig = node_in(&keys, &set, 0, None).await;
+        *rig.svc.engine.epoch_manager_mut() = n42_h2_consensus::EpochManager::with_epoch_length(set.clone(), 10);
+        // Views 21..=30 are epoch 2, for which no set is known.
+        let base = if case == "prepare" { 0 } else { 20 };
+        let peer = PeerId::random();
+        let mut blocks: Vec<(B256, Header, alloy_primitives::Bytes)> = Vec::new();
+        let mut parent = B256::ZERO;
+        for number in 1..=4u64 {
+            let view = base + number;
+            let qc = match (number, case) {
+                (1, _) => Vec::new(),
+                (_, "prepare") => prepare_qc(&rig.svc, &keys, &quorum, view - 1, parent),
+                _ => header_qc(&rig.svc, &keys, &quorum, view - 1, parent, parent),
+            };
+            let block = block_with_extra(number, parent, view, qc);
+            parent = block.0;
+            blocks.push(block);
+        }
+        catching_up(&mut rig, peer, 1, 4);
+        rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 4, step: 1 }, chunks(&blocks)));
+        import(&mut rig).await;
+        assert!(executed(&rig).is_empty(), "{case}: nothing anchored, nothing executed");
+        assert!(!rig.svc.refused_range_peers.contains_key(&peer), "{case}: not a fault");
+        assert!(rig.svc.catch_up.is_some(), "{case}: the pull goes on");
+    }
 }
 
 #[tokio::test]
@@ -703,13 +869,13 @@ async fn a_short_probe_reply_ends_the_pull_only_at_the_height_the_probe_began_at
     for (probe_height, ends) in [(2u64, true), (5, false)] {
         let mut rig = node(1, 0, None).await;
         let peer = PeerId::random();
-        let blocks = chain(2);
-        rig.svc.catch_up =
-            Some(CatchUp { peer, next: 1, target: 1024, started_at: 0, probing: true, probe_height, prev_hash: None });
+        let blocks = anchored_chain(&rig, 2);
+        rig.svc.catch_up = Some(CatchUp { probing: true, probe_height, ..CatchUp::new(peer, 0, 1024) });
         rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 1024, step: 1 }, chunks(&blocks)));
         let events = import(&mut rig).await;
         if ends {
-            assert_eq!(events, vec![ServiceEvent::Synced { height: 2, complete: true }]);
+            // Block 2's anchor is not served: it stays unexecuted.
+            assert_eq!(events, vec![ServiceEvent::Synced { height: 1, complete: true }]);
             assert!(rig.svc.catch_up.is_none());
         } else {
             // Short of the window but below the probe's height: a server's
@@ -724,33 +890,33 @@ async fn a_short_probe_reply_ends_the_pull_only_at_the_height_the_probe_began_at
 async fn an_empty_probe_ends_a_pull_that_already_made_progress() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    rig.svc.catch_up = Some(CatchUp { peer, next: 11, target: 1034, started_at: 4, probing: true, probe_height: 0, prev_hash: None });
+    rig.svc.catch_up = Some(CatchUp { next: 11, executed: 10, probing: true, ..CatchUp::new(peer, 4, 1034) });
     rig.svc.pending_imports.push((peer, RangeRequest { start: 11, count: 1024, step: 1 }, Vec::new()));
     assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 10, complete: true }]);
 }
 
 /// Sync standard B2: a server that stops at its head -- cleanly, or (gov5
 /// main, n42-26) with an error chunk the codec turns into a short reply --
-/// leaves a prefix. The pull imports it and asks on from after it; the
-/// refusal that answers that is where the peer's chain ends, and the pull
-/// finishes without blaming the peer.
+/// leaves a prefix. The pull imports what of it is anchored and asks on from
+/// after it; the refusal that answers that is where the peer's chain ends,
+/// and the pull finishes without blaming the peer.
 #[tokio::test]
 async fn a_pull_asks_on_after_a_prefix_and_ends_without_blame_where_the_peer_stops() {
     let mut rig = node(1, 0, None).await;
     let peer = PeerId::random();
-    let blocks = chain(3);
+    let blocks = anchored_chain(&rig, 3);
     catching_up(&mut rig, peer, 1, 8);
     rig.svc.pending_imports.push((peer, RangeRequest { start: 1, count: 8, step: 1 }, chunks(&blocks)));
     assert!(import(&mut rig).await.is_empty());
     let catch_up = rig.svc.catch_up.as_ref().expect("still pulling");
     assert_eq!((catch_up.next, catch_up.probing), (4, false), "asks on from after the prefix");
-    assert_eq!(rig.svc.imported_height, Some(3));
+    assert_eq!(rig.svc.imported_height, Some(2));
 
     let request = RangeRequest { start: 4, count: 5, step: 1 };
     rig.svc
         .handle_transport_event(TransportEvent::RangeFetched { peer, request, reply: Err("code 2: invalid block number".into()) })
         .expect("handled");
-    assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 3, complete: true }]);
+    assert_eq!(import(&mut rig).await, vec![ServiceEvent::Synced { height: 2, complete: true }]);
     assert!(rig.svc.catch_up.is_none());
     assert_eq!(rig.svc.failed_peer, None, "not blamed");
     assert!(!rig.svc.refused_range_peers.contains_key(&peer), "nor refused");
@@ -832,7 +998,7 @@ async fn a_restarted_server_serves_and_advertises_up_to_its_restored_commit() {
     })
     .await;
     a.svc.catch_up =
-        Some(CatchUp { peer: target, next: 1, target: 10, started_at: 0, probing: false, probe_height: 0, prev_hash: None });
+        Some(CatchUp::new(target, 0, 10));
 
     a.svc.transport.request_range(target, RangeRequest { start: 1, count: 10, step: 1 });
     pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| !a.svc.pending_imports.is_empty()).await;
@@ -1226,7 +1392,7 @@ async fn a_range_is_served_off_the_loop_and_its_slots_are_held_until_the_answer_
     // committed height reach its import queue (as empty replies).
     a.svc.pending_imports.clear();
     a.svc.catch_up =
-        Some(CatchUp { peer: target, next: 100, target: 103, started_at: 99, probing: false, probe_height: 0, prev_hash: None });
+        Some(CatchUp::new(target, 99, 103));
     let before = b.seen.len();
     for start in 100..104 {
         a.svc.transport.request_range(target, RangeRequest { start, count: 1, step: 1 });
@@ -1258,7 +1424,7 @@ async fn a_fifth_range_request_from_one_peer_is_refused_with_the_server_error_co
     // `a` pulls from `b`, so a refusal reaches its import queue (as an empty
     // reply) rather than only a log line.
     a.svc.catch_up =
-        Some(CatchUp { peer: target, next: 2, target: 2, started_at: 1, probing: false, probe_height: 0, prev_hash: None });
+        Some(CatchUp::new(target, 1, 2));
 
     // Four of `a`'s requests are in flight at `b` (held here, so the timing
     // of the mock execution layer cannot free them): `a`'s share is full.
@@ -1281,10 +1447,15 @@ async fn a_fifth_range_request_from_one_peer_is_refused_with_the_server_error_co
     assert_eq!(a.svc.pending_imports[0].2.len(), 1, "block 2");
 }
 
+/// Two real services over loopback, one validator set: the member behind
+/// pulls the honest peer's anchored chain and executes all of it but the
+/// top block, whose anchor no header carries yet.
 #[tokio::test]
 async fn a_member_behind_its_peer_pulls_the_gap_and_finishes_level() {
-    let (b_height, blocks) = (3u64, chain(3));
-    let mut b = node(1, 0, None).await;
+    let (keys, set) = keys(1);
+    let mut b = node_in(&keys, &set, 0, None).await;
+    let b_height = 4u64;
+    let blocks = anchored_chain(&b, b_height);
     b.svc.transport.set_advertised_height(b_height);
     {
         use n42_h2_execution::ExecutionLayer;
@@ -1295,17 +1466,18 @@ async fn a_member_behind_its_peer_pulls_the_gap_and_finishes_level() {
         }
     }
     b.svc.committed_height = Some(b_height);
-    let mut a = node(1, 0, Some(b.addr.clone())).await;
+    let mut a = node_in(&keys, &set, 0, Some(b.addr.clone())).await;
     let mut a_events = Vec::new();
     pump(&mut a, &mut b, (true, true), &mut a_events, |_, _, events| {
         events.iter().any(|e| matches!(e, ServiceEvent::Synced { .. }))
     })
     .await;
-    assert!(a_events.contains(&ServiceEvent::Syncing { from: 0, to: 3 }), "{a_events:?}");
+    assert!(a_events.contains(&ServiceEvent::Syncing { from: 0, to: 4 }), "{a_events:?}");
     assert!(a_events.contains(&ServiceEvent::Synced { height: 3, complete: true }), "{a_events:?}");
-    for (hash, _, _) in &blocks {
+    for (hash, _, _) in &blocks[..3] {
         assert!(a.svc.imported.contains(hash), "block {hash} was pulled");
     }
+    assert!(!a.svc.imported.contains(&blocks[3].0), "the top block waits for its anchor");
     assert_eq!(a.svc.driver.head(), blocks[2].0);
     assert!(a.svc.catch_up.is_none());
     assert_eq!(a.svc.failed_peer, None);

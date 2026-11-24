@@ -2070,7 +2070,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     /// Sets the profile-1 vote rules ([`n42_h2_consensus::VoteRules`]) on
-    /// this node: the engine's Round 1 and CommitVote gates and its progress
+    /// this node: the engine's Round 1 and `CommitVote` gates and its progress
     /// votes, the driver's vote before the slot and settlement tags, and the
     /// vote transport (E16: every vote is published on the consensus topic;
     /// `/n42/vote/1` is not a standard protocol). Once, before the node runs;

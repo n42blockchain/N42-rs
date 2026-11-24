@@ -57,6 +57,9 @@ pub struct N42EngineValidator<ChainSpec> {
     /// runs itself.
     chain_spec: Arc<ChainSpec>,
     profile: N42HeaderProfile,
+    /// The profile-1 header rules (default: none), for the payload
+    /// attributes' timestamp rule (B4).
+    header_rules: n42_h2_consensus::HeaderRules,
 }
 
 impl<ChainSpec> N42EngineValidator<ChainSpec> {
@@ -66,7 +69,14 @@ impl<ChainSpec> N42EngineValidator<ChainSpec> {
             inner: EthereumEngineValidator::new(chain_spec.clone()),
             chain_spec,
             profile,
+            header_rules: n42_h2_consensus::HeaderRules::default(),
         }
+    }
+
+    /// The same validator under the profile-1 header rules `rules`.
+    pub fn with_header_rules(mut self, rules: n42_h2_consensus::HeaderRules) -> Self {
+        self.header_rules = rules;
+        self
     }
 
     /// The profile in force.
@@ -691,6 +701,25 @@ where
 {
     type Block = EthBlock;
 
+    /// Engine API rule 7 (attributes later than the head), except on a
+    /// profile-1 chain, where a block may share its parent's timestamp (B4,
+    /// O7): there only an earlier timestamp is refused. reth's default is
+    /// the strict `>`.
+    fn validate_payload_attributes_against_header(
+        &self,
+        attr: &Types::PayloadAttributes,
+        header: &<Self::Block as reth_primitives_traits::Block>::Header,
+    ) -> Result<(), reth_payload_primitives::InvalidPayloadAttributesError> {
+        use alloy_consensus::BlockHeader as _;
+        use reth_payload_primitives::PayloadAttributes as _;
+        let (attr_time, head_time) = (attr.timestamp(), header.timestamp());
+        let refused = if self.header_rules.is_profile1() { attr_time < head_time } else { attr_time <= head_time };
+        if refused {
+            return Err(reth_payload_primitives::InvalidPayloadAttributesError::InvalidTimestamp);
+        }
+        Ok(())
+    }
+
     fn convert_payload_to_block(
         &self,
         payload: ExecutionData,
@@ -963,7 +992,8 @@ where
     async fn build(self, ctx: &AddOnsContext<'_, Node>) -> eyre::Result<Self::Validator> {
         let chain_spec = ctx.config.chain.clone();
         let profile = header_profile_for(chain_spec.as_ref());
-        Ok(N42EngineValidator::new(chain_spec, profile))
+        let rules = crate::hotstuff_consensus::chain_header_rules(chain_spec.as_ref());
+        Ok(N42EngineValidator::new(chain_spec, profile).with_header_rules(rules))
     }
 }
 
@@ -2366,5 +2396,37 @@ mod tests {
                 .expect("converts with the frame root");
             assert_eq!(sealed.hash(), hash);
         });
+    }
+
+    /// B4 / O7: the payload attributes may share the head's timestamp on a
+    /// profile-1 chain; reth's rule 7 (strictly later) holds everywhere else.
+    #[test]
+    fn b4_profile1_attributes_may_share_the_head_timestamp() {
+        let head = gov5_header(B256::ZERO, U256::ZERO);
+        let attrs = |timestamp| EthPayloadAttributes {
+            timestamp,
+            prev_randao: B256::ZERO,
+            suggested_fee_recipient: alloy_primitives::Address::ZERO,
+            withdrawals: Some(Vec::new()),
+            parent_beacon_block_root: Some(B256::ZERO),
+            slot_number: None,
+            target_gas_limit: None,
+            mobile_registry_root: None,
+        };
+        let check = |validator: &N42EngineValidator<ChainSpec>, timestamp| {
+            <N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::validate_payload_attributes_against_header(
+                validator,
+                &attrs(timestamp),
+                &head,
+            )
+        };
+        let plain = N42EngineValidator::new(MAINNET.clone(), N42HeaderProfile::Gov5H2);
+        let profile1 = N42EngineValidator::new(MAINNET.clone(), N42HeaderProfile::Gov5H2).with_header_rules(
+            n42_h2_consensus::HeaderRules::profile1(30_000_000, n42_h2_consensus::PROFILE1_MAX_BLOCK_BYTES, None),
+        );
+        assert!(check(&plain, head.timestamp).is_err());
+        check(&plain, head.timestamp + 1).unwrap();
+        check(&profile1, head.timestamp).expect("equal timestamps on profile 1");
+        assert!(check(&profile1, head.timestamp - 1).is_err());
     }
 }

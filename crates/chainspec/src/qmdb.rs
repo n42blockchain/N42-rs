@@ -388,7 +388,61 @@ pub fn genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header {
         header.state_root = qmdb_genesis_root(genesis)
             .expect("a genesis allocation always has a QMDB root");
     }
+    if is_profile1(genesis) {
+        // The mixed production standard, profile 1 (A6 with B3, B8/AM3, B10,
+        // B12), as gov5 writes it (vector V1): ommers hash zero, the
+        // requests hash the empty trie root, element 22 the 0x80 gap, slot
+        // number 0. Element 24 (`mobileRegistryRoot`, zero) is not an
+        // Ethereum field: it is in the hash ([`sealed_genesis_header`]) and on
+        // the N42 header.
+        header.ommers_hash = B256::ZERO;
+        header.requests_hash = Some(alloy_consensus::EMPTY_ROOT_HASH);
+        header.block_access_list_hash = None;
+        header.slot_number = Some(0);
+    }
     header
+}
+
+/// [`genesis_header`], sealed. On a profile-1 genesis the hash is the N42
+/// header's, which carries `mobileRegistryRoot` (zero) as element 24 after
+/// the Ethereum fields; every other genesis hashes as reth does.
+pub fn sealed_genesis_header(
+    genesis: &Genesis,
+    hardforks: &ChainHardforks,
+) -> reth_primitives_traits::SealedHeader<Header> {
+    let header = genesis_header(genesis, hardforks);
+    if !is_profile1(genesis) {
+        return reth_primitives_traits::SealedHeader::new_unhashed(header);
+    }
+    let hash = hash_with_zero_registry_root(&header);
+    reth_primitives_traits::SealedHeader::new(header, hash)
+}
+
+/// keccak of the N42 header with `mobileRegistryRoot` zero: the Ethereum
+/// fields through the requests hash, then element 22 (the access-list hash,
+/// `0x80` when absent), element 23 (the slot number) and element 24 (a zero
+/// 32-byte string). alloy's own encoding stops at the last present field and
+/// knows no element 24, so the three are written here.
+fn hash_with_zero_registry_root(header: &Header) -> B256 {
+    use alloy_rlp::Encodable as _;
+    let mut head = header.clone();
+    head.block_access_list_hash = None;
+    head.slot_number = None;
+    let mut ethereum = Vec::new();
+    head.encode(&mut ethereum);
+    let mut cursor = ethereum.as_slice();
+    let list = alloy_rlp::Header::decode(&mut cursor).expect("a header encodes as a list");
+    let mut payload = cursor[..list.payload_length].to_vec();
+    match header.block_access_list_hash {
+        Some(hash) => hash.encode(&mut payload),
+        None => payload.push(alloy_rlp::EMPTY_STRING_CODE),
+    }
+    header.slot_number.unwrap_or_default().encode(&mut payload);
+    B256::ZERO.encode(&mut payload);
+    let mut out = Vec::with_capacity(payload.len() + 9);
+    alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut out);
+    out.extend_from_slice(&payload);
+    alloy_primitives::keccak256(out)
 }
 
 #[cfg(test)]

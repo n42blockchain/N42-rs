@@ -1710,6 +1710,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         validator_count: usize,
     ) -> Self {
         let identity = transport.identity();
+        // The genesis QC certifies the genesis block: what a leader builds on
+        // and a voter checks the parent against while no QC has formed.
+        engine.set_genesis_block(identity.genesis_hash);
         engine.set_vote_aggregate(vote_aggregate_from_env());
         engine.set_vote_log_fatal_after(vote_log_fatal_after_from_env());
         // How a body this node kept as bytes becomes a payload, for the
@@ -4103,8 +4106,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         {
             return None;
         }
-        let certified = self.engine.locked_qc().block_hash;
-        let head = if certified == B256::ZERO { self.driver.head() } else { certified };
+        let head = self.proposal_parent();
         let tick = self.pacing_tick(&head)?;
         (tick > std::time::Instant::now()).then(|| tokio::time::Instant::from_std(tick))
     }
@@ -4190,6 +4192,17 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
+    /// The parent of this leader's next block: the block its highest QC
+    /// certifies ([`ConsensusEngine::proposal_parent`]), the genesis block
+    /// for the genesis QC. The execution layer's head only when the engine
+    /// names no genesis block (a harness without one).
+    fn proposal_parent(&self) -> B256 {
+        match self.engine.proposal_parent() {
+            B256::ZERO => self.driver.head(),
+            parent => parent,
+        }
+    }
+
     /// Builds and announces a block when this node is the leader of a view it
     /// has not yet proposed for.
     async fn propose_if_leader(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
@@ -4243,16 +4256,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         // has yet to import that block — it joined after the block went round,
         // or the QC reached it before the body — would otherwise propose a
         // sibling from a stale head. Such a leader asks for the block and
-        // proposes once it has it; the genesis QC certifies nothing and leaves
-        // the head in charge.
+        // proposes once it has it. The genesis QC certifies the genesis block:
+        // a block the execution layer imported without a QC (a proposal the
+        // fleet refused, then a timeout certificate) is not a parent.
         // Timed from here to the build, because the phase analysis says a
         // leader spends 1,397 ms between committing and publishing a body while
         // building and sealing account for 887 of it. The 510 ms in between is
         // this function, and nothing here looks like 510 ms -- which is exactly
         // why it gets measured rather than reasoned about.
         let decided = std::time::Instant::now();
-        let certified = self.engine.locked_qc().block_hash;
-        let head = if certified == B256::ZERO { self.driver.head() } else { certified };
+        let head = self.proposal_parent();
         let from_el = !self.block_headers.contains_key(&head);
         let head_header = match self.block_headers.get(&head) {
             Some(header) => Some(header.clone()),
@@ -4265,7 +4278,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             },
         };
-        if head != self.driver.head() && head_header.is_none() {
+        // The genesis block is every execution layer's from the start; it is
+        // never asked for (no peer serves it as a body).
+        if head != self.driver.head() && head != self.identity.genesis_hash && head_header.is_none() {
             warn!(target: "n42.h2.node", view, certified = ?head, imported = ?self.driver.head(), "the block our highest QC certifies is not imported; asking for it before proposing");
             if self.await_body(head) {
                 for peer in self.transport.connected_peer_ids() {

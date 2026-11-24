@@ -775,3 +775,25 @@ Profile-1 genesis (a zero address refuses the genesis). B11: gov5 followers chec
 field is present after activation and carry the value, which is the interim rule of AM12. V8's
 refused cases also include zero `epochLength`, a reward above `u64::MAX` gwei, and a non-zero
 reward with a zero faucet address.
+
+**AM17 (owner, 2026-11-24): the slot is 8 seconds; 500 ms belongs to the performance line; 100
+validators are a design and test requirement.**
+- N42's own chain, which Profile 1 standardises, has an 8-second slot. The standard genesis sets
+  `blockIntervalMs: 8000`. The 500 ms interval (and everything measured at it) is the performance
+  line: chains outside the profile (AM9, AM11). This replaces the `blockIntervalMs` value of O8 and
+  of section 5.
+- Values that depend on the slot are re-derived before the genesis file is cut, with gov5 (whose
+  production fleet runs this slot): `baseTimeoutMs` / `maxTimeoutMs` (a view timeout must exceed
+  the slot plus a block's cycle; 6000 / 30000 were chosen for sub-second pacing), `leaderTenure`
+  (8 slots = 64 s a tenure; with n validators a member leads once every n × 64 s), `epochLength` in
+  blocks, the gas limit per 8-second block, and the timestamp rule's bound (B4: with an 8-second
+  slot timestamps are strictly increasing in practice; the `>=` rule stays valid).
+- 100 validators: the profile must be DESIGNED for 100+ validators and PROVEN at that size. Review
+  before milestone 2, per item: quorum certificate size and BLS aggregation / verification cost at
+  100 signers, vote transport (gossip mesh and direct votes) at 100 members, timeout certificates
+  and rotate-on-timeout with many absent members, tenure and epoch arithmetic, the committee pool
+  alongside a 100-member validator set, range/state sync serving with many peers, status handshake
+  fan-out. Test: a mixed round with at least 100 validators (several per execution layer, all three
+  clients' validators present) is a gate of milestone 2, not a late add-on; it replaces the
+  post-milestone-3 gate of AM11(b). A round with members absent (f = 33) and a leader killed is
+  part of it.

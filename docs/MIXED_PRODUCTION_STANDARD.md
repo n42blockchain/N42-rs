@@ -797,3 +797,9 @@ validators are a design and test requirement.**
   clients' validators present) is a gate of milestone 2, not a late add-on; it replaces the
   post-milestone-3 gate of AM11(b). A round with members absent (f = 33) and a leader killed is
   part of it.
+
+**AM18 (owner, 2026-11-24): n42-26 agrees.** The owner confirmed n42-26's agreement to v0.3. With
+gov5 (AM16) and n42-rs (AM15) all three clients agree to the standard as amended through AM17. The
+remaining open items are named in the text: the slot-dependent genesis values (AM17), E2
+validator-set changes (AM5), B11 (AM12), the 100-validator review and round (AM17), and n42-26's
+milestone-1 entry form (AM6: verifying non-validator node first, unless its owner says otherwise).

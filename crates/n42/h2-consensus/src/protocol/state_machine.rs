@@ -348,6 +348,17 @@ pub struct ConsensusEngine {
     /// the engine goes through [`Self::leader_index_for_view`] so that this
     /// is applied in exactly one place.
     pub(super) leader_tenure: u64,
+    /// The rotate-on-timeout activation (`hotstuff.rotateOnTimeoutView`):
+    /// `Some(a)` moves a TC for a view `>= a` to the next tenure window
+    /// ([`LeaderSelector::view_after_timeout`]); `None` is the classic
+    /// `view + 1`. Chain configuration, like the tenure: never persisted,
+    /// set once before the engine runs.
+    pub(super) rotate_on_timeout_from: Option<u64>,
+    /// The chain's genesis `epochLength` (views; 0 = none) the rotated view
+    /// is clamped to. Explicit rather than read from `epoch_manager`, whose
+    /// length a node may run at 0 while gov5 runs the genesis value: the
+    /// view sequence must be the same on every client either way.
+    pub(super) rotate_epoch_length: u64,
     /// Explicitly selected signing domain. Native is the safe default; H2-v4
     /// is enabled only for gov5 participant mode.
     pub(super) signing_profile: ConsensusSigningProfile,
@@ -543,6 +554,8 @@ impl ConsensusEngine {
             local_public_key,
             epoch_manager,
             leader_tenure: 1,
+            rotate_on_timeout_from: None,
+            rotate_epoch_length: 0,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
             two_phase_vote_gate: false,
@@ -665,6 +678,8 @@ impl ConsensusEngine {
             local_public_key,
             epoch_manager,
             leader_tenure: 1,
+            rotate_on_timeout_from: None,
+            rotate_epoch_length: 0,
             signing_profile: ConsensusSigningProfile::Native,
             vote_before_import: false,
             two_phase_vote_gate: false,
@@ -1143,6 +1158,46 @@ impl ConsensusEngine {
     /// is refused.
     pub fn set_leader_tenure(&mut self, tenure: u64) {
         self.leader_tenure = tenure.max(1);
+    }
+
+    /// Sets the rotate-on-timeout activation (the chain's
+    /// `hotstuff.rotateOnTimeoutView`; `None` = rule off) and the chain's
+    /// genesis `epochLength` in views (0 = no epochs), which clamps the
+    /// rotated view to the next epoch boundary as gov5 does with its
+    /// engine's epoch length. Consensus-visible like the tenure: every
+    /// member must agree. gov5's `SetRotateOnTimeout`.
+    pub fn set_rotate_on_timeout(&mut self, from_view: Option<u64>, epoch_length: u64) {
+        self.rotate_on_timeout_from = from_view;
+        self.rotate_epoch_length = epoch_length;
+    }
+
+    /// The rotate-on-timeout activation; see [`Self::set_rotate_on_timeout`].
+    pub const fn rotate_on_timeout(&self) -> Option<u64> {
+        self.rotate_on_timeout_from
+    }
+
+    /// The view entered on a TC for `tc_view` under this chain's rule
+    /// (gov5's engine `viewAfterTC`): `tc_view + 1`, or the next tenure
+    /// window once rotate-on-timeout is active for `tc_view`. Every place
+    /// that used `tc.view + 1` goes through here.
+    pub fn view_after_tc(&self, tc_view: u64) -> u64 {
+        let rotate = self
+            .rotate_on_timeout_from
+            .is_some_and(|from| tc_view >= from);
+        if !rotate {
+            // Bit for bit the pre-rule behaviour (saturating at u64::MAX).
+            return tc_view.saturating_add(1);
+        }
+        match LeaderSelector::view_after_timeout(
+            tc_view,
+            self.leader_tenure,
+            self.rotate_epoch_length,
+            true,
+        ) {
+            // gov5 wraps to 0 at u64::MAX; the engine never moves backwards.
+            0 => u64::MAX,
+            view => view,
+        }
     }
 
     /// **Bench only, unsafe**: vote on a verified proposal before executing
@@ -7184,3 +7239,7 @@ mod gap_tests;
 #[cfg(test)]
 #[path = "state_machine_vote_retry_tests.rs"]
 mod vote_retry_tests;
+
+#[cfg(test)]
+#[path = "state_machine_rotate_tests.rs"]
+mod rotate_tests;

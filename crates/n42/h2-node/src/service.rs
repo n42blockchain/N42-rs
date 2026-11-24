@@ -618,6 +618,13 @@ pub struct H2Service<E> {
     /// The highest pulled block the anchored import released for execution:
     /// with the committed head, where the next pull starts.
     sync_head: Option<(u64, B256)>,
+    /// Each peer's range-serving byte bucket (sync standard §6.3).
+    range_buckets: std::collections::HashMap<PeerId, SharedBucket>,
+    /// The buckets' refill rate and burst, in bytes ([`RANGE_RATE_BYTES`],
+    /// [`RANGE_BURST_BYTES`]).
+    range_rate: (f64, f64),
+    /// Range requests refused because the peer's bucket was empty.
+    range_rate_limited: u64,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -761,6 +768,45 @@ struct CatchUp {
     pending_qcs: std::collections::HashMap<B256, QuorumCertificate>,
     /// The peer that served the block `prev_hash` names.
     prev_peer: Option<PeerId>,
+}
+
+/// The range bytes one peer is served per second, on average (sync
+/// standard §6.3: a token bucket of 64 MiB/s).
+const RANGE_RATE_BYTES: f64 = (64u64 << 20) as f64;
+
+/// The range bytes one peer may be served in a burst (§6.3: 256 MiB).
+const RANGE_BURST_BYTES: f64 = (256u64 << 20) as f64;
+
+/// A [`ByteBucket`] the loop and a serving task share.
+type SharedBucket = Arc<std::sync::Mutex<ByteBucket>>;
+
+/// Byte buckets kept before the full ones are forgotten.
+const MAX_RANGE_BUCKETS: usize = 1024;
+
+/// A per-peer token bucket of range bytes. A request is served while the
+/// bucket holds anything; the reply's bytes are taken afterwards and may
+/// leave it in debt, which the refill pays back before the next.
+#[derive(Debug, Clone, Copy)]
+struct ByteBucket {
+    tokens: f64,
+    at: std::time::Instant,
+}
+
+impl ByteBucket {
+    /// The bucket refilled at `rate` bytes/s up to `burst`, as of `now`.
+    fn refill(&mut self, (rate, burst): (f64, f64), now: std::time::Instant) {
+        let secs = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = rate.mul_add(secs, self.tokens).min(burst);
+        self.at = now;
+    }
+
+    /// Takes `bytes` from `bucket`: whether it still holds anything.
+    fn spend(bucket: &SharedBucket, rate: (f64, f64), bytes: usize) -> bool {
+        let mut bucket = bucket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        bucket.refill(rate, std::time::Instant::now());
+        bucket.tokens -= bytes as f64;
+        bucket.tokens > 0.0
+    }
 }
 
 /// Anchor QCs a pull keeps for blocks it has not buffered yet.
@@ -1767,6 +1813,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             sync_anchor_would_refuse: 0,
             sync_safety: crate::sync_safety::SyncSafety::default(),
             sync_head: None,
+            range_buckets: std::collections::HashMap::new(),
+            range_rate: (RANGE_RATE_BYTES, RANGE_BURST_BYTES),
+            range_rate_limited: 0,
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -3043,13 +3092,20 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Committed blocks only (sync standard Q-S5, B4): the
                 // execution layer's canonical chain also holds the head
                 // consensus has not committed and blocks pulled unproven.
-                if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
+                if !self.range_bucket_allows(peer) {
+                    // Over its byte rate (sync standard §6.3): refused before
+                    // the first block, which a client backs off from.
+                    self.range_rate_limited += 1;
+                    debug!(target: "n42.h2.node", %peer, ?request, "peer over its range byte rate; range refused");
+                    self.transport.respond_range_error(channel, "server busy: rate limited".to_owned());
+                } else if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
                     let el = self.driver.execution_layer_arc();
                     let back = self.served_txns.0.clone();
                     let budget = self.serve_bytes.clone();
                     let ceiling = self.serve_ceiling();
+                    let meter = self.range_buckets.get(&peer).map(|bucket| (Arc::clone(bucket), self.range_rate));
                     tokio::spawn(async move {
-                        let range = serve_range(&*el, request, &budget, ceiling).await;
+                        let range = serve_range_metered(&*el, request, &budget, ceiling, meter).await;
                         let _ = back.send(Served::Range { peer, request, channel, range, slot }).await;
                     });
                 } else {
@@ -5328,6 +5384,15 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         };
         let was_empty = sched.buffered() == 0;
+        if let Err(reason) = &reply
+            && reason.contains("busy")
+        {
+            // Over a server quota (sync standard §6.3): back off, no score,
+            // and the range goes to whichever peer is free.
+            debug!(target: "n42.h2.node", %peer, ?request, reason, "pipelined range refused as busy; the peer backs off");
+            sched.on_busy(peer, &request, std::time::Instant::now());
+            return;
+        }
         let chunks = reply.unwrap_or_else(|reason| {
             debug!(target: "n42.h2.node", %peer, ?request, reason, "pipelined range refused");
             Vec::new()
@@ -6450,6 +6515,29 @@ impl<E: ExecutionLayer> H2Service<E> {
         Ok((block_hash, header, true))
     }
 
+    /// Whether `peer`'s range byte bucket holds anything (refilled first).
+    /// The serving task takes each block's bytes from it as it reads them
+    /// ([`serve_range_metered`]).
+    fn range_bucket_allows(&mut self, peer: PeerId) -> bool {
+        let now = std::time::Instant::now();
+        let rate = self.range_rate;
+        if self.range_buckets.len() >= MAX_RANGE_BUCKETS && !self.range_buckets.contains_key(&peer) {
+            // Forget the buckets that are full again: they hold no debt.
+            self.range_buckets.retain(|_, bucket| {
+                let mut bucket = bucket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                bucket.refill(rate, now);
+                bucket.tokens < rate.1
+            });
+        }
+        let bucket = self
+            .range_buckets
+            .entry(peer)
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(ByteBucket { tokens: rate.1, at: now })));
+        let mut bucket = bucket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        bucket.refill(rate, now);
+        bucket.tokens > 0.0
+    }
+
     /// Hands a fill prepared on a worker to the swarm, and says how long it
     /// took: `walk_ms` on the worker, `waited_ms` from ready to handed over
     /// (the wait defect 17b was, 5.5-5.9 s in loop247).
@@ -7216,6 +7304,19 @@ async fn serve_range<E: ExecutionLayer>(
     budget: &Arc<tokio::sync::Semaphore>,
     ceiling: ServeCeiling,
 ) -> ServedRange {
+    serve_range_metered(el, request, budget, ceiling, None).await
+}
+
+/// [`serve_range`], each block's bytes taken from the asking peer's byte
+/// bucket (sync standard §6.3) as it is read: the reply ends cleanly after
+/// the block that empties it.
+async fn serve_range_metered<E: ExecutionLayer>(
+    el: &E,
+    request: n42_h2_net::RangeRequest,
+    budget: &Arc<tokio::sync::Semaphore>,
+    ceiling: ServeCeiling,
+    meter: Option<(SharedBucket, (f64, f64))>,
+) -> ServedRange {
     let (ceiling, restored) = match ceiling {
         ServeCeiling::Height(height) => (height, None),
         // The restored commit's number, once: a block the execution layer
@@ -7264,7 +7365,11 @@ async fn serve_range<E: ExecutionLayer>(
                     }
                 }
                 bytes = bytes.saturating_add(rlp.len());
+                let spent = meter.as_ref().is_some_and(|(bucket, rate)| !ByteBucket::spend(bucket, *rate, rlp.len()));
                 rlps.push(rlp);
+                if spent {
+                    break;
+                }
             }
             Ok(None) => break,
             Err(err) => {

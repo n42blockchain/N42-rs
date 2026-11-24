@@ -334,3 +334,51 @@ async fn a_forging_peer_inside_a_pipelined_pull_is_excluded_and_the_pull_goes_on
     let hashes: Vec<B256> = honest[..count as usize - 1].iter().map(|b| b.0).collect();
     assert_eq!(executed(&a), hashes, "the honest chain, each block once, in order");
 }
+
+/// Sync standard §6.3: a server meters each peer's range bytes with a
+/// token bucket (64 MiB/s, burst 256 MiB). An ordinary catch-up stays far
+/// inside it and is never refused; a greedy peer asking for the same range
+/// over and over from a server whose bucket is small is refused as busy
+/// once its bucket is spent, while another peer is still served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_greedy_peer_is_throttled_by_its_byte_rate_and_an_ordinary_catch_up_is_not() {
+    let (keys, set) = keys(1);
+    let builder = node_in(&keys, &set, 0, None).await;
+    let count = 300;
+    let blocks = anchored_chain(&builder, count);
+    drop(builder);
+    let mut servers = vec![server_with(&keys, &set, &blocks).await];
+    let mut a = puller(&keys, &set, &mut servers, 0, 0, true).await;
+    let mut events = Vec::new();
+    pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| synced(events).is_some()).await;
+    assert_eq!(synced(&events), Some((count - 1, true)), "{events:?}");
+    assert_eq!(servers[0].svc.range_rate_limited, 0, "an ordinary catch-up is not throttled");
+
+    // A bucket of 4 KiB refilled at 1 byte/s: the first reply ends where
+    // it is spent, the next is refused.
+    let mut b = servers.pop().expect("the server");
+    b.svc.range_rate = (1.0, 4096.0);
+    b.svc.range_buckets.clear();
+    let target = peer_of(&b);
+    let mut a_events = Vec::new();
+    a.svc.pending_imports.clear();
+    a.svc.transport.request_range(target, RangeRequest { start: 1, count: 64, step: 1 });
+    pump(&mut a, &mut b, (false, true), &mut a_events, |a, _, _| !a.svc.pending_imports.is_empty()).await;
+    let first = a.svc.pending_imports[0].2.len();
+    assert!((1..64).contains(&first), "cut short at the bucket: {first}");
+    for round in 1..=3 {
+        a.svc.transport.request_range(target, RangeRequest { start: 1, count: 64, step: 1 });
+        pump(&mut a, &mut b, (false, true), &mut a_events, |_, b, _| b.svc.range_rate_limited >= round).await;
+    }
+    assert_eq!(a.svc.pending_imports.len(), 1, "nothing more served");
+
+    // Another peer has a bucket of its own.
+    let mut c = node_in(&keys, &set, 0, Some(b.addr.clone())).await;
+    let mut c_events = Vec::new();
+    pump(&mut c, &mut b, (false, true), &mut c_events, |c, _, _| c.svc.pending_status.iter().any(|(peer, _)| *peer == target))
+        .await;
+    c.svc.transport.request_range(target, RangeRequest { start: 1, count: 4, step: 1 });
+    pump(&mut c, &mut b, (false, true), &mut c_events, |c, _, _| !c.svc.pending_imports.is_empty()).await;
+    assert_eq!(c.svc.pending_imports[0].2.len(), 4, "served in full");
+    assert_eq!(b.svc.range_rate_limited, 3);
+}

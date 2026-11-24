@@ -449,6 +449,25 @@ impl RangeScheduler {
         ReplyOutcome::Buffered(served as usize)
     }
 
+    /// `peer` refused `request` as busy (over a server quota, sync standard
+    /// §6.3): the range goes back to be asked of any free peer and the peer
+    /// backs off as after a missed deadline -- not a sign of its head, no
+    /// score.
+    pub(crate) fn on_busy(&mut self, peer: PeerId, request: &RangeRequest, now: Instant) {
+        let Some(slot) = self.slots.get(&peer).filter(|slot| slot.start == request.start).cloned() else {
+            return;
+        };
+        self.slots.remove(&peer);
+        let stat = self.peers.entry(peer).or_default();
+        stat.busy = false;
+        if slot.reassigned {
+            return;
+        }
+        stat.timeouts += 1;
+        stat.backoff_until = Some(now + Duration::from_secs(1u64 << stat.timeouts.min(6)));
+        self.add_gap(slot.start, slot.count);
+    }
+
     /// Ranges whose deadline passed go back to be asked of another peer;
     /// their peer backs off (doubling) and its rate is halved. Returns the
     /// peers that missed one.
@@ -742,6 +761,19 @@ mod tests {
         assert_eq!(again, vec![(honest, RangeRequest { start: 4, count: 7, step: 1 })], "the rest, to the honest peer");
         assert!(s.has_ready(11) && !s.has_ready(4), "the honest reply waits in the buffer again");
         assert!(!s.exhausted(&[(forger, 100), (honest, 100)]));
+    }
+
+    #[test]
+    fn a_busy_refusal_backs_the_peer_off_without_ending_it() {
+        let (a, b) = (peer(1), peer(2));
+        let mut s = RangeScheduler::with_shape(1, 10, 1);
+        let now = Instant::now();
+        let r = s.assign(1, &[(a, 100), (b, 100)], now).remove(0);
+        s.on_busy(r.0, &r.1, now);
+        assert_eq!(s.exhausted_from(&r.0), None, "not taken as the peer's head");
+        let again = s.assign(1, &[(a, 100), (b, 100)], now).remove(0);
+        assert_ne!(again.0, r.0, "the other peer takes the range while it backs off");
+        assert_eq!(again.1.start, 1);
     }
 
     #[test]

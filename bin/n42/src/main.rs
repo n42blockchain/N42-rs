@@ -83,6 +83,24 @@ fn main() {
     // accesses are serialised by std's lock, and no C library code on them
     // calls `getenv` (audit 2026-10 E-9).
     unsafe { n42_env::profile::reconcile_and_report("n42", features) };
+    // Profile 1 of the mixed production standard: the genesis is the only
+    // source of consensus-visible values, so a variable or flag that could
+    // change one refuses the start (every command with a chain: `node`,
+    // `init`, ...); the block size bound is the genesis's `maxBlockBytes`.
+    if let Some(spec) = cli.command.chain_spec() {
+        if let Err(err) = n42_qmdb_reth::profile1::refuse_process_overrides(&spec.genesis) {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+        if let Some(bytes) = n42_qmdb_reth::profile1::max_block_bytes(&spec.genesis) {
+            if let Err(cap) = n42_engine_types::byte_budget::set_wire_cap(bytes) {
+                eprintln!(
+                    "error: the block size cap was fixed at {cap} bytes before the genesis's maxBlockBytes {bytes} was read"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
     // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
     // would silently verify everything (or nothing); refuse to start instead.
     let ingest_mode = match n42_tx_types::ingest_verify_mode() {

@@ -51,8 +51,22 @@ pub const DEFAULT_WIRE_CAP: usize = 1 << 20;
 /// cap, which is this. Read once: the validator process reads the same
 /// variable once.
 pub fn wire_cap() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| wire_cap_from(std::env::var("N42_MAX_GOSSIP_MB").ok().as_deref()))
+    *WIRE_CAP.get_or_init(|| wire_cap_from(std::env::var("N42_MAX_GOSSIP_MB").ok().as_deref()))
+}
+
+static WIRE_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Fixes [`wire_cap`] to `bytes` before anything reads it: a profile-1
+/// chain takes the bound from its genesis (`maxBlockBytes`, standard B15)
+/// and refuses `N42_MAX_GOSSIP_MB`. Returns the cap already in force when it
+/// was read (or set) first and differs.
+pub fn set_wire_cap(bytes: usize) -> Result<(), usize> {
+    let cap = *WIRE_CAP.get_or_init(|| bytes);
+    if cap == bytes {
+        Ok(())
+    } else {
+        Err(cap)
+    }
 }
 
 /// The cap `N42_MAX_GOSSIP_MB` names, in bytes.

@@ -168,8 +168,23 @@ const MAX_FUTURE_MESSAGES: usize = 256;
 /// Maximum number of buffered future-view messages attributed to one sender.
 const MAX_FUTURE_MESSAGES_PER_SENDER: usize = 8;
 
-/// Maximum number of buffered future-view messages for one view.
+/// Maximum number of buffered future-view messages for one view, at the
+/// smallest. A view's share grows with its validator set (see
+/// [`future_view_cap`]): 64 is below one quorum from 63 validators up.
 const MAX_FUTURE_MESSAGES_PER_VIEW: usize = 64;
+
+/// The future-buffer caps for a view whose set has `validators` members:
+/// `(per view, total)`. One view holds a signature-checked message from each
+/// member plus the unchecked class (`validators + 2`), so a genuine quorum of
+/// either kind fits; the total holds two such views. Never below the fixed
+/// floors the seven-member fleet was sized for.
+const fn future_view_cap(validators: usize) -> (usize, usize) {
+    let per_view = 2 * validators + 2;
+    let per_view = if per_view > MAX_FUTURE_MESSAGES_PER_VIEW { per_view } else { MAX_FUTURE_MESSAGES_PER_VIEW };
+    let total = 2 * per_view;
+    let total = if total > MAX_FUTURE_MESSAGES { total } else { MAX_FUTURE_MESSAGES };
+    (per_view, total)
+}
 
 /// Minimum number of buffered future-view messages per view that were taken
 /// without a signature check (CommitVote, PrepareQC, Decide). These name a
@@ -1564,12 +1579,13 @@ impl ConsensusEngine {
     ///   came with it, so junk cannot take a slot. A CommitVote is not (its
     ///   domain needs the proposal's changes hash); the caps bound it.
     /// - At most [`MAX_FUTURE_MESSAGES_PER_SENDER`] per sender and
-    ///   [`MAX_FUTURE_MESSAGES_PER_VIEW`] per view. Messages taken without a
+    ///   [`future_view_cap`] per view (at least
+    ///   [`MAX_FUTURE_MESSAGES_PER_VIEW`]). Messages taken without a
     ///   signature check (CommitVote, PrepareQC, Decide) do not count
     ///   against the sender they name: they share a per-view class of at
     ///   least [`MIN_FUTURE_UNCHECKED_PER_VIEW`], oldest out first. When a
-    ///   sender cap or the total
-    ///   [`MAX_FUTURE_MESSAGES`] is reached the highest view goes: a lower
+    ///   sender cap or the total (at least [`MAX_FUTURE_MESSAGES`]) is
+    ///   reached the highest view goes: a lower
     ///   view replaces it, a message at or above it is dropped.
     pub(super) fn buffer_future_message(
         &mut self,
@@ -1635,13 +1651,16 @@ impl ConsensusEngine {
         }
 
         // Per-view cap: the messages of one view are equals, so a full view
-        // takes no more.
+        // takes no more. It scales with the view's set so that a quorum of a
+        // 100-member set fits (a fixed 64 did not).
+        let (per_view_cap, total_cap) =
+            future_view_cap(self.validator_set_for_view(view).len() as usize);
         let in_view = self
             .future_msg_buffer
             .iter()
             .filter(|(buffered_view, _)| *buffered_view == view)
             .count();
-        if in_view >= MAX_FUTURE_MESSAGES_PER_VIEW {
+        if in_view >= per_view_cap {
             return false;
         }
 
@@ -1681,7 +1700,7 @@ impl ConsensusEngine {
         }
         // The total cap: evict the highest view if the new message is for a
         // lower one.
-        if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES
+        if self.future_msg_buffer.len() >= total_cap
             && !self.evict_highest_future_message(view, |_| true)
         {
             return false;

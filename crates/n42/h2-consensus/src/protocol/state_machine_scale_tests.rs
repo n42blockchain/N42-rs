@@ -443,3 +443,28 @@ fn scale_200_one_leader_down() {
     leader_down(200);
 }
 
+/// A commit quorum of a 100-member set for a future view fits the future
+/// buffer. The per-view cap was a fixed 64, below the 67 a quorum needs, so
+/// the class meant to hold "a genuine commit quorum" (`validators + 2`) was
+/// cut short; it now scales with the set.
+#[test]
+fn a_100_member_commit_quorum_fits_the_future_buffer() {
+    let n = 100;
+    let (sks, vs) = validators(n);
+    let (tx, _rx) = mpsc::channel(1024);
+    let mut engine = ConsensusEngine::new(0, sks[0].clone(), vs.clone(), BASE_MS, MAX_MS, tx);
+    let view = engine.current_view() + 3;
+    let block_hash = B256::repeat_byte(0x67);
+    // Buffered unchecked (the commit domain needs the proposal), so one
+    // signature serves every voter here.
+    let signature = sks[0].sign(b"unchecked");
+    for voter in 1..=vs.quorum_size() as u32 {
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(
+            n42_h2_primitives::consensus::CommitVote { view, block_hash, voter, signature: signature.clone() },
+        )));
+    }
+    let held = engine.future_msg_buffer.iter().filter(|(v, _)| *v == view).count();
+    assert_eq!(held, vs.quorum_size(), "a whole commit quorum is held");
+    assert_eq!(future_view_cap(n), (202, 404));
+    assert_eq!(future_view_cap(7), (MAX_FUTURE_MESSAGES_PER_VIEW, MAX_FUTURE_MESSAGES));
+}

@@ -1880,7 +1880,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self
     }
 
-    /// Keeps the safety halt's evidence in `path` (h2_validator:
+    /// Keeps the safety halt's evidence in `path` (`h2_validator`:
     /// `<datadir>/safety-halt.json`, [`crate::safety_halt::evidence_path`]).
     /// A file already there -- or one that cannot be read -- means this node
     /// halted on a conflicting commit before: it starts halted, and stays so

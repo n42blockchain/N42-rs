@@ -178,11 +178,15 @@ mod tests {
         parse_path(&fixture("genesis_alloc_storage_with_nonce.json")).expect("a nonce keeps the account");
     }
 
+    /// A genesis with `rotateOnTimeoutView` loads, and the parsed `hotstuff`
+    /// config carries the value: 0 (the rule from the first view) and null
+    /// (off).
     #[test]
-    fn rotate_on_timeout_refuses_the_genesis_unless_it_is_null() {
-        let err = parse_path(&fixture("genesis_rotate_on_timeout.json")).expect_err("refused");
-        let message = format!("{err:#}");
-        assert!(message.contains("rotateOnTimeoutView = 0"), "{message}");
-        parse_path(&fixture("genesis_rotate_on_timeout_null.json")).expect("null keeps the rule off");
+    fn a_genesis_with_rotate_on_timeout_loads_and_carries_the_value() {
+        for (name, want) in [("genesis_rotate_on_timeout.json", Some(0)), ("genesis_rotate_on_timeout_null.json", None)] {
+            let spec = parse_path(&fixture(name)).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let config = crate::HotStuffGenesisConfig::from_genesis(&spec.genesis).expect("a hotstuff block");
+            assert_eq!(config.rotate_on_timeout_view, want, "{name}");
+        }
     }
 }

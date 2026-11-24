@@ -16,10 +16,11 @@
 #   P1_BIN=<dir>          release dir holding n42 and examples/h2_validator, h2_keygen
 #   P1_CPUS=<list>        taskset CPU list (default skips the faulty core 99/227)
 #
-# Ports, member i (0..3): libp2p TCP 3070i (body channel 3170i), EL HTTP 2014i,
-# EL authrpc 2034i, EL devp2p 2044i (discovery off, no peers). gov5's 30700/30701/
-# 30704, 20140/20141/20144, 21140+ and 6210+ are only bound for members 0, 1 --
-# never run those beside gov5. Keys: BLS secret i = 0x00 || sha256("n42-profile1-
+# Ports, member i: libp2p TCP P (body channel P+1000), EL HTTP H, authrpc H+200,
+# devp2p H+300 (discovery off, no peers), with P/H = 30702/20142 and 30703/20143
+# for members 2 and 3 (the plan's n42-rs ports) and 30712/20152, 30713/20153 for
+# members 0 and 1. gov5's 30700/30701/30704, 20140/20141/20144, 21140+ and
+# 6210+ are never bound. Keys: BLS secret i = 0x00 || sha256("n42-profile1-
 # test-validator-<i>")[1:] (TEST ONLY); libp2p node key i = sha256("n42-profile1-
 # rs-node-key-<i>"), so the peer id is stable across runs.
 #
@@ -40,10 +41,14 @@ KEYGEN=$P1_BIN/examples/h2_keygen
 G=$P1_DIR/genesis.json
 for v in $(compgen -e | /usr/bin/grep '^N42_'); do unset "$v"; done
 
-p2p_port() { echo $((30700 + $1)); }
-http_port() { echo $((20140 + $1)); }
-auth_port() { echo $((20340 + $1)); }
-devp2p_port() { echo $((20440 + $1)); }
+# Members 2 and 3 take the ports the mixed-round plan reserves for n42-rs
+# (30702/30703, 20142/20143); members 0 and 1 stay off gov5's 30700/30701 and
+# 20140/20141 and use 30712/30713, 20152/20153.
+shift_of() { if [ "$1" -lt 2 ]; then echo 12; else echo 0; fi; }
+p2p_port() { echo $((30700 + $1 + $(shift_of "$1"))); }
+http_port() { echo $((20140 + $1 + $(shift_of "$1"))); }
+auth_port() { echo $((20340 + $1 + $(shift_of "$1"))); }
+devp2p_port() { echo $((20440 + $1 + $(shift_of "$1"))); }
 mdir() { echo "$P1_DIR/m$1"; }
 peer_id() { cat "$(mdir "$1")/peer-id"; }
 maddr() { echo "/ip4/127.0.0.1/tcp/$(p2p_port "$1")/p2p/$(peer_id "$1")"; }

@@ -53,8 +53,22 @@ pub const DEFAULT_MAX_GOSSIP_SIZE: usize = 1 << 20;
 /// Read once. A cap that changed under a running node would let it publish a
 /// block it would then refuse to accept back.
 pub fn max_gossip_size() -> usize {
-    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| gossip_size_from(std::env::var("N42_MAX_GOSSIP_MB").ok().as_deref()))
+    *GOSSIP_SIZE.get_or_init(|| gossip_size_from(std::env::var("N42_MAX_GOSSIP_MB").ok().as_deref()))
+}
+
+static GOSSIP_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Fixes [`max_gossip_size`] to `bytes` before anything reads it: a
+/// profile-1 chain takes the bound from its genesis (`maxBlockBytes`,
+/// standard B15) and refuses `N42_MAX_GOSSIP_MB`. Returns the size already
+/// in force when it was read (or set) first and differs.
+pub fn set_max_gossip_size(bytes: usize) -> Result<(), usize> {
+    let size = *GOSSIP_SIZE.get_or_init(|| bytes);
+    if size == bytes {
+        Ok(())
+    } else {
+        Err(size)
+    }
 }
 
 /// The cap `N42_MAX_GOSSIP_MB` names, in bytes. Anything unset, unparseable or

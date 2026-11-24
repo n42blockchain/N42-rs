@@ -84,12 +84,14 @@ Effects are for N42's shapes:
 
 ## 3. Gaps and where they are fixed
 
-> **Note for the evm2 port (2026-11-24, from n42-26):** n42-rs skips these calls only because alloy-evm 0.39
-> gates them on the CHAIN SPEC (`system_calls/mod.rs:86`, `is_amsterdam_active_at_timestamp`) and reth's
-> Amsterdam is off on native chains. evm2 (rev 66687c18) gates them on the SPEC ID
-> (`block/ethereum/execution.rs:422`, `spec_id.enables(AMSTERDAM)`) with no hook, so once the N42 EVM layer
-> moves to evm2 the calls run on native chains (no-ops while both addresses are empty, but not off). The
-> port must gate them explicitly; n42-26 hit this first.
+> **CORRECTION 2026-11-24 (supersedes this morning's note and G1's "the Rust node never ran them"):** n42-rs
+> has executed with evm2 (rev 66687c18) since the reth v2.9.0 port (merge `6703c576f`, 2026-11-06); `Cargo.lock`
+> holds no revm or alloy-evm package (the `Cargo.toml` comment saying otherwise is stale). evm2 gates the 8282
+> calls on the spec id (`block/ethereum/execution.rs:422`), and `N42EvmConfig` raises native chains past
+> `glamsterdamTime` (profile 1 from block 0) to `SpecId::AMSTERDAM`, so n42-rs MAKES the two calls today. They
+> are no-ops only while both addresses have no code; anyone can deploy the predeploys by Nick's method (native
+> chains accept pre-EIP-155 transactions), after which n42-rs's state would differ from gov5's, which gates
+> them off. Fix scheduled: `docs/EVM2_PORT_PLAN.md` S1-S2 (explicit gate on native chains + tests).
 
 **G1 — EIP-8282 end-of-block calls (blocking; gov5 finding).** gov5 runs the builder
 deposit and exit request calls at every Amsterdam block, native chains included, and

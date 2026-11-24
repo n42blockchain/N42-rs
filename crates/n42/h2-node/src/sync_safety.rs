@@ -8,7 +8,8 @@
 //!   committed chain -- a verified anchor (or a block authenticated below
 //!   one) at a height this node committed, with another hash. A safety
 //!   violation: the importer stops, alerts, and neither executes nor
-//!   reorgs. Consensus keeps running on its own chain.
+//!   reorgs; the node then enters the safety halt
+//!   ([`crate::safety_halt`]: no vote, no proposal, no import).
 //! - **Equivocation**: two verified anchors from peers for different blocks
 //!   at one height (or two commit QCs for different blocks at one view).
 //!   The same halt, and both certificates are kept as evidence (mixed
@@ -122,6 +123,58 @@ impl SyncSafety {
     #[cfg(test)]
     pub(crate) fn committed_at(&self, number: u64) -> Option<B256> {
         self.by_height.get(&number).filter(|c| c.origin == Origin::Committed).map(|c| c.hash)
+    }
+
+    /// Whether a live commit of `hash` (at `number`, when a header that
+    /// hashes to it is held), certified by `qc`, contradicts this node's
+    /// own committed chain: a commit recorded at that height or that view
+    /// for another block, or -- read through `ancestor(from, from_number,
+    /// at)`, the block at height `at` below `from` by the parent links of
+    /// headers held -- a chain that does not run through the committed head
+    /// (sync standard 3.3; gov5's `commitConflictsWithFloor`). Records
+    /// nothing. `None` when consistent, or when the ancestry is not held
+    /// here (undecided: never a proof). On a conflict, the halt (this
+    /// node's side first) and the height the two chains differ at.
+    pub(crate) fn live_commit_conflict(
+        &self,
+        number: Option<u64>,
+        hash: B256,
+        qc: &QuorumCertificate,
+        ancestor: impl Fn(B256, u64, u64) -> Option<B256>,
+    ) -> Option<(SyncHalt, u64)> {
+        if qc.view == 0 {
+            return None;
+        }
+        let incoming = Certified { hash, number, qc: qc.clone(), origin: Origin::Committed };
+        let conflict = |ours: Certified, at: u64| {
+            Some((SyncHalt { kind: HaltKind::Conflict, first: ours, second: incoming.clone() }, at))
+        };
+        // Two commit QCs naming different blocks at one view.
+        if qc.block_hash == hash
+            && let Some(old) = self.by_view.get(&qc.view).filter(|old| {
+                old.origin == Origin::Committed && old.qc.block_hash == old.hash && old.hash != hash
+            })
+        {
+            return conflict(old.clone(), old.number.or(number).unwrap_or_default());
+        }
+        let number = number?;
+        if let Some(old) = self.by_height.get(&number).filter(|old| old.origin == Origin::Committed) {
+            return if old.hash == hash { None } else { conflict(old.clone(), number) };
+        }
+        let (head_number, head_hash) = self.committed_head()?;
+        let head = self.by_height.get(&head_number)?.clone();
+        if number > head_number {
+            // The commit has to descend from the committed head.
+            let at = ancestor(hash, number, head_number)?;
+            (at != head_hash).then(|| conflict(head, head_number)).flatten()
+        } else {
+            // Below the head, with no record of its own: the head's
+            // ancestor at that height is this node's committed block there.
+            let ours = ancestor(head_hash, head_number, number)?;
+            (ours != hash)
+                .then(|| conflict(Certified { hash: ours, number: Some(number), ..head }, number))
+                .flatten()
+        }
     }
 
     /// This node committed `qc.block_hash` (at `number`, when known). A
@@ -248,6 +301,60 @@ mod tests {
         s.note_anchor(Some(4), b, &qc(6, top)).expect("above the commit");
         s.note_anchor(None, top, &qc(6, top)).expect("view 6 names `top` only");
         assert!(s.note_anchor(Some(3), b, &qc(6, top)).is_err(), "another block at the committed height");
+    }
+
+    /// Headers as parent links: block `n` of chain `c` is `[c; n]`-ish.
+    fn link(chain: u8, n: u64) -> B256 {
+        let mut b = [chain; 32];
+        b[..8].copy_from_slice(&n.to_be_bytes());
+        B256::from(b)
+    }
+
+    /// `ancestor` over chains whose blocks link to the same chain's block
+    /// below, chain `b` forking off chain `a` above height `fork`.
+    fn walk(fork: u64) -> impl Fn(B256, u64, u64) -> Option<B256> {
+        move |from: B256, from_number: u64, at: u64| {
+            let chain = from.0[31];
+            (at <= from_number).then(|| if chain == 0xb && at <= fork { link(0xa, at) } else { link(chain, at) })
+        }
+    }
+
+    #[test]
+    fn a_live_commit_that_extends_the_committed_head_is_no_conflict() {
+        let mut s = SyncSafety::default();
+        assert!(s.live_commit_conflict(Some(5), link(0xa, 5), &qc(5, link(0xa, 5)), walk(0)).is_none(), "nothing committed yet");
+        s.note_committed(Some(5), &qc(5, link(0xa, 5))).expect("ours");
+        // The next block, one a few heights up (views timed out), a repeat.
+        for (n, view) in [(6, 6), (9, 12), (5, 5)] {
+            assert!(s.live_commit_conflict(Some(n), link(0xa, n), &qc(view, link(0xa, n)), walk(0)).is_none(), "{n}");
+        }
+        // A fork above the committed head joins it.
+        assert!(s.live_commit_conflict(Some(8), link(0xb, 8), &qc(8, link(0xb, 8)), walk(5)).is_none());
+        // Genesis and an unknown height or ancestry decide nothing.
+        assert!(s.live_commit_conflict(Some(5), link(0xb, 5), &QuorumCertificate::genesis(), walk(0)).is_none());
+        assert!(s.live_commit_conflict(None, link(0xb, 7), &qc(7, link(0xb, 7)), walk(0)).is_none());
+        assert!(s.live_commit_conflict(Some(7), link(0xb, 7), &qc(7, link(0xb, 7)), |_, _, _| None).is_none());
+    }
+
+    #[test]
+    fn a_live_commit_off_the_committed_chain_is_a_conflict() {
+        let mut s = SyncSafety::default();
+        s.note_committed(Some(5), &qc(5, link(0xa, 5))).expect("ours");
+        // Another block at the committed height.
+        let (halt, at) = s.live_commit_conflict(Some(5), link(0xb, 5), &qc(9, link(0xb, 5)), walk(3)).expect("same height");
+        assert_eq!((halt.kind, at), (HaltKind::Conflict, 5));
+        assert_eq!((halt.first.hash, halt.first.qc.view), (link(0xa, 5), 5));
+        assert_eq!((halt.second.hash, halt.second.qc.view, halt.second.number), (link(0xb, 5), 9, Some(5)));
+        // Above it, on a chain that forked below it.
+        let (halt, at) = s.live_commit_conflict(Some(8), link(0xb, 8), &qc(10, link(0xb, 8)), walk(3)).expect("above");
+        assert_eq!((halt.first.hash, halt.second.hash, at), (link(0xa, 5), link(0xb, 8), 5));
+        // Below it, where the committed chain holds another block.
+        let (halt, at) = s.live_commit_conflict(Some(4), link(0xb, 4), &qc(11, link(0xb, 4)), walk(3)).expect("below");
+        assert_eq!((halt.first.hash, halt.first.qc.view, at), (link(0xa, 4), 5, 4));
+        // The same view as a commit of this node's, another block, height unknown.
+        let (halt, _) = s.live_commit_conflict(None, link(0xb, 6), &qc(5, link(0xb, 6)), walk(3)).expect("same view");
+        assert_eq!(halt.first.hash, link(0xa, 5));
+        assert!(s.halt().is_none(), "a check records nothing");
     }
 
     #[test]

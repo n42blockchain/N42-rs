@@ -157,6 +157,11 @@ pub const LEGACY_COMMITTEE_POOL_FIELDS: &[(&str, &str)] = &[
     ("allowHandover", "no handover in profile 1 (A19)"),
 ];
 
+/// The deferred-execution depth profile 1 runs (A10, O4). This node also
+/// runs depth 2 on its own chains, but no other client does, so on profile 1
+/// a depth of 2 is refused as gov5's V8 case `deferred_depth_2` requires.
+pub const PROFILE1_DEFERRED_EXECUTION_DEPTH: u64 = 1;
+
 /// The smallest validator set profile 1 runs (A3: `n >= 4`).
 pub const MIN_VALIDATORS: usize = 4;
 
@@ -176,7 +181,7 @@ pub const ACTIVATIONS: &[(&str, bool, &str)] = &[
     ("N42-native transaction and EVM rules (no blobs)", true, "reth_chainspec::qmdb::is_n42_native"),
     ("QMDB state commitment", true, "reth_chainspec::qmdb::state_scheme"),
     ("rotate-on-timeout", true, "HotStuffGenesisConfig::rotate_on_timeout_view = Some(0)"),
-    ("two-phase vote gate (commit vote after own import)", true, "HotStuffGenesisConfig::two_phase_vote_gate"),
+    ("profile-1 vote rules (Round 1 after check, CommitVote after own import, no progress or direct-only votes, split tags)", true, "HotStuffGenesisConfig::vote_rules -> H2Service::with_vote_rules (two_phase_vote_gate stays off)"),
     ("H2-v4 signing", true, "HotStuffGenesisConfig::interop_v4"),
     ("committee pool / parentBeaconRoot link", true, "HotStuffGenesisConfig::committee_pool (enabled)"),
     ("QC embedding in Extra", true, "unconditional on a --chain validator (h2_validator gov5 profile)"),
@@ -354,6 +359,15 @@ pub fn profile1(genesis: &Genesis) -> Result<Option<Profile1Config>, Profile1Err
     }
     let deferred_execution_depth = reth_chainspec::qmdb::check_deferred_execution_depth(genesis)
         .map_err(|e| invalid(format!("{hs}.deferredExecutionDepth"), e.to_string()))?;
+    if deferred_execution_depth != PROFILE1_DEFERRED_EXECUTION_DEPTH {
+        return Err(invalid(
+            format!("{hs}.deferredExecutionDepth"),
+            format!(
+                "{deferred_execution_depth} is not implemented on profile 1, which runs depth \
+                 {PROFILE1_DEFERRED_EXECUTION_DEPTH} (A10, O4: a deeper depth is a later profile change; gov5 V8 deferred_depth_2)"
+            ),
+        ));
+    }
     let gas_limit = u64_field(hotstuff, hs, "gasLimit")?;
     if gas_limit == 0 {
         return Err(invalid(format!("{hs}.gasLimit"), "must be above 0 (A23)"));
@@ -599,7 +613,20 @@ pub struct Rule {
 /// Environment variables refused on a profile-1 chain (J4, AM10). Variables
 /// this node reads that change no consensus-visible value (threads,
 /// allocator, parallel build/import, persistence and caches, ingest, logging,
-/// `N42_SETTLEMENT_TAGS`, the `N42_PROFILE=x22` knobs) stay allowed.
+/// the `N42_PROFILE=x22` knobs) stay allowed. The ones the standard's review
+/// asked about, each allowed for the reason given:
+///
+/// | Knob | Why it stays allowed |
+/// |---|---|
+/// | `N42_CHECK_BEFORE_SLOT` | the vote still waits for this execution layer's check of that very block (a check-only answer it vouches for); the commit vote still waits for the own import (`VoteRules`) |
+/// | `N42_IMPORT_ONCE` | keys sharing one execution layer share its one import and check of the block; the answer is the same |
+/// | `N42_COMPACT_BODY` | the body's shape on the direct push channel between this client's members; the block and the topic's body are unchanged |
+/// | `N42_BLOCK_BY_DESCRIPTION` | the follower checks the same transactions, held by reference instead of copied |
+/// | `N42_BODY_ONCE` | the body reaches the execution layer as it arrived instead of decoded twice |
+/// | `N42_TAKE_COMPACT` | the leader's build answer leaves out bytes it never reads; the block is the same |
+/// | `N42_BLOCK_TOPIC_ALWAYS` | the topic is skipped only when the direct push reached every connected member, so a member without it (gov5) still gets the topic |
+/// | `N42_FOLLOWER_EXEC_GATE` | how many executions overlap on this node's worker pool |
+/// | `--builder.extradata` | this node's builder ignores it: a header's `extraData` is the HotStuff seal |
 pub const FORBIDDEN_ENV: &[Rule] = &[
     Rule { name: "N42_MAX_GOSSIP_MB", when: When::Set, reason: "the block size bound is config.hotstuff.maxBlockBytes (B15)" },
     Rule { name: "N42_FRAME_BLOCKS", when: When::NotOneOf(OFF), reason: "frame blocks are not in profile 1 (A12)" },
@@ -611,6 +638,7 @@ pub const FORBIDDEN_ENV: &[Rule] = &[
     Rule { name: "N42_INGEST_VERIFY", when: When::NotOneOf(&["", "all"]), reason: "a node takes another's word for a sender (J4)" },
     Rule { name: "N42_FRAME_GATEWAYS", when: When::Set, reason: "frames attested by a bench gateway key skip checks; no frames in profile 1 (A12, J4)" },
     Rule { name: "N42_SYNC_ANCHOR", when: When::NotOneOf(&["", "enforce", "on", "1", "true"]), reason: "anchored ranges are enforced (section 3)" },
+    Rule { name: "N42_SETTLEMENT_TAGS", when: When::NotOneOf(&["", "split"]), reason: "safe and finalized are the split tags; legacy reports uncertified blocks as finalized (E14, AM19)" },
     Rule { name: "N42_DEFERRED_DEPTH*", when: When::Set, reason: "the depth is config.hotstuff.deferredExecutionDepth (A10; gov5's name)" },
 ];
 
@@ -767,7 +795,8 @@ mod tests {
         let hotstuff = HotStuffGenesisConfig::from_genesis(g).expect("a hotstuff block");
         assert_eq!(hotstuff.profile1(), profile1(g).expect("valid").as_ref(), "the typed config is attached");
         assert_eq!(hotstuff.rotate_on_timeout_view, Some(0));
-        assert!(hotstuff.two_phase_vote_gate);
+        assert!(!hotstuff.two_phase_vote_gate, "VoteRules carries the gate on profile 1");
+        assert_eq!(hotstuff.vote_rules(), n42_h2_consensus::VoteRules::PROFILE1);
         assert!(hotstuff.interop_v4);
         assert_eq!(hotstuff.base_timeout, 24_000);
         assert_eq!(hotstuff.max_timeout, 96_000);
@@ -803,6 +832,7 @@ mod tests {
                 assert_eq!(profile1(&spec.genesis), Ok(None), "{name}");
                 if let Ok(hotstuff) = HotStuffGenesisConfig::from_genesis(&spec.genesis) {
                     assert!(hotstuff.profile1().is_none(), "{name}");
+                    assert_eq!(hotstuff.vote_rules(), n42_h2_consensus::VoteRules::TODAY, "{name}");
                 }
                 refuse_overrides(
                     &spec.genesis,
@@ -857,13 +887,77 @@ mod tests {
             ("refused_profile_string", "n42Profile = \"1\""),
         ];
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/profile1");
-        let on_disk = std::fs::read_dir(&dir).expect("the fixture directory").count();
+        let on_disk = std::fs::read_dir(&dir)
+            .expect("the fixture directory")
+            .filter(|entry| entry.as_ref().expect("an entry").path().extension().is_some_and(|e| e == "json"))
+            .count();
         assert_eq!(on_disk, CASES.len(), "every fixture has a case and every case a fixture");
         for (name, cause) in CASES {
             let err = parse(&dir.join(format!("{name}.json"))).expect_err(name);
             let message = format!("{err:#}");
             assert!(message.contains(cause), "{name}: {message}");
         }
+    }
+
+    // ------------------------------------------------ gov5's vectors (V1, V8) --
+
+    fn gov5_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/profile1/gov5")
+    }
+
+    /// gov5's published closed key lists (V8 `allowed-keys.json`) are exactly
+    /// this node's tables.
+    #[test]
+    fn gov5_allowed_keys_equal_the_closed_tables() {
+        let raw = std::fs::read_to_string(gov5_dir().join("V8/allowed-keys.json")).expect("V8 allowed keys");
+        let allowed: Value = serde_json::from_str(&raw).expect("json");
+        let keys = |section: &str| -> std::collections::BTreeSet<String> {
+            ["mandatory", "optional"]
+                .iter()
+                .flat_map(|kind| allowed[section][*kind].as_array().expect("a list").iter())
+                .map(|key| key.as_str().expect("a key").to_owned())
+                .collect()
+        };
+        let ours = |table: &[&str]| table.iter().map(|key| (*key).to_owned()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys("config"), ours(CONFIG_KEYS));
+        assert_eq!(keys("config.hotstuff"), ours(HOTSTUFF_KEYS));
+        assert_eq!(keys("config.hotstuff.committeePool"), ours(COMMITTEE_POOL_KEYS));
+        assert_eq!(keys("config.hotstuff.validators[]"), ours(VALIDATOR_KEYS));
+        // The one optional key on both sides.
+        assert_eq!(allowed["config"]["optional"], serde_json::json!(["blobSchedule"]));
+    }
+
+    /// gov5's V1 test genesis (the AM22 values) loads through the parser and
+    /// [`profile1`].
+    #[test]
+    fn gov5_genesis_8s_loads() {
+        let spec = parse(&gov5_dir().join("V1/genesis_8s.json")).unwrap_or_else(|e| panic!("genesis_8s: {e:#}"));
+        let config = profile1(&spec.genesis).expect("valid").expect("a profile-1 genesis");
+        assert_eq!(
+            (config.chain_id, config.leader_tenure, config.base_timeout_ms, config.max_timeout_ms),
+            (1144, 1, 24_000, 96_000)
+        );
+        assert_eq!((config.block_interval_ms, config.epoch_length, config.deferred_execution_depth), (8_000, 10_800, 1));
+        assert_eq!((config.gas_limit, config.max_block_bytes, config.validators.len()), (480_000_000, 64 << 20, 4));
+        let hotstuff = HotStuffGenesisConfig::from_genesis(&spec.genesis).expect("a hotstuff block");
+        assert_eq!(hotstuff.profile1(), Some(&config));
+    }
+
+    /// Each of gov5's 14 refused geneses (V8 `refused/`) is refused here.
+    #[test]
+    fn gov5_refused_cases_are_refused() {
+        let dir = gov5_dir().join("V8/refused");
+        let mut cases = 0;
+        for entry in std::fs::read_dir(&dir).expect("V8 refused") {
+            let path = entry.expect("an entry").path();
+            let case: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+            let name = case["case"].as_str().expect("a case name");
+            let genesis: Genesis = serde_json::from_value(case["genesis"].clone()).expect("a genesis");
+            let err = crate::check_genesis(&genesis).expect_err(name);
+            println!("{name}: {err:#}");
+            cases += 1;
+        }
+        assert_eq!(cases, 14);
     }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -891,6 +985,7 @@ mod tests {
             ("N42_SYNC_ANCHOR", "observe"),
             ("N42_SYNC_ANCHOR", "off"),
             ("N42_DEFERRED_DEPTH_K", "2"),
+            ("N42_SETTLEMENT_TAGS", "legacy"),
         ] {
             let err = refuse_overrides(g, env(&[("N42_PROFILE", "x22"), (name, value)]), args(&[])).expect_err(name);
             assert!(err.to_string().contains(name), "{name}: {err}");
@@ -920,8 +1015,16 @@ mod tests {
             &spec.genesis,
             env(&[
                 ("N42_PROFILE", "x22"),
-                ("N42_SETTLEMENT_TAGS", "legacy"),
+                ("N42_SETTLEMENT_TAGS", "split"),
                 ("N42_VOTE_TRANSPORT", "both"),
+                ("N42_CHECK_BEFORE_SLOT", "1"),
+                ("N42_IMPORT_ONCE", "1"),
+                ("N42_COMPACT_BODY", "1"),
+                ("N42_BLOCK_BY_DESCRIPTION", "1"),
+                ("N42_BODY_ONCE", "1"),
+                ("N42_TAKE_COMPACT", "1"),
+                ("N42_BLOCK_TOPIC_ALWAYS", "1"),
+                ("N42_FOLLOWER_EXEC_GATE", "0"),
                 ("N42_SYNC_ANCHOR", "enforce"),
                 ("N42_FRAME_BLOCKS", "0"),
                 ("N42_BENCH_UNSAFE", ""),
@@ -929,7 +1032,7 @@ mod tests {
                 ("N42_PARALLEL_BUILD", "1"),
                 ("MALLOC_CONF", "thp:always"),
             ]),
-            args(&["node", "--chain", "x.json", "--straggler-grace-ms", "0", "--http", "--genesis-extra", "1"]),
+            args(&["node", "--chain", "x.json", "--straggler-grace-ms", "0", "--http", "--genesis-extra", "1", "--builder.extradata", "n42"]),
         )
         .expect("nothing consensus-visible");
     }

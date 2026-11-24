@@ -518,6 +518,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("signing      : H2-v4");
         }
         engine.set_leader_tenure(leader_tenure);
+        // Profile 1 (AM5): the validator set is the genesis set; every
+        // reconfiguration entry point of the engine refuses.
+        if hotstuff_config.as_ref().is_some_and(|config| config.profile1().is_some()) {
+            engine.epoch_manager_mut().set_fixed_validator_set(true);
+            println!("validators   : fixed to the genesis set (profile 1)");
+        }
         engine.set_rotate_on_timeout(
             rotate_on_timeout_view,
             hotstuff_config.as_ref().map_or(0, |config| config.epoch_length),
@@ -601,6 +607,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
+        // The chain's vote rules (profile 1: `VoteRules::PROFILE1`, from the
+        // genesis's `n42Profile`; today's otherwise).
+        let vote_rules = hotstuff_config
+            .as_ref()
+            .map_or(n42_h2_consensus::VoteRules::TODAY, n42_qmdb_reth::HotStuffGenesisConfig::vote_rules);
+        if vote_rules.profile1 {
+            service = service.with_vote_rules(vote_rules);
+            println!("vote rules   : profile 1 (Round 1 after the check, commit vote after the own import)");
+        }
         if let Some(store) = store {
             // Inside the service, not on the event it emits: the checkpoint has
             // to be durable before the commit reaches the execution layer, and

@@ -1573,3 +1573,43 @@ fn a_fill_request_cannot_name_more_than_a_reply_may_carry() {
     assert!(err.contains("exceed"), "{err}");
     assert_eq!(ask((0..20).collect()).expect("20 MiB fits"), 20);
 }
+
+/// A profile-1 genesis (`n42Profile: 1`) maps onto the profile-1 vote rules
+/// as `h2_validator` maps it, and a service given them behaves as profile 1:
+/// the engine's and driver's gates, gossip-only votes, `split` tags that a
+/// later `legacy` does not undo, no progress votes, and gov5's two-phase
+/// header vote left off so the two gates cannot disagree.
+#[tokio::test]
+async fn a_profile1_genesis_yields_the_profile1_vote_rules() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../chainspec/res/genesis");
+    let genesis = serde_json::from_str(&std::fs::read_to_string(dir.join("n42_profile1_draft.json")).expect("draft"))
+        .expect("a genesis");
+    let hotstuff = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&genesis).expect("a hotstuff block");
+    assert!(hotstuff.profile1().is_some());
+    assert!(!hotstuff.two_phase_vote_gate, "VoteRules, not twoPhaseVoteGate, gates profile 1");
+    let rules = hotstuff.vote_rules();
+    assert_eq!(rules, n42_h2_consensus::VoteRules::PROFILE1);
+
+    let rig = node(4, 0, None).await;
+    let mut svc = rig
+        .svc
+        .with_vote_transport(crate::direct_votes::VoteTransport::Direct)
+        .with_vote_rules(rules)
+        .with_vote_transport(crate::direct_votes::VoteTransport::Direct);
+    assert_eq!(svc.vote_rules(), rules);
+    assert_eq!(svc.engine().vote_rules(), rules);
+    assert!(!svc.engine().two_phase_vote_gate());
+    assert_eq!(svc.driver.vote_rules(), rules);
+    assert_eq!(svc.direct_votes.mode(), crate::direct_votes::VoteTransport::Gossip);
+    svc.driver.set_settlement_tags(n42_h2_execution::SettlementTags::Legacy);
+    assert_eq!(svc.driver.settlement_tags(), n42_h2_execution::SettlementTags::Split);
+    svc.driver.set_vote_before_slot(true);
+    svc = svc.with_straggler_grace(Duration::from_millis(600));
+    assert!(!svc.engine().vote_rules().progress_votes_allowed());
+
+    // A pre-profile genesis keeps today's rules.
+    let devnet = serde_json::from_str(&std::fs::read_to_string(dir.join("n42_devnet.json")).expect("devnet"))
+        .expect("a genesis");
+    let today = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&devnet).expect("a hotstuff block");
+    assert_eq!(today.vote_rules(), n42_h2_consensus::VoteRules::TODAY);
+}

@@ -33,7 +33,7 @@ use alloy_primitives::{logs_bloom, Address, B256, U256};
 use n42_consensus_traits::{AposError, AposResult, SignerManager};
 use n42_h2_consensus::{
     gov5_receipts_root, gov5_rewards_root, is_empty_requests_hash, validate_gov5_h2_header, validate_gov5_header_tail, HeaderTailRules,
-    withdrawals_to_rewards,
+    withdrawals_to_rewards, HeaderRules, PROFILE1_REQUESTS_HASH,
     HeaderExtra, ReceiptView, SimulatedCommitteePool, GOV5_EMPTY_REQUESTS_HASH,
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -72,6 +72,21 @@ pub struct HotStuffConsensus<ChainSpec> {
     /// header's parent beacon root must be the Blake3 of the parent's
     /// committee evidence, which the pool rebuilds from the parent header.
     committee: Option<SimulatedCommitteePool>,
+    /// The mixed production standard's profile-1 header rules, when the
+    /// chain runs profile 1 ([`chain_header_rules`]); the default checks
+    /// nothing more than before.
+    header_rules: HeaderRules,
+}
+
+/// The header rules of the chain `genesis` describes.
+///
+/// The single place the genesis layer's profile-1 configuration
+/// (`n42_qmdb_reth::Profile1Config`, built on a parallel branch) is mapped
+/// onto [`HeaderRules`]: until that mapping lands every chain gets the
+/// default, today's behaviour, byte for byte. The consensus engine, the
+/// engine validator and the payload builder all read it from here.
+pub fn chain_header_rules(_genesis: &alloy_genesis::Genesis) -> HeaderRules {
+    HeaderRules::default()
 }
 
 /// A header whose parent beacon root is not the parent's committee evidence.
@@ -97,12 +112,26 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> HotStuffConsensus<ChainSpec> {
             },
             Err(_) => None,
         };
+        let header_rules = chain_header_rules(chain_spec.genesis());
         Self {
             ethereum: EthBeaconConsensus::new(chain_spec.clone()),
             chain_spec,
             signer: RwLock::new(None),
             committee,
+            header_rules,
         }
+    }
+
+    /// The same rules under the profile-1 header rules `rules`.
+    pub fn with_header_rules(mut self, rules: HeaderRules) -> Self {
+        self.header_rules = rules;
+        self
+    }
+
+    /// The profile-1 header rules in force (the default when the chain is
+    /// not profile 1).
+    pub const fn header_rules(&self) -> &HeaderRules {
+        &self.header_rules
     }
 
     /// The committee pool the chain runs, if any.
@@ -361,6 +390,11 @@ where
             return Err(ConsensusError::RequestsHashUnexpected);
         }
 
+        // Profile 1 (B1-B3, B5, B6, B8-B12, A23): the strict layout, the
+        // constant fields, one requests-hash spelling, and the seal when the
+        // rules know the proposers. Nothing on another chain.
+        self.header_rules.check_header(header).map_err(|err| ConsensusError::Other(Arc::new(err)))?;
+
         Ok(())
     }
 
@@ -373,7 +407,20 @@ where
         // limit ramp, base fee, blob gas: gov5 checks the first two and
         // relies on every producer deriving the rest the same way, which is
         // what checking them here guarantees for blocks this node accepts.
-        self.ethereum.validate_header_against_parent(header, parent)?;
+        if self.header_rules.is_profile1() {
+            // Profile 1 replaces Ethereum's parent rules (B4, O7): a
+            // timestamp equal to the parent's is valid, where reth's
+            // `validate_against_parent_timestamp` wants it strictly greater.
+            // Everything else Ethereum checks is checked here at least as
+            // strictly: the link, the base fee (B14), the gas limit (A23:
+            // equal to the constant, so the ramp holds) and, through B9's
+            // zeros, the blob gas.
+            self.header_rules
+                .check_against_parent(header, parent, parent.hash())
+                .map_err(|err| ConsensusError::Other(Arc::new(err)))?;
+        } else {
+            self.ethereum.validate_header_against_parent(header, parent)?;
+        }
         // Deferred execution: the header's execution fields are the parent's
         // result, which this node executed (or, before the fork, which the
         // parent's own header carries). The first header past the fork
@@ -486,7 +533,9 @@ where
             (Some(header_root), Some(withdrawals)) => {
                 let trie_root = body.calculate_withdrawals_root().unwrap_or_default();
                 let gov5_root = Some(gov5_rewards_root(withdrawals_to_rewards(withdrawals.as_slice())));
-                if header_root != trie_root && Some(header_root) != gov5_root {
+                // Profile 1 (B6): the rewards commitment only.
+                let trie_accepted = !self.header_rules.is_profile1() && header_root == trie_root;
+                if !trie_accepted && Some(header_root) != gov5_root {
                     return Err(ConsensusError::BodyWithdrawalsRootDiff(
                         GotExpected {
                             got: trie_root,
@@ -646,6 +695,17 @@ where
         // Requests: gov5 spells "none" as the empty trie root where EIP-7685
         // says sha256 of nothing; both are accepted for a block that made no
         // requests, and a block that did is held to the EIP.
+        if self.header_rules.is_profile1() {
+            // Profile 1 (B8, AM3): one spelling, the empty trie root, and no
+            // EIP-7685 requests on a native chain.
+            let header_hash = header.requests_hash.ok_or(ConsensusError::RequestsHashMissing)?;
+            if header_hash != PROFILE1_REQUESTS_HASH || !result.requests.is_empty() {
+                return Err(ConsensusError::BodyRequestsHashDiff(
+                    GotExpected { got: result.requests.requests_hash(), expected: header_hash }.into(),
+                ));
+            }
+            return Ok(());
+        }
         if self.chain_spec.is_prague_active_at_timestamp(header.timestamp) {
             let Some(header_hash) = header.requests_hash else {
                 return Err(ConsensusError::RequestsHashMissing);
@@ -1247,6 +1307,52 @@ mod tests {
             c.validate_header_against_parent(&sealed(bad), &parent),
             Err(ConsensusError::GasLimitInvalidIncrease { .. })
         ));
+    }
+
+    fn profile1_consensus() -> HotStuffConsensus<n42_header::N42ChainSpec> {
+        consensus().with_header_rules(HeaderRules::profile1(30_000_000, n42_h2_consensus::PROFILE1_MAX_BLOCK_BYTES, None))
+    }
+
+    /// B4 / O7 on the execution layer: reth's `validate_against_parent_timestamp`
+    /// refuses a child with its parent's timestamp (`linkage_errors_are_the_ethereum_ones`);
+    /// a profile-1 chain accepts it and still refuses an earlier one.
+    #[test]
+    fn b4_profile1_accepts_equal_timestamps_and_refuses_earlier() {
+        let c = profile1_consensus();
+        let (parent, mut child) = parent_and_child();
+        child.timestamp = parent.timestamp;
+        child.base_fee_per_gas = Some(n42_h2_consensus::profile1_base_fee(parent.header()));
+        c.validate_header_against_parent(&sealed(child.clone()), &parent).expect("equal timestamps");
+        assert!(matches!(
+            consensus().validate_header_against_parent(&sealed(child.clone()), &parent),
+            Err(ConsensusError::TimestampIsInPast { .. })
+        ));
+        let mut early = child.clone();
+        early.timestamp = parent.timestamp - 1;
+        let err = c.validate_header_against_parent(&sealed(early), &parent).unwrap_err();
+        assert!(other_err::<n42_h2_consensus::Profile1Error>(&err).is_some(), "{err}");
+        // A23 on the parent rules: a limit step Ethereum would allow is not
+        // the constant (refused standalone by `validate_header`), and B14.
+        let mut fee = child;
+        fee.base_fee_per_gas = Some(1);
+        let err = c.validate_header_against_parent(&sealed(fee), &parent).unwrap_err();
+        assert!(err.to_string().contains("B14"), "{err}");
+    }
+
+    /// B3 and B8 on the execution layer: the empty-list ommers hash and
+    /// EIP-7685's requests hash pass today's rules and not profile 1's.
+    #[test]
+    fn b3_b8_profile1_refuses_what_the_default_accepts() {
+        let mut ommers = good_header(5, TS_PRAGUE);
+        ommers.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+        consensus().validate_header(&sealed(ommers.clone())).expect("today: either ommers spelling");
+        let err = profile1_consensus().validate_header(&sealed(ommers)).unwrap_err();
+        assert!(err.to_string().contains("B3"), "{err}");
+        let mut requests = good_header(5, TS_PRAGUE);
+        requests.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+        consensus().validate_header(&sealed(requests.clone())).expect("today: either requests spelling");
+        let err = profile1_consensus().validate_header(&sealed(requests)).unwrap_err();
+        assert!(err.to_string().starts_with("B8") || err.to_string().contains("B8"), "{err}");
     }
 
     fn deferred_consensus() -> HotStuffConsensus<n42_header::N42ChainSpec> {

@@ -323,6 +323,9 @@ pub struct H2Service<E> {
     /// Votes straight to the leader (`N42_VOTE_TRANSPORT`; see
     /// [`crate::direct_votes`]).
     direct_votes: crate::direct_votes::DirectVotes,
+    /// The profile-1 vote rules ([`n42_h2_consensus::VoteRules`]); see
+    /// [`Self::with_vote_rules`].
+    vote_rules: n42_h2_consensus::VoteRules,
     /// This validator's hello, signed once.
     vote_hello: Option<[u8; 96]>,
     /// The leader's build throttle (see [`crate::build_throttle`] and
@@ -1661,6 +1664,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             straggler_wait: None,
             straggler_waits: 0,
             direct_votes: crate::direct_votes::DirectVotes::new(crate::direct_votes::VoteTransport::from_env()),
+            vote_rules: n42_h2_consensus::VoteRules::TODAY,
             vote_hello: None,
             build_throttle: None,
             last_drain: (0, 0, 0, ""),
@@ -2056,9 +2060,37 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     /// Chooses how votes travel (`N42_VOTE_TRANSPORT`, read by
     /// [`Self::new`]); see [`crate::direct_votes`].
+    ///
+    /// Under profile 1 ([`Self::with_vote_rules`]) every vote goes by the
+    /// consensus topic alone: `gossip` whatever is asked.
     pub fn with_vote_transport(mut self, mode: crate::direct_votes::VoteTransport) -> Self {
+        let mode = if self.vote_rules.direct_votes_allowed() { mode } else { crate::direct_votes::VoteTransport::Gossip };
         self.direct_votes = crate::direct_votes::DirectVotes::new(mode);
         self
+    }
+
+    /// Sets the profile-1 vote rules ([`n42_h2_consensus::VoteRules`]) on
+    /// this node: the engine's Round 1 and CommitVote gates and its progress
+    /// votes, the driver's vote before the slot and settlement tags, and the
+    /// vote transport (E16: every vote is published on the consensus topic;
+    /// `/n42/vote/1` is not a standard protocol). Once, before the node runs;
+    /// the default is today's behaviour.
+    pub fn with_vote_rules(mut self, rules: n42_h2_consensus::VoteRules) -> Self {
+        self.vote_rules = rules;
+        self.engine.set_vote_rules(rules);
+        self.driver.set_vote_rules(rules);
+        if !rules.direct_votes_allowed()
+            && self.direct_votes.mode() != crate::direct_votes::VoteTransport::Gossip
+        {
+            warn!(target: "n42.h2.node", "direct votes are not available on a profile-1 chain; votes go by the consensus topic");
+            self.direct_votes = crate::direct_votes::DirectVotes::new(crate::direct_votes::VoteTransport::Gossip);
+        }
+        self
+    }
+
+    /// The vote rules in force; see [`Self::with_vote_rules`].
+    pub const fn vote_rules(&self) -> n42_h2_consensus::VoteRules {
+        self.vote_rules
     }
 
     /// Holds this leader's proposals back while its execution layer carries
@@ -4490,7 +4522,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) {
         use crate::direct_votes::VoteTransport;
         use n42_h2_primitives::consensus::ConsensusMessage as M;
-        let mode = self.direct_votes.mode();
+        let mode = if self.vote_rules.direct_votes_allowed() { self.direct_votes.mode() } else { VoteTransport::Gossip };
         if mode != VoteTransport::Gossip && matches!(message, M::Vote(_) | M::CommitVote(_)) {
             match self.direct_votes.peer_of(target) {
                 Some(peer) => {

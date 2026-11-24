@@ -109,3 +109,5 @@ mod tests;
 mod profile1_vectors;
 #[cfg(test)]
 mod profile1_v5;
+#[cfg(test)]
+mod profile1_node_paths;

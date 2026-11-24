@@ -850,3 +850,20 @@ has since made Profile 1's (AM17).
   drop it from Profile 1 (headers carry a zero parent-beacon-root link), or keep it with the
   statement that it is a load generator with no security meaning. gov5 owns the mechanism and
   answers; until then A19 stands as written.
+
+**AM22: the standard genesis values for the 8-second slot (gov5's proposal, accepted; to be proven
+before the file is cut).** `blockIntervalMs` 8000, `baseTimeoutMs` 24000, `maxTimeoutMs` 96000,
+`leaderTenure` 1, `epochLength` 10800 (about 24 h), gas limit 480M fixed (not scaled by the slot),
+`deferredExecutionDepth` 1. These replace O8 and the section-5 values.
+- The view timer runs from view start and the pacing happens inside the view, so the base timeout
+  must exceed slot + build + two network hops; 6000 ms is wrong at 8 s.
+- Tenure 1: a tenure longer than one block serves sub-second pipelining, which Profile 1 does not
+  have; at 100 validators tenure 8 would give each leader 64 s and a slow leader a long hold.
+  Rotate-on-timeout stays in the rule set (from view 0) and is a no-op at tenure 1; a chain that
+  sets a longer tenure gets it with no further change.
+- Honest baseline (gov5): no client has run an 8-second slot; gov5's proven chains are 3-4 s with
+  6000 / 30000 and tenure 1, always 7 validators; the largest in-process test is 100, and vote
+  collection, timeout certificates and view change have never run at 100. So: (a) a gov5 round at
+  8 s with these values comes BEFORE the genesis file is cut, and a mixed one is part of M1';
+  (b) batched vote verification and a timeout-certificate path that is not quadratic in the
+  validator count are milestone-2 work for every client, ahead of the 100-validator round (AM17).

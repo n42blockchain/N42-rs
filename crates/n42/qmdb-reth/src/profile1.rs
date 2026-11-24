@@ -613,7 +613,20 @@ pub struct Rule {
 /// Environment variables refused on a profile-1 chain (J4, AM10). Variables
 /// this node reads that change no consensus-visible value (threads,
 /// allocator, parallel build/import, persistence and caches, ingest, logging,
-/// `N42_SETTLEMENT_TAGS`, the `N42_PROFILE=x22` knobs) stay allowed.
+/// the `N42_PROFILE=x22` knobs) stay allowed. The ones the standard's review
+/// asked about, each allowed for the reason given:
+///
+/// | Knob | Why it stays allowed |
+/// |---|---|
+/// | `N42_CHECK_BEFORE_SLOT` | the vote still waits for this execution layer's check of that very block (a check-only answer it vouches for); the commit vote still waits for the own import (`VoteRules`) |
+/// | `N42_IMPORT_ONCE` | keys sharing one execution layer share its one import and check of the block; the answer is the same |
+/// | `N42_COMPACT_BODY` | the body's shape on the direct push channel between this client's members; the block and the topic's body are unchanged |
+/// | `N42_BLOCK_BY_DESCRIPTION` | the follower checks the same transactions, held by reference instead of copied |
+/// | `N42_BODY_ONCE` | the body reaches the execution layer as it arrived instead of decoded twice |
+/// | `N42_TAKE_COMPACT` | the leader's build answer leaves out bytes it never reads; the block is the same |
+/// | `N42_BLOCK_TOPIC_ALWAYS` | the topic is skipped only when the direct push reached every connected member, so a member without it (gov5) still gets the topic |
+/// | `N42_FOLLOWER_EXEC_GATE` | how many executions overlap on this node's worker pool |
+/// | `--builder.extradata` | this node's builder ignores it: a header's `extraData` is the HotStuff seal |
 pub const FORBIDDEN_ENV: &[Rule] = &[
     Rule { name: "N42_MAX_GOSSIP_MB", when: When::Set, reason: "the block size bound is config.hotstuff.maxBlockBytes (B15)" },
     Rule { name: "N42_FRAME_BLOCKS", when: When::NotOneOf(OFF), reason: "frame blocks are not in profile 1 (A12)" },
@@ -625,6 +638,7 @@ pub const FORBIDDEN_ENV: &[Rule] = &[
     Rule { name: "N42_INGEST_VERIFY", when: When::NotOneOf(&["", "all"]), reason: "a node takes another's word for a sender (J4)" },
     Rule { name: "N42_FRAME_GATEWAYS", when: When::Set, reason: "frames attested by a bench gateway key skip checks; no frames in profile 1 (A12, J4)" },
     Rule { name: "N42_SYNC_ANCHOR", when: When::NotOneOf(&["", "enforce", "on", "1", "true"]), reason: "anchored ranges are enforced (section 3)" },
+    Rule { name: "N42_SETTLEMENT_TAGS", when: When::NotOneOf(&["", "split"]), reason: "safe and finalized are the split tags; legacy reports uncertified blocks as finalized (E14, AM19)" },
     Rule { name: "N42_DEFERRED_DEPTH*", when: When::Set, reason: "the depth is config.hotstuff.deferredExecutionDepth (A10; gov5's name)" },
 ];
 
@@ -971,6 +985,7 @@ mod tests {
             ("N42_SYNC_ANCHOR", "observe"),
             ("N42_SYNC_ANCHOR", "off"),
             ("N42_DEFERRED_DEPTH_K", "2"),
+            ("N42_SETTLEMENT_TAGS", "legacy"),
         ] {
             let err = refuse_overrides(g, env(&[("N42_PROFILE", "x22"), (name, value)]), args(&[])).expect_err(name);
             assert!(err.to_string().contains(name), "{name}: {err}");
@@ -1000,8 +1015,16 @@ mod tests {
             &spec.genesis,
             env(&[
                 ("N42_PROFILE", "x22"),
-                ("N42_SETTLEMENT_TAGS", "legacy"),
+                ("N42_SETTLEMENT_TAGS", "split"),
                 ("N42_VOTE_TRANSPORT", "both"),
+                ("N42_CHECK_BEFORE_SLOT", "1"),
+                ("N42_IMPORT_ONCE", "1"),
+                ("N42_COMPACT_BODY", "1"),
+                ("N42_BLOCK_BY_DESCRIPTION", "1"),
+                ("N42_BODY_ONCE", "1"),
+                ("N42_TAKE_COMPACT", "1"),
+                ("N42_BLOCK_TOPIC_ALWAYS", "1"),
+                ("N42_FOLLOWER_EXEC_GATE", "0"),
                 ("N42_SYNC_ANCHOR", "enforce"),
                 ("N42_FRAME_BLOCKS", "0"),
                 ("N42_BENCH_UNSAFE", ""),
@@ -1009,7 +1032,7 @@ mod tests {
                 ("N42_PARALLEL_BUILD", "1"),
                 ("MALLOC_CONF", "thp:always"),
             ]),
-            args(&["node", "--chain", "x.json", "--straggler-grace-ms", "0", "--http", "--genesis-extra", "1"]),
+            args(&["node", "--chain", "x.json", "--straggler-grace-ms", "0", "--http", "--genesis-extra", "1", "--builder.extradata", "n42"]),
         )
         .expect("nothing consensus-visible");
     }

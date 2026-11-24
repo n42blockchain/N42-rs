@@ -1033,7 +1033,14 @@ impl From<Genesis> for ChainSpec {
             (EthereumHardfork::Bpo3.boxed(), genesis.config.bpo3_time),
             (EthereumHardfork::Bpo4.boxed(), genesis.config.bpo4_time),
             (EthereumHardfork::Bpo5.boxed(), genesis.config.bpo5_time),
-            (EthereumHardfork::Amsterdam.boxed(), genesis.config.amsterdam_time),
+            // N42: on a profile-1 genesis `amsterdamTime: 0` names gov5's
+            // Glamsterdam rule set (standard AM1, `qmdb::glamsterdam_time`),
+            // not reth's Amsterdam bundle, which stays unscheduled as it is on
+            // every native chain that runs Glamsterdam today.
+            (
+                EthereumHardfork::Amsterdam.boxed(),
+                genesis.config.amsterdam_time.filter(|_| !crate::qmdb::is_profile1(&genesis)),
+            ),
             (EthereumHardfork::Bogota.boxed(), genesis.config.bogota_time),
         ];
 

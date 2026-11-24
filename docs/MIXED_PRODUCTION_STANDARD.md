@@ -704,3 +704,26 @@ number is refused. All three clients.
 gov5's 03:40 readings of D3 (the system caller appears only if it changed), D5, C6, B3 (ommersHash
 zero in genesis too), B15, A13 and J4 are accepted as the reading of the standard. n42-rs takes D3
 (the `0xff…fe` live empty leaf goes away) and A13 on its milestone-1 list.
+
+### Amendments AM9-AM11 (n42-26, second batch, accepted)
+
+**AM9: "deleted" means "not available on Profile 1".** Wherever this standard says a rule, format,
+transaction type or switch is deleted or removed, read: it MUST NOT be reachable on a chain whose
+genesis says `"n42Profile": 1`. A client may keep the code for chains outside the profile (its own
+performance or research chains: type `0x50`, frame blocks, deferred depth 2, bench knobs). Joining
+Profile 1 with such a feature later is welcome and goes through a profile change; it is not
+required of any client.
+
+**AM10: forbidden environment and flags (J4).** On a genesis with `"n42Profile": 1`, a node that
+finds one of the J4 variables or flags set REFUSES TO START, naming it. On a genesis without the
+field the same variables remain that client's ordinary configuration. (Precedent in n42-26: the
+test chain-id range and `N42_BENCH_UNSAFE=1`.)
+
+**AM11: the Profile-1 numbers are Profile 1's only.** `leaderTenure` 8, gas limit 480M and
+`blockIntervalMs` 500 are the values of the standard genesis, chosen so three clients can run
+together; they are per-chain genesis constants (O4, O8, O9), not limits on any client's own chains.
+At 480M gas and 500 ms a block holds at most 480M / 21,000 ≈ 22,857 plain transfers, about 46k TPS,
+so a Profile-1 round is never compared with a single-client performance figure. Open, for the
+owner: (a) how the 500 ms block interval relates to the project's 8-second slot; (b) the values are
+proven on 4-7 validators only: a mixed round with 100+ validators is added as a gate before the
+profile is called production-ready (after milestone 3).

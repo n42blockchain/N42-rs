@@ -157,6 +157,11 @@ pub const LEGACY_COMMITTEE_POOL_FIELDS: &[(&str, &str)] = &[
     ("allowHandover", "no handover in profile 1 (A19)"),
 ];
 
+/// The deferred-execution depth profile 1 runs (A10, O4). This node also
+/// runs depth 2 on its own chains, but no other client does, so on profile 1
+/// a depth of 2 is refused as gov5's V8 case `deferred_depth_2` requires.
+pub const PROFILE1_DEFERRED_EXECUTION_DEPTH: u64 = 1;
+
 /// The smallest validator set profile 1 runs (A3: `n >= 4`).
 pub const MIN_VALIDATORS: usize = 4;
 
@@ -354,6 +359,15 @@ pub fn profile1(genesis: &Genesis) -> Result<Option<Profile1Config>, Profile1Err
     }
     let deferred_execution_depth = reth_chainspec::qmdb::check_deferred_execution_depth(genesis)
         .map_err(|e| invalid(format!("{hs}.deferredExecutionDepth"), e.to_string()))?;
+    if deferred_execution_depth != PROFILE1_DEFERRED_EXECUTION_DEPTH {
+        return Err(invalid(
+            format!("{hs}.deferredExecutionDepth"),
+            format!(
+                "{deferred_execution_depth} is not implemented on profile 1, which runs depth \
+                 {PROFILE1_DEFERRED_EXECUTION_DEPTH} (A10, O4: a deeper depth is a later profile change; gov5 V8 deferred_depth_2)"
+            ),
+        ));
+    }
     let gas_limit = u64_field(hotstuff, hs, "gasLimit")?;
     if gas_limit == 0 {
         return Err(invalid(format!("{hs}.gasLimit"), "must be above 0 (A23)"));
@@ -857,13 +871,77 @@ mod tests {
             ("refused_profile_string", "n42Profile = \"1\""),
         ];
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/profile1");
-        let on_disk = std::fs::read_dir(&dir).expect("the fixture directory").count();
+        let on_disk = std::fs::read_dir(&dir)
+            .expect("the fixture directory")
+            .filter(|entry| entry.as_ref().expect("an entry").path().extension().is_some_and(|e| e == "json"))
+            .count();
         assert_eq!(on_disk, CASES.len(), "every fixture has a case and every case a fixture");
         for (name, cause) in CASES {
             let err = parse(&dir.join(format!("{name}.json"))).expect_err(name);
             let message = format!("{err:#}");
             assert!(message.contains(cause), "{name}: {message}");
         }
+    }
+
+    // ------------------------------------------------ gov5's vectors (V1, V8) --
+
+    fn gov5_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/profile1/gov5")
+    }
+
+    /// gov5's published closed key lists (V8 `allowed-keys.json`) are exactly
+    /// this node's tables.
+    #[test]
+    fn gov5_allowed_keys_equal_the_closed_tables() {
+        let raw = std::fs::read_to_string(gov5_dir().join("V8/allowed-keys.json")).expect("V8 allowed keys");
+        let allowed: Value = serde_json::from_str(&raw).expect("json");
+        let keys = |section: &str| -> std::collections::BTreeSet<String> {
+            ["mandatory", "optional"]
+                .iter()
+                .flat_map(|kind| allowed[section][*kind].as_array().expect("a list").iter())
+                .map(|key| key.as_str().expect("a key").to_owned())
+                .collect()
+        };
+        let ours = |table: &[&str]| table.iter().map(|key| (*key).to_owned()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys("config"), ours(CONFIG_KEYS));
+        assert_eq!(keys("config.hotstuff"), ours(HOTSTUFF_KEYS));
+        assert_eq!(keys("config.hotstuff.committeePool"), ours(COMMITTEE_POOL_KEYS));
+        assert_eq!(keys("config.hotstuff.validators[]"), ours(VALIDATOR_KEYS));
+        // The one optional key on both sides.
+        assert_eq!(allowed["config"]["optional"], serde_json::json!(["blobSchedule"]));
+    }
+
+    /// gov5's V1 test genesis (the AM22 values) loads through the parser and
+    /// [`profile1`].
+    #[test]
+    fn gov5_genesis_8s_loads() {
+        let spec = parse(&gov5_dir().join("V1/genesis_8s.json")).unwrap_or_else(|e| panic!("genesis_8s: {e:#}"));
+        let config = profile1(&spec.genesis).expect("valid").expect("a profile-1 genesis");
+        assert_eq!(
+            (config.chain_id, config.leader_tenure, config.base_timeout_ms, config.max_timeout_ms),
+            (1144, 1, 24_000, 96_000)
+        );
+        assert_eq!((config.block_interval_ms, config.epoch_length, config.deferred_execution_depth), (8_000, 10_800, 1));
+        assert_eq!((config.gas_limit, config.max_block_bytes, config.validators.len()), (480_000_000, 64 << 20, 4));
+        let hotstuff = HotStuffGenesisConfig::from_genesis(&spec.genesis).expect("a hotstuff block");
+        assert_eq!(hotstuff.profile1(), Some(&config));
+    }
+
+    /// Each of gov5's 14 refused geneses (V8 `refused/`) is refused here.
+    #[test]
+    fn gov5_refused_cases_are_refused() {
+        let dir = gov5_dir().join("V8/refused");
+        let mut cases = 0;
+        for entry in std::fs::read_dir(&dir).expect("V8 refused") {
+            let path = entry.expect("an entry").path();
+            let case: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+            let name = case["case"].as_str().expect("a case name");
+            let genesis: Genesis = serde_json::from_value(case["genesis"].clone()).expect("a genesis");
+            let err = crate::check_genesis(&genesis).expect_err(name);
+            println!("{name}: {err:#}");
+            cases += 1;
+        }
+        assert_eq!(cases, 14);
     }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

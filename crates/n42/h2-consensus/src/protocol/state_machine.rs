@@ -2697,6 +2697,88 @@ mod tests {
         assert_eq!(engine.verify_sync_anchor_qc(&sentinel), SyncQcVerdict::Genesis);
     }
 
+    /// gov5's 2026-11-24 finding, pinned for this engine: a node restarted in
+    /// genesis epoch E (by the chain's `epochLength`) must anchor commit QCs
+    /// of E+1, E+2, ... pulled by range, including views that jump over a
+    /// boundary (timeouts) so that none lands on it. The node builds its
+    /// `EpochManager` with `EpochManager::new` (`h2_validator`): epochs are
+    /// disabled in the engine (the genesis `epochLength` only reaches the
+    /// rotate-on-timeout rule), so the static set answers every view and no
+    /// boundary has to be crossed for a set to be known. Checked both on a
+    /// devnet-shaped chain (epochLength 20) and on profile 1 (fixed set,
+    /// epochLength 10800).
+    #[test]
+    fn a_restarted_node_anchors_qcs_many_epochs_past_its_own_static_set() {
+        for (epoch_length, fixed) in [(20u64, false), (10_800, true)] {
+            let (_, sks, vs, _) = make_engine(4, 0);
+            let (output_tx, _rx) = mpsc::channel(64);
+            // Restart in epoch 2 (by the chain's epochLength), as h2_validator
+            // does: EpochManager::new, then the recovered state.
+            let restart_view = 2 * epoch_length + 5;
+            let committed = build_test_commit_qc(restart_view - 1, B256::repeat_byte(0x50), &sks, &vs, &[0, 1, 2]);
+            let mut engine = ConsensusEngine::with_recovered_state(
+                0,
+                sks[0].clone(),
+                EpochManager::new(vs.clone()),
+                1_000,
+                8_000,
+                output_tx,
+                restart_view,
+                committed.clone(),
+                committed,
+                0,
+                restart_view - 1,
+            );
+            engine.set_rotate_on_timeout(Some(1), epoch_length);
+            if fixed {
+                engine.epoch_manager_mut().set_fixed_validator_set(true);
+            }
+            let anchor = |engine: &ConsensusEngine, view: u64| {
+                let qc = build_test_commit_qc(view, B256::repeat_byte(view as u8), &sks, &vs, &[0, 1, 3]);
+                let verdict = engine.verify_sync_anchor_qc(&crate::wire_bridge::qc_to_wire(&qc).unwrap());
+                assert_eq!(verdict, SyncQcVerdict::Anchor(Box::new(qc)), "epochLength {epoch_length}: view {view}");
+            };
+            // Next epoch's first view, a view past a boundary no view landed
+            // on, and views several epochs on.
+            for view in [
+                3 * epoch_length + 1,
+                3 * epoch_length + 3,
+                5 * epoch_length + 7,
+                9 * epoch_length + 2,
+                40 * epoch_length + 11,
+            ] {
+                anchor(&engine, view);
+            }
+            // A timeout jump over two boundaries, then QCs behind and ahead.
+            engine.advance_to_view(6 * epoch_length + 3).expect("view jump");
+            assert_eq!(engine.epoch_manager().current_epoch(), 0, "epochs are disabled in the engine");
+            for view in [restart_view, 4 * epoch_length + 9, 6 * epoch_length + 3, 12 * epoch_length + 4] {
+                anchor(&engine, view);
+            }
+            // A QC of another set still does not verify: the set is fixed,
+            // not guessed.
+            let other_sks: Vec<_> = (0..4).map(|i| test_key(0x60 + i as u8)).collect();
+            let other_infos: Vec<_> = other_sks
+                .iter()
+                .enumerate()
+                .map(|(i, sk)| ValidatorInfo {
+                    address: Address::with_last_byte(0x60 + i as u8),
+                    bls_public_key: sk.public_key(),
+                    p2p_peer_id: None,
+                })
+                .collect();
+            let other_vs = ValidatorSet::new(&other_infos, 1);
+            let foreign = build_test_commit_qc(7 * epoch_length + 1, B256::repeat_byte(0x51), &other_sks, &other_vs, &[0, 1, 2]);
+            assert!(
+                matches!(
+                    engine.verify_sync_anchor_qc(&crate::wire_bridge::qc_to_wire(&foreign).unwrap()),
+                    SyncQcVerdict::Invalid(_)
+                ),
+                "epochLength {epoch_length}: a foreign committee's QC"
+            );
+        }
+    }
+
     #[test]
     fn test_epoch_boundaries_advance_without_membership_changes() {
         let (mut engine, _, vs, mut output_rx) = make_engine(4, 0);

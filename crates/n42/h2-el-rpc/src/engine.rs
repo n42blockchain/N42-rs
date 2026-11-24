@@ -2811,14 +2811,23 @@ fn built_block_from_header(
         None => ExecutionPayloadSidecar::none(),
         Some(_) => {
             let cancun = CancunPayloadFields { parent_beacon_block_root, versioned_hashes: Vec::new() };
-            match (header.requests_hash.is_some(), requests) {
-                (true, requests) => ExecutionPayloadSidecar::v4(
-                    cancun,
-                    PraguePayloadFields {
-                        requests: RequestsOrHash::Requests(Requests::new(requests.unwrap_or_default())),
-                    },
-                ),
-                (false, _) => ExecutionPayloadSidecar::v3(cancun),
+            match (header.requests_hash, requests) {
+                (Some(header_hash), requests) => {
+                    let requests = Requests::new(requests.unwrap_or_default());
+                    // AM25: on a profile-1 chain the header carries the
+                    // parent's requests hash, which the built list (this
+                    // block's own) need not reproduce; the header's hash then
+                    // goes as it is. Elsewhere the two always agree.
+                    let requests = if requests.requests_hash() == header_hash {
+                        RequestsOrHash::Requests(requests)
+                    } else if header_hash == alloy_eips::eip7685::EMPTY_REQUESTS_HASH {
+                        RequestsOrHash::Requests(Requests::default())
+                    } else {
+                        RequestsOrHash::Hash(header_hash)
+                    };
+                    ExecutionPayloadSidecar::v4(cancun, PraguePayloadFields { requests })
+                }
+                (None, _) => ExecutionPayloadSidecar::v3(cancun),
             }
         }
     };

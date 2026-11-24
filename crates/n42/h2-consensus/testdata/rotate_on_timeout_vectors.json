@@ -1,0 +1,22 @@
+{
+  "source": "Transcribed from N42-SYNC-SPEC.md section 10.4 (view_after_tc table), identical to gov5 TestViewAfterTimeoutVectors (branch feat/hotstuff-rotate-on-timeout, internal/consensus/hotstuff/rotate_on_timeout_test.go). The spec carries no machine-readable form.",
+  "fields": ["tc_view", "tenure", "epoch_length", "active", "view_after_tc"],
+  "vectors": [
+    [8, 8, 0, false, 9],
+    [8, 8, 0, true, 16],
+    [9, 8, 0, true, 16],
+    [15, 8, 0, true, 16],
+    [16, 8, 0, true, 24],
+    [7, 8, 0, true, 8],
+    [0, 8, 0, true, 8],
+    [5, 1, 0, true, 6],
+    [5, 0, 0, true, 6],
+    [8, 8, 10, true, 11],
+    [10, 8, 10, true, 11],
+    [11, 8, 10, true, 16],
+    [17, 8, 10, true, 21],
+    [100, 32, 0, true, 128],
+    [18446744073709551614, 8, 0, true, 18446744073709551615],
+    [18446744073709551612, 8, 0, true, 18446744073709551613]
+  ]
+}

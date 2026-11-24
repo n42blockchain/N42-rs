@@ -32,9 +32,9 @@ use n42_header::N42Header as Header;
 use alloy_primitives::{logs_bloom, Address, B256, U256};
 use n42_consensus_traits::{AposError, AposResult, SignerManager};
 use n42_h2_consensus::{
-    gov5_receipts_root, gov5_rewards_root, is_empty_requests_hash, validate_gov5_h2_header, validate_gov5_header_tail, HeaderTailRules,
+    gov5_receipts_root, gov5_rewards_root, validate_gov5_h2_header, validate_gov5_header_tail, HeaderTailRules,
     withdrawals_to_rewards,
-    HeaderExtra, ReceiptView, SimulatedCommitteePool, GOV5_EMPTY_REQUESTS_HASH,
+    HeaderExtra, ReceiptView, SimulatedCommitteePool,
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
@@ -354,8 +354,7 @@ where
         }
 
         if self.chain_spec.is_prague_active_at_timestamp(timestamp) {
-            // Not before the chain's requests-hash time: gov5 wrote none then.
-            if header.requests_hash.is_none() && reth_chainspec::qmdb::requests_hash_active_at(self.chain_spec.genesis(), timestamp) {
+            if header.requests_hash.is_none() {
                 return Err(ConsensusError::RequestsHashMissing);
             }
         } else if header.requests_hash.is_some() {
@@ -644,26 +643,14 @@ where
 {
     /// The block's EIP-7685 requests hash against the execution's requests.
     fn validate_requests_hash(&self, header: &Header, result: &BlockExecutionResult<Receipt>) -> Result<(), ConsensusError> {
-        // Requests: gov5 spells "none" as the empty trie root where EIP-7685
-        // says sha256 of nothing; both are accepted for a block that made no
-        // requests, and a block that did is held to the EIP.
-        if self.chain_spec.is_prague_active_at_timestamp(header.timestamp)
-            && reth_chainspec::qmdb::requests_hash_active_at(self.chain_spec.genesis(), header.timestamp)
-        {
+        // EIP-7685, as on Ethereum: a Prague header carries the hash of the
+        // requests its block produced, sha256 of nothing when there are none.
+        if self.chain_spec.is_prague_active_at_timestamp(header.timestamp) {
             let Some(header_hash) = header.requests_hash else {
                 return Err(ConsensusError::RequestsHashMissing);
             };
-            let matches = if result.requests.is_empty() {
-                is_empty_requests_hash(header_hash)
-            } else {
-                header_hash == result.requests.requests_hash()
-            };
-            if !matches {
-                let expected = if result.requests.is_empty() {
-                    GOV5_EMPTY_REQUESTS_HASH
-                } else {
-                    result.requests.requests_hash()
-                };
+            let expected = result.requests.requests_hash();
+            if header_hash != expected {
                 return Err(ConsensusError::BodyRequestsHashDiff(
                     GotExpected {
                         got: expected,
@@ -1047,7 +1034,7 @@ mod tests {
             header.parent_beacon_block_root = Some(B256::ZERO);
         }
         if ts >= TS_PRAGUE {
-            header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+            header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         }
         header
     }
@@ -1203,58 +1190,8 @@ mod tests {
         header.requests_hash = None;
         assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::RequestsHashMissing)));
         let mut header = good_header(5, TS_CANCUN);
-        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::RequestsHashUnexpected)));
-    }
-
-    /// A chain that ran Prague's rules before its headers carried
-    /// `requestsHash` (gov5's `pectraTime` ahead of its `pragueTime`, chain
-    /// 94): before the genesis's `requestsHashTime` the field is neither
-    /// required nor checked, as gov5 neither wrote nor checked it; from that
-    /// time the Ethereum rule holds.
-    #[test]
-    fn the_requests_hash_is_held_from_the_genesis_requests_hash_time() {
-        const AT: u64 = TS_PRAGUE + 100;
-        let mut genesis = alloy_genesis::Genesis::default();
-        genesis.config.extra_fields.insert(reth_chainspec::qmdb::REQUESTS_HASH_TIME_KEY.to_owned(), serde_json::json!(AT));
-        let c = HotStuffConsensus::new(Arc::new(n42_header::N42ChainSpec::from(
-            ChainSpecBuilder::mainnet().genesis(genesis).build(),
-        )));
-        assert!(c.chain_spec().is_prague_active_at_timestamp(AT - 1), "Prague's rules are on before the time");
-        let empty = result_of(vec![], 0);
-        let mut requests = Requests::default();
-        requests.push_request_with_type(0x01, [1u8, 2, 3]);
-        let mut with_requests = result_of(vec![], 0);
-        with_requests.requests = requests;
-
-        // Before: a header without the hash passes, also for a block that
-        // made requests, and a hash that is there is not compared.
-        let mut before = good_header(5, AT - 1);
-        before.requests_hash = None;
-        assert!(c.validate_header(&sealed(before)).is_ok());
-        let mut before = header_for(&[], 5, AT - 1);
-        before.requests_hash = None;
-        assert!(c.validate_block_post_execution(&recovered(before.clone()), &empty, None, None).is_ok());
-        assert!(c.validate_block_post_execution(&recovered(before.clone()), &with_requests, None, None).is_ok());
-        before.requests_hash = Some(B256::repeat_byte(5));
-        assert!(c.validate_block_post_execution(&recovered(before), &empty, None, None).is_ok());
-
-        // From it: missing is refused, before and after execution.
-        let mut at = good_header(5, AT);
-        at.requests_hash = None;
-        assert!(matches!(c.validate_header(&sealed(at)), Err(ConsensusError::RequestsHashMissing)));
-        let mut at = header_for(&[], 5, AT);
-        at.requests_hash = None;
-        assert!(matches!(
-            c.validate_block_post_execution(&recovered(at.clone()), &empty, None, None),
-            Err(ConsensusError::RequestsHashMissing)
-        ));
-        at.requests_hash = Some(Requests::default().requests_hash());
-        assert!(c.validate_block_post_execution(&recovered(at.clone()), &empty, None, None).is_ok());
-        assert!(matches!(
-            c.validate_block_post_execution(&recovered(at), &with_requests, None, None),
-            Err(ConsensusError::BodyRequestsHashDiff(_))
-        ));
     }
 
     fn parent_and_child() -> (N42Sealed, Header) {
@@ -1421,7 +1358,7 @@ mod tests {
         child.base_fee_per_gas = Some(875);
         child.blob_gas_used = Some(0);
         child.excess_blob_gas = Some(0);
-        child.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        child.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         child.withdrawals_root = Some(EMPTY_ROOT_HASH);
         child.parent_beacon_block_root = Some(expected);
         c.validate_header_against_parent(&sealed(child.clone()), &parent).unwrap();
@@ -1744,7 +1681,7 @@ mod tests {
         with_requests.requests = requests.clone();
         header.requests_hash = Some(requests.requests_hash());
         assert!(c.validate_block_post_execution(&recovered(header.clone()), &with_requests, None, None).is_ok());
-        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         assert!(matches!(
             c.validate_block_post_execution(&recovered(header), &with_requests, None, None),
             Err(ConsensusError::BodyRequestsHashDiff(_))

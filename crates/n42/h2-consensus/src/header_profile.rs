@@ -71,12 +71,6 @@ pub const MAX_HEADER_EXTRA_LEN: usize = 4096;
 pub const GOV5_NIL_HASH: B256 =
     b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
 
-/// What gov5 wrote in `requestsHash` when a Prague block carried no
-/// EIP-7685 requests, before it followed the EIP: `keccak256(RLP([]))`, the
-/// empty trie root, where the EIP says `sha256("")`. Still read as "no
-/// requests" ([`is_empty_requests_hash`]); never written here.
-pub const GOV5_EMPTY_REQUESTS_HASH: B256 = alloy_consensus::EMPTY_ROOT_HASH;
-
 /// gov5's `withdrawalsRoot`: not a withdrawals commitment at all but
 /// `hash.DeriveSha(rewards)` — keccak over the concatenated
 /// `rlp([address, amount])` of the block's validator rewards, keccak of
@@ -137,42 +131,6 @@ pub fn withdrawals_to_rewards(withdrawals: &[Withdrawal]) -> Vec<(Address, U256)
         .iter()
         .map(|withdrawal| (withdrawal.address, U256::from(withdrawal.amount) * U256::from(GWEI)))
         .collect()
-}
-
-/// The timestamp from which a sealed header carries `requestsHash`; zero
-/// while it always does.
-static REQUESTS_HASH_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Sets the chain's `requestsHashTime` for the headers sealed here (`None`:
-/// from Prague, as on Ethereum, the default).
-///
-/// The execution layer's builder fills `requestsHash` in from its one Prague
-/// time. A chain that ran the Prague rules before its headers carried the
-/// field has `requestsHashTime` in its genesis; a header sealed before that
-/// time leaves the field out, as every other producer on the chain does and
-/// as Ethereum requires before Prague.
-pub fn set_requests_hash_time(time: Option<u64>) {
-    REQUESTS_HASH_TIME.store(time.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The `requestsHash` a header at `timestamp` is sealed with, given the one
-/// its builder set: none before the chain's `requestsHashTime`, and "no
-/// requests" as EIP-7685 spells it, sha256 of nothing.
-fn sealed_requests_hash(requests_hash: Option<B256>, timestamp: u64) -> Option<B256> {
-    requests_hash_from(requests_hash, timestamp, REQUESTS_HASH_TIME.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// [`sealed_requests_hash`] for a given `requestsHashTime` (zero: always).
-fn requests_hash_from(requests_hash: Option<B256>, timestamp: u64, requests_hash_time: u64) -> Option<B256> {
-    if timestamp < requests_hash_time {
-        return None;
-    }
-    requests_hash.map(|hash| if is_empty_requests_hash(hash) { EMPTY_REQUESTS_HASH } else { hash })
-}
-
-/// Whether a `requestsHash` says "no requests" in either convention.
-pub fn is_empty_requests_hash(hash: B256) -> bool {
-    hash == EMPTY_REQUESTS_HASH || hash == GOV5_EMPTY_REQUESTS_HASH
 }
 
 /// What a header's extra data says.
@@ -544,7 +502,7 @@ pub fn execution_data_from_raw_parts(
             let cancun = CancunPayloadFields { parent_beacon_block_root, versioned_hashes };
             match header.requests_hash {
                 None => ExecutionPayloadSidecar::v3(cancun),
-                Some(hash) if is_empty_requests_hash(hash) => ExecutionPayloadSidecar::v4(
+                Some(EMPTY_REQUESTS_HASH) => ExecutionPayloadSidecar::v4(
                     cancun,
                     PraguePayloadFields { requests: RequestsOrHash::Requests(Requests::default()) },
                 ),
@@ -601,7 +559,7 @@ pub fn execution_data_for_block_with_bal(
             };
             match block.header.requests_hash {
                 None => ExecutionPayloadSidecar::v3(cancun),
-                Some(hash) if is_empty_requests_hash(hash) => ExecutionPayloadSidecar::v4(
+                Some(EMPTY_REQUESTS_HASH) => ExecutionPayloadSidecar::v4(
                     cancun,
                     PraguePayloadFields {
                         requests: RequestsOrHash::Requests(Requests::default()),
@@ -694,26 +652,17 @@ pub fn reconstruct_gov5_h2_block_from_or_tx_root<T>(
 ) -> Result<Block<T, N42Header>, HeaderProfileError> {
     let expected = execution.block_hash();
     validate_gov5_h2_header(&block.header)?;
-    // Two more fields a payload cannot carry as gov5 wrote them: the
+    // One more field a payload cannot carry as gov5 wrote it: the
     // withdrawals root, which gov5 fills with its rewards commitment (the
     // payload's empty withdrawals list reconstructs to the trie's empty
-    // root), and the requests hash, whose "none" gov5 spells differently
-    // from EIP-7685. Each has the value the payload implies and the value
-    // gov5 would have written; the hash picks.
+    // root). It has the value the payload implies and the value gov5 would
+    // have written; the hash picks. The requests hash is EIP-7685's on both.
     let withdrawals_roots: Vec<Option<B256>> = match block.header.withdrawals_root {
         Some(root) => {
             let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
             vec![Some(root), Some(gov5_rewards_root(rewards))]
         }
         None => vec![None],
-    };
-    let requests_hashes: Vec<Option<B256>> = match block.header.requests_hash {
-        // The last is a header sealed before the chain's `requestsHashTime`:
-        // the payload names an empty request set, the header has no field.
-        Some(hash) if is_empty_requests_hash(hash) => {
-            vec![Some(hash), Some(GOV5_EMPTY_REQUESTS_HASH), Some(EMPTY_REQUESTS_HASH), None]
-        }
-        other => vec![other],
     };
     // And a third the payload cannot carry: EIP-7928's access list *hash*.
     // The Engine API sends the list, not its hash — the execution layer derives
@@ -747,18 +696,15 @@ pub fn reconstruct_gov5_h2_block_from_or_tx_root<T>(
         for ommers_hash in [B256::ZERO, EMPTY_OMMER_ROOT_HASH] {
             for difficulty in [U256::ZERO, U256::from(1)] {
                 for withdrawals_root in &withdrawals_roots {
-                    for requests_hash in &requests_hashes {
-                        for bal_hash in &bal_hashes {
-                            for slot_number in &slot_numbers {
-                                block.header.ommers_hash = ommers_hash;
-                                block.header.difficulty = difficulty;
-                                block.header.withdrawals_root = *withdrawals_root;
-                                block.header.requests_hash = *requests_hash;
-                                block.header.block_access_list_hash = *bal_hash;
-                                block.header.slot_number = *slot_number;
-                                if block.header.hash_slow() == expected {
-                                    return Ok(block);
-                                }
+                    for bal_hash in &bal_hashes {
+                        for slot_number in &slot_numbers {
+                            block.header.ommers_hash = ommers_hash;
+                            block.header.difficulty = difficulty;
+                            block.header.withdrawals_root = *withdrawals_root;
+                            block.header.block_access_list_hash = *bal_hash;
+                            block.header.slot_number = *slot_number;
+                            if block.header.hash_slow() == expected {
+                                return Ok(block);
                             }
                         }
                     }
@@ -774,8 +720,8 @@ pub fn reconstruct_gov5_h2_block_from_or_tx_root<T>(
     // instead of only that one is.
     Err(HeaderProfileError::Reconstruction(format!(
         "no gov5 header variant hashes to the payload's block hash {expected}: number {} slot {:?} \
-         bal hash candidates {:?} withdrawals roots {:?} requests hashes {:?}",
-        block.header.number, block.header.slot_number, bal_hashes, withdrawals_roots, requests_hashes
+         bal hash candidates {:?} withdrawals roots {:?} requests hash {:?}",
+        block.header.number, block.header.slot_number, bal_hashes, withdrawals_roots, block.header.requests_hash
     )))
 }
 
@@ -834,7 +780,6 @@ pub fn gov5_h2_header_for_view_with_qc(
     if header.withdrawals_root.is_some() {
         header.withdrawals_root = Some(gov5_rewards_root(withdrawals_to_rewards(withdrawals)));
     }
-    header.requests_hash = sealed_requests_hash(header.requests_hash, header.timestamp);
     if let Some(key) = sealer {
         seal_header(&mut header, key)?;
     }
@@ -925,7 +870,6 @@ pub fn normalize_to_gov5_h2_with_header_with_qc(
         let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
         block.header.withdrawals_root = Some(gov5_rewards_root(rewards));
     }
-    block.header.requests_hash = sealed_requests_hash(block.header.requests_hash, block.header.timestamp);
     // The access-list hash is *not* recomputed here. An earlier version of this
     // function did, on the reading that `try_into_block` fills the field with
     // keccak of the encoding rather than EIP-7928's hash. That reading came from
@@ -1413,52 +1357,14 @@ mod tests {
         assert_eq!(reconstructed.header.ommers_hash, B256::ZERO);
         assert_eq!(header_view(&reconstructed.header).unwrap(), 42);
         verify_seal(&reconstructed.header, &key.public_key()).unwrap();
-        // Execution outputs survived, and the two roots gov5 spells its own
-        // way took gov5's spelling. "No requests" is the EIP's sha256 of
-        // nothing, which gov5 checks from its `pragueTime`, not the empty
-        // trie root it used to write.
+        // Execution outputs survived, the two roots gov5 spells its own way
+        // took gov5's spelling, and the requests hash is EIP-7685's, as the
+        // builder set it.
         assert_eq!(reconstructed.header.state_root, B256::repeat_byte(2));
         assert_eq!(reconstructed.header.receipts_root, GOV5_NIL_HASH);
         assert_eq!(reconstructed.header.withdrawals_root, Some(GOV5_NIL_HASH));
         assert_eq!(reconstructed.header.requests_hash, Some(EMPTY_REQUESTS_HASH));
         assert!(proposed.sidecar.requests().is_some());
-    }
-
-    /// Before the chain's `requestsHashTime` a sealed header has no
-    /// `requestsHash`, whatever the builder set; from it, the EIP's spelling.
-    #[test]
-    fn the_requests_hash_is_sealed_from_the_requests_hash_time() {
-        let other = B256::repeat_byte(0x55);
-        for built in [None, Some(EMPTY_REQUESTS_HASH), Some(GOV5_EMPTY_REQUESTS_HASH), Some(other)] {
-            assert_eq!(requests_hash_from(built, 99, 100), None);
-        }
-        for time in [0, 100] {
-            assert_eq!(requests_hash_from(None, 100, time), None);
-            assert_eq!(requests_hash_from(Some(GOV5_EMPTY_REQUESTS_HASH), 100, time), Some(EMPTY_REQUESTS_HASH));
-            assert_eq!(requests_hash_from(Some(EMPTY_REQUESTS_HASH), 100, time), Some(EMPTY_REQUESTS_HASH));
-            assert_eq!(requests_hash_from(Some(other), 100, time), Some(other));
-        }
-    }
-
-    /// A header sealed without `requestsHash` is found again from the
-    /// builder's payload, which names an empty request set.
-    #[test]
-    fn a_header_sealed_without_requests_hash_is_reconstructed_from_a_prague_payload() {
-        let key = BlsSecretKey::random().unwrap();
-        let mut ethereum = fixture_header();
-        ethereum.ommers_hash = EMPTY_OMMER_ROOT_HASH;
-        ethereum.extra_data = Bytes::from(vec![0u8; 97]);
-        let block = block_for_header(ethereum, vec![]);
-        let built = execution_data_for_block(block.header.hash_slow(), &block);
-        let mut proposed = normalize_to_gov5_h2(&built, 42, Some(&key)).unwrap();
-        assert!(proposed.sidecar.requests().is_some());
-
-        let mut sealed = reconstruct_gov5_h2_block::<TxEnvelope>(&proposed).unwrap().header;
-        sealed.requests_hash = None;
-        proposed.payload.as_v1_mut().block_hash = sealed.hash_slow();
-        let reconstructed = reconstruct_gov5_h2_block::<TxEnvelope>(&proposed).unwrap();
-        assert_eq!(reconstructed.header.hash_slow(), sealed.hash_slow());
-        assert_eq!(reconstructed.header.requests_hash, None);
     }
 
     /// Section 6.9 of `docs/MATURITY_HARDENING_2026_10.md`: a header carrying
@@ -1514,10 +1420,6 @@ mod tests {
     #[test]
     fn gov5_roots_for_nothing_are_what_gov5_writes() {
         assert_eq!(gov5_rewards_root([]), GOV5_NIL_HASH);
-        assert_eq!(GOV5_EMPTY_REQUESTS_HASH, alloy_consensus::EMPTY_ROOT_HASH);
-        assert!(is_empty_requests_hash(EMPTY_REQUESTS_HASH));
-        assert!(is_empty_requests_hash(GOV5_EMPTY_REQUESTS_HASH));
-        assert!(!is_empty_requests_hash(B256::ZERO));
     }
 
     #[test]

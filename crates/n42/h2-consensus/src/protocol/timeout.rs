@@ -53,7 +53,8 @@ impl ConsensusEngine {
             );
             return Ok(false);
         };
-        let next_view = timeout.view.saturating_add(1);
+        // The view this timeout's TC leads to (rotate-on-timeout aware).
+        let next_view = self.view_after_tc(timeout.view);
         let Some(next_view_set) = self
             .epoch_manager
             .known_validator_set_for_view(next_view)
@@ -269,7 +270,7 @@ impl ConsensusEngine {
             // Check if quorum was reached while we were waiting (messages may have
             // arrived between repeats). A quorum can advance even without the next leader.
             let quorum_size = self.validator_set_for_view(view).quorum_size();
-            let next_view = view.saturating_add(1);
+            let next_view = self.view_after_tc(view);
             // edition-2021: N42-26 writes this as a let-chain.
             let collector_has_quorum = self
                 .timeout_collector
@@ -378,7 +379,9 @@ impl ConsensusEngine {
 
         let n_validators = view_set.len();
         let quorum_size = view_set.quorum_size();
-        let next_view = view.saturating_add(1);
+        // The view a TC for this one leads to, and so the leader that will
+        // sign its NewView (rotate-on-timeout aware).
+        let next_view = self.view_after_tc(view);
         let next_leader = self.leader_index_for_view(next_view);
         let relay_timeout = (timeout.sender != self.my_index && next_leader != self.my_index)
             .then(|| timeout.clone());
@@ -471,14 +474,17 @@ impl ConsensusEngine {
             });
         }
 
-        // TC must be for the previous view (nv.view - 1).
-        if nv.timeout_cert.view != nv.view.saturating_sub(1) {
+        // The TC must be for the view this NewView succeeds: nv.view - 1,
+        // or, under rotate-on-timeout, the view whose successor is nv.view
+        // (gov5 `processNewView`: `viewAfterTC(tc.View) != nv.View`).
+        // `tc.view < nv.view` keeps the switch-off check exactly the old
+        // `tc.view == nv.view - 1` (also at u64::MAX, where +1 saturates).
+        if nv.timeout_cert.view >= nv.view || self.view_after_tc(nv.timeout_cert.view) != nv.view {
             return Err(ConsensusError::InvalidTC {
                 view: nv.timeout_cert.view,
                 reason: format!(
-                    "TC view {} does not match expected view {} (nv.view - 1)",
-                    nv.timeout_cert.view,
-                    nv.view.saturating_sub(1)
+                    "TC view {} does not precede the NewView view {}",
+                    nv.timeout_cert.view, nv.view
                 ),
             });
         }
@@ -521,7 +527,7 @@ impl ConsensusEngine {
     /// carrying it is judged on its own. `Ok(true)` when the node moved.
     pub fn adopt_embedded_tc(&mut self, tc: &TimeoutCertificate) -> ConsensusResult<bool> {
         let current_view = self.round_state.current_view();
-        let target_view = tc.view.saturating_add(1);
+        let target_view = self.view_after_tc(tc.view);
         if tc.view == 0 || target_view <= current_view {
             return Ok(false);
         }

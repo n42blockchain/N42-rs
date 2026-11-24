@@ -26,6 +26,8 @@ struct Rig {
     addr: libp2p::Multiaddr,
     /// The kind of every transport event a pump handed to the service.
     seen: Vec<&'static str>,
+    /// The validator keys of the rig's set, to sign certificates with.
+    keys: Vec<BlsSecretKey>,
 }
 
 fn keys(count: usize) -> (Vec<BlsSecretKey>, ValidatorSet) {
@@ -97,7 +99,7 @@ async fn node_in_with_vote_log(
     let el = MockExecutionLayer::new();
     let driver = ExecutionDriver::new(el.clone(), ID.genesis_hash);
     let svc = H2Service::new(transport, engine, driver, rx, keys.len());
-    Rig { svc, el, addr, seen: Vec::new() }
+    Rig { svc, el, addr, seen: Vec::new(), keys: keys.to_vec() }
 }
 
 /// A block of the mock's shape and the gov5 RLP it travels as.
@@ -190,15 +192,15 @@ async fn a_range_is_served_from_the_start_until_the_first_missing_block() {
         within(el.new_payload(built.execution_data)).await.expect("accepted");
     }
     let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1 << 20));
-    let served = within(serve_range(&el, n42_h2_net::RangeRequest { start: 2, count: 10, step: 1 }, &budget)).await.rlps;
+    let served = within(serve_range(&el, n42_h2_net::RangeRequest { start: 2, count: 10, step: 1 }, &budget, ServeCeiling::Height(u64::MAX))).await.rlps;
     assert_eq!(served.len(), 2, "blocks 2 and 3, then block 4 is missing");
     for (rlp, number) in served.iter().zip([2u64, 3]) {
         let (_, header) = n42_h2_consensus::decode_block_body_header(rlp, HeaderProfile::Ethereum).expect("a body");
         assert_eq!(header.number, number);
     }
-    let none = within(serve_range(&el, n42_h2_net::RangeRequest { start: 50, count: 5, step: 1 }, &budget)).await;
+    let none = within(serve_range(&el, n42_h2_net::RangeRequest { start: 50, count: 5, step: 1 }, &budget, ServeCeiling::Height(u64::MAX))).await;
     assert!(none.rlps.is_empty() && !none.short_of_budget, "nothing past the head");
-    let capped = within(serve_range(&el, n42_h2_net::RangeRequest { start: 1, count: 1, step: 1 }, &budget)).await;
+    let capped = within(serve_range(&el, n42_h2_net::RangeRequest { start: 1, count: 1, step: 1 }, &budget, ServeCeiling::Height(u64::MAX))).await;
     assert_eq!(capped.rlps.len(), 1, "count bounds the answer");
 }
 
@@ -219,13 +221,58 @@ async fn range_replies_draw_on_one_byte_budget_held_until_dropped() {
     // One KiB: one small block's worth.
     let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let request = n42_h2_net::RangeRequest { start: 1, count: 3, step: 1 };
-    let first = within(serve_range(&el, request, &budget)).await;
+    let first = within(serve_range(&el, request, &budget, ServeCeiling::Height(u64::MAX))).await;
     assert_eq!((first.rlps.len(), first.short_of_budget), (1, true), "cut short where the budget ends");
     assert_eq!(budget.available_permits(), 0, "held while the reply is");
-    let second = within(serve_range(&el, request, &budget)).await;
+    let second = within(serve_range(&el, request, &budget, ServeCeiling::Height(u64::MAX))).await;
     assert!(second.rlps.is_empty() && second.short_of_budget, "nothing left to start another");
     drop(first);
     assert_eq!(budget.available_permits(), 1, "given back with the reply");
+}
+
+/// Sync standard Q-S5 (B4): v1 serves committed blocks only. The execution
+/// layer holds blocks 1..=5, three of them committed: a request inside the
+/// committed height is served whole, one straddling it the committed prefix,
+/// one beyond it nothing.
+#[tokio::test]
+async fn a_range_is_served_up_to_the_committed_height_only() {
+    use n42_h2_execution::ExecutionLayer;
+    let el = MockExecutionLayer::new();
+    let mut hashes = vec![B256::ZERO];
+    for number in 1..=5 {
+        let built = MockExecutionLayer::built_block_on(number, hashes[number as usize - 1]);
+        hashes.push(built.hash);
+        within(el.new_payload(built.execution_data)).await.expect("accepted");
+    }
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1 << 20));
+    let serve = |start, count, ceiling| {
+        let (el, budget) = (&el, &budget);
+        async move { within(serve_range(el, n42_h2_net::RangeRequest { start, count, step: 1 }, budget, ceiling)).await }
+    };
+    let numbers = |served: &ServedRange| -> Vec<u64> {
+        served
+            .rlps
+            .iter()
+            .map(|rlp| n42_h2_consensus::decode_block_body_header(rlp, HeaderProfile::Ethereum).expect("a body").1.number)
+            .collect()
+    };
+    let committed = ServeCeiling::Height(3);
+    assert_eq!(numbers(&serve(2, 2, committed).await), vec![2, 3], "inside");
+    let straddling = serve(2, 10, committed).await;
+    assert_eq!(numbers(&straddling), vec![2, 3], "straddling: the committed prefix");
+    assert!(!straddling.short_of_budget);
+    assert_eq!(straddling.ceiling, 3);
+    assert!(serve(4, 10, committed).await.rlps.is_empty(), "beyond: nothing, though the layer holds 4 and 5");
+    assert!(serve(1, 3, ServeCeiling::Height(0)).await.rlps.is_empty(), "nothing committed: nothing served");
+
+    // After a restart, before a live commit: the restored commit's block,
+    // numbered by the execution layer, and the number comes back to be kept.
+    let restored = serve(1, 10, ServeCeiling::Block(hashes[2])).await;
+    assert_eq!(numbers(&restored), vec![1, 2]);
+    assert_eq!(restored.restored, Some((hashes[2], 2)));
+    // A restored block the layer does not hold: fail closed.
+    let unknown = serve(1, 10, ServeCeiling::Block(B256::repeat_byte(9))).await;
+    assert!(unknown.rlps.is_empty() && unknown.restored.is_none());
 }
 
 #[test]
@@ -814,7 +861,7 @@ async fn a_range_reply_is_queued_and_a_refusal_is_handed_on_only_to_the_running_
     assert!(rig.svc.pending_imports.is_empty());
 
     // With this peer's catch-up running it becomes an empty reply for the import loop.
-    rig.svc.catch_up = Some(CatchUp { peer, next: 4, target: 20, started_at: 3, probing: false, probe_height: 0, prev_hash: None });
+    rig.svc.catch_up = Some(CatchUp::new(peer, 3, 20));
     rig.svc
         .handle_transport_event(TransportEvent::RangeFetched { peer, request, reply: Err("nope".into()) })
         .expect("ok");

@@ -37,16 +37,18 @@ pub mod state_reader;
 pub mod strategy;
 
 pub use chainspec::{
-    qmdb_genesis_root, state_scheme, with_declared_state_scheme, N42ChainSpecParser, StateScheme,
+    check_genesis, qmdb_genesis_root, state_scheme, with_declared_state_scheme, N42ChainSpecParser, StateScheme,
     STATE_SCHEME_KEY, STATE_SCHEME_QMDB,
 };
 pub use changes::{
     changes_from_alloc, changes_from_bundle, changes_from_execution, system_caller_leaf_at, with_prague_system_caller, sorted_operations_from_accounts, sorted_operations_from_accounts_timed, sorted_operations_from_execution, operations_ahead, OpsAhead, OpsSplit,
 };
-pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
+pub use hotstuff::{
+    refuse_unimplemented_rules, GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig, UNIMPLEMENTED_ACTIVATING_FIELDS,
+};
 pub use reth_chainspec::qmdb::{
     check_deferred_execution_depth, deferred_execution_active_at, deferred_execution_depth, deferred_execution_depth_at,
-    deferred_execution_time, requests_hash_time, DeferredDepthError, DEFERRED_EXECUTION_DEPTH_KEY, SUPPORTED_DEFERRED_EXECUTION_DEPTH,
+    deferred_execution_time, DeferredDepthError, DEFERRED_EXECUTION_DEPTH_KEY, SUPPORTED_DEFERRED_EXECUTION_DEPTH,
 };
 /// The tree a producer computed for a block it has not yet sealed.
 pub use n42_qmdb_state::forest::PreparedBlock;

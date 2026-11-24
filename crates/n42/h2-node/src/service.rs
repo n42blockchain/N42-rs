@@ -70,6 +70,8 @@ use n42_h2_wire::{H2Message, H2V4Envelope};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::sync_anchor::{AnchorBuffer, Buffered, SyncAnchorMode};
+
 /// Decides what a leader proposes for a view, given the view number and the
 /// current head. `None` declines the view — see
 /// [`H2Service::with_payload_attributes`].
@@ -361,6 +363,11 @@ pub struct H2Service<E> {
     /// The highest block number consensus has committed here: a build ahead
     /// on a parent below it is stale ([`stale_build_parent`]).
     committed_height: Option<u64>,
+    /// The block of the commit restored at start (the engine's persisted
+    /// `last_committed_qc`) and its number as the execution layer gave it:
+    /// what is known committed before the first live commit. Read for range
+    /// serving ([`Self::serve_ceiling`]) and the status height.
+    restored_committed: Option<(B256, u64)>,
     /// Whether to start a build before this node is leader. Off by default:
     /// it is a change to when the execution layer is asked for a payload, and
     /// the first measurement of it was a fourfold regression rather than the
@@ -572,6 +579,15 @@ pub struct H2Service<E> {
     fill_bytes: FillBudget,
     /// Header QCs that verified, so the vote path checks each once.
     verified_header_qcs: std::cell::RefCell<VerifiedHeaderQcs>,
+    /// Header QCs that verified as sync anchors (commit domain, the set of
+    /// their exact view), so the catch-up checks each once.
+    sync_anchor_qcs: std::cell::RefCell<VerifiedHeaderQcs>,
+    /// How the catch-up treats blocks no verified anchor covers
+    /// (`N42_SYNC_ANCHOR`, see [`crate::sync_anchor`]).
+    sync_anchor_mode: SyncAnchorMode,
+    /// Under `observe`: pulled blocks executed that `enforce` would have held
+    /// unexecuted, and pulls it would have ended.
+    sync_anchor_would_refuse: u64,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -690,6 +706,32 @@ struct CatchUp {
     /// imported: the next pulled block must name it as its parent. `None`
     /// before the first, whose parent the execution layer checks.
     prev_hash: Option<B256>,
+    /// Under `N42_SYNC_ANCHOR=enforce`: the pulled blocks not yet executed,
+    /// waiting for an anchor (see [`crate::sync_anchor`]).
+    anchored: AnchorBuffer<(n42_h2_net::RawGossipBlock, Bytes)>,
+    /// Under `observe`: the same bookkeeping without the blocks, to log what
+    /// `enforce` would have held.
+    shadow: AnchorBuffer<()>,
+    /// The highest height this pull executed (or found already imported).
+    executed: u64,
+}
+
+impl CatchUp {
+    /// A pull from `peer` of the blocks above `started_at` up to `target`.
+    fn new(peer: PeerId, started_at: u64, target: u64) -> Self {
+        Self {
+            peer,
+            next: started_at + 1,
+            target,
+            started_at,
+            probing: false,
+            probe_height: 0,
+            prev_hash: None,
+            anchored: AnchorBuffer::default(),
+            shadow: AnchorBuffer::default(),
+            executed: started_at,
+        }
+    }
 }
 
 /// How many block requests may wait for the execution layer at once, and
@@ -1575,6 +1617,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             always_publish_topic: n42_env::flag("N42_BLOCK_TOPIC_ALWAYS", false),
             prepare_on: None,
             committed_height: None,
+            restored_committed: None,
             prepare_ahead: false,
             defer_reason: None,
             header_profile: HeaderProfile::Ethereum,
@@ -1632,6 +1675,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             fill_slots: ServeSlots::shared(MAX_FILL_SERVES_PER_PEER, MAX_FILL_SERVES_IN_FLIGHT),
             fill_bytes: FillBudget::new(MAX_FILL_SERVE_BYTES >> 10),
             verified_header_qcs: std::cell::RefCell::default(),
+            sync_anchor_qcs: std::cell::RefCell::default(),
+            sync_anchor_mode: SyncAnchorMode::from_env(),
+            sync_anchor_would_refuse: 0,
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -1808,6 +1854,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                 warn!(target: "n42.h2.node", view = qc.view, %err, "the committed QC does not encode; headers keep the previous one");
             }
         }
+    }
+
+    /// Sets how the range catch-up treats pulled blocks no verified anchor
+    /// covers, in place of `N42_SYNC_ANCHOR` (see [`crate::sync_anchor`]).
+    pub const fn with_sync_anchor_mode(mut self, mode: SyncAnchorMode) -> Self {
+        self.sync_anchor_mode = mode;
+        self
     }
 
     /// Sets the header shape used on the block topic.
@@ -2864,12 +2917,17 @@ impl<E: ExecutionLayer> H2Service<E> {
                 //
                 // Off the loop: up to 32 sequential lookups and the replies'
                 // bytes used to sit on this loop, which is the view's.
+                //
+                // Committed blocks only (sync standard Q-S5, B4): the
+                // execution layer's canonical chain also holds the head
+                // consensus has not committed and blocks pulled unproven.
                 if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
                     let el = self.driver.execution_layer_arc();
                     let back = self.served_txns.0.clone();
                     let budget = self.serve_bytes.clone();
+                    let ceiling = self.serve_ceiling();
                     tokio::spawn(async move {
-                        let range = serve_range(&*el, request, &budget).await;
+                        let range = serve_range(&*el, request, &budget, ceiling).await;
                         let _ = back.send(Served::Range { peer, request, channel, range, slot }).await;
                     });
                 } else {
@@ -2965,9 +3023,12 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Feeds a decoded consensus message to the engine.
     fn accept_envelope(&mut self, envelope: &H2V4Envelope) {
         // gov5's SyncInfo TC, before the message itself as gov5 orders it;
-        // translated only when it is ahead of this node (R2-C1).
+        // translated only when the view it leads to is ahead of this node
+        // (R2-C1). Under rotate-on-timeout a TC for a view this node already
+        // left by a QC can still move it (spec section 10.4 S11); with the
+        // rule off this is the old `tc.view >= current_view`.
         if let Some(tc) = wire_bridge::embedded_tc(envelope)
-            && tc.view >= self.engine.current_view()
+            && self.engine.view_after_tc(tc.view) > self.engine.current_view()
         {
             match wire_bridge::tc_to_engine(tc, self.validator_count) {
                 Ok(tc) => {
@@ -3282,6 +3343,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                     if self.unproven_from.is_some_and(|from| number >= from) {
                         self.unproven_from = None;
                     }
+                }
+                // A live commit is an anchor for the catch-up too (sync
+                // standard §3.3): pulled blocks it names, and those below
+                // them, are executed on the next import step.
+                if let Some(catch_up) = self.catch_up.as_mut() {
+                    catch_up.anchored.anchor(block_hash);
+                    catch_up.shadow.anchor(block_hash);
                 }
                 self.loop_spend.open(view);
                 events.push(ServiceEvent::Committed {
@@ -4498,15 +4566,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let advertised = height;
         let height = capped_catch_up_target(advertised, latest, far_ahead_limit());
         info!(target: "n42.h2.node", %peer, from = latest, to = height, advertised, "behind a peer; pulling the gap by range");
-        self.catch_up = Some(CatchUp {
-            peer,
-            next: latest + 1,
-            target: height,
-            started_at: latest,
-            probing: false,
-            probe_height: 0,
-            prev_hash: None,
-        });
+        self.catch_up = Some(CatchUp::new(peer, latest, height));
         self.request_next_range();
         events.push(ServiceEvent::Syncing {
             from: latest,
@@ -4533,7 +4593,16 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// layer, at most [`PULLED_BLOCKS_PER_STEP`] per call — what is left of a
     /// reply waits for the next step; asks for the next range while the
     /// target is not reached.
+    ///
+    /// Under `N42_SYNC_ANCHOR=enforce` (the default) a pulled block is
+    /// screened and buffered, and only the blocks a verified anchor
+    /// authenticates are executed, in order (see [`Self::buffer_pulled`]).
     async fn import_ranges(&mut self, events: &mut Vec<ServiceEvent>) {
+        let enforce = self.sync_anchor_mode == SyncAnchorMode::Enforce;
+        // Pulled blocks a live commit anchored since the last step.
+        if enforce && self.catch_up.is_some() && !self.release_anchored(events).await {
+            return;
+        }
         let mut budget = PULLED_BLOCKS_PER_STEP;
         let mut replies = std::mem::take(&mut self.pending_imports).into_iter();
         while let Some((peer, request, chunks)) = replies.next() {
@@ -4546,6 +4615,15 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             if chunks.is_empty() {
                 if catch_up.probing {
+                    self.finish_catch_up(events, true);
+                } else if catch_up.next > catch_up.started_at + 1 {
+                    // This pull already took blocks: an empty answer (or a
+                    // refusal, which reaches here as one) after them is
+                    // where the peer's served chain ends -- its committed
+                    // head, or a gov5 main / n42-26 server's stored one. Not
+                    // a fault (sync standard §3.5); what is left arrives by
+                    // gossip or from another peer's pull.
+                    debug!(target: "n42.h2.node", %peer, ?request, "peer served up to its head; catch-up done");
                     self.finish_catch_up(events, true);
                 } else {
                     warn!(target: "n42.h2.node", %peer, ?request, "peer served none of the range; catch-up stopped");
@@ -4576,11 +4654,18 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let hash = block.block_hash;
                 let number = block.header.number;
                 self.note_peer_height(peer, number);
+                if enforce {
+                    if !self.buffer_pulled(peer, block, chunk.rlp, events).await {
+                        return;
+                    }
+                    continue;
+                }
                 // Gossip may have got there first: bodies held back while
                 // the pull was far behind are executed as it closes in, and
                 // their commits finalise them. A forkchoice back to a block
                 // behind the finalised one is a reorg reth refuses.
                 if self.imported.contains(&hash) {
+                    self.observe_pulled(peer, &block.header, hash, chunk.rlp.len());
                     if let Some(c) = self.catch_up.as_mut() {
                         c.next += 1;
                         c.prev_hash = Some(hash);
@@ -4612,6 +4697,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.finish_catch_up(events, false);
                     return;
                 }
+                self.observe_pulled(peer, &block.header, hash, chunk.rlp.len());
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
                         // A verified header QC proves the chain up to the
@@ -4685,6 +4771,188 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
+    /// The anchored import (sync standard §3.4, `N42_SYNC_ANCHOR=enforce`):
+    /// screens one pulled block, harvests the anchor its header QC names,
+    /// buffers it, and executes the buffered blocks an anchor now covers.
+    ///
+    /// - Screening: the block extends the one pulled before it, its header
+    ///   extra decodes (gov5's profile), and its QC is no later than its own
+    ///   view and, under a known set, verifies. A failure is the peer's fault:
+    ///   the rest of its range is dropped and it is not asked for the gap
+    ///   again.
+    /// - A commit-domain QC verified under the set of its exact view names
+    ///   an anchor ([`Self::sync_anchor_of`]); the block it names and every
+    ///   buffered block below it are authenticated (the buffer is
+    ///   parent-linked), and a live commit is an anchor too.
+    /// - Only an authenticated block at the head of the buffer is executed.
+    ///   The unanchored tail above the highest anchor waits, unexecuted, for
+    ///   a later QC or a commit. Past [`crate::sync_anchor::MAX_TAIL_BLOCKS`]
+    ///   blocks or [`crate::sync_anchor::MAX_TAIL_BYTES`] it is dropped and
+    ///   the pull ends with a reason; the peer is not blamed (§3.5), what was
+    ///   executed stays.
+    ///
+    /// `false` when the pull ended.
+    async fn buffer_pulled(
+        &mut self,
+        peer: PeerId,
+        block: n42_h2_net::RawGossipBlock,
+        rlp: Bytes,
+        events: &mut Vec<ServiceEvent>,
+    ) -> bool {
+        let (hash, number) = (block.block_hash, block.header.number);
+        if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
+            && block.header.parent_hash != prev
+        {
+            warn!(target: "n42.h2.node", %peer, number, parent = %block.header.parent_hash, %prev, "peer served a block that does not extend the one before it; the rest of its range is dropped");
+            self.refused_range_peers.insert(peer, number);
+            self.finish_catch_up(events, false);
+            return false;
+        }
+        let anchor = match self.sync_anchor_of(&block.header) {
+            Ok(anchor) => anchor,
+            Err(reason) => {
+                warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
+                self.refused_range_peers.insert(peer, number);
+                self.finish_catch_up(events, false);
+                return false;
+            }
+        };
+        let Some(c) = self.catch_up.as_mut() else {
+            return false;
+        };
+        if let Some(named) = anchor {
+            c.anchored.anchor(named);
+        }
+        c.anchored.push(Buffered { number, hash, bytes: rlp.len(), item: (block, rlp) });
+        c.next += 1;
+        c.prev_hash = Some(hash);
+        if !self.release_anchored(events).await {
+            return false;
+        }
+        let Some(c) = self.catch_up.as_mut() else {
+            return false;
+        };
+        if c.anchored.tail_over_bound() {
+            let (blocks, bytes) = c.anchored.tail();
+            c.anchored.clear();
+            warn!(
+                target: "n42.h2.node",
+                %peer, number, blocks, bytes, executed = c.executed,
+                "no verified anchor covers the pulled blocks within the unanchored-tail bound (64 blocks / 512 MiB): the tail is dropped unexecuted and the pull ends; the peer is not blamed"
+            );
+            self.finish_catch_up(events, false);
+            return false;
+        }
+        true
+    }
+
+    /// Executes, in order, the buffered pulled blocks an anchor covers.
+    /// `false` when the pull ended (the execution layer refused one, or
+    /// there is no pull).
+    async fn release_anchored(&mut self, events: &mut Vec<ServiceEvent>) -> bool {
+        loop {
+            let Some(c) = self.catch_up.as_mut() else {
+                return false;
+            };
+            let Some(ready) = c.anchored.pop_ready() else {
+                return true;
+            };
+            let (block, rlp) = ready.item;
+            if !self.imported.contains(&ready.hash) {
+                if let Err(err) = self.driver.import_pulled(block.execution_data()).await {
+                    warn!(target: "n42.h2.node", number = ready.number, %err, "could not import an anchored pulled block; catch-up stopped");
+                    self.finish_catch_up(events, false);
+                    return false;
+                }
+                self.remember_imported(ready.hash);
+                self.note_imported(ready.number);
+                self.remember_block(ready.hash, &block.header);
+                self.remember_body(ready.hash, rlp);
+            }
+            if let Some(c) = self.catch_up.as_mut() {
+                c.executed = ready.number;
+            }
+        }
+    }
+
+    /// Under `N42_SYNC_ANCHOR=observe`: the anchored import's bookkeeping
+    /// beside the import as it was, logging what `enforce` would have done
+    /// differently -- a QC it would refuse, a pull it would end at the tail
+    /// bound. The blocks it would have left unexecuted are logged when the
+    /// pull ends ([`Self::finish_catch_up`]).
+    fn observe_pulled(&mut self, peer: PeerId, header: &Header, hash: B256, bytes: usize) {
+        if self.sync_anchor_mode != SyncAnchorMode::Observe {
+            return;
+        }
+        let number = header.number;
+        let anchor = match self.sync_anchor_of(header) {
+            Ok(anchor) => anchor,
+            Err(reason) => {
+                self.sync_anchor_would_refuse += 1;
+                warn!(target: "n42.h2.node", %peer, number, %reason, "sync anchor (observe): enforce would refuse this block's QC and end the pull");
+                None
+            }
+        };
+        let Some(c) = self.catch_up.as_mut() else {
+            return;
+        };
+        if let Some(named) = anchor {
+            c.shadow.anchor(named);
+        }
+        c.shadow.push(Buffered { number, hash, bytes, item: () });
+        while c.shadow.pop_ready().is_some() {}
+        if c.shadow.tail_over_bound() {
+            let (blocks, bytes) = c.shadow.tail();
+            c.shadow.clear();
+            self.sync_anchor_would_refuse += 1;
+            warn!(
+                target: "n42.h2.node",
+                %peer, number, blocks, bytes,
+                "sync anchor (observe): no verified anchor within the unanchored-tail bound; enforce would have executed none of these blocks and ended the pull here"
+            );
+        }
+    }
+
+    /// The anchor a pulled header's embedded QC names, for the sync
+    /// importer: the block hash of a commit-domain QC that verifies against
+    /// the set of its exact view
+    /// ([`ConsensusEngine::verify_sync_anchor_qc`]). No QC, the genesis
+    /// sentinel, a prepare-domain QC and a QC whose set this node does not
+    /// know name none (the last fails closed: nothing it would cover is
+    /// executed); none of them is the peer's fault. A QC that does not
+    /// decode (gov5's profile), names a view past the header's own, or does
+    /// not verify under a known set is an error: a provable fault.
+    fn sync_anchor_of(&self, header: &Header) -> Result<Option<B256>, String> {
+        let Some((key, wire)) = self.header_qc_wire(header)? else {
+            return Ok(None);
+        };
+        if let Some(qc) = self.sync_anchor_qcs.borrow().get(&key) {
+            return Ok(Some(qc.block_hash));
+        }
+        match self.engine.verify_sync_anchor_qc(&wire) {
+            n42_h2_consensus::SyncQcVerdict::Anchor(qc) => {
+                let named = qc.block_hash;
+                self.sync_anchor_qcs.borrow_mut().insert(key, *qc);
+                Ok(Some(named))
+            }
+            n42_h2_consensus::SyncQcVerdict::Genesis => Ok(None),
+            n42_h2_consensus::SyncQcVerdict::PrepareDomain => {
+                debug!(target: "n42.h2.node", qc_view = wire.view, number = header.number, "header QC verifies only in the prepare domain: not a sync anchor");
+                Ok(None)
+            }
+            n42_h2_consensus::SyncQcVerdict::UnknownSet => {
+                warn!(
+                    target: "n42.h2.node",
+                    qc_view = wire.view,
+                    number = header.number,
+                    "no validator set known for the header QC's view: not a sync anchor (fails closed); pulled blocks above the last anchor are not executed"
+                );
+                Ok(None)
+            }
+            n42_h2_consensus::SyncQcVerdict::Invalid(reason) => Err(format!("header QC does not verify: {reason}")),
+        }
+    }
+
     /// What a range-pulled block has to show before it is imported.
     ///
     /// - It extends the block this pull imported last.
@@ -4740,6 +5008,34 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// verified again ([`VerifiedHeaderQcs`]): the live path asks for every
     /// block it votes on.
     fn check_header_qc(&self, header: &Header) -> Result<Option<QuorumCertificate>, String> {
+        let Some((key, wire)) = self.header_qc_wire(header)? else {
+            return Ok(None);
+        };
+        if let Some(qc) = self.verified_header_qcs.borrow().get(&key) {
+            return Ok(Some(qc));
+        }
+        let Some(qc) = self.engine.verify_header_qc(&wire).map_err(|err| err.to_string())? else {
+            debug!(
+                target: "n42.h2.node",
+                qc_view = wire.view,
+                number = header.number,
+                "validator set for the certificate's view is not known; the header QC is unchecked"
+            );
+            return Ok(None);
+        };
+        self.verified_header_qcs.borrow_mut().insert(key, qc.clone());
+        Ok(Some(qc))
+    }
+
+    /// The QC a header embeds, decoded, with the keccak of its bytes (the
+    /// key of the verified-QC caches): `None` when it embeds none, or when
+    /// its extra data is not the `HotStuff` layout outside gov5's profile.
+    /// Extra data that does not decode under gov5's profile, a QC that does
+    /// not decode, and one whose view is past the header's own are refused.
+    fn header_qc_wire(
+        &self,
+        header: &Header,
+    ) -> Result<Option<(B256, n42_h2_wire::h2_wire::H2QuorumCertificate)>, String> {
         let extra = match n42_h2_consensus::HeaderExtra::decode(&header.extra_data) {
             Ok(extra) => extra,
             Err(err) if self.header_profile == HeaderProfile::Gov5H2 => return Err(err.to_string()),
@@ -4758,21 +5054,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         if wire.view > extra.view {
             return Err(format!("header QC view {} is past the header's view {}", wire.view, extra.view));
         }
-        let key = alloy_primitives::keccak256(&extra.qc);
-        if let Some(qc) = self.verified_header_qcs.borrow().get(&key) {
-            return Ok(Some(qc));
-        }
-        let Some(qc) = self.engine.verify_header_qc(&wire).map_err(|err| err.to_string())? else {
-            debug!(
-                target: "n42.h2.node",
-                qc_view = wire.view,
-                number = header.number,
-                "validator set for the certificate's view is not known; the header QC is unchecked"
-            );
-            return Ok(None);
-        };
-        self.verified_header_qcs.borrow_mut().insert(key, qc.clone());
-        Ok(Some(qc))
+        Ok(Some((alloy_primitives::keccak256(&extra.qc), wire)))
     }
 
     /// What the mobile service needs of a committed block: its number and,
@@ -4803,16 +5085,57 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// starts above the commit. `None` on a fresh consensus state (a node
     /// started on a snapshot has nothing to measure from) or when the layer
     /// is not ahead.
-    #[allow(clippy::needless_pass_by_ref_mut)] // hot-path method; the receiver is kept
     async fn unproven_after_restart(&mut self) -> Option<u64> {
         let qc = self.engine.last_committed_qc();
         if qc.view == 0 {
             return None;
         }
-        let el = self.driver.execution_layer();
+        let el = self.driver.execution_layer_arc();
         let committed = el.block_by_hash(qc.block_hash).await.ok().flatten()?.header.number;
+        self.learn_restored_commit((qc.block_hash, committed));
         let latest = el.latest_block_number().await.ok().flatten()?;
         (latest > committed).then_some(committed + 1)
+    }
+
+    /// The highest block this node serves by range: what it knows committed
+    /// (sync standard Q-S5: v1 serves committed blocks only; B4).
+    ///
+    /// - The height of the last live commit ([`Self::committed_height`]).
+    /// - Before the first live commit, the block of the commit restored at
+    ///   start (the engine's persisted `last_committed_qc`, commit domain
+    ///   only), by the number the execution layer gives it.
+    /// - Nothing committed at all (a fresh consensus state, also a node
+    ///   started on a snapshot): genesis only.
+    fn serve_ceiling(&self) -> ServeCeiling {
+        if let Some(height) = self.committed_height {
+            return ServeCeiling::Height(height);
+        }
+        let qc = self.engine.last_committed_qc();
+        if qc.view == 0 {
+            return ServeCeiling::Height(0);
+        }
+        if let Some((hash, number)) = self.restored_committed
+            && hash == qc.block_hash
+        {
+            return ServeCeiling::Height(number);
+        }
+        match self.block_numbers.get(&qc.block_hash) {
+            Some(number) => ServeCeiling::Height(*number),
+            None => ServeCeiling::Block(qc.block_hash),
+        }
+    }
+
+    /// Records the restored commit's number, and advertises it while no live
+    /// commit has: the status height is the committed head (sync standard
+    /// §4.1).
+    fn learn_restored_commit(&mut self, restored: (B256, u64)) {
+        if self.restored_committed == Some(restored) {
+            return;
+        }
+        self.restored_committed = Some(restored);
+        if self.committed_height.is_none() {
+            self.transport.set_advertised_height(restored.1);
+        }
     }
 
     /// Whether `certified` lies on `header`'s parent chain, walking the
@@ -4850,17 +5173,39 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some(catch_up) = self.catch_up.take() else {
             return;
         };
-        let height = catch_up.next.saturating_sub(1);
-        if height > catch_up.started_at {
-            self.transport.set_advertised_height(height);
-        }
+        let pulled = catch_up.next.saturating_sub(1);
+        // What this pull executed: under the anchor rule the unanchored tail
+        // is not, and it is dropped with the pull -- the live path or the
+        // next pull brings it once a QC or a commit covers it.
+        let height = match self.sync_anchor_mode {
+            SyncAnchorMode::Enforce => {
+                let (held, _) = catch_up.anchored.tail();
+                if held > 0 {
+                    info!(target: "n42.h2.node", held, executed = catch_up.executed, pulled, "pulled blocks no verified anchor covers are left unexecuted");
+                }
+                catch_up.executed
+            }
+            SyncAnchorMode::Observe => {
+                let (held, _) = catch_up.shadow.tail();
+                if held > 0 {
+                    self.sync_anchor_would_refuse += held as u64;
+                    warn!(target: "n42.h2.node", held, pulled, "sync anchor (observe): enforce would have left these pulled blocks unexecuted (no verified anchor covers them)");
+                }
+                pulled
+            }
+            SyncAnchorMode::Off => pulled,
+        };
+        // The status height stays the committed head (sync standard §4.1):
+        // pulled blocks are unproven until a commit names them, and this
+        // node serves only what it committed, so advertising the pulled
+        // height would send peers for blocks it will not serve.
         self.catch_up_retry_after = Some(std::time::Instant::now() + CATCH_UP_RETRY);
         self.failed_peer = (!complete).then_some(catch_up.peer);
         // What the peer actually served replaces what it advertised, so a
         // height it cannot back stops starting a pull every retry; blocks it
         // gossips later raise it again.
         if let Some(known) = self.peer_heights.get_mut(&catch_up.peer) {
-            *known = (*known).min(height.max(catch_up.started_at));
+            *known = (*known).min(pulled.max(catch_up.started_at));
         }
         info!(target: "n42.h2.node", from = catch_up.started_at, height, target = catch_up.target, complete, "catch-up finished");
         events.push(ServiceEvent::Synced { height, complete });
@@ -5348,9 +5693,21 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.respond_block_within_budget(peer, channel, body);
             }
             Served::Range { peer, request, channel, mut range, slot } => {
-                debug!(target: "n42.h2.node", %peer, ?request, served = range.rlps.len(), short_of_budget = range.short_of_budget, "peer asked for a range");
+                debug!(target: "n42.h2.node", %peer, ?request, served = range.rlps.len(), short_of_budget = range.short_of_budget, ceiling = ?range.ceiling, "peer asked for a range");
+                if let Some(restored) = range.restored {
+                    self.learn_restored_commit(restored);
+                }
                 if range.rlps.is_empty() && range.short_of_budget {
                     self.transport.respond_range_error(channel, "server busy".to_owned());
+                    return;
+                }
+                if range.rlps.is_empty() {
+                    // Not one block to serve -- the start is past what this
+                    // node has committed, or not held: gov5's answer for a
+                    // first block it does not have, one error chunk with
+                    // the server-error code (`ErrInvalidBlockNr`). A reply
+                    // with blocks always ends cleanly (sync standard §4.3).
+                    self.transport.respond_range_error(channel, "invalid block number".to_owned());
                     return;
                 }
                 let rlps = std::mem::take(&mut range.rlps);
@@ -6082,13 +6439,33 @@ impl<E: ExecutionLayer> H2Service<E> {
 ///
 /// At most [`MAX_SERVED_RANGE_BLOCKS`] blocks and
 /// [`n42_h2_net::MAX_RANGE_REPLY_BYTES`] of them (one block always), so one
-/// request costs a bounded number of lookups and bytes.
+/// request costs a bounded number of lookups and bytes; and none above
+/// `ceiling`, the committed height: a request reaching past it is served the
+/// committed prefix and ends cleanly.
 async fn serve_range<E: ExecutionLayer>(
     el: &E,
     request: n42_h2_net::RangeRequest,
     budget: &Arc<tokio::sync::Semaphore>,
+    ceiling: ServeCeiling,
 ) -> ServedRange {
-    let count = request.count.min(MAX_RANGE_BLOCKS).min(MAX_SERVED_RANGE_BLOCKS);
+    let (ceiling, restored) = match ceiling {
+        ServeCeiling::Height(height) => (height, None),
+        // The restored commit's number, once: a block the execution layer
+        // does not give is served nothing above genesis (fail closed).
+        ServeCeiling::Block(hash) => match el.block_by_hash(hash).await {
+            Ok(Some(block)) => (block.header.number, Some((hash, block.header.number))),
+            Ok(None) => (0, None),
+            Err(err) => {
+                debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not give the restored commit's number");
+                (0, None)
+            }
+        },
+    };
+    let count = request
+        .count
+        .min(MAX_RANGE_BLOCKS)
+        .min(MAX_SERVED_RANGE_BLOCKS)
+        .min(ceiling.saturating_add(1).saturating_sub(request.start));
     let mut rlps = Vec::new();
     let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let mut short_of_budget = false;
@@ -6128,7 +6505,18 @@ async fn serve_range<E: ExecutionLayer>(
             }
         }
     }
-    ServedRange { rlps, held, short_of_budget }
+    ServedRange { rlps, held, short_of_budget, ceiling, restored }
+}
+
+/// The highest block a range reply may carry: the committed height (v1
+/// serves committed blocks only, sync standard Q-S5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServeCeiling {
+    /// The height, known.
+    Height(u64),
+    /// The block of the commit restored at start, whose number the
+    /// execution layer gives.
+    Block(B256),
 }
 
 /// A range reply and the share of [`MAX_SERVE_BYTES`] it holds until it is
@@ -6141,6 +6529,10 @@ struct ServedRange {
     held: Option<tokio::sync::OwnedSemaphorePermit>,
     /// The budget ran out before the reply was complete.
     short_of_budget: bool,
+    /// The committed height the reply was capped at.
+    ceiling: u64,
+    /// The restored commit's block and number, when this reply looked it up.
+    restored: Option<(B256, u64)>,
 }
 
 /// A share of `budget` (KiB permits) for a reply of `bytes`, or none while

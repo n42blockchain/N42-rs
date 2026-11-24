@@ -17,9 +17,7 @@
 //! number; reth knows them only by timestamp, so `--fork-time shanghai=<ts>`
 //! (the timestamp of that block, which makes the two schedules equivalent on
 //! a chain whose timestamps only ever grow) becomes `shanghaiTime`. gov5's
-//! `pectraTime` is reth's `pragueTime`; when gov5 also sets its own
-//! `pragueTime` later than that -- the time from which its headers carry
-//! `requestsHash` -- it becomes `requestsHashTime`. gov5's own forks (`eofTime`,
+//! `pectraTime` is reth's `pragueTime`. gov5's own forks (`eofTime`,
 //! `ltHashTime`, `mobileAnchorTime`, `glamsterdamTime`, `beijingBlock`) have no
 //! reth spelling and are carried through untouched, where they change nothing.
 
@@ -67,24 +65,6 @@ struct Cli {
     expect_hash: Option<alloy_primitives::B256>,
 }
 
-/// gov5 runs Prague's execution rules from `pectraTime` and seals
-/// `requestsHash` from `pragueTime`. reth has one time for both, `pragueTime`:
-/// it gets the earlier, and a later gov5 `pragueTime` is kept as
-/// `requestsHashTime` (`reth_chainspec::qmdb::REQUESTS_HASH_TIME_KEY`).
-fn fold_prague(config: &mut Map<String, Value>) {
-    let Some(pectra) = config.get("pectraTime").and_then(Value::as_u64) else { return };
-    match config.get("pragueTime").and_then(Value::as_u64) {
-        Some(prague) if prague > pectra => {
-            config.insert("requestsHashTime".into(), json!(prague));
-            config.insert("pragueTime".into(), json!(pectra));
-        }
-        Some(_) => {}
-        None => {
-            config.insert("pragueTime".into(), json!(pectra));
-        }
-    }
-}
-
 fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
     let mut config: Map<String, Value> = serde_json::from_slice(&std::fs::read(&cli.chainspec)?)
@@ -117,7 +97,9 @@ fn main() -> eyre::Result<()> {
             );
         }
     }
-    fold_prague(&mut config);
+    if let (Some(pectra), None) = (config.get("pectraTime").cloned(), config.get("pragueTime")) {
+        config.insert("pragueTime".into(), pectra);
+    }
     // A chain that never had proof of work: reth needs the merge to have
     // happened at genesis to run it as one.
     config.entry("terminalTotalDifficulty").or_insert(json!(0));
@@ -202,35 +184,4 @@ fn base64_decode(text: &str) -> eyre::Result<Vec<u8>> {
         }
     }
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn folded(config: Value) -> Map<String, Value> {
-        let mut config = config.as_object().unwrap().clone();
-        fold_prague(&mut config);
-        config
-    }
-
-    /// reth's `pragueTime` is the time Prague's rules start, gov5's
-    /// `pectraTime`; a later gov5 `pragueTime` is the requests-hash time.
-    #[test]
-    fn a_later_gov5_prague_time_becomes_the_requests_hash_time() {
-        let only_pectra = folded(json!({"pectraTime": 100}));
-        assert_eq!(only_pectra["pragueTime"], json!(100));
-        assert!(!only_pectra.contains_key("requestsHashTime"));
-
-        let later = folded(json!({"pectraTime": 100, "pragueTime": 500}));
-        assert_eq!(later["pragueTime"], json!(100));
-        assert_eq!(later["requestsHashTime"], json!(500));
-
-        let same = folded(json!({"pectraTime": 100, "pragueTime": 100}));
-        assert_eq!(same["pragueTime"], json!(100));
-        assert!(!same.contains_key("requestsHashTime"));
-
-        let neither = folded(json!({"chainId": 94}));
-        assert!(!neither.contains_key("pragueTime"));
-    }
 }

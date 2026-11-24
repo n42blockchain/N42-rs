@@ -131,29 +131,6 @@ pub fn glamsterdam_active_at(genesis: &Genesis, timestamp: u64) -> bool {
     glamsterdam_time(genesis).is_some_and(|at| timestamp >= at)
 }
 
-/// Genesis `config` key: the time from which a Prague header carries
-/// `requestsHash`, on a chain where that is later than Prague's execution
-/// rules. gov5 runs those rules from its `pectraTime` (reth's `pragueTime`
-/// here) but seals and checks the EIP-7685 hash only from its own
-/// `pragueTime`; chain 94 scheduled `pectraTime` alone at first, so its
-/// headers before that time carry no hash. `n42-gov5-genesis` writes this key
-/// from gov5's `pragueTime` when it is later than `pectraTime`. Absent means
-/// from Prague, as on Ethereum.
-pub const REQUESTS_HASH_TIME_KEY: &str = "requestsHashTime";
-
-/// The time from which Prague headers carry `requestsHash`, if the genesis
-/// sets it apart from Prague.
-pub fn requests_hash_time(genesis: &Genesis) -> Option<u64> {
-    genesis.config.extra_fields.get_deserialized::<u64>(REQUESTS_HASH_TIME_KEY).and_then(Result::ok)
-}
-
-/// Whether a Prague header with `timestamp` must carry `requestsHash` and is
-/// held to it. Before [`REQUESTS_HASH_TIME_KEY`] gov5 neither wrote nor
-/// checked the field, so it is not checked here either.
-pub fn requests_hash_active_at(genesis: &Genesis, timestamp: u64) -> bool {
-    requests_hash_time(genesis).is_none_or(|at| timestamp >= at)
-}
-
 /// Genesis `config` key gov5 reads the consensus engine from
 /// (`params.ChainConfig.Consensus`).
 pub const CONSENSUS_KEY: &str = "consensus";

@@ -91,6 +91,16 @@ pub struct HotStuffGenesisConfig {
     /// the same way; its Round 1 stays import-gated.
     #[serde(default)]
     pub two_phase_vote_gate: bool,
+    /// gov5's `rotateOnTimeoutView` (`params.HotStuffConfig`, branch
+    /// `feat/hotstuff-rotate-on-timeout`): a timeout certificate for a view
+    /// at or above this one moves the chain to the first view of the next
+    /// leader-tenure window instead of `view + 1`, so a dead leader loses the
+    /// rest of its tenure (N42-SYNC-SPEC section 10). Absent (or `null`) is
+    /// the classic view change; 0 applies from the first view. Consensus-
+    /// critical: every member must carry the same value, and no environment
+    /// variable changes it.
+    #[serde(default)]
+    pub rotate_on_timeout_view: Option<u64>,
 }
 
 /// `hotstuff.committeePool` in the genesis.
@@ -193,6 +203,56 @@ pub enum HotStuffConfigError {
     /// The chain says it is `HotStuff` but lists nobody to run it.
     #[error("genesis \"hotstuff\" block lists no validators")]
     NoValidators,
+    /// The block turns on a consensus rule this node does not implement, so
+    /// running it would split the fleet the moment the rule applies.
+    #[error(
+        "genesis \"hotstuff\" block sets {field} = {value}, a consensus rule this node does not \
+         implement; it would not follow the rest of the fleet once the rule applies. Remove the \
+         field (absent or null keeps the rule off) or run a build that implements it"
+    )]
+    Unimplemented {
+        /// The genesis key, as gov5 spells it.
+        field: &'static str,
+        /// Its value, as JSON.
+        value: String,
+    },
+}
+
+/// `hotstuff` keys that switch on a consensus rule this node does not
+/// implement. [`HotStuffGenesisConfig`] ignores keys it does not know, so a
+/// key listed here is refused by [`refuse_unimplemented_rules`] instead of
+/// being dropped in silence.
+///
+/// Empty today: `rotateOnTimeoutView` (sync standard section 10.3), the one
+/// key listed until now, is implemented and read into
+/// [`HotStuffGenesisConfig::rotate_on_timeout_view`]. A gov5 rule this node
+/// does not run yet goes here until it does.
+///
+/// Only listed keys are refused, not every unknown key: gov5 writes settings
+/// for subsystems this node does not have, and those must still load.
+pub const UNIMPLEMENTED_ACTIVATING_FIELDS: &[&str] = &[];
+
+/// Refuses a genesis whose `hotstuff` block sets one of
+/// [`UNIMPLEMENTED_ACTIVATING_FIELDS`] to anything but `null`. A genesis
+/// without a `hotstuff` block, or with a malformed one, is left to
+/// [`HotStuffGenesisConfig::from_genesis`].
+pub fn refuse_unimplemented_rules(genesis: &Genesis) -> Result<(), HotStuffConfigError> {
+    refuse_listed_rules(genesis, UNIMPLEMENTED_ACTIVATING_FIELDS)
+}
+
+/// [`refuse_unimplemented_rules`] over an explicit key list, so the
+/// mechanism stays testable while the shipped list is empty.
+fn refuse_listed_rules(genesis: &Genesis, fields: &[&'static str]) -> Result<(), HotStuffConfigError> {
+    let Some(hotstuff) = genesis.config.extra_fields.get(HOTSTUFF_KEY).and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    for &field in fields {
+        match hotstuff.get(field) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(value) => return Err(HotStuffConfigError::Unimplemented { field, value: value.to_string() }),
+        }
+    }
+    Ok(())
 }
 
 impl HotStuffGenesisConfig {
@@ -290,6 +350,19 @@ mod tests {
         let off: HotStuffGenesisConfig = serde_json::from_str("{}").unwrap();
         assert!(!off.two_phase_vote_gate);
         assert!(!HotStuffGenesisConfig::from_genesis(&N42_DEVNET.genesis).unwrap().two_phase_vote_gate);
+    }
+
+    /// gov5's `rotateOnTimeoutView`: absent or null is off, a number is the
+    /// first TC view the rule applies to (0 included).
+    #[test]
+    fn the_rotate_on_timeout_view_is_read() {
+        let parse = |json: &str| serde_json::from_str::<HotStuffGenesisConfig>(json).unwrap().rotate_on_timeout_view;
+        assert_eq!(parse("{}"), None);
+        assert_eq!(parse(r#"{"rotateOnTimeoutView":null}"#), None);
+        assert_eq!(parse(r#"{"rotateOnTimeoutView":0}"#), Some(0));
+        assert_eq!(parse(r#"{"rotateOnTimeoutView":100}"#), Some(100));
+        assert!(serde_json::from_str::<HotStuffGenesisConfig>(r#"{"rotateOnTimeoutView":-1}"#).is_err());
+        assert_eq!(HotStuffGenesisConfig::from_genesis(&N42_DEVNET.genesis).unwrap().rotate_on_timeout_view, None);
     }
 
     #[test]
@@ -417,5 +490,56 @@ mod tests {
     fn the_two_fleets_share_a_genesis_hash() {
         assert_eq!(spec_of(FLEET7).genesis_hash(), spec_of(FLEET4).genesis_hash());
         assert_eq!(spec_of(FLEET7_BENCH).genesis_hash(), spec_of(FLEET4_BENCH).genesis_hash());
+    }
+
+    fn with_hotstuff(hotstuff: &str) -> Genesis {
+        serde_json::from_str(&format!(r#"{{"config":{{"chainId":1,"hotstuff":{hotstuff}}},"alloc":{{}}}}"#))
+            .expect("a genesis")
+    }
+
+    /// A listed key is refused only when it activates: absent or null is
+    /// off, any value switches the rule on. Run over a test-only list, since
+    /// the shipped list is empty.
+    #[test]
+    fn a_listed_rule_is_refused_only_when_it_activates() {
+        const LIST: &[&str] = &["testOnlyRuleView"];
+        for off in [r#"{"leaderTenure":8}"#, r#"{"leaderTenure":8,"testOnlyRuleView":null}"#] {
+            refuse_listed_rules(&with_hotstuff(off), LIST).expect(off);
+        }
+        for on in ["0", "100", "18446744073709551615"] {
+            let genesis = with_hotstuff(&format!(r#"{{"leaderTenure":8,"testOnlyRuleView":{on}}}"#));
+            match refuse_listed_rules(&genesis, LIST) {
+                Err(HotStuffConfigError::Unimplemented { field: "testOnlyRuleView", value }) => {
+                    assert_eq!(value, on);
+                }
+                other => panic!("{on}: {other:?}"),
+            }
+            // The config reader itself still ignores the key.
+            HotStuffGenesisConfig::from_genesis(&genesis).expect("still a hotstuff block");
+        }
+        // Unknown keys outside the list keep loading.
+        refuse_listed_rules(&with_hotstuff(r#"{"fastPropose":true,"ethELCompat":true}"#), LIST).expect("not listed");
+        // No hotstuff block at all: nothing to refuse.
+        let plain: Genesis = serde_json::from_str(r#"{"config":{"chainId":1},"alloc":{}}"#).unwrap();
+        refuse_listed_rules(&plain, LIST).expect("no hotstuff block");
+    }
+
+    /// `rotateOnTimeoutView` is implemented: any value loads and the parsed
+    /// config carries it (gov5's `*uint64`, absent or null = off).
+    #[test]
+    fn rotate_on_timeout_loads_and_is_carried() {
+        assert!(UNIMPLEMENTED_ACTIVATING_FIELDS.is_empty());
+        for (json, want) in [
+            (r#"{"leaderTenure":8}"#, None),
+            (r#"{"leaderTenure":8,"rotateOnTimeoutView":null}"#, None),
+            (r#"{"leaderTenure":8,"rotateOnTimeoutView":0}"#, Some(0)),
+            (r#"{"leaderTenure":8,"rotateOnTimeoutView":100}"#, Some(100)),
+            (r#"{"leaderTenure":8,"rotateOnTimeoutView":18446744073709551615}"#, Some(u64::MAX)),
+        ] {
+            let genesis = with_hotstuff(json);
+            refuse_unimplemented_rules(&genesis).expect(json);
+            let config = HotStuffGenesisConfig::from_genesis(&genesis).expect(json);
+            assert_eq!(config.rotate_on_timeout_view, want, "{json}");
+        }
     }
 }

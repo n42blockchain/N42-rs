@@ -1,6 +1,7 @@
 //! Read-only verification of chain-bound gov5 H2-v4 consensus traffic.
 
 use alloy_primitives::B256;
+use crate::validator::LeaderSelector;
 use crate::ValidatorSet;
 use n42_h2_wire::h2_v4::{
     H2V4Envelope, commit_signing_message, new_view_signing_message, proposal_signing_message,
@@ -147,6 +148,22 @@ pub fn verify_h2_v4_shadow_message_with_tenure(
     validator_set: &ValidatorSet,
     leader_tenure: u64,
 ) -> Result<H2V4ShadowProof, H2V4ShadowError> {
+    verify_h2_v4_shadow_message_with_schedule(envelope, validator_set, leader_tenure, None, 0)
+}
+
+/// [`verify_h2_v4_shadow_message_with_tenure`] on a chain that also runs
+/// rotate-on-timeout (`hotstuff.rotateOnTimeoutView`, `None` = off): a
+/// NewView must succeed its TC's view by
+/// [`LeaderSelector::view_after_timeout`] rather than by one.
+/// `epoch_length` is the chain's epoch length in views (0 = no epochs),
+/// which clamps the rotated view to the next epoch boundary.
+pub fn verify_h2_v4_shadow_message_with_schedule(
+    envelope: &H2V4Envelope,
+    validator_set: &ValidatorSet,
+    leader_tenure: u64,
+    rotate_on_timeout_from: Option<u64>,
+    epoch_length: u64,
+) -> Result<H2V4ShadowProof, H2V4ShadowError> {
     let identity = envelope.identity;
     let changes_hash = envelope.changes_hash;
     let (kind, view) = match &envelope.message {
@@ -267,8 +284,13 @@ pub fn verify_h2_v4_shadow_message_with_tenure(
         }
         H2Message::NewView(new_view) => {
             verify_leader("NewView", new_view.view, new_view.leader, validator_set, leader_tenure)?;
-            if new_view.view == 0
-                || new_view.timeout_certificate.view.checked_add(1) != Some(new_view.view)
+            let tc_view = new_view.timeout_certificate.view;
+            let rotate = rotate_on_timeout_from.is_some_and(|from| tc_view >= from);
+            // `tc_view < view` keeps the switch-off check exactly the old
+            // `tc_view + 1 == view` (no overflow, view != 0).
+            if tc_view >= new_view.view
+                || LeaderSelector::view_after_timeout(tc_view, leader_tenure, epoch_length, rotate)
+                    != new_view.view
             {
                 return Err(H2V4ShadowError::FieldMismatch {
                     component: "NewView TimeoutCertificate",
@@ -825,6 +847,44 @@ mod tests {
                 expected: 1,
             })
         );
+    }
+
+    /// Rotate-on-timeout in the shadow verifier: with tenure 2 a TC for view
+    /// 2 leads to view 4 (leader 2), not view 3; the classic successor is
+    /// refused under the rule and the rotated one without it.
+    #[test]
+    fn shadow_new_view_follows_rotate_on_timeout() {
+        let (keys, validator_set) = shadow_validators();
+        let identity = H2V4ChainIdentity {
+            chain_id: 94,
+            genesis_hash: B256::repeat_byte(0x11),
+        };
+        let new_view = |view: u64, leader: usize| H2V4Envelope {
+            identity,
+            changes_hash: B256::repeat_byte(0x22),
+            message: H2Message::NewView(H2NewView {
+                view,
+                timeout_certificate: aggregate_tc(&keys, identity, 2),
+                leader: leader as u32,
+                signature: keys[leader].sign_h2_v4(&new_view_signing_message(identity, view)),
+            }),
+        };
+        let check = |envelope: &H2V4Envelope, rotate: Option<u64>| {
+            verify_h2_v4_shadow_message_with_schedule(envelope, &validator_set, 2, rotate, 0)
+        };
+        let mismatch = Err(H2V4ShadowError::FieldMismatch {
+            component: "NewView TimeoutCertificate",
+        });
+        let (classic, rotated) = (new_view(3, 1), new_view(4, 2));
+        assert!(check(&classic, None).is_ok());
+        assert_eq!(check(&rotated, None), mismatch);
+        assert_eq!(check(&classic, Some(0)), mismatch);
+        assert!(check(&rotated, Some(0)).is_ok());
+        assert!(check(&rotated, Some(2)).is_ok(), "activation at the TC view");
+        assert!(check(&classic, Some(3)).is_ok(), "TC view below the activation");
+        assert_eq!(check(&rotated, Some(3)), mismatch);
+        // The tenure-only entry point is the switch-off schedule.
+        assert!(verify_h2_v4_shadow_message_with_tenure(&classic, &validator_set, 2).is_ok());
     }
 
     /// Byte-exact contract with gov5; see the equivalent check in

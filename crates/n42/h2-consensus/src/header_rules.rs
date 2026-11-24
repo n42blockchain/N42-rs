@@ -28,9 +28,12 @@
 //! - **B5 / B6** a parent beacon root and a withdrawals root are present
 //!   (their values are the committee and rewards checks of the caller).
 //! - **A23** the gas limit is the chain's constant.
-//! - **B8 / AM24** the requests hash is exactly EIP-7685's hash of no
-//!   requests, `sha256("")` = `0xe3b0c442…b855`, as on Ethereum; the empty
-//!   trie root that AM3 named is refused.
+//! - **B8 / AM24 / AM25** the requests hash is present; it is a deferred
+//!   field (header N carries block N-1's EIP-7685 requests hash), so block 1
+//!   carries the genesis's, exactly EIP-7685's hash of no requests,
+//!   `sha256("")` = `0xe3b0c442…b855` (the empty trie root that AM3 named is
+//!   refused there); later headers are checked against the parent's execution
+//!   by the execution layer.
 //! - **B9** blob gas used 0, excess blob gas 0, both present.
 //! - **B10** the slot number (element 23) is the block number.
 //! - **B11** `mobileRegistryRoot` (element 24) is present (its value is the
@@ -51,10 +54,15 @@ use alloy_eips::eip1559::BaseFeeParams;
 use alloy_primitives::{Address, B256, U256};
 use n42_h2_primitives::bls::BlsSignature;
 
-/// Profile 1's requests hash (B8 as amended by AM24, which replaces AM3):
-/// EIP-7685's hash of no requests, `sha256("")`, in every header, genesis
-/// included. It is the value Ethereum writes; the empty trie root of AM3 was
-/// the requests root of an EIP draft that Ethereum did not ship.
+/// Profile 1's requests hash of no requests (B8 as amended by AM24 and AM25):
+/// EIP-7685's `sha256("")`, the value Ethereum writes (the empty trie root of
+/// AM3 was the requests root of an EIP draft that Ethereum did not ship).
+/// Since AM25 `requestsHash` is a deferred field: header N carries the
+/// requests hash of block N-1's execution, so this fixed value is what the
+/// genesis and block 1 carry (and every header after a block that produced
+/// no requests); past block 1 the header alone is checked for presence and
+/// the carried value against this node's execution of the parent
+/// (`HotStuffConsensus::validate_header_against_parent`).
 pub const PROFILE1_REQUESTS_HASH: B256 = alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 
 /// B4: how far past this node's clock a header's timestamp may be when it
@@ -279,8 +287,9 @@ pub enum Profile1Error {
         /// The chain's constant.
         expected: u64,
     },
-    /// B8 / AM3: the requests hash is not the empty trie root.
-    #[error("B8: requests hash {0} is not the empty trie root")]
+    /// B8 / AM25: block 1's requests hash is not `sha256("")` (block 1
+    /// carries the genesis's, which is the hash of no requests).
+    #[error("B8: requests hash {0} of block 1 is not sha256(\"\") (EIP-7685's hash of no requests)")]
     RequestsHash(B256),
     /// B9: blob gas used or excess blob gas is not 0.
     #[error("B9: blob gas used {used} / excess blob gas {excess} are not 0")]
@@ -418,9 +427,12 @@ pub fn validate_profile1_header(header: &N42Header, rules: &HeaderRules) -> Resu
     if header.parent_beacon_block_root.is_none() {
         return Err(Profile1Error::Missing { item: "B5", field: "parentBeaconRoot" });
     }
+    // B8 / AM25: a deferred field. Block 1 carries the genesis's, the hash of
+    // no requests; a later header carries its parent's, which only the
+    // parent's execution tells (checked against it, not here).
     match header.requests_hash {
         None => return Err(Profile1Error::Missing { item: "B8", field: "requestsHash" }),
-        Some(hash) if hash != PROFILE1_REQUESTS_HASH => return Err(Profile1Error::RequestsHash(hash)),
+        Some(hash) if header.number <= 1 && hash != PROFILE1_REQUESTS_HASH => return Err(Profile1Error::RequestsHash(hash)),
         Some(_) => {}
     }
     match (header.blob_gas_used, header.excess_blob_gas) {

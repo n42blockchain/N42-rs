@@ -255,24 +255,42 @@ fn a23_gas_limit_is_the_constant() {
 
 #[test]
 fn b8_requests_hash_has_one_spelling() {
-    // Accept: EIP-7685's sha256("") (the fixture); AM24's constant.
+    // EIP-7685's sha256("") (the fixture); AM24's constant.
     assert_eq!(
         PROFILE1_REQUESTS_HASH,
         b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
     );
-    // Reject: the empty trie root (AM3's value), the empty-ommers hash, absent.
-    assert!(matches!(
-        check(&edited(|h| h.requests_hash = Some(alloy_consensus::EMPTY_ROOT_HASH))),
-        Err(Profile1Error::RequestsHash(_))
-    ));
-    assert!(matches!(
-        check(&edited(|h| h.requests_hash = Some(EMPTY_OMMER_ROOT_HASH))),
-        Err(Profile1Error::RequestsHash(_))
-    ));
+    // Absent is refused at every height.
     assert!(matches!(
         check(&edited(|h| h.requests_hash = None)),
         Err(Profile1Error::Missing { item: "B8", .. })
     ));
+}
+
+/// AM25: `requestsHash` is a deferred field. Block 1 carries the genesis's,
+/// the hash of no requests, so anything else is refused on the header alone;
+/// past block 1 the header carries its parent's requests hash, which only the
+/// parent's execution tells (checked against it by the execution layer's
+/// `validate_header_against_parent`), so the header alone is checked for
+/// presence.
+#[test]
+fn b8_am25_block_1_carries_the_hash_of_no_requests_later_headers_the_parents() {
+    let at_1 = |hash| {
+        let mut header = unsealed(5);
+        header.number = 1;
+        header.requests_hash = hash;
+        seal(header)
+    };
+    let rules = rules();
+    rules.check_header(&at_1(Some(PROFILE1_REQUESTS_HASH))).expect("block 1 with sha256(\"\")");
+    for wrong in [alloy_consensus::EMPTY_ROOT_HASH, EMPTY_OMMER_ROOT_HASH, B256::repeat_byte(7)] {
+        assert!(matches!(rules.check_header(&at_1(Some(wrong))), Err(Profile1Error::RequestsHash(_))));
+    }
+    assert!(matches!(rules.check_header(&at_1(None)), Err(Profile1Error::Missing { item: "B8", .. })));
+    // Block 5 carrying block 4's requests hash: any value passes the header alone.
+    for carried in [PROFILE1_REQUESTS_HASH, B256::repeat_byte(7), alloy_consensus::EMPTY_ROOT_HASH] {
+        check(&edited(|h| h.requests_hash = Some(carried))).expect("a carried requests hash");
+    }
 }
 
 #[test]

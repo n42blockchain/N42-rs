@@ -211,6 +211,9 @@ struct PeerStat {
     timeouts: u32,
     /// Not asked again before this (a soft fault: back-off, no score).
     backoff_until: Option<Instant>,
+    /// It served a block that failed screening (a provable fault): not
+    /// asked again in this pull.
+    excluded: bool,
 }
 
 /// One range in flight.
@@ -297,7 +300,61 @@ impl RangeScheduler {
 
     /// Whether `peer` may serve a range starting at `start`.
     fn serves(stat: Option<&PeerStat>, height: u64, start: u64) -> bool {
-        height >= start && stat.and_then(|s| s.exhausted_from).is_none_or(|from| start < from)
+        height >= start
+            && stat.is_none_or(|s| !s.excluded)
+            && stat.and_then(|s| s.exhausted_from).is_none_or(|from| start < from)
+    }
+
+    /// Records `count` blocks from `start` to be asked for again.
+    fn add_gap(&mut self, start: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let entry = self.gaps.entry(start).or_insert(count);
+        *entry = (*entry).max(count);
+    }
+
+    /// `peer` served a block that failed screening (sync standard §3.5):
+    /// it is asked for nothing more in this pull, its range in flight and
+    /// its buffered replies go back to be asked of another peer, and so does
+    /// `rest` (the failing block's range and what followed it in the reply).
+    pub(crate) fn exclude(&mut self, peer: PeerId, rest: Option<(u64, u64)>) {
+        self.peers.entry(peer).or_default().excluded = true;
+        if let Some(slot) = self.slots.get_mut(&peer)
+            && !slot.reassigned
+        {
+            slot.reassigned = true;
+            let (start, count) = (slot.start, slot.count);
+            self.add_gap(start, count);
+        }
+        let theirs: Vec<u64> = self.ready.iter().filter(|(_, r)| r.peer == peer).map(|(start, _)| *start).collect();
+        for start in theirs {
+            if let Some(ready) = self.ready.remove(&start) {
+                self.ready_bytes = self.ready_bytes.saturating_sub(ready.bytes);
+                self.add_gap(start, ready.chunks.len() as u64);
+            }
+        }
+        if let Some((start, count)) = rest {
+            self.add_gap(start, count);
+        }
+    }
+
+    /// A reply handed out by [`Self::pop_ready`] and not screened, back into
+    /// the reorder buffer -- or, from an excluded peer, back to be asked of
+    /// another.
+    pub(crate) fn put_back(&mut self, peer: PeerId, start: u64, chunks: Vec<BlockChunk>) {
+        if self.peers.get(&peer).is_some_and(|s| s.excluded) {
+            self.add_gap(start, chunks.len() as u64);
+            return;
+        }
+        let bytes = chunks.iter().map(|c| c.rlp.len()).sum();
+        self.ready_bytes += bytes;
+        self.ready.insert(start, Ready { peer, chunks, bytes });
+    }
+
+    /// Whether `peer` is excluded from this pull.
+    pub(crate) fn is_excluded(&self, peer: &PeerId) -> bool {
+        self.peers.get(peer).is_some_and(|s| s.excluded)
     }
 
     /// The lowest height still to be asked for.
@@ -370,7 +427,7 @@ impl RangeScheduler {
         let served = chunks.len() as u64;
         if served == 0 {
             stat.exhausted_from = Some(stat.exhausted_from.map_or(slot.start, |from| from.min(slot.start)));
-            self.gaps.insert(slot.start, slot.count);
+            self.add_gap(slot.start, slot.count);
             return ReplyOutcome::Empty;
         }
         let secs = now.duration_since(slot.sent).as_secs_f64().max(1e-3);
@@ -382,7 +439,7 @@ impl RangeScheduler {
             // Short: a server caps a reply by bytes and blocks, so the rest
             // is asked again (of whichever peer is free) rather than taken
             // as this peer's head.
-            self.gaps.insert(slot.start + served, slot.count - served);
+            self.add_gap(slot.start + served, slot.count - served);
         }
         let mut chunks = chunks;
         chunks.truncate(served as usize);
@@ -402,7 +459,8 @@ impl RangeScheduler {
                 continue;
             }
             slot.reassigned = true;
-            self.gaps.insert(slot.start, slot.count);
+            let entry = self.gaps.entry(slot.start).or_insert(slot.count);
+            *entry = (*entry).max(slot.count);
             let stat = self.peers.entry(*peer).or_default();
             stat.timeouts += 1;
             stat.bps = stat.bps.map(|bps| bps / 2.0);
@@ -660,6 +718,30 @@ mod tests {
         assert!(s.assign(1, &[(a, 100)], now).is_empty(), "not asked past where it served nothing");
         let _ = s.pop_ready(1);
         assert!(s.exhausted(&[(a, 100)]));
+    }
+
+    #[test]
+    fn an_excluded_peer_is_asked_nothing_more_and_its_ranges_go_to_another() {
+        let (forger, honest) = (peer(1), peer(2));
+        let mut s = RangeScheduler::with_shape(1, 10, 2);
+        let now = Instant::now();
+        let asked = s.assign(1, &[(forger, 100), (honest, 100)], now);
+        let forged = asked.iter().find(|(p, _)| *p == forger).expect("forger asked").1.clone();
+        let fair = asked.iter().find(|(p, _)| *p == honest).expect("honest asked").1.clone();
+        assert_eq!(s.on_reply(forger, &forged, chunks(10), now), ReplyOutcome::Buffered(10));
+        assert_eq!(s.on_reply(honest, &fair, chunks(10), now), ReplyOutcome::Buffered(10));
+        // The forger's first range is screened; its block 4 fails.
+        let (_, r, mut got) = s.pop_ready(1).expect("first range");
+        assert_eq!(r.start, 1);
+        let rest = got.split_off(3);
+        let (_, later_req, later) = s.pop_ready(11).expect("second range");
+        s.exclude(forger, Some((4, rest.len() as u64)));
+        s.put_back(honest, later_req.start, later);
+        assert!(s.is_excluded(&forger));
+        let again = s.assign(4, &[(forger, 100), (honest, 100)], now);
+        assert_eq!(again, vec![(honest, RangeRequest { start: 4, count: 7, step: 1 })], "the rest, to the honest peer");
+        assert!(s.has_ready(11) && !s.has_ready(4), "the honest reply waits in the buffer again");
+        assert!(!s.exhausted(&[(forger, 100), (honest, 100)]));
     }
 
     #[test]

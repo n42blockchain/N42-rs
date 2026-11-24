@@ -302,3 +302,35 @@ async fn a_stalled_importer_falls_back_to_the_serial_pull() {
     let hashes: Vec<B256> = blocks[..count as usize - 1].iter().map(|b| b.0).collect();
     assert_eq!(unique, hashes, "the serial pull finished the chain, in order");
 }
+
+/// A forging peer inside a pipelined pull: every block it serves past
+/// block 1 carries a QC that does not verify. Its range goes to the honest
+/// peer and it is excluded for the rest of the pull -- the pull does not
+/// end on it: one pull, complete, the honest chain executed once in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forging_peer_inside_a_pipelined_pull_is_excluded_and_the_pull_goes_on() {
+    let (keys, set) = keys(1);
+    let builder = node_in(&keys, &set, 0, None).await;
+    let count = 300;
+    let honest = anchored_chain(&builder, count);
+    let mut forged = honest[..1].to_vec();
+    let mut parent = forged[0].0;
+    for number in 2..=count {
+        let qc = header_qc(&builder.svc, &builder.keys, &[0], number - 1, parent, B256::repeat_byte(7));
+        let block = block_with_extra(number, parent, number, qc);
+        parent = block.0;
+        forged.push(block);
+    }
+    drop(builder);
+    let mut servers = vec![server_with(&keys, &set, &forged).await, server_with(&keys, &set, &honest).await];
+    let forger = peer_of(&servers[0]);
+    let mut a = puller(&keys, &set, &mut servers, 0, 0, true).await;
+    let mut events = Vec::new();
+    pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| synced(events).is_some()).await;
+    let pulls = events.iter().filter(|e| matches!(e, ServiceEvent::Synced { .. })).count();
+    assert_eq!(pulls, 1, "{events:?}");
+    assert_eq!(synced(&events), Some((count - 1, true)), "one pull, complete: {events:?}");
+    assert!(a.svc.refused_range_peers.contains_key(&forger), "the forger is refused");
+    let hashes: Vec<B256> = honest[..count as usize - 1].iter().map(|b| b.0).collect();
+    assert_eq!(executed(&a), hashes, "the honest chain, each block once, in order");
+}

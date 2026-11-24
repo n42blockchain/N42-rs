@@ -759,6 +759,8 @@ struct CatchUp {
     top_anchor: Option<QuorumCertificate>,
     /// The QCs of anchors naming blocks not buffered yet, by the hash named.
     pending_qcs: std::collections::HashMap<B256, QuorumCertificate>,
+    /// The peer that served the block `prev_hash` names.
+    prev_peer: Option<PeerId>,
 }
 
 /// Anchor QCs a pull keeps for blocks it has not buffered yet.
@@ -797,6 +799,7 @@ impl CatchUp {
             end: None,
             top_anchor: None,
             pending_qcs: std::collections::HashMap::new(),
+            prev_peer: None,
         }
     }
 }
@@ -4806,18 +4809,22 @@ impl<E: ExecutionLayer> H2Service<E> {
                 };
                 budget -= 1;
                 let screened_at = std::time::Instant::now();
+                let expected = self.catch_up.as_ref().map(|c| c.next).unwrap_or_default();
                 let block = match decode_block_rlp_raw(&chunk.rlp, self.header_profile) {
                     Ok(block) => block,
                     Err(err) => {
-                        warn!(target: "n42.h2.node", %peer, %err, "peer served a block this node cannot read; catch-up stopped");
-                        self.finish_catch_up(events, false);
+                        warn!(target: "n42.h2.node", %peer, %err, "peer served a block this node cannot read");
+                        if self.pull_fault(peer, expected, events) {
+                            self.requeue_after_fault(peer, chunks.len() as u64, replies.collect());
+                        }
                         return;
                     }
                 };
-                let expected = self.catch_up.as_ref().map(|c| c.next).unwrap_or_default();
                 if block.header.number != expected {
-                    warn!(target: "n42.h2.node", %peer, got = block.header.number, expected, "peer served blocks out of order; catch-up stopped");
-                    self.finish_catch_up(events, false);
+                    warn!(target: "n42.h2.node", %peer, got = block.header.number, expected, "peer served blocks out of order");
+                    if self.pull_fault(peer, expected, events) {
+                        self.requeue_after_fault(peer, chunks.len() as u64, replies.collect());
+                    }
                     return;
                 }
                 let hash = block.block_hash;
@@ -4828,6 +4835,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // execution inside it is timed apart and taken out.
                     let executing_before = self.catch_up.as_ref().map(|c| c.times.new_payload + c.times.forkchoice);
                     if !self.buffer_pulled(peer, block, chunk.rlp, events).await {
+                        // A pipelined pull goes on without the peer.
+                        if self.catch_up.is_some() {
+                            self.requeue_after_fault(peer, chunks.len() as u64, replies.collect());
+                        }
                         return;
                     }
                     if let (Some(c), Some(before)) = (self.catch_up.as_mut(), executing_before) {
@@ -4856,8 +4867,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     Ok(proven) => proven,
                     Err(reason) => {
                         warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
-                        self.refused_range_peers.insert(peer, number);
-                        self.finish_catch_up(events, false);
+                        if self.pull_fault(peer, number, events) {
+                            self.requeue_after_fault(peer, chunks.len() as u64, replies.collect());
+                        }
                         return;
                     }
                 };
@@ -4995,23 +5007,33 @@ impl<E: ExecutionLayer> H2Service<E> {
         events: &mut Vec<ServiceEvent>,
     ) -> bool {
         let (hash, number) = (block.block_hash, block.header.number);
-        if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
-            && block.header.parent_hash != prev
-        {
-            warn!(target: "n42.h2.node", %peer, number, parent = %block.header.parent_hash, %prev, "peer served a block that does not extend the one before it; the rest of its range is dropped");
-            self.refused_range_peers.insert(peer, number);
-            self.finish_catch_up(events, false);
-            return false;
-        }
+        // The header's own QC first: a forged one is this peer's fault
+        // whatever came before it.
         let anchor = match self.sync_anchor_of(&block.header) {
             Ok(anchor) => anchor,
             Err(reason) => {
                 warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
-                self.refused_range_peers.insert(peer, number);
-                self.finish_catch_up(events, false);
+                self.pull_fault(peer, number, events);
                 return false;
             }
         };
+        if let Some(c) = self.catch_up.as_ref()
+            && let Some(prev) = c.prev_hash
+            && block.header.parent_hash != prev
+        {
+            // The peer's fault when the block before is its own or is
+            // authenticated. Across two peers' replies above the last
+            // anchor either may be the forger: the pull ends, no one blamed.
+            let certified = c.anchored.authenticated_to().is_some_and(|to| to + 1 >= number) || c.executed + 1 >= number;
+            if c.prev_peer == Some(peer) || certified {
+                warn!(target: "n42.h2.node", %peer, number, parent = %block.header.parent_hash, %prev, "peer served a block that does not extend the one before it; the rest of its range is dropped");
+                self.pull_fault(peer, number, events);
+            } else {
+                warn!(target: "n42.h2.node", %peer, number, parent = %block.header.parent_hash, %prev, prev_peer = ?c.prev_peer, "two peers' replies do not link above the last anchor; the pull ends, neither is blamed");
+                self.finish_catch_up(events, false);
+            }
+            return false;
+        }
         let Some(c) = self.catch_up.as_mut() else {
             return false;
         };
@@ -5045,6 +5067,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         c.next += 1;
         c.prev_hash = Some(hash);
+        c.prev_peer = Some(peer);
         if let Some(halt) = fault {
             self.halt_sync(halt, events);
             return false;
@@ -5067,6 +5090,40 @@ impl<E: ExecutionLayer> H2Service<E> {
             return false;
         }
         true
+    }
+
+    /// A pulled block failed its screening: a provable fault of `peer`
+    /// (sync standard §3.5), which is not asked for this gap again. A serial
+    /// pull ends. A pipelined one goes on without it (`true`): the peer is
+    /// excluded for the rest of the pull and its ranges go to the others
+    /// ([`Self::requeue_after_fault`]).
+    fn pull_fault(&mut self, peer: PeerId, number: u64, events: &mut Vec<ServiceEvent>) -> bool {
+        self.refused_range_peers.insert(peer, number);
+        if self.catch_up.as_ref().is_some_and(|c| c.sched.is_some()) {
+            info!(target: "n42.h2.node", %peer, number, "pipelined pull: the peer is excluded for the rest of the pull, its ranges go to the others");
+            return true;
+        }
+        self.finish_catch_up(events, false);
+        false
+    }
+
+    /// After a screening fault of `peer` in a pipelined pull that goes on:
+    /// the failing block, the `rest` of its reply after it, every range of
+    /// the peer's in flight or buffered, go back to be asked of another
+    /// peer; the `later` replies queued behind it go back to the reorder
+    /// buffer.
+    fn requeue_after_fault(&mut self, peer: PeerId, rest: u64, later: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>) {
+        let Some(c) = self.catch_up.as_mut() else {
+            return;
+        };
+        let next = c.next;
+        let Some(sched) = c.sched.as_mut() else {
+            return;
+        };
+        sched.exclude(peer, Some((next, rest + 1)));
+        for (from, request, chunks) in later {
+            sched.put_back(from, request.start, chunks);
+        }
     }
 
     /// Executes, in order, the buffered pulled blocks an anchor covers.

@@ -335,6 +335,18 @@ impl HotStuffGenesisConfig {
         self.profile1.as_ref()
     }
 
+    /// The vote and execution-write rules the chain runs: profile 1's when
+    /// the genesis is a valid profile-1 genesis ([`Self::profile1`]),
+    /// today's otherwise. What `h2_validator` hands
+    /// `H2Service::with_vote_rules`.
+    pub const fn vote_rules(&self) -> n42_h2_consensus::VoteRules {
+        if self.profile1.is_some() {
+            n42_h2_consensus::VoteRules::PROFILE1
+        } else {
+            n42_h2_consensus::VoteRules::TODAY
+        }
+    }
+
     /// [`Self::from_genesis`] without the profile-1 validation (which itself
     /// reads the block through this).
     pub(crate) fn from_genesis_unvalidated(genesis: &Genesis) -> Result<Self, HotStuffConfigError> {
@@ -373,8 +385,11 @@ impl HotStuffGenesisConfig {
         }
         // A22: rotate-on-timeout from view 0.
         self.rotate_on_timeout_view = Some(0);
-        // A13 / AM23: the commit vote waits for this node's own import.
-        self.two_phase_vote_gate = true;
+        // A13 / AM19 / AM23: the vote gates are `n42_h2_consensus::VoteRules`
+        // (`Self::vote_rules`), not gov5's `twoPhaseVoteGate` (refused on
+        // profile 1): its header-vote road is closed there, so the flag stays
+        // off and the two cannot pull in different directions.
+        self.two_phase_vote_gate = false;
         // A14: H2-v4 signing only.
         self.interop_v4 = true;
         // A19: the committee pool is always on; the `enabled` flag is gone.

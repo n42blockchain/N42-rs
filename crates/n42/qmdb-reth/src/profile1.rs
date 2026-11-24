@@ -181,7 +181,7 @@ pub const ACTIVATIONS: &[(&str, bool, &str)] = &[
     ("N42-native transaction and EVM rules (no blobs)", true, "reth_chainspec::qmdb::is_n42_native"),
     ("QMDB state commitment", true, "reth_chainspec::qmdb::state_scheme"),
     ("rotate-on-timeout", true, "HotStuffGenesisConfig::rotate_on_timeout_view = Some(0)"),
-    ("two-phase vote gate (commit vote after own import)", true, "HotStuffGenesisConfig::two_phase_vote_gate"),
+    ("profile-1 vote rules (Round 1 after check, CommitVote after own import, no progress or direct-only votes, split tags)", true, "HotStuffGenesisConfig::vote_rules -> H2Service::with_vote_rules (two_phase_vote_gate stays off)"),
     ("H2-v4 signing", true, "HotStuffGenesisConfig::interop_v4"),
     ("committee pool / parentBeaconRoot link", true, "HotStuffGenesisConfig::committee_pool (enabled)"),
     ("QC embedding in Extra", true, "unconditional on a --chain validator (h2_validator gov5 profile)"),
@@ -781,7 +781,8 @@ mod tests {
         let hotstuff = HotStuffGenesisConfig::from_genesis(g).expect("a hotstuff block");
         assert_eq!(hotstuff.profile1(), profile1(g).expect("valid").as_ref(), "the typed config is attached");
         assert_eq!(hotstuff.rotate_on_timeout_view, Some(0));
-        assert!(hotstuff.two_phase_vote_gate);
+        assert!(!hotstuff.two_phase_vote_gate, "VoteRules carries the gate on profile 1");
+        assert_eq!(hotstuff.vote_rules(), n42_h2_consensus::VoteRules::PROFILE1);
         assert!(hotstuff.interop_v4);
         assert_eq!(hotstuff.base_timeout, 24_000);
         assert_eq!(hotstuff.max_timeout, 96_000);
@@ -817,6 +818,7 @@ mod tests {
                 assert_eq!(profile1(&spec.genesis), Ok(None), "{name}");
                 if let Ok(hotstuff) = HotStuffGenesisConfig::from_genesis(&spec.genesis) {
                     assert!(hotstuff.profile1().is_none(), "{name}");
+                    assert_eq!(hotstuff.vote_rules(), n42_h2_consensus::VoteRules::TODAY, "{name}");
                 }
                 refuse_overrides(
                     &spec.genesis,

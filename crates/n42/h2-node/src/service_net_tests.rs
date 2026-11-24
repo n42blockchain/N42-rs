@@ -13,7 +13,7 @@ use super::*;
 use n42_h2_net::RangeRequest;
 
 /// `count` blocks numbered from 1 as a chain, with their gov5 RLP.
-fn chain(count: u64) -> Vec<(B256, Header, alloy_primitives::Bytes)> {
+pub(super) fn chain(count: u64) -> Vec<(B256, Header, alloy_primitives::Bytes)> {
     let mut parent = B256::ZERO;
     let mut blocks = Vec::new();
     for number in 1..=count {
@@ -376,7 +376,7 @@ async fn a_pull_stops_and_blames_the_peer_when_its_reply_is_unusable() {
 /// The committed QC a gov5 leader embeds in a header: `signers` of `keys`
 /// sign `signed` under the rig engine's profile, and the certificate names
 /// `(view, named)`. A `signed` other than `named` is a forged certificate.
-fn header_qc(
+pub(super) fn header_qc(
     svc: &H2Service<MockExecutionLayer>,
     keys: &[BlsSecretKey],
     signers: &[usize],
@@ -390,13 +390,13 @@ fn header_qc(
 
 /// The same certificate signed in the prepare (vote) domain: what a
 /// proposal's justify QC is, and not a sync anchor.
-fn prepare_qc(svc: &H2Service<MockExecutionLayer>, keys: &[BlsSecretKey], signers: &[usize], view: u64, named: B256) -> Vec<u8> {
+pub(super) fn prepare_qc(svc: &H2Service<MockExecutionLayer>, keys: &[BlsSecretKey], signers: &[usize], view: u64, named: B256) -> Vec<u8> {
     let message = svc.engine.signing_profile().vote_message(view, named);
     qc_signed_over(svc, keys, signers, view, named, &message)
 }
 
 /// gov5's `HotStuffQC` bytes naming `(view, named)`, signed over `message`.
-fn qc_signed_over(
+pub(super) fn qc_signed_over(
     svc: &H2Service<MockExecutionLayer>,
     keys: &[BlsSecretKey],
     signers: &[usize],
@@ -933,6 +933,9 @@ async fn an_anchored_chain_that_does_not_join_the_committed_head_halts_the_impor
     assert_eq!((halt.second.hash, halt.second.number), (theirs[1].0, Some(2)));
     assert_eq!(halt.second.qc.view, 3, "the QC that authenticated block 3, from block 4's header");
     assert!(!rig.svc.refused_range_peers.contains_key(&peer), "a verified certificate is not the relay's fault");
+    // And the whole node halts (crate::safety_halt), not the importer alone.
+    assert_eq!(rig.svc.safety_halt().and_then(|h| h.evidence()).map(|e| e.source.as_str()), Some("sync"));
+    assert_eq!(rig.svc.voting_halted(), Some("commit_conflict"));
 
     // No pull starts again, however far ahead a peer says it is.
     rig.svc.catch_up_retry_after = None;
@@ -972,6 +975,7 @@ async fn two_verified_anchors_for_different_blocks_at_one_height_halt_and_keep_t
     assert_eq!((halt.first.qc.view, halt.second.qc.view), (3, 104));
     let evidence: Vec<_> = rig.svc.sync_equivocation_evidence().cloned().collect();
     assert_eq!(evidence, vec![halt.clone()], "both certificates kept");
+    assert_eq!(rig.svc.safety_halt().map(|h| h.reason()), Some("equivocation"), "the node halts");
     assert!(!rig.svc.refused_range_peers.contains_key(&second));
 }
 

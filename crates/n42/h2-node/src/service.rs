@@ -625,6 +625,18 @@ pub struct H2Service<E> {
     /// and view, and the conflict or equivocation that halted the sync
     /// importer ([`crate::sync_safety`]).
     sync_safety: crate::sync_safety::SyncSafety,
+    /// The safety halt ([`crate::safety_halt`]): set on proof of a
+    /// conflicting commit, or read back from the evidence file at start.
+    /// While set, this node neither votes, proposes, imports nor commits.
+    safety_halt: Option<crate::safety_halt::SafetyHalt>,
+    /// Where the halt's evidence is kept (`<datadir>/safety-halt.json`);
+    /// without one the halt lasts as long as the process.
+    safety_halt_file: Option<std::path::PathBuf>,
+    /// When the halt's `error!` line was last written.
+    safety_halt_logged: Option<std::time::Instant>,
+    /// Commits decided before this node held their block's header: checked
+    /// against the committed chain once the header arrives (bounded).
+    unchecked_commits: std::collections::HashMap<B256, QuorumCertificate>,
     /// The highest pulled block the anchored import released for execution:
     /// with the committed head, where the next pull starts.
     sync_head: Option<(u64, B256)>,
@@ -1479,6 +1491,10 @@ pub(crate) const CLAIMS_PER_BLOCK: usize = 4;
 
 const REMEMBERED_TIMESTAMPS: usize = 256;
 
+/// Commits decided before their block's header was held, kept to be checked
+/// when it arrives ([`H2Service::commit_conflicts`]).
+const MAX_UNCHECKED_COMMITS: usize = 256;
+
 /// What a leader knows when deciding whether, and how, to propose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposalContext {
@@ -1825,6 +1841,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             range_mode: None,
             sync_anchor_would_refuse: 0,
             sync_safety: crate::sync_safety::SyncSafety::default(),
+            safety_halt: None,
+            safety_halt_file: None,
+            safety_halt_logged: None,
+            unchecked_commits: std::collections::HashMap::new(),
             sync_head: None,
             range_buckets: std::collections::HashMap::new(),
             range_rate: (RANGE_RATE_BYTES, RANGE_BURST_BYTES),
@@ -1858,6 +1878,148 @@ impl<E: ExecutionLayer> H2Service<E> {
     pub const fn with_halt_on_commit_invalid(mut self, on: bool) -> Self {
         self.halt_on_commit_invalid = on;
         self
+    }
+
+    /// Keeps the safety halt's evidence in `path` (`h2_validator`:
+    /// `<datadir>/safety-halt.json`, [`crate::safety_halt::evidence_path`]).
+    /// A file already there -- or one that cannot be read -- means this node
+    /// halted on a conflicting commit before: it starts halted, and stays so
+    /// until the operator moves the file away and restarts it
+    /// ([`crate::safety_halt`]).
+    #[must_use]
+    pub fn with_safety_halt_file(mut self, path: std::path::PathBuf) -> Self {
+        let found = crate::safety_halt::load(&path);
+        self.safety_halt_file = Some(path);
+        if let Some(halt) = found {
+            self.apply_safety_halt(halt);
+        }
+        self
+    }
+
+    /// Why this node is halted on proof of a conflicting commit, if it is.
+    pub const fn safety_halt(&self) -> Option<&crate::safety_halt::SafetyHalt> {
+        self.safety_halt.as_ref()
+    }
+
+    /// Enters the safety halt on `halt`, found on `source` (sync standard
+    /// 3.3): the evidence is written first, then this node stops voting,
+    /// proposing, importing and committing for good. A second violation
+    /// after the first changes nothing (the first is the evidence kept).
+    fn enter_safety_halt(&mut self, halt: &crate::sync_safety::SyncHalt, source: &str, height: Option<u64>) {
+        if self.safety_halt.is_some() {
+            return;
+        }
+        let evidence =
+            crate::safety_halt::SafetyEvidence::new(halt, source, height, |hash| self.block_headers.get(hash).cloned());
+        if let Some(path) = &self.safety_halt_file
+            && let Err(err) = crate::safety_halt::persist(path, &evidence)
+        {
+            // Halted all the same; only the restart would not know.
+            error!(target: "n42.h2.node", path = %path.display(), %err, "could not write the safety halt's evidence; the halt holds until this process ends");
+        }
+        self.apply_safety_halt(crate::safety_halt::SafetyHalt::Proven(Box::new(evidence)));
+    }
+
+    /// Stops everything a halted node must not do (see
+    /// [`crate::safety_halt`]): the engine's votes, timeouts and proposals,
+    /// the driver's imports and forkchoices, every consensus message and own
+    /// body queued, the sync importer.
+    fn apply_safety_halt(&mut self, halt: crate::safety_halt::SafetyHalt) {
+        metrics::gauge!(crate::safety_halt::METRIC_SAFETY_HALTED, "reason" => halt.reason()).set(1.0);
+        self.safety_halt = Some(halt);
+        self.engine.halt_voting("commit_conflict");
+        self.driver.halt();
+        self.outbox.clear();
+        self.body_outbox.clear();
+        self.ready_bodies.clear();
+        self.held_bodies.clear();
+        self.unchecked_commits.clear();
+        self.proposal_deferred = false;
+        if self.catch_up.take().is_some() {
+            self.pending_imports.clear();
+        }
+        self.abandon_pulled_imports();
+        self.log_safety_halt();
+    }
+
+    /// The halt's `error!` line: both blocks, their heights and their QCs'
+    /// views, and what the operator does.
+    fn log_safety_halt(&mut self) {
+        self.safety_halt_logged = Some(std::time::Instant::now());
+        let file = self.safety_halt_file.as_ref().map(|p| p.display().to_string());
+        match &self.safety_halt {
+            Some(crate::safety_halt::SafetyHalt::Proven(e)) => error!(
+                target: "n42.h2.node",
+                reason = %e.reason,
+                source = %e.source,
+                height = ?e.height,
+                first = %e.first.hash,
+                first_number = ?e.first.number,
+                first_qc_view = e.first.qc.view,
+                first_qc_names = %e.first.qc.block_hash,
+                first_origin = %e.first.origin,
+                second = %e.second.hash,
+                second_number = ?e.second.number,
+                second_qc_view = e.second.qc.view,
+                second_qc_names = %e.second.qc.block_hash,
+                second_origin = %e.second.origin,
+                evidence = ?file,
+                "SAFETY HALT: verified commit certificates contradict this node's committed chain (sync standard 3.3). \
+                 This node no longer votes, proposes, imports or commits; it serves what it committed. Operator: decide \
+                 which chain is correct, repair this node if it is on the wrong one, then stop it, move the evidence file \
+                 out of the datadir (keep it) and restart"
+            ),
+            Some(crate::safety_halt::SafetyHalt::Unreadable { path, error }) => error!(
+                target: "n42.h2.node",
+                path = %path.display(),
+                %error,
+                "SAFETY HALT: a safety-halt evidence file is present but cannot be read; this node stays halted \
+                 (fail closed). Operator: inspect it, then move it out of the datadir and restart"
+            ),
+            None => {}
+        }
+    }
+
+    /// The block at height `at` below `from` (at `from_number`), by the
+    /// parent links of headers held here; `None` past what is held or
+    /// further than gov5's walk bound.
+    fn header_ancestor(&self, from: B256, from_number: u64, at: u64) -> Option<B256> {
+        const MAX_WALK: u64 = 4096;
+        if at > from_number || from_number - at > MAX_WALK {
+            return None;
+        }
+        let mut cursor = from;
+        for number in (at + 1..=from_number).rev() {
+            let header = self.block_headers.get(&cursor)?;
+            if header.number != number {
+                return None;
+            }
+            cursor = header.parent_hash;
+        }
+        Some(cursor)
+    }
+
+    /// A commit the engine decided, checked against this node's committed
+    /// chain before anything of it is written or sent (gov5's
+    /// `commitConflictsWithFloor`): `true` when it conflicts and the node
+    /// is now halted. A commit whose block's height is not known here is
+    /// checked again when its header arrives.
+    fn commit_conflicts(&mut self, block_hash: B256, commit_qc: &QuorumCertificate) -> bool {
+        let number = self.block_numbers.get(&block_hash).copied();
+        let found = self
+            .sync_safety
+            .live_commit_conflict(number, block_hash, commit_qc, |from, n, at| self.header_ancestor(from, n, at));
+        if let Some((halt, height)) = found {
+            self.enter_safety_halt(&halt, "live-commit", Some(height));
+            return true;
+        }
+        if number.is_none() && commit_qc.view != 0 {
+            if self.unchecked_commits.len() >= MAX_UNCHECKED_COMMITS {
+                self.unchecked_commits.clear();
+            }
+            self.unchecked_commits.insert(block_hash, commit_qc.clone());
+        }
+        false
     }
 
     /// Why this node no longer votes, if it does not.
@@ -1901,6 +2063,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.vote_log_failures_exported = failures;
         }
         self.halt_on_commit_refusal();
+        if self.safety_halt.is_some()
+            && self.safety_halt_logged.is_none_or(|at| at.elapsed() >= crate::safety_halt::HALT_LOG_EVERY)
+        {
+            self.log_safety_halt();
+        }
         // However the engine came to halt -- the batch vote paths drop its
         // `Fatal` for a vote log that keeps failing, at debug -- the halt is
         // reported here, once: the gauge, and for the vote log the same
@@ -3484,6 +3651,26 @@ impl<E: ExecutionLayer> H2Service<E> {
         output: EngineOutput,
         events: &mut Vec<ServiceEvent>,
     ) -> Result<(), ServiceError> {
+        // A halted node sends nothing, executes nothing and commits nothing
+        // (crate::safety_halt): what the engine still emits is dropped here.
+        if self.safety_halt.is_some() {
+            if matches!(
+                output,
+                EngineOutput::BroadcastMessage(_)
+                    | EngineOutput::SendToValidator(..)
+                    | EngineOutput::ExecuteBlock(_)
+                    | EngineOutput::BlockCommitted { .. }
+            ) {
+                debug!(target: "n42.h2.node", "safety halt: engine output dropped");
+                return Ok(());
+            }
+        } else if let EngineOutput::BlockCommitted { block_hash, commit_qc, .. } = &output
+            && self.commit_conflicts(*block_hash, commit_qc)
+        {
+            // Refused before the checkpoint, the header QC and the
+            // forkchoice: nothing of the conflicting commit is written.
+            return Ok(());
+        }
         // The engine's committed QC has moved: the next header this node
         // seals carries it, whatever happens to the commit below.
         if matches!(output, EngineOutput::BlockCommitted { .. }) {
@@ -3728,6 +3915,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// proposal built on the critical path (loop111 S2: 2-3 a window, 410-670
     /// ms each); that parent takes the forkchoice path directly.
     async fn prepare_next_build(&mut self, parent: B256, on_seal: bool) {
+        if self.safety_halt.is_some() {
+            return;
+        }
         // Cloned, not borrowed: installing the chain sealer below needs
         // `&mut self`, and it is one `Arc`.
         let Some(build_attributes) = self.payload_attributes.clone() else {
@@ -4003,7 +4193,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Builds and announces a block when this node is the leader of a view it
     /// has not yet proposed for.
     async fn propose_if_leader(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
-        if self.payload_attributes.is_none() {
+        if self.payload_attributes.is_none() || self.safety_halt.is_some() {
             return Ok(());
         }
         let view = self.engine.current_view();
@@ -4658,6 +4848,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Encodes `message` as its gossip bytes and sends it to `peer` over the
     /// vote protocol; false if it cannot be encoded.
     fn send_direct_vote(&mut self, peer: PeerId, message: &n42_h2_primitives::consensus::ConsensusMessage) -> bool {
+        if self.safety_halt.is_some() {
+            return false;
+        }
         let Ok(envelope) = wire_bridge::to_wire(message, self.identity, B256::ZERO) else {
             return false;
         };
@@ -4686,6 +4879,10 @@ impl<E: ExecutionLayer> H2Service<E> {
         events: &mut Vec<ServiceEvent>,
     ) {
         let view = message.view();
+        if self.safety_halt.is_some() {
+            debug!(target: "n42.h2.node", kind = message_kind(&message), view, "safety halt: consensus message not sent");
+            return;
+        }
         if trace_messages() {
             info!(target: "n42.h2.trace", kind = message_kind(&message), view, "send");
         }
@@ -4766,6 +4963,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // A pull's last imports are reported before another starts: the
         // next one reads the execution layer's height.
         if self.sync_safety.halt().is_some()
+            || self.safety_halt.is_some()
             || self.catch_up.is_some()
             || !self.in_import.is_empty()
             || self
@@ -5360,9 +5558,10 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Halts the sync importer on a safety violation (sync standard §3.3):
     /// one error line with both blocks and both QCs' views, the
     /// [`crate::sync_safety::METRIC_SYNC_HALTED`] gauge, and the pull ended
-    /// with nothing more of it executed. No later pull starts; consensus
-    /// keeps running on this node's own chain, and nothing is reorged.
-    /// Read back with [`Self::sync_halt`].
+    /// with nothing more of it executed. No later pull starts and nothing is
+    /// reorged; the whole node then enters the safety halt
+    /// ([`crate::safety_halt`]: no vote, no proposal, no import).
+    /// Read back with [`Self::sync_halt`] and [`Self::safety_halt`].
     fn halt_sync(&mut self, halt: crate::sync_safety::SyncHalt, events: &mut Vec<ServiceEvent>) {
         let (first, second) = (&halt.first, &halt.second);
         error!(
@@ -5379,7 +5578,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             second_qc_view = second.qc.view,
             second_qc_names = %second.qc.block_hash,
             second_origin = ?second.origin,
-            "SYNC HALTED: two verified certificates contradict each other (sync standard 3.3); the sync importer executes and reorgs nothing more, consensus continues on this node's own chain; operator action needed"
+            "SYNC HALTED: two verified certificates contradict each other (sync standard 3.3); the sync importer executes and reorgs nothing more and the node enters the safety halt; operator action needed"
         );
         metrics::gauge!(crate::sync_safety::METRIC_SYNC_HALTED, "reason" => halt.kind.label()).set(1.0);
         if halt.kind == crate::sync_safety::HaltKind::Equivocation {
@@ -5389,6 +5588,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.abandon_pulled_imports();
         }
         self.finish_catch_up(events, false);
+        // Proof of a conflicting commit stops the whole node, not only the
+        // importer (owner rule, fail closed: crate::safety_halt).
+        self.enter_safety_halt(&halt, "sync", None);
     }
 
     /// The safety violation that halted the sync importer, if one did
@@ -5976,6 +6178,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// the embedded QC (B1, E13). A profile-1 block whose header this node
     /// does not hold is refused: its rules cannot have been checked.
     fn vote_refusal(&self, block_hash: &B256) -> Option<String> {
+        // A node halted on a conflicting commit votes on no road
+        // (crate::safety_halt); the engine is halted too, this says why.
+        if self.safety_halt.is_some() {
+            return Some("safety halt: proof of a conflicting commit".to_owned());
+        }
         if let Some(reason) = self.header_qc_refusal(block_hash) {
             return Some(reason);
         }
@@ -7000,10 +7207,22 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.block_timestamps.insert(block_hash, header.timestamp).is_none() {
             self.block_numbers.insert(block_hash, header.number);
             self.block_headers.insert(block_hash, header.clone());
+            // A commit decided before this header was held is checked now,
+            // before anything votes for or imports the block.
+            if let Some(qc) = self.unchecked_commits.remove(&block_hash)
+                && self.safety_halt.is_none()
+            {
+                let found = self.sync_safety.live_commit_conflict(Some(header.number), block_hash, &qc, |from, n, at| {
+                    self.header_ancestor(from, n, at)
+                });
+                if let Some((halt, height)) = found {
+                    self.enter_safety_halt(&halt, "live-commit", Some(height));
+                }
+            }
             // gov5's header vote under its two-phase gate (audit 2026-10
             // R2-C9): the header releases Round 1, once its QC passes the
             // check every vote of this node passes (R3-C2).
-            if self.engine.two_phase_vote_gate() {
+            if self.engine.two_phase_vote_gate() && self.safety_halt.is_none() {
                 if let Some(reason) = self.vote_refusal(&block_hash) {
                     warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no header vote");
                 } else if let Err(err) = self.engine.header_known(block_hash, header.parent_hash) {

@@ -982,3 +982,28 @@ async fn a_finished_build_ahead_is_kept_for_the_first_build_of_a_tenure() {
     driver.build_block_on(GENESIS, attrs(), 1).await.expect("built");
     assert_eq!(driver.last_build_path(), (true, None));
 }
+
+#[tokio::test]
+async fn a_halted_driver_sends_no_import_and_no_commit_forkchoice() {
+    // A safety halt (a conflicting commit, sync standard 3.3): nothing
+    // reaches the execution layer after it, a commit the driver was holding
+    // for a block still to come included, and a later halt changes nothing.
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let (held, next) = (B256::repeat_byte(0x11), B256::repeat_byte(0x22));
+    driver.commit_when_imported(held);
+    driver.halt();
+    driver.halt();
+    assert!(driver.is_halted());
+
+    driver.cache_payload(held, MockExecutionLayer::payload_for(held, 1));
+    driver.cache_payload(next, MockExecutionLayer::payload_for(next, 2));
+    for output in [execute(held), committed(held), execute(next), committed(next)] {
+        let action = driver.handle_output(&output).await;
+        assert!(action.imported_block().is_none() && action.missing_block().is_none(), "{action:?}");
+    }
+    assert!(driver.retry_failed_imports().await.is_empty());
+    assert!(driver.retry_failed_commit().await.is_empty());
+    assert!(el.calls().is_empty(), "the execution layer was called after the halt: {:?}", el.calls());
+    assert_eq!((driver.head(), driver.finalized()), (GENESIS, GENESIS));
+}

@@ -61,7 +61,7 @@ due.
 | 23 | Provable fault: a QC that decodes but fails against a known set (§3.5) | Refuses the peer for this gap (`service.rs:4594-4601`). No 3-in-10-min disconnect | P | Add the fault counter and the 1 h back-off (with the multi-peer work). |
 | 24 | Gap sizing: (f+1)-th highest status height, never the single max; never gates production (§3.4.1, §6.4) | The single max of `peer_heights` (`service.rs:4447-4456`). Heights come from statuses and from every gossiped or served block number (`note_peer_height`, `service.rs:5181-5184`, `4578`). The first window is capped at `latest + 8·N42_FAR_AHEAD_BLOCKS` (`service.rs:832-842`, `4499`), then probes window by window. It does **not** gate production: no leader path reads `catch_up` | P | Target = max(highest verified anchor, (f+1)-th highest height). Keep the cap. |
 | 25 | Screening before buffering: contiguity, parent link, `Extra`, tx and rewards roots (§3.4.3) | Number and parent link (`service.rs:4570-4575`, `4720-4724`), `Extra` (`:4743-4747`). Tx root and body binding are left to reth's `newPayload` validation, i.e. after the block is in the importer | P | Check the roots in the fetch stage (`decode_block_rlp_raw` plus a tx root check) before buffering. |
-| 26 | Conflict or equivocation of anchors → halt and alert; never rewrite committed history (§3.3) | Not implemented for the sync path. An FCU to a sibling would be a reth reorg (refused below finalized) | **N** | Halt the importer and producer, and alert (with W7). |
+| 26 | Conflict or equivocation of anchors → halt and alert; never rewrite committed history (§3.3) | Done (2026-11-24): every conflict or equivocation the sync record finds, and a live commit that does not extend the committed chain, put the whole node in the safety halt (section 1.6) | **Y** | — |
 | 27 | Handover: in sync mode, no other path inserts heights ≤ range end; leave sync on gap ≤ 2 for 3 commits (§3.4.7) | The live path (gossip, fetch-on-miss, held bodies) imports concurrently, and the pull skips what was already imported (`service.rs:4579-4589`) | P | Add a Live/Range mode (the S5 equivalent). Cache live bodies into the buffer while in Range mode. |
 | 28 | Long gap → state sync (§3.4.8) | none | – | W13 |
 
@@ -102,6 +102,25 @@ due.
 9. **Line drift:** the spec's `service.rs:4590-4602` is now `4594-4614`. `serve_range:6086/6097`, `state_machine.rs:2044-2108`, `forest.rs:44`, `qmdb-state/lib.rs:83-87` and all of the §10.5 references still match.
 
 ---
+
+### 1.6 Safety halt on a conflicting commit (owner rule, fail closed)
+
+Since 2026-11-24 (`fix/commit-conflict-halt`) a node that holds proof of a conflicting commit stops importing,
+voting and producing, as gov5 does (`internal/commit_conflict.go`, `internal/consensus/hotstuff/safety_halt.go`).
+Proof is only what this node verified against a known set in the commit domain: a live commit (Decide or own
+commit QC) of a block at a committed height or view other than the committed one, or on a chain that does not run
+through the committed head (`SyncSafety::live_commit_conflict`, checked before the checkpoint and the forkchoice,
+and again when a header that arrived late makes the height known), plus every conflict or equivocation the sync
+record finds. Forged, prepare-domain, foreign-set or under-quorum QCs and commits whose height or ancestry is not held
+never halt. On proof the engine halts voting (no Round 1, commit vote, timeout or proposal; the node no longer
+counts in any quorum), every queued consensus message is dropped, `vote_refusal` refuses every vote road, the
+execution driver sends no import or forkchoice (`ExecutionDriver::halt`) and the importer pulls nothing; status,
+range and by-hash serving continue up to the committed head. One `error!` line names both blocks, heights and QC
+views every minute, `n42_h2_safety_halted{reason}` is 1, and both QCs with the headers held are written to
+`<datadir>/safety-halt.json` (`crates/n42/h2-node/src/safety_halt.rs`). gov5 keeps its halt in memory and relies on
+its chain refusing the same commit after a restart; here the file is the halt: a node that finds it at start, or
+cannot read it, starts halted. **Resume** is the operator's act alone: decide which chain is right, repair this node
+if it is on the wrong one, stop it, move the file out of the datadir (keep it) and restart.
 
 ## 2. Draft answers to the five questions of the notice
 

@@ -1109,6 +1109,9 @@ mod net_tests;
 #[path = "service_mesh_tests.rs"]
 mod mesh_tests;
 
+#[path = "service_halt_tests.rs"]
+mod halt_tests;
+
 // ---------------------------------------------------------------------------
 // Blocks taken without their transactions (N42_TAKE_COMPACT)
 // ---------------------------------------------------------------------------

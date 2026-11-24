@@ -38,7 +38,11 @@
 //! already signed, which is equivocation) and a checkpoint so the node rejoins
 //! near the head instead of proposing from genesis, which a live execution layer
 //! answers with `-38006 Too deep reorg`. Without it the node runs stateless and
-//! must not be restarted into a fleet it was already voting in.
+//! must not be restarted into a fleet it was already voting in. The datadir
+//! also keeps `safety-halt.json`, written when the node halts on proof of a
+//! conflicting commit: while it is there the node does not vote, propose or
+//! import (move it away and restart to resume, after deciding which chain
+//! is right).
 //!
 //! `--mobileverify.http <addr>` serves gov5's `/mobileverify` phone surface
 //! (`docs/MOBILEVERIFY_V3_PARITY.md`): registration, packets relayed from the
@@ -630,6 +634,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .save(&n42_h2_node::persistence::checkpoint_from(engine))
                     .map_err(|error| error.to_string())
             });
+        }
+        if let Some(dir) = &datadir {
+            // The safety halt's evidence (n42_h2_node::safety_halt): a node
+            // that halted on a conflicting commit finds it here at start and
+            // stays halted until the operator moves the file away.
+            let path = n42_h2_node::safety_halt::evidence_path(std::path::Path::new(dir));
+            service = service.with_safety_halt_file(path.clone());
+            if service.safety_halt().is_some() {
+                println!("SAFETY HALT  : {} present; this node will not vote, propose or import (move it away to resume)", path.display());
+            }
         }
         if gov5_profile {
             service = service.with_gov5_h2_profile(seal_key);

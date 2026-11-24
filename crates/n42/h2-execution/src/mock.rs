@@ -89,6 +89,13 @@ pub struct MockBehaviour {
     /// for the block asked about; `Some(Some(other))` answers CHECKED naming
     /// `other` -- another build -- which must release no vote.
     pub check_only: Option<Option<B256>>,
+    /// How long a `newPayload` takes: a test's stand-in for execution.
+    pub new_payload_delay: Option<std::time::Duration>,
+    /// When set, a `newPayload` waits for a permit before it is recorded:
+    /// a test stops the execution layer mid-catch-up.
+    pub new_payload_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// How long an attribute-less forkchoice takes.
+    pub forkchoice_delay: Option<std::time::Duration>,
 }
 
 impl Default for MockBehaviour {
@@ -106,6 +113,9 @@ impl Default for MockBehaviour {
             body_gate: None,
             elide_builds: false,
             check_only: None,
+            new_payload_delay: None,
+            new_payload_gate: None,
+            forkchoice_delay: None,
         }
     }
 }
@@ -336,6 +346,18 @@ impl ExecutionLayer for MockExecutionLayer {
 
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
         let hash = payload.payload.block_hash();
+        let (gate, delay) = {
+            let behaviour = self.behaviour.lock().expect("mock behaviour lock");
+            (behaviour.new_payload_gate.clone(), behaviour.new_payload_delay)
+        };
+        if let Some(gate) = gate
+            && let Ok(permit) = gate.acquire().await
+        {
+            permit.forget();
+        }
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.record(ElCall::NewPayload(hash));
         let behaviour = self.behaviour.lock().expect("mock behaviour lock").clone();
         if let Some(error) = behaviour.new_payload_error {
@@ -371,11 +393,17 @@ impl ExecutionLayer for MockExecutionLayer {
         &self,
         state: ForkchoiceState,
     ) -> Result<ForkchoiceUpdated, ElError> {
-        let gate = self.behaviour.lock().unwrap_or_else(|p| p.into_inner()).forkchoice_gate.clone();
+        let (gate, delay) = {
+            let behaviour = self.behaviour.lock().unwrap_or_else(|p| p.into_inner());
+            (behaviour.forkchoice_gate.clone(), behaviour.forkchoice_delay)
+        };
         if let Some(gate) = gate
             && let Ok(permit) = gate.acquire().await
         {
             permit.forget();
+        }
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
         self.record(ElCall::ForkchoiceUpdated(state));
         let failure = self.behaviour.lock().unwrap_or_else(|p| p.into_inner()).forkchoice_error.clone();

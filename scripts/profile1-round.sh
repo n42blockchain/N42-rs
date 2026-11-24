@@ -139,13 +139,15 @@ cmd_up() {
   pgrep -af "$(mine_re)" | cut -c1-150
 }
 
+member_alive() { pgrep -fc "^[${P1_BIN:0:1}]${P1_BIN:1}/(n42 node|examples/h2_validator) --datadir $(mdir "$1")/"; }
+el_alive() { pgrep -f "^[${P1_BIN:0:1}]${P1_BIN:1}/n42 node --datadir $(mdir "$1")/el " >/dev/null; }
 height() { rpc "$(http_port "$1")" eth_blockNumber '[]' | python3 -I -c "import sys,json;print(int(json.load(sys.stdin)['result'],16))" 2>/dev/null; }
 head_hash() { rpc "$(http_port "$1")" eth_getBlockByNumber '["latest",false]' | python3 -I -c "import sys,json;print(json.load(sys.stdin)['result']['hash'])" 2>/dev/null; }
 
 # A line the round fails on: a profile-1 refusal, a refused header/vote,
 # a bad block, a halt. A dial refused by a peer that is not up yet is not one.
 REFUSAL_RE='refus|profile 1:|profile-1|BAD BLOCK|bad block|conflicting commit|safety halt|SAFETY HALT|invalid block|InvalidBlock'
-BENIGN_RE='Connection refused|connection refused|failed to dial|Failed to dial|OutgoingConnectionError'
+BENIGN_RE='Connection refused|connection refused|failed to dial|Failed to dial|OutgoingConnectionError|eth_getProof refused'
 
 cmd_status() {
   printf '%-6s %-7s %-68s %-5s %-8s %-8s %-6s %s\n' member height head led timeouts refusals halt alive
@@ -156,8 +158,11 @@ cmd_status() {
     tmo=$(strip "$d/v.log" 2>/dev/null | /usr/bin/grep -ac 'view timed out')
     ref=$(cat "$d/v.log" "$d/el.log" 2>/dev/null | strip | /usr/bin/grep -aE "$REFUSAL_RE" | /usr/bin/grep -avEc "$BENIGN_RE")
     halt=no; [ -e "$d/consensus/safety-halt.json" ] && halt=YES
-    alive=$(pgrep -fc "^[${P1_BIN:0:1}]${P1_BIN:1}/(n42 node|examples/h2_validator) --datadir $d/")
-    printf '%-6s %-7s %-68s %-5s %-8s %-8s %-6s %s\n' "$i" "$(height "$i")" "$(head_hash "$i")" "$led" "$tmo" "$ref" "$halt" "$alive/2"
+    alive=$(member_alive "$i")
+    local h=- hh=-
+    # Never read the RPC of a port this member does not own.
+    if el_alive "$i"; then h=$(height "$i"); hh=$(head_hash "$i"); fi
+    printf '%-6s %-7s %-68s %-5s %-8s %-8s %-6s %s\n' "$i" "$h" "$hh" "$led" "$tmo" "$ref" "$halt" "$alive/2"
   done
 }
 
@@ -165,6 +170,7 @@ cmd_headers() {
   local from=${1:?from} to=${2:?to}
   for i in $P1_MEMBERS; do
     local d; d=$(mdir "$i")
+    el_alive "$i" || { echo "member $i: execution layer of $P1_DIR not running; no headers" >&2; continue; }
     # Columns: number ts hash gasUsed gasLimit ntx (the plan's parser format, no header row).
     python3 -I - "$(http_port "$i")" "$from" "$to" > "$P1_DIR/headers-node$i.tsv" <<'PY'
 import json, sys, urllib.request

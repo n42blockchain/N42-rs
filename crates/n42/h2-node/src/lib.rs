@@ -24,6 +24,7 @@ pub mod mobile;
 pub mod persistence;
 pub mod service;
 pub mod straggler;
+pub mod sync_anchor;
 pub mod tx_source;
 
 pub mod body_channel;

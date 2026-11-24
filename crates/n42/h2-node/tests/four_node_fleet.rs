@@ -497,7 +497,16 @@ async fn a_member_that_starts_behind_pulls_the_chain_from_its_peers() {
     .await;
     started.expect("the three-member fleet commits five blocks");
 
-    let (late, _) = build_node(3, late_key, &validator_set, identity, first_addr, false, false).await;
+    let (mut late, _) = build_node(3, late_key, &validator_set, identity, first_addr, false, false).await;
+    // Under the Ethereum header profile this fleet runs, a header embeds no
+    // QC, so nothing anchors a pull (sync standard §3.3) and `enforce` would
+    // execute none of it. gov5's profile embeds them, but the mock execution
+    // layer cannot serve a gov5-profile header back by range (a payload does
+    // not carry its difficulty and other gov5 fields, so the served block
+    // hashes differently). This test is about the pull mechanics end to end,
+    // so it runs `observe`; the anchored pull between two real services is
+    // `a_member_behind_its_peer_pulls_the_gap_and_finishes_level`.
+    late.service = late.service.with_sync_anchor_mode(n42_h2_node::sync_anchor::SyncAnchorMode::Observe);
     handles.push(spawn_node(3, late, tx.clone()));
 
     let synced = tokio::time::timeout(Duration::from_secs(60), async {

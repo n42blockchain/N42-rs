@@ -302,10 +302,8 @@ fn assert_v3(file: &str, cases: usize) {
 /// gov5's block 1 names. Ignored on main: the gov5-shaped profile-1 genesis
 /// header (ommers hash zero, requests hash the empty trie root, slot number 0,
 /// `mobileRegistryRoot` as element 24) is built by `fix(chainspec): build
-/// gov5's profile-1 genesis header` on feat/profile1-header-rules (72b1c21f9),
-/// not merged yet; without it the hash is reth's Ethereum genesis hash.
+/// gov5's profile-1 genesis header` (merged with the profile-1 header rules).
 #[test]
-#[ignore = "needs the profile-1 genesis header of feat/profile1-header-rules (72b1c21f9)"]
 fn v3_genesis_hash_equals_gov5() {
     for file in ["V3/main.json", "V3/system_address_live.json"] {
         let vector = vector(file);

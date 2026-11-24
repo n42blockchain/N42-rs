@@ -255,14 +255,14 @@ fn a23_gas_limit_is_the_constant() {
 
 #[test]
 fn b8_requests_hash_has_one_spelling() {
-    // Accept: the empty trie root (the fixture); AM3's constant.
+    // Accept: EIP-7685's sha256("") (the fixture); AM24's constant.
     assert_eq!(
         PROFILE1_REQUESTS_HASH,
-        b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+        b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
     );
-    // Reject: EIP-7685's sha256(""), the empty-ommers hash, absent.
+    // Reject: the empty trie root (AM3's value), the empty-ommers hash, absent.
     assert!(matches!(
-        check(&edited(|h| h.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH))),
+        check(&edited(|h| h.requests_hash = Some(alloy_consensus::EMPTY_ROOT_HASH))),
         Err(Profile1Error::RequestsHash(_))
     ));
     assert!(matches!(
@@ -356,11 +356,11 @@ fn a6_genesis_header() {
         ..Default::default()
     });
     validate_profile1_genesis_header(&genesis, &rules).expect("profile-1 genesis");
-    // What reth's genesis builder stamps today: the empty-list ommers hash and
-    // EIP-7685's requests hash. Both are refused.
+    // The empty-list ommers hash, which reth's genesis builder stamps today,
+    // is refused; so is the empty trie root as the requests hash (AM3's value).
     genesis.ommers_hash = EMPTY_OMMER_ROOT_HASH;
     assert!(validate_profile1_genesis_header(&genesis, &rules).is_err());
     genesis.ommers_hash = B256::ZERO;
-    genesis.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+    genesis.requests_hash = Some(alloy_consensus::EMPTY_ROOT_HASH);
     assert!(validate_profile1_genesis_header(&genesis, &rules).is_err());
 }

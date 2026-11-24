@@ -10,7 +10,7 @@
   "block": {
     "number": 1,
     "timestamp": 1795564801,
-    "parentHash": "0x3ad9d8c17b5f5edb7136648e34e32fef1ee4104facc82fc70117ce5d7ae882f2",
+    "parentHash": "0x1feee5ac916e77a1d2d1ed7cf03f8b84516c459fcc0607b1d34605e8eef2c776",
     "coinbase": "0x0af682426022f37276f3576c7560158a4070d8b2",
     "gasLimit": 480000000,
     "baseFeePerGas": 1000000000,

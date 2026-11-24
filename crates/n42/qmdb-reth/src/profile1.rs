@@ -821,11 +821,11 @@ mod tests {
         let header = spec.genesis_header();
         assert_eq!(header.state_root, qmdb::qmdb_genesis_root(g).expect("a root"));
         // gov5's profile-1 genesis (vector V1): element 22 the 0x80 gap, slot
-        // number 0, ommers hash zero, the requests hash the empty trie root.
+        // number 0, ommers hash zero, the requests hash EIP-7685's sha256 of nothing.
         assert_eq!(header.block_access_list_hash, None);
         assert_eq!(header.slot_number, Some(0));
         assert_eq!(header.ommers_hash, B256::ZERO);
-        assert_eq!(header.requests_hash, Some(alloy_consensus::EMPTY_ROOT_HASH));
+        assert_eq!(header.requests_hash, Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH));
         assert!(header.extra_data.is_empty());
         assert_eq!(header.gas_limit, 480_000_000);
 

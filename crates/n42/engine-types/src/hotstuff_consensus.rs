@@ -32,9 +32,9 @@ use n42_header::N42Header as Header;
 use alloy_primitives::{logs_bloom, Address, B256, U256};
 use n42_consensus_traits::{AposError, AposResult, SignerManager};
 use n42_h2_consensus::{
-    gov5_receipts_root, gov5_rewards_root, is_empty_requests_hash, validate_gov5_h2_header, validate_gov5_header_tail, HeaderTailRules,
+    gov5_receipts_root, gov5_rewards_root, validate_gov5_h2_header, validate_gov5_header_tail, HeaderTailRules,
     withdrawals_to_rewards, HeaderRules, PROFILE1_REQUESTS_HASH,
-    HeaderExtra, ReceiptView, SimulatedCommitteePool, GOV5_EMPTY_REQUESTS_HASH,
+    HeaderExtra, ReceiptView, SimulatedCommitteePool,
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
@@ -697,11 +697,10 @@ where
 {
     /// The block's EIP-7685 requests hash against the execution's requests.
     fn validate_requests_hash(&self, header: &Header, result: &BlockExecutionResult<Receipt>) -> Result<(), ConsensusError> {
-        // Requests: gov5 spells "none" as the empty trie root where EIP-7685
-        // says sha256 of nothing; both are accepted for a block that made no
-        // requests, and a block that did is held to the EIP.
+        // EIP-7685, as on Ethereum: a Prague header carries the hash of the
+        // requests its block produced, sha256 of nothing when there are none.
         if self.header_rules.is_profile1() {
-            // Profile 1 (B8, AM3): one spelling, the empty trie root, and no
+            // Profile 1 (B8, AM24): that hash of no requests, and no
             // EIP-7685 requests on a native chain.
             let header_hash = header.requests_hash.ok_or(ConsensusError::RequestsHashMissing)?;
             if header_hash != PROFILE1_REQUESTS_HASH || !result.requests.is_empty() {
@@ -715,17 +714,8 @@ where
             let Some(header_hash) = header.requests_hash else {
                 return Err(ConsensusError::RequestsHashMissing);
             };
-            let matches = if result.requests.is_empty() {
-                is_empty_requests_hash(header_hash)
-            } else {
-                header_hash == result.requests.requests_hash()
-            };
-            if !matches {
-                let expected = if result.requests.is_empty() {
-                    GOV5_EMPTY_REQUESTS_HASH
-                } else {
-                    result.requests.requests_hash()
-                };
+            let expected = result.requests.requests_hash();
+            if header_hash != expected {
                 return Err(ConsensusError::BodyRequestsHashDiff(
                     GotExpected {
                         got: expected,
@@ -1109,7 +1099,7 @@ mod tests {
             header.parent_beacon_block_root = Some(B256::ZERO);
         }
         if ts >= TS_PRAGUE {
-            header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+            header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         }
         header
     }
@@ -1265,7 +1255,7 @@ mod tests {
         header.requests_hash = None;
         assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::RequestsHashMissing)));
         let mut header = good_header(5, TS_CANCUN);
-        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         assert!(matches!(c.validate_header(&sealed(header)), Err(ConsensusError::RequestsHashUnexpected)));
     }
 
@@ -1344,8 +1334,9 @@ mod tests {
         assert!(err.to_string().contains("B14"), "{err}");
     }
 
-    /// B3 and B8 on the execution layer: the empty-list ommers hash and
-    /// EIP-7685's requests hash pass today's rules and not profile 1's.
+    /// B3 and B8 on the execution layer: the empty-list ommers hash passes
+    /// today's rules and not profile 1's; the empty trie root as the requests
+    /// hash (AM3's value, superseded by AM24) is refused by profile 1.
     #[test]
     fn b3_b8_profile1_refuses_what_the_default_accepts() {
         let mut ommers = good_header(5, TS_PRAGUE);
@@ -1354,8 +1345,7 @@ mod tests {
         let err = profile1_consensus().validate_header(&sealed(ommers)).unwrap_err();
         assert!(err.to_string().contains("B3"), "{err}");
         let mut requests = good_header(5, TS_PRAGUE);
-        requests.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
-        consensus().validate_header(&sealed(requests.clone())).expect("today: either requests spelling");
+        requests.requests_hash = Some(alloy_consensus::EMPTY_ROOT_HASH);
         let err = profile1_consensus().validate_header(&sealed(requests)).unwrap_err();
         assert!(err.to_string().starts_with("B8") || err.to_string().contains("B8"), "{err}");
     }
@@ -1395,7 +1385,7 @@ mod tests {
         }
         assert!(differs.is_empty(), "genesis fields differ:\n{}", differs.join("\n"));
         assert_eq!(alloy_rlp::encode(ours.header()), gov5_rlp, "genesis RLP");
-        let gov5_hash: B256 = "0x6f733745517957b421dcea37f6c879db89501aac0715f769fbc76ec54efe7e4f".parse().unwrap();
+        let gov5_hash: B256 = "0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc".parse().unwrap();
         assert_eq!(ours.hash(), gov5_hash, "our genesis hash");
         assert_eq!(spec.inner().genesis_hash(), gov5_hash, "the Ethereum view names the same hash");
         let rules = chain_header_rules(&spec);
@@ -1525,7 +1515,7 @@ mod tests {
         child.base_fee_per_gas = Some(875);
         child.blob_gas_used = Some(0);
         child.excess_blob_gas = Some(0);
-        child.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        child.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         child.withdrawals_root = Some(EMPTY_ROOT_HASH);
         child.parent_beacon_block_root = Some(expected);
         c.validate_header_against_parent(&sealed(child.clone()), &parent).unwrap();
@@ -1848,7 +1838,7 @@ mod tests {
         with_requests.requests = requests.clone();
         header.requests_hash = Some(requests.requests_hash());
         assert!(c.validate_block_post_execution(&recovered(header.clone()), &with_requests, None, None).is_ok());
-        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+        header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         assert!(matches!(
             c.validate_block_post_execution(&recovered(header), &with_requests, None, None),
             Err(ConsensusError::BodyRequestsHashDiff(_))

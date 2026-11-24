@@ -389,14 +389,14 @@ pub fn genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header {
             .expect("a genesis allocation always has a QMDB root");
     }
     if is_profile1(genesis) {
-        // The mixed production standard, profile 1 (A6 with B3, B8/AM3, B10,
+        // The mixed production standard, profile 1 (A6 with B3, B8/AM24, B10,
         // B12), as gov5 writes it (vector V1): ommers hash zero, the
-        // requests hash the empty trie root, element 22 the 0x80 gap, slot
+        // requests hash EIP-7685's sha256 of nothing, element 22 the 0x80 gap, slot
         // number 0. Element 24 (`mobileRegistryRoot`, zero) is not an
         // Ethereum field: it is in the hash ([`sealed_genesis_header`]) and on
         // the N42 header.
         header.ommers_hash = B256::ZERO;
-        header.requests_hash = Some(alloy_consensus::EMPTY_ROOT_HASH);
+        header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         header.block_access_list_hash = None;
         header.slot_number = Some(0);
     }

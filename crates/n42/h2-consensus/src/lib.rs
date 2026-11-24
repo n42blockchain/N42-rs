@@ -51,7 +51,7 @@ pub use error::{ConsensusError, ConsensusResult};
 pub use header_profile::{
     block_for_header, block_for_header_with_rewards, execution_data_for_block, gov5_receipts_root,
     gov5_h2_header_for_view, gov5_h2_header_for_view_with_qc, gov5_rewards_root, header_view,
-    is_empty_requests_hash, normalize_to_gov5_h2,
+    normalize_to_gov5_h2,
     normalize_to_gov5_h2_with_header, normalize_to_gov5_h2_with_header_with_qc,
     normalize_to_gov5_h2_from_header, normalize_to_gov5_h2_from_header_with_qc,
     execution_data_for_block_with_bal, execution_data_from_raw_parts,
@@ -59,7 +59,7 @@ pub use header_profile::{
     withdrawals_to_rewards,
     validate_gov5_h2_header, validate_gov5_header_tail, verify_seal, HeaderTailRules, HeaderExtra, HeaderProfileError, N42HeaderProfile,
     ReceiptView, N42Header,
-    EXTRA_SEAL_LEN, GOV5_EMPTY_REQUESTS_HASH, GOV5_HEADER_EXTRA_MAGIC, GOV5_NIL_HASH,
+    EXTRA_SEAL_LEN, GOV5_HEADER_EXTRA_MAGIC, GOV5_NIL_HASH,
     MAX_HEADER_EXTRA_LEN,
 };
 pub use header_rules::{

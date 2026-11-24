@@ -6,7 +6,7 @@ gov5's code is the bytes reference. Do not edit by hand: rerun the test with
 
 ## Identity and validators
 
-Chain id 1144, genesis hash `0x6f733745517957b421dcea37f6c879db89501aac0715f769fbc76ec54efe7e4f` and the four validators (with their test BLS
+Chain id 1144, genesis hash `0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc` and the four validators (with their test BLS
 secret keys) are vector V1's. Leader tenure 1, epoch length 10800 (AM22). Signatures use
 the POP DST `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`; aggregates are plain BLS aggregates over the
 signers in the bitmap (validator index order = bitmap order = genesis list order).
@@ -67,5 +67,5 @@ signers in the bitmap (validator index order = bitmap order = genesis list order
 | n | quorum | QC | TC | Decide wire | NewView wire | NewView envelope | NewView gossip |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 4 | 3 | 151 | 270 | 204 | 391 | 474 | 442 |
-| 100 | 67 | 163 | 294 | 216 | 415 | 498 | 449 |
-| 512 | 342 | 214 | 396 | 267 | 517 | 600 | 455 |
+| 100 | 67 | 163 | 294 | 216 | 415 | 498 | 450 |
+| 512 | 342 | 214 | 396 | 267 | 517 | 600 | 460 |

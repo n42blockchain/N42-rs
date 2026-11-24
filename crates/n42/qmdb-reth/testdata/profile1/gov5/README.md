@@ -3,14 +3,14 @@
 Copied unchanged from `/data/blockchain/wr-logs/qs-scratch/profile1/vectors/` on 2026-11-24:
 V8 (gov5 branch feat/profile1 at 015bd9f6: the closed key list and 14 refused geneses,
 each `{"case", "expectedError", "genesis"}`) and V1's test genesis `genesis_8s.json`
-(gov5 genesis hash `0x6f733745517957b421dcea37f6c879db89501aac0715f769fbc76ec54efe7e4f`).
+(gov5 genesis hash `0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc`).
 Byte-exact contracts: compare by SHA-256 of the raw bytes, never edit. Checked by
 `n42_qmdb_reth::profile1::tests` (`gov5_*`).
 
 | SHA-256 | File |
 | --- | --- |
 | `effc8f8abde676bda14ad8e86d6ac616ac3a653fa4db1a1b789cbe695807ca73` | `V1/genesis_8s.json` |
-| `8fe4c193b27662005484d1c5ade50df455e18b8823254afda01978b9b34081b6` | `V1/README.md` |
+| `c69c8fc2d38e3aaa9b5e27f9f017e98c95796b808f350da0a7fec0e134898f8d` | `V1/README.md` |
 | `d4994e7b82b14c9824bec2473971109a6319072a9db87169ee715b921fa77e7a` | `V8/allowed-keys.json` |
 | `7a0d47d25e8c76640284bca827ea3eff1649d7c81da4c2b0edcac337519040cf` | `V8/README.md` |
 | `f0c5f138fab35d30d3176748f8c80d13aab673afbee53d1cc611484afc2255cd` | `V8/refused/committee_pool_enabled.json` |

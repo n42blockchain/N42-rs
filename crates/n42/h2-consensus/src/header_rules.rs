@@ -28,8 +28,9 @@
 //! - **B5 / B6** a parent beacon root and a withdrawals root are present
 //!   (their values are the committee and rewards checks of the caller).
 //! - **A23** the gas limit is the chain's constant.
-//! - **B8 / AM3** the requests hash is exactly the empty trie root
-//!   `0x56e81f17…b421`; EIP-7685's `sha256("")` is refused.
+//! - **B8 / AM24** the requests hash is exactly EIP-7685's hash of no
+//!   requests, `sha256("")` = `0xe3b0c442…b855`, as on Ethereum; the empty
+//!   trie root that AM3 named is refused.
 //! - **B9** blob gas used 0, excess blob gas 0, both present.
 //! - **B10** the slot number (element 23) is the block number.
 //! - **B11** `mobileRegistryRoot` (element 24) is present (its value is the
@@ -50,9 +51,11 @@ use alloy_eips::eip1559::BaseFeeParams;
 use alloy_primitives::{Address, B256, U256};
 use n42_h2_primitives::bls::BlsSignature;
 
-/// Profile 1's requests hash (B8 as corrected by AM3): the empty trie root,
-/// in every header, genesis included.
-pub const PROFILE1_REQUESTS_HASH: B256 = alloy_consensus::EMPTY_ROOT_HASH;
+/// Profile 1's requests hash (B8 as amended by AM24, which replaces AM3):
+/// EIP-7685's hash of no requests, `sha256("")`, in every header, genesis
+/// included. It is the value Ethereum writes; the empty trie root of AM3 was
+/// the requests root of an EIP draft that Ethereum did not ship.
+pub const PROFILE1_REQUESTS_HASH: B256 = alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 
 /// B4: how far past this node's clock a header's timestamp may be when it
 /// votes, in seconds.
@@ -544,7 +547,7 @@ pub fn validate_profile1_genesis_header(header: &N42Header, rules: &HeaderRules)
         return fail(format!("gas limit {} is not the chain's {}", header.gas_limit, rules.gas_limit));
     }
     if header.requests_hash != Some(PROFILE1_REQUESTS_HASH) {
-        return fail(format!("requests hash {:?} is not the empty trie root", header.requests_hash));
+        return fail(format!("requests hash {:?} is not the EIP-7685 hash of no requests", header.requests_hash));
     }
     if header.blob_gas_used != Some(0) || header.excess_blob_gas != Some(0) {
         return fail("blob gas fields are not 0".into());

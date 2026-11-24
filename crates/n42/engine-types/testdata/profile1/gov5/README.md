@@ -11,8 +11,8 @@ Byte-exact contracts: compare by SHA-256 of the raw bytes, never edit. Checked b
 
 | SHA-256 | File |
 | --- | --- |
-| `f4f5e7701616b12a8771a2dbd49227ea60eb5652b5646e1d4776d5c8a8027418` | `V3/main.json` |
+| `532be4ecb286e7fd2db9af79b9fd60b9b61ff6ad74dbeed26bf5e446a3a4a971` | `V3/main.json` |
 | `92d32b519170eead4c22c1e5f58433439907d9c80487d1b388fa414622022547` | `V3/README.md` |
-| `e05110e39c882d31d0b606e15800052d8a5ec50c942e40d7c4392b517ecd2469` | `V3/system_address_live.json` |
+| `127cc0006ee7671209e2bc283d3c0d7675d9ae7ae119851af733b9860541f0d3` | `V3/system_address_live.json` |
 | `0c3f7add34f3f75ec41ef05fe09b8f9f47718751e6906828d2a907f5516a7dda` | `V4/README.md` |
-| `7cbf30aa4abe2d792f7f3398091943334225d848e72cecc6337d513247eff5c1` | `V4/transactions.json` |
+| `a68635cf58031de3852c99d6914eac2a0ba817b072c3f1e402fd9a891bcc3ca4` | `V4/transactions.json` |

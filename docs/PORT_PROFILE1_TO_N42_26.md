@@ -59,7 +59,7 @@ the worktree `/home/n42/src/n42/n42-26/.artifacts/reth-upgrade-2110/n42-26-p1` (
 Each step names the standard items, the vector cases that prove it, the n42-rs source, what n42-26 has, the
 distance, and MY estimate (one engineer who knows n42-26, full time; assumption per row).
 
-### Step 1. Genesis: V8 + V1 genesis hash (0x6f733745...7e4f)
+### Step 1. Genesis: V8 + V1 genesis hash (0x188e9d93...90dc since AM24; 0x6f733745...7e4f before it)
 
 Items: A1-A3, A5-A8, A15-A19, A22-A23, J3 (P4 closed keys), J4/AM10 (forbidden env), AM3 (requestsHash), B3
 (ommers 0), B12 (element 22 gap), B11/AM12/AM16 (faucet non-zero, reward string, whole gwei).

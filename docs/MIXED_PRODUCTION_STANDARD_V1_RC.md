@@ -61,7 +61,7 @@ file (A6) are the only sources. Fork digest = `genesisHash[0:4]`. The signing id
 client, and nothing else is (P3, P4).
 
 **A3. Validator set.** `config.hotstuff.validators[] = {address, blsKey}`; list order = QC bitmap order =
-leader index. `f = ⌊(n−1)/3⌋`, quorum `2f+1`, `n ≥ 4` (fewer refuses the genesis). The set is the genesis set
+leader index. `f = ⌊(n−1)/3⌋`, quorum `q = n − f` (equal to `2f+1` only when `n = 3f+1`; with `2f+1` two quorums of e.g. n = 5, 6, 8 could overlap in f or fewer nodes — corrected 2026-11-24, all three clients already use `n − f`), `n ≥ 4` (fewer refuses the genesis). The set is the genesis set
 for the whole chain and for every epoch (E2).
 
 **A4. Fork schedule.** Execution is every Ethereum fork through Osaka plus `amsterdamTime: 0`, all at 0,

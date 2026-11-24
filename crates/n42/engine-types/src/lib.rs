@@ -104,3 +104,6 @@ mod tests;
 //
 //     handle.node_exit_future.await
 // }
+
+#[cfg(test)]
+mod profile1_vectors;

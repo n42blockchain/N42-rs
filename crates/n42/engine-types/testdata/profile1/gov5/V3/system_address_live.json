@@ -1,0 +1,197 @@
+{
+  "vector": "V3",
+  "chain": "system-address-live",
+  "description": "Standard Profile-1 genesis plus the funded test sender and 0xff..fe holding 1 wei. The EIP-2935/4788/7002/7251 system calls leave 0xff..fe unchanged, so under A9 it is not written (D3).",
+  "genesis": "internal/testdata/profile1/standard_genesis.json",
+  "allocAdditions": {
+    "0xbbe8de86315808f7d16c5ae2650a17bbb22355f7": {
+      "balance": "0x56bc75e2d63100000"
+    },
+    "0xfffffffffffffffffffffffffffffffffffffffe": {
+      "balance": "0x1"
+    }
+  },
+  "genesisQmdbStateRoot": "0xe0145fb9d25e0790fc120d13e9ceb72020d4c1d0c6c063aa6dbc48bc007df9b9",
+  "blocks": [
+    {
+      "case": "empty-block",
+      "description": "No transactions; 0xff..fe exists and is unchanged: no op (D3).",
+      "header": {
+        "number": 1,
+        "timestamp": 1795564801,
+        "parentHash": "0x2ae3abff96207b3680e1b33936e6418ae81de319c6b65d212d21a64599ef7908",
+        "coinbase": "0x0af682426022f37276f3576c7560158a4070d8b2",
+        "gasLimit": 480000000,
+        "baseFeePerGas": 1000000000,
+        "parentBeaconBlockRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "prevRandao": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "transactions": [],
+      "accountOps": [
+        {
+          "address": "0x42e9819036f61bf665d5f727e8c03121f12f586e",
+          "qmdbKeyHash": "0x1498372ce1bf264018ebf4e033f4dfd8e83ea6e344e068b572ab4435388e70f3",
+          "op": "write",
+          "nonce": 0,
+          "balance": "0x33b2e3cadb136f08f640000",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x020c033b2e3cadb136f08f640000"
+        },
+        {
+          "address": "0x0000f90827f1c53a10cb7a02335b175320002935",
+          "qmdbKeyHash": "0x2c9213778d67108f6cf8ef9e9571660b96c336f1f56c717053dc51c7495841ec",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x0",
+          "codeHash": "0x6e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d",
+          "qmdbValue": "0x09016e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d"
+        },
+        {
+          "address": "0x0af682426022f37276f3576c7560158a4070d8b2",
+          "qmdbKeyHash": "0x322c3b1004ad3b4bab6e704c0fee7bd8496d79c27d6c44808702402e3361789e",
+          "op": "write",
+          "nonce": 0,
+          "balance": "0xde0b6b3a7640000",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x02080de0b6b3a7640000"
+        },
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "qmdbKeyHash": "0x605cb59505588c1ebecee051d8a102041630c2f11dd4ab81a3aa1a058efa3d78",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x0",
+          "codeHash": "0xf57acd40259872606d76197ef052f3d35588dadf919ee1f0e3cb9b62d3f4b02c",
+          "qmdbValue": "0x0901f57acd40259872606d76197ef052f3d35588dadf919ee1f0e3cb9b62d3f4b02c"
+        }
+      ],
+      "storageOps": [
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000001d4c",
+          "qmdbKeyHash": "0x2e318b3db5a32ab375781db4528f19b0d2f59eb056fbd229deaa41d5190c7bbb",
+          "op": "write",
+          "value": "0x000000000000000000000000000000000000000000000000000000006b062501"
+        },
+        {
+          "address": "0x0000f90827f1c53a10cb7a02335b175320002935",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "qmdbKeyHash": "0x66082e0d73cb1333d5e46aa267c519ab33646316ed39d28372de378ae742a32f",
+          "op": "write",
+          "value": "0x2ae3abff96207b3680e1b33936e6418ae81de319c6b65d212d21a64599ef7908"
+        }
+      ],
+      "mustNotAppear": [
+        "0xfffffffffffffffffffffffffffffffffffffffe"
+      ],
+      "qmdbStateRoot": "0xd8444fb53ce19051ee8138258fc5b8903ab0272528e61465ab9313819370e3f5"
+    },
+    {
+      "case": "plain-transfer",
+      "description": "1 ether to 0x..aa; 0xff..fe still unchanged.",
+      "header": {
+        "number": 2,
+        "timestamp": 1795564802,
+        "parentHash": "0x553601b980eb2bf1f880141a8a20a350d9483e977b170c99ea51e0bf54718a78",
+        "coinbase": "0x0af682426022f37276f3576c7560158a4070d8b2",
+        "gasLimit": 480000000,
+        "baseFeePerGas": 1000000000,
+        "parentBeaconBlockRoot": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "prevRandao": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "transactions": [
+        "0x02f87582047880843b9aca008477359400839896809400000000000000000000000000000000000000aa880de0b6b3a764000080c001a09b7397238fa1cef24953c96ddd87c6e017b1a86732feffeb1334dba2c5110e8da0227c63d9f37155057af7ddc27ef3a21b6bd8320d9d537b6b5d67295fcb171cec"
+      ],
+      "accountOps": [
+        {
+          "address": "0x42e9819036f61bf665d5f727e8c03121f12f586e",
+          "qmdbKeyHash": "0x1498372ce1bf264018ebf4e033f4dfd8e83ea6e344e068b572ab4435388e70f3",
+          "op": "write",
+          "nonce": 0,
+          "balance": "0x33b2e3cbb91eda436c80000",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x020c033b2e3cbb91eda436c80000"
+        },
+        {
+          "address": "0x0000f90827f1c53a10cb7a02335b175320002935",
+          "qmdbKeyHash": "0x2c9213778d67108f6cf8ef9e9571660b96c336f1f56c717053dc51c7495841ec",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x0",
+          "codeHash": "0x6e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d",
+          "qmdbValue": "0x09016e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d"
+        },
+        {
+          "address": "0x0af682426022f37276f3576c7560158a4070d8b2",
+          "qmdbKeyHash": "0x322c3b1004ad3b4bab6e704c0fee7bd8496d79c27d6c44808702402e3361789e",
+          "op": "write",
+          "nonce": 0,
+          "balance": "0x1bc2277c751a3000",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x02081bc2277c751a3000"
+        },
+        {
+          "address": "0x00000000000000000000000000000000000000aa",
+          "qmdbKeyHash": "0x4e6b5e634b9d43f2d7ecb0f33227d7f30a828b384cae9e4daf1ab88b3b9a69f9",
+          "op": "write",
+          "nonce": 0,
+          "balance": "0xde0b6b3a7640000",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x02080de0b6b3a7640000"
+        },
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "qmdbKeyHash": "0x605cb59505588c1ebecee051d8a102041630c2f11dd4ab81a3aa1a058efa3d78",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x0",
+          "codeHash": "0xf57acd40259872606d76197ef052f3d35588dadf919ee1f0e3cb9b62d3f4b02c",
+          "qmdbValue": "0x0901f57acd40259872606d76197ef052f3d35588dadf919ee1f0e3cb9b62d3f4b02c"
+        },
+        {
+          "address": "0xbbe8de86315808f7d16c5ae2650a17bbb22355f7",
+          "qmdbKeyHash": "0x7b9f464e5f70f81fd28673248bb188687abf958dd13e44e38d73d5462b7d1e63",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x55de5334f6f07a000",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x030109055de5334f6f07a000"
+        }
+      ],
+      "storageOps": [
+        {
+          "address": "0x0000f90827f1c53a10cb7a02335b175320002935",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000001",
+          "qmdbKeyHash": "0x2cad6c7c5dbe324a93304f9313598374a5a62da7ebb9779e39e35a60130a8b53",
+          "op": "write",
+          "value": "0x553601b980eb2bf1f880141a8a20a350d9483e977b170c99ea51e0bf54718a78"
+        },
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000003d4c",
+          "qmdbKeyHash": "0x94a173b541f5026bf466a6d28714aa8baa1cd2842a2ce26640446cbaced9c5da",
+          "op": "write",
+          "value": "0x1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000001d4d",
+          "qmdbKeyHash": "0xef2f498bba42f64b6acf355b1f8f6a362e9bd29575fd1fb468622337bda821d7",
+          "op": "write",
+          "value": "0x000000000000000000000000000000000000000000000000000000006b062502"
+        }
+      ],
+      "mustNotAppear": [
+        "0xfffffffffffffffffffffffffffffffffffffffe"
+      ],
+      "qmdbStateRoot": "0x1737f5343d936f7e6e1b15ac267d02a61ab54b865cf256f612b3745310b2e9d7"
+    }
+  ],
+  "notes": [
+    "Write set = the operations the state root applies to QMDB (gov5 IntraBlockState.LastRootDirtySet): accountOps and storageOps, each sorted by qmdbKeyHash (D6). op=delete removes the key; a delete of a key the tree does not hold changes nothing.",
+    "qmdbValue is the qmdb_compat account encoding (EncodeAccountValue); storage values are 32-byte words.",
+    "Execution per block: EIP-4788 then EIP-2935 at block start, the transactions, EIP-7002 then EIP-7251 at block end, then the A8 reward (devBlockReward to coinbase and to devFaucetAddress), then A9 (unchanged accounts not written) and D5 (storage net change) from block 1.",
+    "Header fields are inputs as given (baseFee fixed at 1 gwei, parentHash = gov5 hash of the previous vector header); header validity is V5's subject, not V3's. gov5 writes the EIP-4788 ring-buffer slots directly on a native chain; the values equal those the canonical contract call stores.",
+    "mustNotAppear lists addresses that must have neither an account nor a storage op in the block."
+  ]
+}

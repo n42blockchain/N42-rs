@@ -621,3 +621,15 @@ fn an_anchor_file_holds_headers_as_hex_lines_or_raw_rlp() {
     assert_eq!(read_headers_from_file(&scratch.path("raw")).unwrap(), headers);
     assert_eq!(read_headers_from_file(&scratch.path("hex")).unwrap(), headers);
 }
+
+#[test]
+fn init_takes_the_anchor_and_the_commit_qc_as_options() {
+    let args = InitArgs::parse_from([
+        "init", "--chain", "dev", "--datadir", "/d", "--state", "s", "--header", "h", "--qmdb", "q",
+        "--anchor", "a.hex", "--commit-qc", "c.qc",
+    ]);
+    assert_eq!(args.anchor, Some(PathBuf::from("a.hex")));
+    assert_eq!(args.commit_qc, Some(PathBuf::from("c.qc")));
+    let args = InitArgs::parse_from(["init", "--chain", "dev", "--datadir", "/d", "--state", "s", "--header", "h", "--qmdb", "q"]);
+    assert_eq!((args.anchor, args.commit_qc), (None, None));
+}

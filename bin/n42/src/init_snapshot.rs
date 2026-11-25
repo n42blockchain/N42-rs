@@ -112,6 +112,7 @@ struct InitArgs {
     /// certified by N+1, and so are N's receipts root, bloom, gas used and
     /// requests hash. N+1 is trusted only once a CommitQC names it or a
     /// descendant: one embedded in a later header of this file, or `--commit-qc`.
+    #[arg(long, value_name = "HEADERS_RLP")]
     anchor: Option<PathBuf>,
     /// A CommitQC (gov5's wire encoding, raw or hex) naming N+1 or a later
     /// header of `--anchor`, when no anchor header embeds one.

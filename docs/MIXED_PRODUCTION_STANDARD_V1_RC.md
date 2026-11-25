@@ -125,15 +125,16 @@ rotates it (A22).
 `maxTimeoutMs ≥ baseTimeoutMs`. Standard values: **24000** and **96000**. The view timer runs from view start;
 the base timeout exceeds the slot plus a block's build plus two network hops.
 
-**A17. Block interval and slot grid (AM27).** `config.hotstuff.blockIntervalMs` = I, mandatory, a whole
-number of seconds (`blockIntervalMs mod 1000 = 0`, checked when the genesis is loaded; a node refuses to
-start otherwise); standard value **8000**. Time is divided into slots counted from the genesis timestamp G, as on the Ethereum beacon chain
-(slot s starts at `G + s·I`; geth `beacon/light/committee_chain.go:499-500` uses the same arithmetic):
-there is no per-block drift. A leader holding parent P (slot `sP = (P.time − G)/I`) proposes in slot
-`s = max(sP + 1, ceil((now − G)/I))` — the first slot boundary that is after the parent's slot and not in
-the past — publishes no earlier than `G + s·I`, and stamps `header.time = G + s·I` (so the timestamp is
-known before the wait and a pipelined build can use it). A leader that enters its view mid-slot (after a
-TC, or a late parent) waits for the next boundary.
+**A17. Block interval and slot grid (AM27, AM27a).** `config.hotstuff.blockIntervalMs` = I (milliseconds),
+mandatory, any positive value (sub-second intervals, e.g. the 30 ms performance line, are allowed); profile 1's
+value is **8000**. Time is divided into slots counted from the genesis timestamp G, as on the Ethereum beacon
+chain (slot s starts at `G·1000 + s·I` ms; geth `beacon/light/committee_chain.go:499-500` uses the same
+arithmetic): there is no per-block drift. A leader holding parent P proposes in the first slot after the
+parent's that is not in the past, publishes no earlier than that slot's start, and stamps
+`header.time = floor(slot start / 1000)` (known before the wait, so a pipelined build can use it). A leader
+that enters its view mid-slot (after a TC, or a late parent) waits for the next boundary. When I is a whole
+number of seconds the parent's slot is `(P.time − G)·1000 / I`; otherwise a client tracks slots in
+milliseconds locally (the header's seconds cannot name a sub-second slot).
 
 **A18. Epochs.** `config.hotstuff.epochLength` E, mandatory, `E ≥ 1` views (missing or 0 refuses the genesis);
 `epoch(v) = (v−1)/E`; boundary b: `b > 1` and `(b−1) mod E = 0`. Standard value: **10800** (about 24 h). With a
@@ -174,10 +175,12 @@ or a seal by any key but the view's leader makes the header invalid.
 hash is invalid), no ommers, `coinbase` = the proposer's address. All checked, in every header including
 genesis.
 
-**B4. Timestamp (AM27).** Checked on import: `(header.time − G) mod I = 0` (on the slot grid) and
-`header.time ≥ parent.time + I` (a later slot). Checked only before voting (never on import of a committed
-block): `header.time ≤ floor(local_now) + 2`. The leader's stamp is A17's slot start. Supersedes AM26
-(stamp at proposal time) and the rc3 rule `max(parent.time, floor(now))`.
+**B4. Timestamp (AM27, AM27a).** Checked on import when I is a whole number of seconds:
+`(header.time − G)·1000 mod I = 0` (on the slot grid) and `header.time ≥ parent.time + I/1000` (a later slot).
+When I is not a whole number of seconds only `header.time ≥ parent.time` is checked (equal seconds allowed),
+because a second holds several slots. Checked only before voting (never on import of a committed block):
+`header.time ≤ floor(local_now) + 2`. The leader's stamp is A17's. Supersedes AM26 (stamp at proposal
+time) and the rc3 rule `max(parent.time, floor(now))`. No interval value makes a node refuse to start.
 
 **B5. parentBeaconRoot.** `Blake3(committee evidence(parent.number, parent.hash, parent.receiptsRoot))` from
 the committee pool (A19); zero for block 1.
@@ -621,6 +624,7 @@ that settled them).
 | AM24 | owner decision: requestsHash = EIP-7685's `sha256("")`; genesis hash and V1/V3/V4/V6 regenerated (rc2) | B8, A6, §4, §5 |
 | AM25 | owner decision: requests produced as on Ethereum and ignored; requestsHash carried as a deferred field (rc3) | A10, B8, A13, §5 (V5) |
 | AM27 | owner decision 2026-11-25: slots counted from the genesis timestamp (beacon-chain style, no cumulative drift); timestamp = slot start; B4 grid + later-slot checks; supersedes AM26 | A17, B4 |
+| AM27a | owner 2026-11-25: be lenient — any positive blockIntervalMs (sub-second allowed, e.g. 30 ms performance branches); grid in ms; exact on-grid check only for whole-second intervals; no start refusal | A17, B4 |
 | gov5 02:55 readings (accepted in v0.2.1) | D3 caller only if changed; D5 gap; C6 no exemption; ommers zero in genesis; B15 gossip; J4 extra entries | D3, D5, C6, B3, B15, J4 |
 | gov5 02:55 | type `0x05` refused | C4 |
 | PN gov5 03:46 (V1 readings, unobjected; V1 equal both ways 04:09/04:28) | QC ancestry checked when known; "QC absent only while none" not enforced; stamp cache local | B1, B4 |

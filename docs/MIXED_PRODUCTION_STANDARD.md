@@ -935,3 +935,7 @@ again. Any user could trigger it.
 
 The owner ruled that block timing is an offset from genesis and must not accumulate drift ("区块链计时规则是从创世块起计算偏移，不累计偏差，看下geth"). Evidence that prompted it: gate-2 and pre-run deltas 0/16/8/8 (AM26 stamping) and the occasional 9 s from "first held the parent + I" pacing. geth references: beacon slots `GenesisTime + slot·12` (beacon/light/committee_chain.go:499-500); clique `parent.Time + Period`, raised to now only when late (consensus/clique/clique.go:567-569). AM27 takes the beacon form: slot s starts at G + s·I; the leader proposes in the first slot after the parent's that is not in the past, publishes at its start and stamps that start; B4 adds on-grid and later-slot checks on import. Text: V1_RC rc4 A17/B4. Supersedes AM26.
 
+## Amendment AM27a (2026-11-25, owner): lenient interval
+
+Owner: "on the performance branches the block interval is about 30 ms, so be lenient". AM27's whole-second requirement (start refusal) is withdrawn: blockIntervalMs may be any positive number of milliseconds; the grid is kept in milliseconds from G; the header's seconds are floor(slot start / 1000); the exact on-grid and later-slot checks apply only to whole-second intervals, otherwise B4 checks non-decreasing seconds. Profile 1 (8000 ms) behaves exactly as under AM27, so no client change is needed before gate 3; the start refusal is removed in each client afterwards.
+

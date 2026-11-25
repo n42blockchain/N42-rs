@@ -5,9 +5,14 @@
 # all-Rust smoke, or a subset beside another client's validators (the mixed
 # round of /data/blockchain/gov5-work/p1mixed/MIXED-ROUND-PLAN.md).
 #
-#   scripts/profile1-round.sh init | up | status | headers <from> <to> | down
+#   scripts/profile1-round.sh init | up | status | headers <from> <to> | catchup <i> |
+#                             load <tx/s> <seconds> | load-genesis <out> | down
 #
-#   P1_MEMBERS="0 1 2 3"  validator indices this script runs ("2 3" in the mixed round)
+#   P1_MEMBERS="0 1 2 3"  validator indices this script runs ("2 3" in the mixed round);
+#                         `up` may start a subset while other members of P1_DIR run
+#                         (a late member: init all, `up` 0 1 2, later `up` 3)
+#   P1_MEMBERS_ALL="..."  the members every started validator dials (default: every
+#                         member initialised in P1_DIR), so a late one reaches everyone
 #   P1_GENESIS=<file>     the profile-1 genesis (default: the V1 genesis_8s.json)
 #   P1_GENESIS_NOW=1      init copies the genesis with "timestamp" = now (only that
 #                         field; the hash changes); 0 uses P1_GENESIS byte for byte
@@ -15,6 +20,14 @@
 #   P1_DIR=<run dir>      everything lives here (default /data/n42-build/p1-round)
 #   P1_BIN=<dir>          release dir holding n42 and examples/h2_validator, h2_keygen
 #   P1_CPUS=<list>        taskset CPU list (default skips the faulty core 99/227)
+#   P1_LOAD=<tx/s>        `up` also starts `load` at that rate for P1_LOAD_SECONDS (3600)
+#   P1_LOAD_SENDERS=64    derived senders (send_tx --senders), split over the members
+#                         loaded (P1_LOAD_MEMBERS, default the running ones of P1_MEMBERS)
+#
+# Load needs a genesis that funds the senders: `load-genesis <out>` writes P1_GENESIS
+# plus alloc entries for the P1_LOAD_SENDERS accounts (tx_flood / gov5 cmd/txflood
+# derivation, offset 0) and the recipient 0x4242..42 (funded, so a transfer to it is
+# 21,000 gas even under Amsterdam's EIP-8037); nothing else changes.
 #
 # Ports, member i: libp2p TCP P (body channel P+1000), EL HTTP H, authrpc H+200,
 # devp2p H+300 (discovery off, no peers), with P/H = 30702/20142 and 30703/20143
@@ -39,16 +52,25 @@ EL=$P1_BIN/n42
 VAL=$P1_BIN/examples/h2_validator
 KEYGEN=$P1_BIN/examples/h2_keygen
 G=$P1_DIR/genesis.json
+P1_LOAD=${P1_LOAD:-}
+P1_LOAD_SECONDS=${P1_LOAD_SECONDS:-3600}
+P1_LOAD_SENDERS=${P1_LOAD_SENDERS:-64}
+SEND_TX=$P1_BIN/examples/send_tx
+LOAD_TO=0x4242424242424242424242424242424242424242
 for v in $(compgen -e | /usr/bin/grep '^N42_'); do unset "$v"; done
 
 # Members 2 and 3 take the ports the mixed-round plan reserves for n42-rs
 # (30702/30703, 20142/20143); members 0 and 1 stay off gov5's 30700/30701 and
 # 20140/20141 and use 30712/30713, 20152/20153.
 shift_of() { if [ "$1" -lt 2 ]; then echo 12; else echo 0; fi; }
-p2p_port() { echo $((30700 + $1 + $(shift_of "$1"))); }
-http_port() { echo $((20140 + $1 + $(shift_of "$1"))); }
-auth_port() { echo $((20340 + $1 + $(shift_of "$1"))); }
-devp2p_port() { echo $((20440 + $1 + $(shift_of "$1"))); }
+# P1_PORT_OFFSET=<n> moves every port of this script by n, for an all-Rust round
+# while another client's round holds the plan's ports (30: 30730-30743, HTTP
+# 20170-20183); a mixed round leaves it 0.
+P1_PORT_OFFSET=${P1_PORT_OFFSET:-0}
+p2p_port() { echo $((30700 + P1_PORT_OFFSET + $1 + $(shift_of "$1"))); }
+http_port() { echo $((20140 + P1_PORT_OFFSET + $1 + $(shift_of "$1"))); }
+auth_port() { echo $((20340 + P1_PORT_OFFSET + $1 + $(shift_of "$1"))); }
+devp2p_port() { echo $((20440 + P1_PORT_OFFSET + $1 + $(shift_of "$1"))); }
 mdir() { echo "$P1_DIR/m$1"; }
 peer_id() { cat "$(mdir "$1")/peer-id"; }
 maddr() { echo "/ip4/127.0.0.1/tcp/$(p2p_port "$1")/p2p/$(peer_id "$1")"; }
@@ -104,13 +126,18 @@ PY
 
 cmd_up() {
   [ -f "$G" ] || { echo "no $G: init first" >&2; exit 1; }
-  if pgrep -f "$(mine_re)" >/dev/null; then echo "members of $P1_DIR already running" >&2; exit 1; fi
+  local all; all=$(members_all)
+  for i in $P1_MEMBERS; do
+    [ -f "$(mdir "$i")/peer-id" ] || { echo "member $i is not initialised in $P1_DIR" >&2; exit 1; }
+    if [ "$(member_alive "$i")" != 0 ]; then echo "member $i of $P1_DIR already running" >&2; exit 1; fi
+  done
   for i in $P1_MEMBERS; do
     for p in $(p2p_port "$i") $((1000 + $(p2p_port "$i"))) $(http_port "$i") $(auth_port "$i") $(devp2p_port "$i"); do
       if port_busy "$p"; then echo "port $p (member $i) is in use; refusing to start" >&2; exit 1; fi
     done
   done
   local tag; tag=$(date -u +%Y%m%dT%H%M%S); echo "$tag" > "$P1_DIR/run-tag"
+  for i in $P1_MEMBERS; do echo "$tag" > "$(mdir "$i")/up-tag"; done
   for i in $P1_MEMBERS; do
     local d; d=$(mdir "$i")
     setsid taskset -c "$P1_CPUS" "$EL" node --datadir "$d/el" --chain "$G" \
@@ -128,7 +155,7 @@ cmd_up() {
   done
   for i in $P1_MEMBERS; do
     local d peers=() j; d=$(mdir "$i")
-    for j in $P1_MEMBERS; do [ "$j" = "$i" ] || peers+=(--peer "$(maddr "$j")"); done
+    for j in $all; do [ "$j" = "$i" ] || peers+=(--peer "$(maddr "$j")"); done
     for j in $P1_EXTRA_PEERS; do peers+=(--peer "$j"); done
     RUST_LOG=${P1_RUST_LOG:-info,n42=debug} setsid taskset -c "$P1_CPUS" "$VAL" --datadir "$d/consensus" \
       --chain "$G" --index "$i" --bls-key "$(cat "$d/bls.key")" --node-key "$d/node.key" \
@@ -142,6 +169,116 @@ cmd_up() {
     echo "member $i up: $(strip "$d/v.log" | /usr/bin/grep -a -m1 'node peer id' | awk '{print $NF}') $(strip "$d/v.log" | /usr/bin/grep -a -m1 '^chain ')"
   done
   pgrep -af "$(mine_re)" | cut -c1-150
+  if [ -n "$P1_LOAD" ]; then cmd_load "$P1_LOAD" "$P1_LOAD_SECONDS"; fi
+}
+
+# Every member initialised in P1_DIR (P1_MEMBERS_ALL overrides).
+members_all() {
+  if [ -n "${P1_MEMBERS_ALL:-}" ]; then echo "$P1_MEMBERS_ALL"; return; fi
+  local f; for f in "$P1_DIR"/m[0-9]/peer-id; do [ -f "$f" ] && basename "$(dirname "$f")" | cut -c2-; done | tr '\n' ' '
+}
+
+cmd_load_genesis() {
+  local out=${1:?out}
+  [ -x "$SEND_TX" ] || { echo "missing $SEND_TX" >&2; exit 1; }
+  "$SEND_TX" --senders "$P1_LOAD_SENDERS" --print-addresses > "$out.senders" || exit 1
+  python3 -I - "$P1_GENESIS" "$out" "$out.senders" "$LOAD_TO" <<'PY2' || exit 1
+import json, sys
+src, out, senders, sink = sys.argv[1:5]
+g = json.load(open(src))
+for a in open(senders).read().split():
+    assert a.lower() not in {k.lower() for k in g["alloc"]}, a
+    g["alloc"][a] = {"balance": hex(10**24)}
+g["alloc"][sink] = {"balance": "0x1"}
+open(out, "w").write(json.dumps(g, indent=2) + "\n")
+PY2
+  rm -f "$out.senders"
+  echo "load genesis: $out ($P1_LOAD_SENDERS senders x 1e24 wei + recipient $LOAD_TO) sha256 $(sha256sum "$out" | cut -c1-64)"
+}
+
+# load <tx/s> <seconds>: send_tx processes over the loaded members, each with its
+# own slice of the derived senders (disjoint nonce sequences), recorded in load.pids.
+cmd_load() {
+  local rate=${1:?tx/s} secs=${2:?seconds}
+  [ -x "$SEND_TX" ] || { echo "missing $SEND_TX" >&2; exit 1; }
+  local targets=() i
+  for i in ${P1_LOAD_MEMBERS:-$P1_MEMBERS}; do el_alive "$i" && targets+=("$i"); done
+  [ ${#targets[@]} -gt 0 ] || { echo "no running member to load" >&2; exit 1; }
+  local k=${#targets[@]} per=$((P1_LOAD_SENDERS / ${#targets[@]})) chain n=0
+  chain=$(python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))['config']['chainId'])" "$G")
+  for i in "${targets[@]}"; do
+    setsid "$SEND_TX" --rpc "http://127.0.0.1:$(http_port "$i")" --senders "$per" --offset $((n * per)) \
+      --to "$LOAD_TO" --value 1 --chain-id "$chain" --rate "$(python3 -I -c "print($rate/$k)")" --seconds "$secs" \
+      >> "$P1_DIR/load-m$i.log" 2>&1 < /dev/null &
+    echo $! >> "$P1_DIR/load.pids"
+    n=$((n + 1))
+  done
+  echo "load: $rate tx/s for ${secs}s over members ${targets[*]} ($per senders each); logs $P1_DIR/load-m*.log"
+}
+
+cmd_load_stop() {
+  [ -f "$P1_DIR/load.pids" ] || return 0
+  local p
+  for p in $(cat "$P1_DIR/load.pids"); do
+    # Only a send_tx this run dir started.
+    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | /usr/bin/grep -q "^$SEND_TX "; then kill -TERM "$p"; fi
+  done
+  rm -f "$P1_DIR/load.pids"
+}
+
+# catchup <i>: when the member's first range request went out, when it reached the
+# head (sync mode: live), how many blocks it pulled, its first vote and first led
+# view after that, and every refusal / timeout / halt.
+cmd_catchup() {
+  local i=${1:?member}; local d; d=$(mdir "$i")
+  strip "$d/v.log" | python3 -I - "$REFUSAL_RE" "$BENIGN_RE" <<'PY2'
+import re, sys
+refusal, benign = re.compile(sys.argv[1]), re.compile(sys.argv[2])
+ts = re.compile(r"^(\S+Z)\s")
+kv = lambda ln, k: (re.search(r"\b" + k + r"=(\S+)", ln) or [None, None])[1]
+first = {}
+start = None; pulls = []; finished = []; refusals = []; timeouts = []
+live_at = None
+for ln in sys.stdin:
+    m = ts.match(ln)
+    if not m:
+        continue
+    t = m.group(1)
+    start = start or t
+    if "pulling the gap by range" in ln:
+        pulls.append((t, kv(ln, "from"), kv(ln, "to")))
+    elif "catch-up finished" in ln:
+        finished.append((t, kv(ln, "from"), kv(ln, "height"), kv(ln, "target"), kv(ln, "complete")))
+    elif "sync mode: live" in ln and live_at is None:
+        live_at = t
+    elif "n42.h2.node: view timed out" in ln:
+        timeouts.append(t)
+    if refusal.search(ln) and not benign.search(ln):
+        refusals.append(ln.strip()[:200])
+    after = live_at or (finished[-1][0] if finished else None)
+    if after:
+        for key, pat in (("vote", "sending vote to leader"), ("commit vote", "sending commit vote"), ("led", "built a block to propose")):
+            if key not in first and pat in ln and t >= after:
+                first[key] = (t, kv(ln, "view"))
+print(f"validator start      : {start}")
+if pulls:
+    print(f"first range request  : {pulls[0][0]} from {pulls[0][1]} to {pulls[0][2]} ({len(pulls)} pulls started)")
+else:
+    print("first range request  : none")
+for f in finished:
+    print(f"catch-up finished    : {f[0]} from {f[1]} height {f[2]} target {f[3]} complete {f[4]}")
+if pulls and finished:
+    print(f"blocks pulled        : {int(finished[-1][2]) - int(pulls[0][1])}")
+print(f"reached the head     : {live_at or 'no sync mode: live line'}")
+for k in ("vote", "commit vote", "led"):
+    v = first.get(k)
+    print(f"first {k:<15}: {v[0] + ' view ' + str(v[1]) if v else 'none'}")
+print(f"view timeouts        : {len(timeouts)}" + (f" (first {timeouts[0]}, last {timeouts[-1]})" if timeouts else ""))
+print(f"refusal lines        : {len(refusals)}")
+for r in refusals[:5]:
+    print("  " + r)
+PY2
+  if [ -e "$d/consensus/safety-halt.json" ]; then echo "halt                 : YES ($d/consensus/safety-halt.json)"; else echo "halt                 : no"; fi
 }
 
 member_alive() { pgrep -fc "^[${P1_BIN:0:1}]${P1_BIN:1}/(n42 node|examples/h2_validator) --datadir $(mdir "$1")/"; }
@@ -214,6 +351,7 @@ for ln in sys.stdin:
 }
 
 cmd_down() {
+  cmd_load_stop
   local re; re=$(mine_re)
   local before; before=$(pgrep -fc "$re")
   echo "stopping $before processes of $P1_DIR (validators first)"
@@ -232,6 +370,9 @@ case ${1:-} in
   up) cmd_up ;;
   status) cmd_status ;;
   headers) shift; cmd_headers "$@" ;;
+  catchup) shift; cmd_catchup "$@" ;;
+  load) shift; cmd_load "$@" ;;
+  load-genesis) shift; cmd_load_genesis "$@" ;;
   down) cmd_down ;;
-  *) sed -n '2,25p' "$0"; exit 2 ;;
+  *) sed -n '2,40p' "$0"; exit 2 ;;
 esac

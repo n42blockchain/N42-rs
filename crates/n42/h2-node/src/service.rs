@@ -4902,7 +4902,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         message: n42_h2_primitives::consensus::ConsensusMessage,
         events: &mut Vec<ServiceEvent>,
     ) {
-        self.publish_with(message, events, false);
+        self.publish_with(message, events, true);
     }
 
     /// [`Self::publish`]; `retransmit_duplicate_timeout` says whether a

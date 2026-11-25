@@ -389,9 +389,12 @@ pub fn block_by_hash_protocol() -> StreamProtocol {
 
 /// gov5 `responseCodeInvalidRequest`.
 pub const RESPONSE_CODE_INVALID_REQUEST: u8 = 1;
-/// gov5 `responseCodeServerError`, which is what it answers for a block it
-/// does not have.
+/// gov5 `responseCodeServerError`.
 pub const RESPONSE_CODE_SERVER_ERROR: u8 = 2;
+/// `RESOURCE_UNAVAILABLE`: the answer to a `block_by_hash` request for a
+/// block this node does not hold (mixed production standard, the
+/// `block_by_hash/1` row: "miss = 0x03 RESOURCE_UNAVAILABLE").
+pub const RESPONSE_CODE_RESOURCE_UNAVAILABLE: u8 = 3;
 /// gov5 `encoder.MaxBlockChunkSize`.
 pub const MAX_BLOCK_CHUNK: u64 = 64 << 20;
 /// Bound on the compressed chunk as it arrives, for a decoded bound of
@@ -479,14 +482,29 @@ impl request_response::Codec for BlockByHashCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let out = encode_block_reply(&reply).map_err(to_io)?;
+        let out = encode_block_by_hash_reply(&reply).map_err(to_io)?;
         io.write_all(&out).await?;
         io.close().await
     }
 }
 
+/// A `block_by_hash` reply: a block as [`encode_block_reply`]; the only error
+/// a by-hash reply carries is a miss, which the standard answers with
+/// [`RESPONSE_CODE_RESOURCE_UNAVAILABLE`].
+pub fn encode_block_by_hash_reply(reply: &BlockReply) -> Result<Vec<u8>, crate::status::StatusError> {
+    match reply {
+        Ok(_) => encode_block_reply(reply),
+        Err(message) => {
+            let mut out = vec![RESPONSE_CODE_RESOURCE_UNAVAILABLE];
+            out.extend_from_slice(&frame_payload(message.as_bytes())?);
+            Ok(out)
+        }
+    }
+}
+
 /// The bytes gov5's `writeBlockChunk` / `writeErrorResponseToStream` put on
-/// the stream for a reply.
+/// the stream for a reply (an error as `RESPONSE_CODE_SERVER_ERROR`, what a
+/// range reply ends with when it fails).
 pub fn encode_block_reply(reply: &BlockReply) -> Result<Vec<u8>, crate::status::StatusError> {
     match reply {
         Ok(chunk) => {
@@ -901,14 +919,19 @@ mod block_by_hash_tests {
     }
 
     #[test]
-    fn a_missing_block_is_gov5s_server_error_with_a_framed_message() {
-        let bytes = encode_block_reply(&Err("block not found".into())).unwrap();
-        assert_eq!(bytes[0], RESPONSE_CODE_SERVER_ERROR);
+    fn a_missing_block_is_resource_unavailable_with_a_framed_message() {
+        let bytes = encode_block_by_hash_reply(&Err("block not found".into())).unwrap();
+        assert_eq!(bytes[0], 0x03, "the standard's by-hash miss code");
+        assert_eq!(bytes[0], RESPONSE_CODE_RESOURCE_UNAVAILABLE);
         assert_eq!(unframe_payload(&bytes[1..]).unwrap(), b"block not found");
         let mut codec = BlockByHashCodec;
         let proto = block_by_hash_protocol();
         let reply = block_on(codec.read_response(&proto, &mut futures::io::Cursor::new(bytes))).unwrap();
-        assert_eq!(reply, Err("code 2: block not found".into()));
+        assert_eq!(reply, Err("code 3: block not found".into()));
+        // What the server writes for a miss is the same bytes.
+        let mut wire = Vec::new();
+        block_on(codec.write_response(&proto, &mut wire, Err("block not found".into()))).unwrap();
+        assert_eq!(wire[0], RESPONSE_CODE_RESOURCE_UNAVAILABLE);
     }
 
     #[test]

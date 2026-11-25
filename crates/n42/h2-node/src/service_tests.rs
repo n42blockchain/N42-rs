@@ -1341,6 +1341,9 @@ async fn profile1_publishes_every_vote_on_the_consensus_topic() {
         assert_eq!(rig.svc.engine.vote_rules(), n42_h2_consensus::VoteRules::PROFILE1);
         assert_eq!(rig.svc.driver.vote_rules(), n42_h2_consensus::VoteRules::PROFILE1);
         assert_eq!(rig.svc.direct_votes.mode(), crate::direct_votes::VoteTransport::Gossip);
+        if std::env::var_os("N42_VOTE_AGGREGATE_VERIFY").is_none() {
+            assert!(rig.svc.engine.vote_aggregate(), "gate 5: batched vote verification is profile 1's default");
+        }
         rig.svc.direct_votes.learn(1, some_peer());
         let mut events = Vec::new();
         rig.svc.send_to_validator(1, test_vote(&keys, 0), &mut events);

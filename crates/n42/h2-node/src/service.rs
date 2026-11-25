@@ -2347,6 +2347,10 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.vote_rules = rules;
         self.engine.set_vote_rules(rules);
         self.driver.set_vote_rules(rules);
+        // Gate 5 of the standard (section 6, AM22) needs batched vote
+        // verification in every client before 100 validators: on profile 1
+        // it is the default, `N42_VOTE_AGGREGATE_VERIFY=0` still turns it off.
+        self.engine.set_vote_aggregate(vote_aggregate_default(rules));
         if !rules.direct_votes_allowed()
             && self.direct_votes.mode() != crate::direct_votes::VoteTransport::Gossip
         {
@@ -8014,7 +8018,14 @@ async fn txns_from_execution_layer<E: ExecutionLayer>(
 /// the fleet's logs (all on one clock when the fleet is on one box).
 /// `N42_VOTE_AGGREGATE_VERIFY=1`: batched vote verification on a leader.
 fn vote_aggregate_from_env() -> bool {
-    n42_env::flag("N42_VOTE_AGGREGATE_VERIFY", false)
+    vote_aggregate_default(n42_h2_consensus::VoteRules::TODAY)
+}
+
+/// `N42_VOTE_AGGREGATE_VERIFY` under `rules`: off by default, on by default
+/// on a profile-1 chain (gate 5 of the standard needs batched vote
+/// verification before 100 validators).
+fn vote_aggregate_default(rules: n42_h2_consensus::VoteRules) -> bool {
+    n42_env::flag("N42_VOTE_AGGREGATE_VERIFY", rules.profile1)
 }
 
 fn trace_messages() -> bool {

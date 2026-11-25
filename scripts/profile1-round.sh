@@ -319,7 +319,7 @@ head_hash() { rpc "$(http_port "$1")" eth_getBlockByNumber '["latest",false]' | 
 # A line the round fails on: a profile-1 refusal, a refused header/vote,
 # a bad block, a halt. A dial refused by a peer that is not up yet is not one.
 REFUSAL_RE='refus|profile 1:|profile-1|BAD BLOCK|bad block|conflicting commit|safety halt|SAFETY HALT|invalid block|InvalidBlock'
-BENIGN_RE='Connection refused|connection refused|failed to dial|Failed to dial|OutgoingConnectionError|eth_getProof refused'
+BENIGN_RE='batched (commit )?vote refused.*view mismatch|Connection refused|connection refused|failed to dial|Failed to dial|OutgoingConnectionError|eth_getProof refused'
 
 cmd_status() {
   printf '%-6s %-7s %-68s %-5s %-8s %-8s %-6s %s\n' member height head led timeouts refusals halt alive

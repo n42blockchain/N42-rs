@@ -1545,14 +1545,14 @@ pub struct ProposalContext {
     /// `None` on a chain without a grid or when the head's timestamp is not
     /// known.
     pub slot_time: Option<u64>,
-    /// A17 / AM27a: the start of that slot in unix milliseconds, the instant
+    /// A17 / `AM27a`: the start of that slot in unix milliseconds, the instant
     /// before which the leader must not publish (`slot_time * 1000` on a
     /// whole-second grid).
     pub slot_start_ms: Option<u64>,
 }
 
 /// The slot chosen per (parent, view) (A17 / AM27), shared with the chain
-/// sealer. Kept as the slot's start in unix milliseconds (AM27a).
+/// sealer. Kept as the slot's start in unix milliseconds (`AM27a`).
 #[derive(Debug, Clone, Default)]
 pub struct ProposalSlots(Arc<std::sync::Mutex<std::collections::HashMap<(B256, u64), u64>>>);
 
@@ -1566,7 +1566,7 @@ impl ProposalSlots {
     /// exactly as AM27. On any other grid the timestamp only bounds it from
     /// below, so when this node chose the head's slot itself (a block it
     /// built: an entry under `head_parent` whose seconds are the head's
-    /// stamp) that slot is used (AM27a: the parent's slot tracked locally).
+    /// stamp) that slot is used (`AM27a`: the parent's slot tracked locally).
     pub fn slot_start_ms(
         &self,
         grid: Option<n42_h2_consensus::SlotGrid>,
@@ -1586,16 +1586,16 @@ impl ProposalSlots {
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default();
         let mut parent_slot = grid.parent_slot(parent_time);
-        if grid.interval_secs().is_none() {
-            if let Some(grandparent) = head_parent {
-                let genesis_ms = grid.genesis_time.saturating_mul(1000);
-                let chosen = slots
-                    .iter()
-                    .filter(|((parent, _), start)| *parent == grandparent && **start / 1000 == parent_time)
-                    .map(|(_, start)| start.saturating_sub(genesis_ms) / grid.interval_ms)
-                    .max();
-                parent_slot = parent_slot.max(chosen.unwrap_or_default());
-            }
+        if grid.interval_secs().is_none()
+            && let Some(grandparent) = head_parent
+        {
+            let genesis_ms = grid.genesis_time.saturating_mul(1000);
+            let chosen = slots
+                .iter()
+                .filter(|((parent, _), start)| *parent == grandparent && **start / 1000 == parent_time)
+                .map(|(_, start)| start.saturating_sub(genesis_ms) / grid.interval_ms)
+                .max();
+            parent_slot = parent_slot.max(chosen.unwrap_or_default());
         }
         let start = grid.slot_start_ms(grid.proposal_slot_after(parent_slot, now_ms));
         if slots.len() >= 1024 {

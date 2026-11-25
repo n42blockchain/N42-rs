@@ -944,7 +944,7 @@ mod tests {
         }
     }
 
-    /// A17 / AM27a: any positive block interval loads, sub-second and
+    /// A17 / `AM27a`: any positive block interval loads, sub-second and
     /// non-whole seconds included, and the header rules carry its grid in
     /// milliseconds; zero is still refused.
     #[test]

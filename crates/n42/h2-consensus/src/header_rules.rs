@@ -23,7 +23,7 @@
 //!   [`crate::seal_hash`] under the H2-v4 proof-of-possession DST.
 //! - **B3** difficulty 0, nonce 0, mix hash zero, ommers hash exactly zero
 //!   (the empty-list hash is invalid), coinbase the proposer's address.
-//! - **B4 / AM27 / AM27a** on a whole-second slot grid ([`SlotGrid`]):
+//! - **B4 / AM27 / `AM27a`** on a whole-second slot grid ([`SlotGrid`]):
 //!   `(time - G) mod I = 0` and `time >= parent.time + I`; on a sub-second
 //!   grid `parent.time <= time`; `time <= now + 2 s` only when voting
 //!   ([`check_profile1_vote_time`]), never on import. Without a grid (rules
@@ -77,7 +77,7 @@ pub const PROFILE1_FUTURE_SLACK_SECS: u64 = 2;
 /// 64 MiB of decoded RLP.
 pub const PROFILE1_MAX_BLOCK_BYTES: u64 = 64 << 20;
 
-/// A17 / AM27 / AM27a: profile 1's slot grid, kept in milliseconds. Slot `s`
+/// A17 / AM27 / `AM27a`: profile 1's slot grid, kept in milliseconds. Slot `s`
 /// starts at `genesis_time * 1000 + s * interval_ms` ms, counted from the
 /// genesis timestamp as on the Ethereum beacon chain, so there is no
 /// per-block drift; a header carries `floor(slot start / 1000)`.
@@ -85,7 +85,7 @@ pub const PROFILE1_MAX_BLOCK_BYTES: u64 = 64 << 20;
 /// When the interval is a whole number of seconds a slot is named by its
 /// header's seconds, and the grid is exactly AM27's. Otherwise a second can
 /// hold several slots (or none), so a parent's slot is not readable from its
-/// timestamp and a producer tracks it locally (AM27a).
+/// timestamp and a producer tracks it locally (`AM27a`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotGrid {
     /// The genesis header's timestamp G, unix seconds.
@@ -97,7 +97,7 @@ pub struct SlotGrid {
 impl SlotGrid {
     /// The grid of a chain with genesis timestamp `genesis_time` and
     /// `blockIntervalMs` = `interval_ms`; `None` when the interval is zero.
-    /// Any positive interval is accepted (AM27a).
+    /// Any positive interval is accepted (`AM27a`).
     pub const fn from_interval_ms(genesis_time: u64, interval_ms: u64) -> Option<Self> {
         if interval_ms == 0 {
             return None;
@@ -108,7 +108,7 @@ impl SlotGrid {
     /// The interval in whole seconds, or `None` when it is not a whole
     /// number of seconds (the exact grid checks of B4 apply only then).
     pub const fn interval_secs(&self) -> Option<u64> {
-        if self.interval_ms == 0 || self.interval_ms % 1000 != 0 {
+        if self.interval_ms == 0 || !self.interval_ms.is_multiple_of(1000) {
             return None;
         }
         Some(self.interval_ms / 1000)
@@ -136,7 +136,7 @@ impl SlotGrid {
             return None;
         }
         let offset_ms = (time - self.genesis_time).saturating_mul(1000);
-        if offset_ms % self.interval_ms != 0 {
+        if !offset_ms.is_multiple_of(self.interval_ms) {
             return None;
         }
         Some(offset_ms / self.interval_ms)
@@ -153,7 +153,7 @@ impl SlotGrid {
             return 0;
         }
         let offset_ms = parent_time.saturating_sub(self.genesis_time).saturating_mul(1000);
-        if self.interval_ms % 1000 == 0 {
+        if self.interval_ms.is_multiple_of(1000) {
             offset_ms / self.interval_ms
         } else {
             offset_ms.div_ceil(self.interval_ms)
@@ -714,7 +714,7 @@ pub const fn check_profile1_vote_time(header_time: u64, now_secs: u64) -> Result
     Ok(())
 }
 
-/// B4 as amended by AM27 / AM27a, checked on import. On a whole-second grid
+/// B4 as amended by AM27 / `AM27a`, checked on import. On a whole-second grid
 /// `(time - G) mod I = 0` and `time >= parent.time + I`; on any other grid
 /// only `time >= parent.time` (equal seconds allowed: a second holds
 /// several slots).

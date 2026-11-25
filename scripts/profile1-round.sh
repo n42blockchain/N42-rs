@@ -464,6 +464,8 @@ PY
   taskset -c "$P1_CPUS" "$init_bin" anchor --chain "$G" --bundle "$snap/bundle" --headers "$snap/anchor.hex" \
     > "$snap/anchor.log" 2>&1 || { echo "anchor failed: $snap/anchor.log" >&2; tail -5 "$snap/anchor.log" >&2; exit 1; }
   echo "$(strip "$snap/anchor.log" | /usr/bin/grep -a '^anchor:') (headers from member $src)"
+  # gov5's bundle carries the genesis too (its validator set checks the QC).
+  cp "$G" "$snap/bundle/genesis.json"
   local d; d=$(mdir "$sj_i")
   rm -rf "$d/el" "$d/consensus"
   taskset -c "$P1_CPUS" "$init_bin" init --datadir "$d/el" --chain "$G" --bundle "$snap/bundle" \

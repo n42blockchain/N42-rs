@@ -347,6 +347,19 @@ fn write_snapshot_files_at(
     code: &[u8],
     registry_root: Option<B256>,
 ) -> n42_header::N42Header {
+    write_snapshot_files_on(scratch, alice, bob, code, registry_root, 1, B256::ZERO)
+}
+
+/// [`write_snapshot_files_at`] at block `number` on `parent_hash`.
+fn write_snapshot_files_on(
+    scratch: &Scratch,
+    alice: Address,
+    bob: Address,
+    code: &[u8],
+    registry_root: Option<B256>,
+    number: u64,
+    parent_hash: B256,
+) -> n42_header::N42Header {
     use n42_twig_core::qmdb_compat::{
         encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbPortableSnapshot,
         QmdbSlotEntry, QmdbSlotSnapshot,
@@ -364,9 +377,10 @@ fn write_snapshot_files_at(
     tree.set(gov5_account_key(&Address::repeat_byte(0xEE).0 .0), vec![0]).unwrap();
     let header = n42_header::N42Header {
         inner: Header {
-            number: 1,
+            number,
+            parent_hash,
             state_root: B256::from(tree.root()),
-            slot_number: registry_root.map(|_| 1),
+            slot_number: registry_root.map(|_| number),
             // A root-carrying head is a post-Prague gov5 header: every
             // Prague field is set; the BAL hash is gov5's gap (native chains).
             ..if registry_root.is_some() {
@@ -393,7 +407,7 @@ fn write_snapshot_files_at(
     let portable = QmdbPortableSnapshot {
         chain_id: chain.chain().id(),
         genesis_hash: chain.genesis_hash().0,
-        block_number: 1,
+        block_number: number,
         block_hash: header.hash_slow().0,
         root: tree.root(),
         slots: QmdbSlotSnapshot {
@@ -453,7 +467,7 @@ fn init_refuses_a_dump_the_snapshot_does_not_authenticate() {
     assert!(format!("{err:#}").contains("ascending"), "repeated account: {err:#}");
 }
 
-/// HEADER_FIELD_PARITY.md 7.1: a head sealed under MobileAnchor and
+/// `HEADER_FIELD_PARITY.md` 7.1: a head sealed under `MobileAnchor` and
 /// Glamsterdam carries `mobileRegistryRoot` at element 24. Decoded as
 /// Ethereum's header it was refused (alloy stops at `slot_number`); decoded as
 /// `N42Header` it keeps the root, so the head hashes to the chain's hash, the
@@ -494,4 +508,228 @@ fn init_starts_at_a_head_that_carries_a_registry_root() {
     let stored = provider.header_by_number(1).unwrap().expect("the head is stored");
     assert_eq!(stored, header);
     assert_eq!(provider.block_hash(1).unwrap(), Some(header.hash_slow()));
+}
+
+/// A four-member set, its rules (the `CommitQC` check only: `profile1` off so
+/// the plain test headers need no seal) and its secret keys.
+fn qc_rules() -> (n42_h2_consensus::HeaderRules, Vec<n42_h2_primitives::BlsSecretKey>) {
+    let keys: Vec<_> = (1u8..=4).map(|i| n42_h2_primitives::BlsSecretKey::from_bytes(&[i; 32]).unwrap()).collect();
+    let validators = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| n42_h2_consensus::ValidatorInfo {
+            address: Address::repeat_byte(i as u8 + 1),
+            bls_public_key: key.public_key(),
+            p2p_peer_id: None,
+        })
+        .collect();
+    let rules = n42_h2_consensus::HeaderRules {
+        proposers: Some(n42_h2_consensus::ProposerSchedule { validators, leader_tenure: 1 }),
+        chain: Some(n42_h2_primitives::consensus::H2V4ChainIdentity { chain_id: 1144, genesis_hash: B256::repeat_byte(9) }),
+        ..Default::default()
+    };
+    (rules, keys)
+}
+
+/// A commit-domain QC on `block` by the members `signers`, gov5's encoding.
+fn commit_qc(rules: &n42_h2_consensus::HeaderRules, keys: &[n42_h2_primitives::BlsSecretKey], view: u64, block: B256, signers: &[usize]) -> Vec<u8> {
+    let profile = n42_h2_consensus::protocol::quorum::ConsensusSigningProfile::H2V4(rules.chain.unwrap());
+    let message = profile.commit_message(view, block, B256::ZERO);
+    let signatures: Vec<_> = signers.iter().map(|i| profile.sign(&keys[*i], &message)).collect();
+    let aggregate = n42_h2_primitives::bls::AggregateSignature::aggregate(&signatures.iter().collect::<Vec<_>>()).unwrap();
+    let mut bitmap = vec![4, 0, 0];
+    for i in signers {
+        bitmap[2] |= 1 << i;
+    }
+    n42_h2_wire::h2_wire::encode_h2_qc(&n42_h2_wire::h2_wire::H2QuorumCertificate {
+        view,
+        block_hash: block,
+        aggregate_signature: aggregate.to_bytes().to_vec(),
+        signers_bitmap: bitmap,
+    })
+    .unwrap()
+}
+
+/// Headers N+1.. after the head `(number, hash)`, linked; `extra(i)` is the
+/// i-th one's extra data.
+fn anchor_chain(head: (u64, B256), count: usize, extra: impl Fn(usize) -> Vec<u8>) -> Vec<n42_header::N42Header> {
+    let mut parent = head.1;
+    (0..count)
+        .map(|i| {
+            let header = n42_header::N42Header::from(Header {
+                number: head.0 + 1 + i as u64,
+                parent_hash: parent,
+                state_root: B256::repeat_byte(0x50 + i as u8),
+                extra_data: extra(i).into(),
+                ..Default::default()
+            });
+            parent = header.hash_slow();
+            header
+        })
+        .collect()
+}
+
+fn profile1_extra(view: u64, qc: &[u8]) -> Vec<u8> {
+    let mut extra = n42_h2_consensus::GOV5_HEADER_EXTRA_MAGIC.to_vec();
+    extra.extend_from_slice(&view.to_le_bytes());
+    extra.extend_from_slice(qc);
+    extra.extend_from_slice(&[0u8; n42_h2_consensus::EXTRA_SEAL_LEN]);
+    extra
+}
+
+#[test]
+fn a_snapshot_anchor_is_trusted_only_under_a_commit_qc_of_the_set() {
+    let (rules, keys) = qc_rules();
+    let head = (40, B256::repeat_byte(4));
+    let headers = anchor_chain(head, 3, |i| profile1_extra(100 + i as u64, &[]));
+    let n1 = headers[0].hash_slow();
+    // A separate CommitQC on N+1 by a quorum anchors it.
+    let qc = commit_qc(&rules, &keys, 101, n1, &[0, 1, 3]);
+    assert_eq!(check_anchor_chain(&rules, head, &headers, Some(&qc)).unwrap(), 41);
+    // Short of a quorum, or signed in another chain's domain: refused.
+    let short = commit_qc(&rules, &keys, 101, n1, &[0, 1]);
+    assert!(check_anchor_chain(&rules, head, &headers, Some(&short)).is_err());
+    let mut other = rules.clone();
+    other.chain = Some(n42_h2_primitives::consensus::H2V4ChainIdentity { chain_id: 1, genesis_hash: B256::ZERO });
+    let foreign = commit_qc(&other, &keys, 101, n1, &[0, 1, 2]);
+    assert!(check_anchor_chain(&rules, head, &headers, Some(&foreign)).is_err());
+    // A QC on a block outside the anchor chain anchors nothing.
+    let elsewhere = commit_qc(&rules, &keys, 101, B256::repeat_byte(1), &[0, 1, 2]);
+    assert!(check_anchor_chain(&rules, head, &headers, Some(&elsewhere)).unwrap_err().to_string().contains("names no header"));
+    // No QC at all: refused, naming what to pass.
+    assert!(check_anchor_chain(&rules, head, &headers, None).unwrap_err().to_string().contains("no CommitQC names"));
+    // A QC embedded in a later header of the anchor chain, on N+2, anchors N+1 too.
+    let embedded = anchor_chain(head, 2, |_| profile1_extra(100, &[]));
+    let n2 = embedded[1].hash_slow();
+    let qc2 = commit_qc(&rules, &keys, 102, n2, &[1, 2, 3]);
+    let mut chain = embedded;
+    let third = n42_header::N42Header::from(Header {
+        number: 43,
+        parent_hash: n2,
+        extra_data: profile1_extra(103, &qc2).into(),
+        ..Default::default()
+    });
+    chain.push(third);
+    assert_eq!(check_anchor_chain(&rules, head, &chain, None).unwrap(), 42);
+    // The anchor must be the head's child, and the chain must link.
+    assert!(check_anchor_chain(&rules, (41, head.1), &headers, Some(&qc)).is_err());
+    let mut broken = headers;
+    broken[1].parent_hash = B256::ZERO;
+    assert!(check_anchor_chain(&rules, head, &broken, Some(&qc)).unwrap_err().to_string().contains("does not follow"));
+}
+
+#[test]
+fn an_anchor_file_holds_headers_as_hex_lines_or_raw_rlp() {
+    let scratch = Scratch::new();
+    let headers = anchor_chain((40, B256::repeat_byte(4)), 3, |_| Vec::new());
+    let mut raw = Vec::new();
+    let mut hex = String::new();
+    for h in &headers {
+        let mut rlp = Vec::new();
+        alloy_rlp::Encodable::encode(h, &mut rlp);
+        raw.extend_from_slice(&rlp);
+        hex.push_str(&format!("0x{}\n", alloy_primitives::hex::encode(&rlp)));
+    }
+    fs::write(scratch.path("raw"), &raw).unwrap();
+    fs::write(scratch.path("hex"), &hex).unwrap();
+    assert_eq!(read_headers_from_file(&scratch.path("raw")).unwrap(), headers);
+    assert_eq!(read_headers_from_file(&scratch.path("hex")).unwrap(), headers);
+}
+
+#[test]
+fn init_takes_the_anchor_and_the_commit_qc_as_options() {
+    let args = InitArgs::parse_from([
+        "init", "--chain", "dev", "--datadir", "/d", "--state", "s", "--header", "h", "--qmdb", "q",
+        "--anchor", "a.hex", "--commit-qc", "c.qc",
+    ]);
+    assert_eq!(args.anchor, Some(PathBuf::from("a.hex")));
+    assert_eq!(args.commit_qc, Some(PathBuf::from("c.qc")));
+    let args = InitArgs::parse_from(["init", "--chain", "dev", "--datadir", "/d", "--state", "s", "--header", "h", "--qmdb", "q"]);
+    assert_eq!((args.anchor, args.commit_qc), (None, None));
+}
+
+#[test]
+fn profile_1_snapshots_are_0x03_only() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/n42/qmdb-reth/testdata/profile1/gov5/V1/genesis_8s.json");
+    let p1: alloy_genesis::Genesis = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(profile1_format(&p1, None).unwrap(), Some(PortableFormat::V2));
+    assert_eq!(profile1_format(&p1, Some(PortableFormat::V2)).unwrap(), Some(PortableFormat::V2));
+    assert!(profile1_format(&p1, Some(PortableFormat::V1)).unwrap_err().to_string().contains("0x01"));
+    let other: alloy_genesis::Genesis = serde_json::from_str(&genesis_json(Some("qmdb"))).unwrap();
+    assert_eq!(profile1_format(&other, None).unwrap(), None);
+    assert_eq!(profile1_format(&other, Some(PortableFormat::V1)).unwrap(), Some(PortableFormat::V1));
+}
+
+#[test]
+fn init_writes_the_real_ancestor_headers_so_blockhash_reads_them() {
+    let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
+    let code = [0x60u8, 0x00, 0x60, 0x00];
+    let scratch = Scratch::new();
+    let genesis_hash = init_args(&scratch, Some("qmdb")).env.chain.genesis_hash();
+    // Blocks 1..=4 above the genesis; the snapshot is at 5, ancestors 2..=4
+    // given (block 1 stays a dummy, as below max(P-255, 1) on a long chain).
+    let mut parent = genesis_hash;
+    let chain: Vec<n42_header::N42Header> = (1..=4)
+        .map(|number| {
+            let h = n42_header::N42Header::from(Header { number, parent_hash: parent, timestamp: number, ..Default::default() });
+            parent = h.hash_slow();
+            h
+        })
+        .collect();
+    let header = write_snapshot_files_on(&scratch, alice, bob, &code, None, 5, parent);
+    let dump = format!(
+        "{}{}\n{}\n",
+        root_line(header.state_root),
+        account_line(alice, 1_000, None, &[]),
+        account_line(bob, 5, Some(&code), &[(1, 11), (2, 22)])
+    );
+    fs::write(scratch.path("state.jsonl"), dump).unwrap();
+    let hex: String = chain[1..]
+        .iter()
+        .map(|h| {
+            let mut rlp = Vec::new();
+            alloy_rlp::Encodable::encode(h, &mut rlp);
+            format!("{}\n", hex::encode(rlp))
+        })
+        .collect();
+    fs::write(scratch.path("ancestors.hex"), hex).unwrap();
+    // Ancestors that do not end at the head's parent are refused.
+    fs::write(scratch.path("bad.hex"), {
+        let mut rlp = Vec::new();
+        alloy_rlp::Encodable::encode(&chain[1], &mut rlp);
+        hex::encode(rlp)
+    })
+    .unwrap();
+    let mut args = init_args(&scratch, Some("qmdb"));
+    args.ancestors = Some(scratch.path("bad.hex"));
+    assert!(init(args, reth_tasks::Runtime::test()).unwrap_err().to_string().contains("not the parent"));
+
+    let mut args = init_args(&scratch, Some("qmdb"));
+    args.ancestors = Some(scratch.path("ancestors.hex"));
+    init(args, reth_tasks::Runtime::test()).expect("init with ancestors");
+    let args = init_args(&scratch, Some("qmdb"));
+    let Environment { provider_factory, .. } =
+        args.env.init::<N42Node>(AccessRights::RO, reth_tasks::Runtime::test()).unwrap();
+    let provider = provider_factory.provider().unwrap();
+    // What the EVM's BLOCKHASH reads (`BlockHashReader`): the real hashes.
+    for h in &chain[1..] {
+        assert_eq!(provider.block_hash(h.number).unwrap(), Some(h.hash_slow()), "block {}", h.number);
+        assert_eq!(provider.header_by_number(h.number).unwrap().as_ref(), Some(h));
+        assert_eq!(provider.header(h.hash_slow()).unwrap().as_ref(), Some(h), "found by hash");
+    }
+    assert_eq!(provider.block_hash(5).unwrap(), Some(header.hash_slow()));
+    assert_eq!(provider.last_block_number().unwrap(), 5);
+}
+
+#[test]
+fn the_dump_leaves_out_empty_accounts_only() {
+    let none = BTreeMap::new();
+    assert!(dump_account(0, U256::ZERO, None, none.clone()).is_none(), "a zero-balance genesis entry");
+    assert!(dump_account(1, U256::ZERO, None, none.clone()).is_some());
+    assert!(dump_account(0, U256::from(1), None, none.clone()).is_some());
+    assert!(dump_account(0, U256::ZERO, Some(Bytes::from_static(&[0x00])), none).is_some());
+    let slots = BTreeMap::from([(B256::with_last_byte(1), B256::with_last_byte(2))]);
+    let row = dump_account(0, U256::ZERO, None, slots.clone()).unwrap();
+    assert_eq!(row.storage, Some(slots));
 }

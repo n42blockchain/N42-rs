@@ -1275,8 +1275,17 @@ impl std::fmt::Debug for QmdbNodeState {
 impl QmdbNodeState {
     /// A handle for `chain`, persisting under `dir`. Not yet usable — see
     /// [`Self::initialize`].
+    ///
+    /// On a profile-1 chain a directory that already holds a file-mode
+    /// checkpoint (`forest.ckpt`) stays in file mode whatever the
+    /// environment says (other chains keep `N42_QMDB_ENTRY_FILE`): the heap layout
+    /// cannot read it, and a forest restored from a `0x03` snapshot with
+    /// tombstones (`n42-init-snapshot init`) exists only in file mode.
     pub fn new(chain: Arc<ChainSpec>, dir: impl Into<PathBuf>) -> Self {
-        Self::new_with_entry_file(chain, dir, entry_file_enabled())
+        let dir = dir.into();
+        let file_mode = entry_file_enabled()
+            || (reth_chainspec::qmdb::is_profile1(&chain.genesis) && dir.join(CKPT_FILE).exists());
+        Self::new_with_entry_file(chain, dir, file_mode)
     }
 
     /// [`Self::new`] with the entry file on or off regardless of the

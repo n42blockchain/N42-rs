@@ -6,11 +6,23 @@
 # round of /data/blockchain/gov5-work/p1mixed/MIXED-ROUND-PLAN.md).
 #
 #   scripts/profile1-round.sh init | up | status | headers <from> <to> | catchup <i> |
-#                             load <tx/s> <seconds> | load-genesis <out> | stop | down
+#                             load <tx/s> <seconds> | load-genesis <out> | stop | down |
+#                             snapshot-join <i> <from>
 #
 #   stop                  SIGTERM P1_MEMBERS (validator, then EL), datadirs kept; `up`
 #                         restarts them and catches up from where they stopped (the
 #                         previous logs move to v.log.<tag> / el.log.<tag>)
+#
+#   snapshot-join <i> <from>  member i (initialised, not running) joins from a state
+#                         snapshot of member <from> (docs/PROFILE1_SNAPSHOT_JOIN.md):
+#                         <from> is stopped, `n42-init-snapshot export --bundle`ed (gov5's
+#                         bundle layout) and restarted; once the chain is past
+#                         N+P1_ANCHOR_HEADERS, headers max(N-255,1).. are read
+#                         (debug_getRawHeader) from a running member and `anchor` adds
+#                         next-header.rlp, commit-qc.bin and bundle.json; member i's
+#                         datadirs are wiped, its EL is `init --bundle`ed (k=1: checked
+#                         against N+1's root under a CommitQC), and it is started.
+#                         Bundle and logs in P1_DIR/snap-<i>.
 #
 #   P1_MEMBERS="0 1 2 3"  validator indices this script runs ("2 3" in the mixed round);
 #                         `up` may start a subset while other members of P1_DIR run
@@ -26,7 +38,7 @@
 #   P1_CPUS=<list>        taskset CPU list (default skips the faulty core 99/227)
 #   P1_LOAD=<tx/s>        `up` also starts `load` at that rate for P1_LOAD_SECONDS (3600)
 #                         (P1_LOAD_MEMBERS, default the running ones of P1_MEMBERS)
-#   P1_LOAD_TOOL=gov5     gov5's gate-3 load.py (P1_LOAD_PY; funds its senders from the
+#   P1_LOAD_TOOL=gov5     gov5's gate-3 load_core.py (P1_LOAD_PY; funds its senders from the
 #                         V1 faucet, so the plain genesis works; 30 tx/s is the agreed rate)
 #                         or send_tx: P1_LOAD_SENDERS=64 derived senders split over the
 #                         members, which needs a genesis that funds them:
@@ -63,7 +75,7 @@ P1_LOAD=${P1_LOAD:-}
 P1_LOAD_SECONDS=${P1_LOAD_SECONDS:-3600}
 P1_LOAD_SENDERS=${P1_LOAD_SENDERS:-64}
 P1_LOAD_TOOL=${P1_LOAD_TOOL:-gov5}
-P1_LOAD_PY=${P1_LOAD_PY:-/data/blockchain/gov5-work/p1mixed/gate3/load.py}
+P1_LOAD_PY=${P1_LOAD_PY:-/data/blockchain/gov5-work/p1mixed/gate3/load_core.py}
 SEND_TX=$P1_BIN/examples/send_tx
 LOAD_TO=0x4242424242424242424242424242424242424242
 for v in $(compgen -e | /usr/bin/grep '^N42_'); do unset "$v"; done
@@ -159,7 +171,7 @@ cmd_up() {
     local d; d=$(mdir "$i")
     setsid taskset -c "$P1_CPUS" "$EL" node --datadir "$d/el" --chain "$G" \
       --authrpc.addr 127.0.0.1 --authrpc.port "$(auth_port "$i")" --authrpc.jwtsecret "$P1_DIR/jwt.hex" \
-      --http --http.addr 127.0.0.1 --http.port "$(http_port "$i")" --http.api eth,net,web3,txpool \
+      --http --http.addr 127.0.0.1 --http.port "$(http_port "$i")" --http.api eth,net,web3,txpool,debug \
       --ipcdisable --port "$(devp2p_port "$i")" --discovery.port "$(devp2p_port "$i")" \
       --disable-discovery --no-persist-peers --max-inbound-peers 0 --max-outbound-peers 0 --disable-tx-gossip \
       --log.file.max-files 0 --color never \
@@ -410,6 +422,59 @@ cmd_down() {
   echo "down: all $before stopped"
 }
 
+
+# snapshot-join <i> <from>: see the header.
+cmd_snapshot_join() {
+  # cmd_stop / cmd_up loop over a global `i`: this function names its members
+  # sj_i / sj_from so their calls cannot change them (bash scoping is dynamic).
+  local sj_i=${1:?member} sj_from=${2:?from member} snap="$P1_DIR/snap-$1" n src j
+  local init_bin=$P1_BIN/n42-init-snapshot
+  [ -x "$init_bin" ] || { echo "missing $init_bin" >&2; exit 1; }
+  [ -f "$(mdir "$sj_i")/peer-id" ] || { echo "member $sj_i is not initialised in $P1_DIR" >&2; exit 1; }
+  [ "$(member_alive "$sj_i")" = 0 ] || { echo "member $sj_i is running; stop it first" >&2; exit 1; }
+  el_alive "$sj_from" || { echo "member $sj_from is not running" >&2; exit 1; }
+  rm -rf "$snap"; mkdir -p "$snap"
+  echo "snapshot-join: stopping member $sj_from to export at $(date -u +%H:%M:%S)"
+  P1_MEMBERS=$sj_from cmd_stop
+  taskset -c "$P1_CPUS" "$init_bin" export --datadir "$(mdir "$sj_from")/el" --chain "$G" \
+    --bundle "$snap/bundle" > "$snap/export.log" 2>&1
+  local rc=$?
+  P1_MEMBERS=$sj_from cmd_up > "$snap/restart-$sj_from.log" 2>&1
+  echo "member $sj_from restarted at $(date -u +%H:%M:%S)"
+  [ $rc = 0 ] || { echo "export failed: $snap/export.log" >&2; tail -5 "$snap/export.log" >&2; exit 1; }
+  n=$(strip "$snap/export.log" | /usr/bin/grep -aoE '^head: block [0-9]+' | awk '{print $3}')
+  echo "export: $(strip "$snap/export.log" | /usr/bin/grep -aE '^(head|state|QMDB)' | tr '\n' ';')"
+  # The anchor: N+1 and the headers after it, from a running member other than i.
+  local want=$((n + ${P1_ANCHOR_HEADERS:-4}))
+  src=
+  for j in $(members_all); do [ "$j" != "$sj_i" ] && el_alive "$j" && { src=$j; break; }; done
+  [ -n "$src" ] || { echo "no running member to read the anchor from" >&2; exit 1; }
+  for _ in $(seq 1 ${P1_ANCHOR_WAIT:-600}); do [ "$(height "$src")" -ge "$want" ] 2>/dev/null && break; sleep 1; done
+  [ "$(height "$src")" -ge "$want" ] || { echo "member $src did not reach block $want" >&2; exit 1; }
+  # Headers max(N-255,1)..N+P1_ANCHOR_HEADERS: the anchor (N+1 and a later header
+  # embedding its CommitQC) and the ancestors gov5's bundle carries.
+  python3 -I - "$(http_port "$src")" $(( n > 256 ? n - 255 : 1 )) "$want" > "$snap/anchor.hex" <<'PY' || exit 1
+import json, sys, urllib.request
+port, a, b = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+reqs = [{"jsonrpc": "2.0", "id": k, "method": "debug_getRawHeader", "params": [hex(k)]} for k in range(a, b + 1)]
+r = urllib.request.Request(f"http://127.0.0.1:{port}", json.dumps(reqs).encode(), {"content-type": "application/json"})
+for x in sorted(json.load(urllib.request.urlopen(r, timeout=30)), key=lambda x: x["id"]):
+    print(x["result"])
+PY
+  taskset -c "$P1_CPUS" "$init_bin" anchor --chain "$G" --bundle "$snap/bundle" --headers "$snap/anchor.hex" \
+    > "$snap/anchor.log" 2>&1 || { echo "anchor failed: $snap/anchor.log" >&2; tail -5 "$snap/anchor.log" >&2; exit 1; }
+  echo "$(strip "$snap/anchor.log" | /usr/bin/grep -a '^anchor:') (headers from member $src)"
+  # gov5's bundle carries the genesis too (its validator set checks the QC).
+  cp "$G" "$snap/bundle/genesis.json"
+  local d; d=$(mdir "$sj_i")
+  rm -rf "$d/el" "$d/consensus"
+  taskset -c "$P1_CPUS" "$init_bin" init --datadir "$d/el" --chain "$G" --bundle "$snap/bundle" \
+    > "$snap/init.log" 2>&1 || { echo "init failed: $snap/init.log" >&2; tail -5 "$snap/init.log" >&2; exit 1; }
+  echo "init: $(strip "$snap/init.log" | /usr/bin/grep -aE '^(bundle|head|anchor|state|QMDB)' | tr '\n' ';')"
+  echo "$n" > "$snap/height"
+  P1_MEMBERS=$sj_i cmd_up
+}
+
 case ${1:-} in
   init) cmd_init ;;
   up) cmd_up ;;
@@ -419,6 +484,7 @@ case ${1:-} in
   load) shift; cmd_load "$@" ;;
   load-genesis) shift; cmd_load_genesis "$@" ;;
   stop) cmd_stop ;;
+  snapshot-join) shift; cmd_snapshot_join "$@" ;;
   down) cmd_down ;;
   *) sed -n '2,40p' "$0"; exit 2 ;;
 esac

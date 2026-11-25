@@ -6,7 +6,11 @@
 # round of /data/blockchain/gov5-work/p1mixed/MIXED-ROUND-PLAN.md).
 #
 #   scripts/profile1-round.sh init | up | status | headers <from> <to> | catchup <i> |
-#                             load <tx/s> <seconds> | load-genesis <out> | down
+#                             load <tx/s> <seconds> | load-genesis <out> | stop | down
+#
+#   stop                  SIGTERM P1_MEMBERS (validator, then EL), datadirs kept; `up`
+#                         restarts them and catches up from where they stopped (the
+#                         previous logs move to v.log.<tag> / el.log.<tag>)
 #
 #   P1_MEMBERS="0 1 2 3"  validator indices this script runs ("2 3" in the mixed round);
 #                         `up` may start a subset while other members of P1_DIR run
@@ -142,7 +146,15 @@ cmd_up() {
     done
   done
   local tag; tag=$(date -u +%Y%m%dT%H%M%S); echo "$tag" > "$P1_DIR/run-tag"
-  for i in $P1_MEMBERS; do echo "$tag" > "$(mdir "$i")/up-tag"; done
+  for i in $P1_MEMBERS; do
+    local d; d=$(mdir "$i")
+    # A restart: keep the previous run's logs beside the new ones.
+    if [ -f "$d/v.log" ]; then
+      local old; old=$(cat "$d/up-tag" 2>/dev/null || echo prev)
+      mv "$d/v.log" "$d/v.log.$old"; [ -f "$d/el.log" ] && mv "$d/el.log" "$d/el.log.$old"
+    fi
+    echo "$tag" > "$d/up-tag"
+  done
   for i in $P1_MEMBERS; do
     local d; d=$(mdir "$i")
     setsid taskset -c "$P1_CPUS" "$EL" node --datadir "$d/el" --chain "$G" \
@@ -368,6 +380,21 @@ for ln in sys.stdin:
   done
 }
 
+# stop: one or more members down, datadirs kept (validator first, then its EL).
+cmd_stop() {
+  local i v e
+  for i in $P1_MEMBERS; do
+    v="^[${P1_BIN:0:1}]${P1_BIN:1}/examples/h2_validator --datadir $(mdir "$i")/"
+    e="^[${P1_BIN:0:1}]${P1_BIN:1}/n42 node --datadir $(mdir "$i")/el "
+    pkill -TERM -f "$v"
+    for _ in $(seq 1 60); do pgrep -f "$v" >/dev/null || break; sleep 1; done
+    pkill -TERM -f "$e"
+    for _ in $(seq 1 240); do pgrep -f "$e" >/dev/null || break; sleep 1; done
+    if pgrep -f "$v|$e" >/dev/null; then echo "member $i STILL RUNNING after SIGTERM" >&2; exit 1; fi
+    echo "member $i stopped (datadir kept) at $(date -u +%H:%M:%S)"
+  done
+}
+
 cmd_down() {
   cmd_load_stop
   local re; re=$(mine_re)
@@ -391,6 +418,7 @@ case ${1:-} in
   catchup) shift; cmd_catchup "$@" ;;
   load) shift; cmd_load "$@" ;;
   load-genesis) shift; cmd_load_genesis "$@" ;;
+  stop) cmd_stop ;;
   down) cmd_down ;;
   *) sed -n '2,40p' "$0"; exit 2 ;;
 esac

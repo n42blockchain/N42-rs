@@ -372,6 +372,14 @@ pub fn profile1(genesis: &Genesis) -> Result<Option<Profile1Config>, Profile1Err
     if block_interval_ms == 0 {
         return Err(invalid(format!("{hs}.blockIntervalMs"), "must be at least 1 (A17)"));
     }
+    // A17 / AM27: the slot grid counts whole seconds from the genesis
+    // timestamp, so the interval must be a whole number of seconds.
+    if block_interval_ms % 1000 != 0 {
+        return Err(invalid(
+            format!("{hs}.blockIntervalMs"),
+            format!("{block_interval_ms} is not a whole number of seconds (A17)"),
+        ));
+    }
     let base_timeout_ms = u64_field(hotstuff, hs, "baseTimeoutMs")?;
     if base_timeout_ms == 0 {
         return Err(invalid(format!("{hs}.baseTimeoutMs"), "must be at least 1 (A16)"));
@@ -916,6 +924,7 @@ mod tests {
             ("refused_missing_state_scheme", "mandatory field config.stateScheme is missing"),
             ("refused_zero_leader_tenure", "config.hotstuff.leaderTenure must be at least 1"),
             ("refused_zero_epoch_length", "config.hotstuff.epochLength must be at least 1"),
+            ("refused_interval_not_whole_seconds", "config.hotstuff.blockIntervalMs 8500 is not a whole number of seconds"),
             ("refused_max_timeout_below_base", "config.hotstuff.maxTimeoutMs 1000 is below baseTimeoutMs 24000"),
             ("refused_depth_not_implemented", "deferredExecutionDepth must be 1 or 2, found 3"),
             ("refused_gas_limit_mismatch", "differs from the genesis header's gasLimit 480000000"),

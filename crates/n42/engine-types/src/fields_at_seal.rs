@@ -422,7 +422,7 @@ mod tests {
         let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, true);
         let prepared = state.compute_operations(parent_sealed, ops.clone()).expect("child root");
         let (receipts_root, logs_bloom) = crate::hotstuff_consensus::gov5_receipt_root_bloom(&receipts());
-        let fields = ExecutedFields { state_root: prepared.root, receipts_root, logs_bloom, gas_used: 63_000 };
+        let fields = ExecutedFields { state_root: prepared.root, receipts_root, logs_bloom, gas_used: 63_000, requests_hash: crate::executed_fields::NO_REQUESTS_HASH };
         state.insert(child_built, 2, prepared).expect("child filed");
         crate::executed_fields::remember(child_built, fields);
         (filed, EarlyInputs { fields, ops, parent_root })
@@ -613,7 +613,7 @@ mod tests {
                 file_parent(&state, genesis, parent_built);
                 crate::executed_fields::remember(
                     parent_built,
-                    ExecutedFields { state_root: alloy_primitives::keccak256(b"depth-two-barrier-0x83"), receipts_root: B256::ZERO, logs_bloom: Bloom::default(), gas_used: 0 },
+                    ExecutedFields { state_root: alloy_primitives::keccak256(b"depth-two-barrier-0x83"), receipts_root: B256::ZERO, logs_bloom: Bloom::default(), gas_used: 0, requests_hash: crate::executed_fields::NO_REQUESTS_HASH },
                 );
             })
         };

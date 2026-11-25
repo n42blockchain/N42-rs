@@ -207,6 +207,7 @@ fn a_known_parent_is_in_unless_its_execution_is_owed_here() {
             receipts_root: B256::repeat_byte(2),
             logs_bloom: Default::default(),
             gas_used: 0,
+            requests_hash: n42_engine_types::executed_fields::NO_REQUESTS_HASH,
         },
     );
     assert!(parent_in(&provider, past.hash(), &genesis, true).unwrap().is_some());
@@ -425,6 +426,7 @@ fn some_fields(byte: u8) -> n42_engine_types::executed_fields::ExecutedFields {
         receipts_root: B256::repeat_byte(byte ^ 1),
         logs_bloom: Default::default(),
         gas_used: 0,
+        requests_hash: n42_engine_types::executed_fields::NO_REQUESTS_HASH,
     }
 }
 

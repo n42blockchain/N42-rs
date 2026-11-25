@@ -2112,9 +2112,15 @@ where
             }
             // A block of transfers produces no EIP-7685 requests; the finish
             // behind the seal says so loudly if that ever stops being true.
-            header.requests_hash = chain_spec
-                .is_prague_active_at_timestamp(attributes.timestamp)
-                .then_some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+            // On a profile-1 chain the requests hash is a deferred field
+            // (AM25): the carried ancestor's, like the fields above.
+            header.requests_hash = chain_spec.is_prague_active_at_timestamp(attributes.timestamp).then_some(
+                if crate::hotstuff_consensus::requests_hash_deferred(chain_spec.genesis()) {
+                    parent_fields.requests_hash
+                } else {
+                    alloy_eips::eip7685::EMPTY_REQUESTS_HASH
+                },
+            );
             header.timestamp = attributes.timestamp;
             header.mix_hash = attributes.prev_randao;
             header.parent_beacon_block_root = attributes.parent_beacon_block_root;
@@ -2972,7 +2978,7 @@ where
                 output_shards = Some(frozen);
                 early_residual = Some(residual);
             }
-            if !execution_result.requests.is_empty() {
+            if !execution_result.requests.is_empty() && !crate::hotstuff_consensus::requests_hash_deferred(chain_spec.genesis()) {
                 tracing::error!(
                     target: "payload_builder",
                     number = block_number,
@@ -3066,12 +3072,13 @@ where
             // it by the time the fields say the block is executed.
             let publish = |prepared: Result<n42_qmdb_reth::PreparedBlock, n42_qmdb_reth::NodeStateError>,
                            (receipts_root, logs_bloom): reth_consensus::ReceiptRootBloom,
-                           gas_used: u64|
+                           gas_used: u64,
+                           requests_hash: B256|
              -> Result<crate::executed_fields::ExecutedFields, PayloadBuilderError> {
                 let prepared = prepared.map_err(PayloadBuilderError::other)?;
                 let state_root = prepared.root;
                 qmdb_state.insert(block_hash, block_number, prepared).map_err(PayloadBuilderError::other)?;
-                let fields = crate::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used };
+                let fields = crate::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used, requests_hash };
                 crate::executed_fields::remember(block_hash, fields);
                 crate::built_executions::answerable(block_hash);
                 fields_published_at.set(Some(std::time::Instant::now()));
@@ -3137,7 +3144,12 @@ where
             root_started_at = Some(root_started);
             root_ended_at = Some(root_ended);
             let published_at = std::time::Instant::now();
-            let fields = publish(prepared, roots, execution_result.gas_used)?;
+            let fields = publish(
+                prepared,
+                roots,
+                execution_result.gas_used,
+                crate::hotstuff_consensus::executed_requests_hash(chain_spec.genesis(), &execution_result.requests),
+            )?;
             root_publish_us.set(published_at.elapsed().as_micros() as u64);
             early_inputs = kept_ops.map(|ops| crate::fields_at_seal::EarlyInputs {
                 fields,
@@ -3389,7 +3401,12 @@ where
                 })?;
                 receipts_late_wait_us.set(late_wait.as_micros() as u64);
                 let published_at = std::time::Instant::now();
-                let fields = publish_ref(prepared, roots, execution_result.gas_used)?;
+                let fields = publish_ref(
+                    prepared,
+                    roots,
+                    execution_result.gas_used,
+                    crate::hotstuff_consensus::executed_requests_hash(chain_spec.genesis(), &execution_result.requests),
+                )?;
                 root_publish_us.set(published_at.elapsed().as_micros() as u64);
                 let early = kept_ops.map(|ops| crate::fields_at_seal::EarlyInputs {
                     fields,
@@ -4673,6 +4690,9 @@ where
     };
     let own_gas_used = block.header().gas_used;
     let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
+    // The carried ancestor's requests hash: what the header carries on a
+    // profile-1 chain (AM25), where it is a deferred field.
+    let mut carried_requests_hash = None;
     if deferred {
         // The header carries the parent's execution (docs/PHASE_D_DEFERRED_EXECUTION.md):
         // what this node executed for the parent, or the parent's own header
@@ -4696,6 +4716,7 @@ where
         header.receipts_root = parent_fields.receipts_root;
         header.logs_bloom = parent_fields.logs_bloom;
         header.gas_used = parent_fields.gas_used;
+        carried_requests_hash = Some(parent_fields.requests_hash);
     } else {
         header.state_root = own_state_root;
         header.receipts_root = own_receipts_root;
@@ -4722,6 +4743,15 @@ where
     header.blob_gas_used = block.header().blob_gas_used;
     header.excess_blob_gas = block.header().excess_blob_gas;
     header.requests_hash = block.header().requests_hash;
+    // AM25: on a profile-1 chain the header carries the parent's requests hash.
+    if let (Some(carried), true) = (carried_requests_hash, crate::hotstuff_consensus::requests_hash_deferred(chain_spec.genesis())) {
+        if header.requests_hash.is_some() {
+            header.requests_hash = Some(carried);
+        }
+    }
+    let own_requests_hash = requests.as_ref().map_or(crate::executed_fields::NO_REQUESTS_HASH, |requests| {
+        crate::hotstuff_consensus::executed_requests_hash(chain_spec.genesis(), requests)
+    });
 
     header.timestamp = attributes.timestamp;
     header.mix_hash = attributes.prev_randao;
@@ -4749,6 +4779,7 @@ where
             receipts_root: own_receipts_root,
             logs_bloom: own_logs_bloom,
             gas_used: own_gas_used,
+            requests_hash: own_requests_hash,
         },
     );
     if let (Some(state), Some(prepared)) = (&qmdb, qmdb_prepared) {
@@ -4867,6 +4898,17 @@ where
         );
     }
     build_stage.at(7);
+    // AM25: on a profile-1 chain the header's requests hash is the parent's,
+    // so the payload's requests are what reproduces it, not this block's own:
+    // none when the parent produced none (an Engine API importer rebuilds the
+    // header's hash from this list).
+    let requests = if crate::hotstuff_consensus::requests_hash_deferred(chain_spec.genesis())
+        && alloy_consensus::BlockHeader::requests_hash(recovered.header()) == Some(crate::executed_fields::NO_REQUESTS_HASH)
+    {
+        requests.map(|_| alloy_eips::eip7685::Requests::default())
+    } else {
+        requests
+    };
     let payload = EthBuiltPayload::new(recovered, total_fees, requests, block_access_list)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars);
@@ -5375,6 +5417,7 @@ mod depth_two_tests {
             receipts_root: B256::repeat_byte(byte ^ 1),
             logs_bloom: Default::default(),
             gas_used: u64::from(byte),
+            requests_hash: crate::executed_fields::NO_REQUESTS_HASH,
         }
     }
 

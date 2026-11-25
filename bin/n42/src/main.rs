@@ -361,7 +361,7 @@ fn main() {
                             let gas_used = receipts.last().map_or(0, |receipt| receipt.cumulative_gas_used);
                             qmdb.remember_checkpoint_parent((head.number, head.hash()), parent.hash(), state_root)?;
                             n42_engine_types::executed_fields::remember(parent.hash(),
-                                n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used });
+                                n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used, requests_hash: n42_engine_types::executed_fields::NO_REQUESTS_HASH });
                             info!(target: "reth::cli", block = parent.number, hash = %parent.hash(), "restored deferred execution parent result");
                         }
                         // Without deferred execution the head's header carries
@@ -384,8 +384,9 @@ fn main() {
                             let ancestor = database.header(*hash).ok()??;
                             if ancestor.hash_slow() != *hash { return None; }
                             if database.block_hash(ancestor.number).ok()? != Some(*hash) { return None; }
+                            let requests_deferred = n42_engine_types::hotstuff_consensus::requests_hash_deferred(&historical_genesis);
                             if !reth_chainspec::qmdb::deferred_execution_active_at(&historical_genesis, ancestor.timestamp) {
-                                return Some(n42_engine_types::executed_fields::fields_from_child_header(&ancestor));
+                                return Some(n42_engine_types::executed_fields::fields_from_child_header_deferring_requests(&ancestor, requests_deferred));
                             }
                             let depth = u8::try_from(reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, ancestor.timestamp)).ok()?;
                             if !(1..=2).contains(&depth) { return None; }
@@ -395,7 +396,7 @@ fn main() {
                             }
                             let carrying = descendants.last()?;
                             if reth_chainspec::qmdb::deferred_execution_depth_at(&historical_genesis, carrying.timestamp) != u64::from(depth) { return None; }
-                            n42_engine_types::executed_fields::fields_from_descendants(&ancestor, &descendants, depth)
+                            n42_engine_types::executed_fields::fields_from_descendants_deferring_requests(&ancestor, &descendants, depth, requests_deferred)
                         });
                         // With HotStuff-2 finality the canonical head is the committed
                         // block, and a build on an ancestor of it is a stale request
@@ -462,9 +463,25 @@ fn main() {
                                 {
                                     let state_root = qmdb.root_of(&head.hash())
                                         .ok_or_else(|| eyre::eyre!("missing QMDB root for recovery head {}", head.number))?;
+                                    // AM25: on a profile-1 chain the head's requests hash is a
+                                    // deferred field its child carries. No table keeps requests,
+                                    // so the head is executed once more on its parent's state.
+                                    let requests_hash = if head.number > 0
+                                        && n42_engine_types::hotstuff_consensus::requests_hash_deferred(genesis)
+                                    {
+                                        match head_requests_hash(&node.provider, node.evm_config(), head.hash()) {
+                                            Ok(hash) => hash,
+                                            Err(err) => {
+                                                error!(target: "reth::cli", %err, block = head.number, "could not re-execute the recovery head for its requests hash; filing the hash of no requests");
+                                                n42_engine_types::executed_fields::NO_REQUESTS_HASH
+                                            }
+                                        }
+                                    } else {
+                                        n42_engine_types::executed_fields::NO_REQUESTS_HASH
+                                    };
                                     n42_engine_types::executed_fields::remember(
                                         head.hash(),
-                                        n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used },
+                                        n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used, requests_hash },
                                     );
                                 }
                             } else {
@@ -1356,4 +1373,22 @@ mod tests {
         assert_eq!(parse(&["--qmdb.history=off"]).unwrap(), Some(HistoryMode::Off));
         assert!(parse(&["--qmdb.history", "lots"]).is_err());
     }
+}
+
+/// The EIP-7685 requests hash of block `hash`'s execution, by executing it
+/// once more on its parent's state: a profile-1 restart's head (AM25), whose
+/// requests hash its child carries and no table keeps.
+fn head_requests_hash<Provider, Evm>(provider: &Provider, evm_config: &Evm, hash: alloy_primitives::B256) -> eyre::Result<alloy_primitives::B256>
+where
+    Provider: reth_provider::BlockReader<Block = n42_tx_types::Block> + reth_provider::StateProviderFactory,
+    Evm: reth_evm::ConfigureEvm<Primitives = n42_tx_types::N42Primitives>,
+{
+    use reth_evm::execute::Executor as _;
+    let block = provider
+        .recovered_block(hash.into(), reth_provider::TransactionVariant::WithHash)?
+        .ok_or_else(|| eyre::eyre!("no block {hash}"))?;
+    let state = provider.state_by_block_hash(block.parent_hash)?;
+    let db = reth_evm::database::StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state));
+    let output = evm_config.executor(db).execute_one(&block)?;
+    Ok(output.requests.requests_hash())
 }

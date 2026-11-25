@@ -74,6 +74,24 @@ enum Command {
     Init(InitArgs),
     /// Writes a datadir's head state as a snapshot.
     Export(ExportArgs),
+    /// Completes an exported bundle with its anchor: header P+1, the
+    /// CommitQC on P+1 or later and the headers below it (`commit-qc.bin`),
+    /// and the manifest.
+    Anchor(AnchorArgs),
+}
+
+#[derive(Debug, Parser)]
+struct AnchorArgs {
+    /// The chain (a genesis path).
+    #[arg(long, value_name = "CHAIN_OR_PATH")]
+    chain: String,
+    /// The bundle directory `export --bundle` wrote.
+    #[arg(long, value_name = "DIR")]
+    bundle: PathBuf,
+    /// Headers max(P-255, 1)..P+k, k past the first one embedding a CommitQC
+    /// on P+1 or later (hex lines, e.g. `debug_getRawHeader`, or raw RLP).
+    #[arg(long, value_name = "HEADERS")]
+    headers: PathBuf,
 }
 
 /// [`N42ChainSpecParser`] over the node's header: the node type opened here
@@ -132,11 +150,16 @@ struct ExportArgs {
     env: EnvironmentArgs<SnapshotChainSpecParser>,
     /// Where the state JSONL (reth `init-state`, gov5's `n42-reth-state-dump`
     /// format) goes; the head's header goes to `<out>.header.rlp`.
-    #[arg(long, value_name = "STATE_JSONL")]
-    out: PathBuf,
+    #[arg(long, value_name = "STATE_JSONL", required_unless_present = "bundle")]
+    out: Option<PathBuf>,
     /// Where the portable QMDB snapshot goes.
-    #[arg(long, value_name = "SNAPSHOT")]
-    qmdb_out: PathBuf,
+    #[arg(long, value_name = "SNAPSHOT", required_unless_present = "bundle")]
+    qmdb_out: Option<PathBuf>,
+    /// Write gov5's bundle layout into this directory instead
+    /// (`state.jsonl`, `state.jsonl.header.rlp`, `qmdb.bin`, `block.rlp`);
+    /// `anchor` adds `next-header.rlp`, `commit-qc.bin` and `bundle.json`.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["out", "qmdb_out"])]
+    bundle: Option<PathBuf>,
     /// The portable layout: `v1` (every slot's key and value; refused on a
     /// compacted tree) or `v2` (the tombstone layout,
     /// `docs/QMDB_COMPACTION_DESIGN.md` section 6). Unset: v1, or v2 when the
@@ -188,6 +211,7 @@ fn main() -> eyre::Result<()> {
     match cli.command {
         Command::Init(args) => init(args, runtime),
         Command::Export(args) => export(args, runtime),
+        Command::Anchor(args) => anchor(args),
     }
 }
 
@@ -708,7 +732,17 @@ fn export(args: ExportArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
 
     let mut header_rlp = Vec::new();
     alloy_rlp::Encodable::encode(&header, &mut header_rlp);
-    let header_path = args.out.with_extension("jsonl.header.rlp");
+    let (out, qmdb_out, header_path) = match &args.bundle {
+        Some(dir) => {
+            fs::create_dir_all(dir)?;
+            (dir.join(bundle::STATE), dir.join(bundle::QMDB), dir.join(bundle::HEADER))
+        }
+        None => {
+            let out = args.out.clone().ok_or_else(|| eyre::eyre!("--out"))?;
+            let header_path = out.with_extension("jsonl.header.rlp");
+            (out, args.qmdb_out.clone().ok_or_else(|| eyre::eyre!("--qmdb-out"))?, header_path)
+        }
+    };
     fs::write(&header_path, &header_rlp)?;
 
     println!("header -> {}", header_path.display());
@@ -729,11 +763,113 @@ fn export(args: ExportArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
         );
     }
     let root = B256::from(verified.root);
-    fs::write(&args.qmdb_out, &portable)?;
-    let (accounts, slots) = write_state_dump(&provider, &provider_factory.latest()?, &chain.genesis, number, root, &args.out)?;
-    println!("state: {accounts} accounts, {slots} slots at block {number} (root {root}) -> {}", args.out.display());
+    fs::write(&qmdb_out, &portable)?;
+    let (accounts, slots) = write_state_dump(&provider, &provider_factory.latest()?, &chain.genesis, number, root, &out)?;
+    println!("state: {accounts} accounts, {slots} slots at block {number} (root {root}) -> {}", out.display());
+    if let Some(dir) = &args.bundle {
+        // Block P in gov5's form, which gov5's importer stores as its head.
+        let block = reth_provider::BlockReader::block_by_number(&provider, number)?
+            .ok_or_else(|| eyre::eyre!("no block body for block {number}"))?;
+        let transactions: Vec<alloy_primitives::Bytes> =
+            block.body.transactions.iter().map(|tx| alloy_eips::eip2718::Encodable2718::encoded_2718(tx).into()).collect();
+        let rewards = n42_h2_consensus::withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
+        let rlp = n42_h2_consensus::block_body::encode_block_rlp_raw(&block.header, &transactions, &rewards, None);
+        fs::write(dir.join(bundle::BLOCK), rlp)?;
+        println!("block {number} -> {}", dir.join(bundle::BLOCK).display());
+    }
     let format = PortableFormat::detect(&portable).map_or_else(|| "?".to_owned(), |format| format.to_string());
-    println!("QMDB snapshot ({format}): {} bytes -> {}", portable.len(), args.qmdb_out.display());
+    println!("QMDB snapshot ({format}): {} bytes -> {}", portable.len(), qmdb_out.display());
+    Ok(())
+}
+
+fn anchor(args: AnchorArgs) -> eyre::Result<()> {
+    let chain = <SnapshotChainSpecParser as reth_cli::chainspec::ChainSpecParser>::parse(&args.chain)?;
+    let dir = &args.bundle;
+    let header = read_header_from_file(&dir.join(bundle::HEADER))?;
+    let head = (header.number, header.hash_slow());
+    let mut headers = read_headers_from_file(&args.headers)?;
+    headers.sort_by_key(|h| h.number);
+    headers.dedup_by_key(|h| h.number);
+    let above: Vec<_> = headers.iter().filter(|h| h.number > head.0).cloned().collect();
+    let rules = n42_engine_types::hotstuff_consensus::chain_header_rules(&*chain);
+    // The first header past P+1 whose embedded QC names P+1 or later.
+    let mut found = None;
+    for end in 2..=above.len() {
+        let carrier = &above[end - 1];
+        let extra = n42_h2_consensus::decode_profile1_extra(&carrier.extra_data).map_err(|e| eyre::eyre!("{e}"))?;
+        if extra.qc.is_empty() {
+            continue;
+        }
+        if let Ok(named) = check_anchor_chain(&rules, head, &above[..end - 1], Some(&extra.qc)) {
+            found = Some((named, extra.qc));
+            break;
+        }
+    }
+    let Some((named, qc)) = found else {
+        bail!("no header in --headers embeds a CommitQC on block {} or later; pass more headers", head.0 + 1)
+    };
+    let wire = n42_h2_wire::h2_wire::decode_h2_qc(&qc).map_err(|e| eyre::eyre!("{e}"))?;
+    let lowest = head.0.saturating_sub(255).max(1);
+    let mut descending: Vec<_> = headers.iter().filter(|h| h.number >= lowest && h.number <= named).cloned().collect();
+    descending.reverse();
+    if descending.len() as u64 != named - lowest + 1 {
+        bail!("--headers must hold every header {lowest}..={named}");
+    }
+    bundle::check_descending_links(&descending, chain.genesis_hash())?;
+    if descending.iter().find(|h| h.number == head.0).map(|h| h.hash_slow()) != Some(head.1) {
+        bail!("--headers' block {} is not the bundle's header", head.0);
+    }
+    let next = above[0].clone();
+    let mut rlp = Vec::new();
+    alloy_rlp::Encodable::encode(&next, &mut rlp);
+    fs::write(dir.join(bundle::NEXT_HEADER), rlp)?;
+    fs::write(dir.join(bundle::COMMIT_QC), bundle::encode_commit_qc_payload(&qc, &descending)?)?;
+
+    let portable = fs::read(dir.join(bundle::QMDB))?;
+    let verified = verify_portable_stream(portable.as_slice(), chain.chain().id(), &chain.genesis_hash().0)
+        .map_err(|e| eyre::eyre!("portable snapshot: {e}"))?;
+    let (mut accounts, mut slots) = (0u64, 0u64);
+    for line in BufReader::new(fs::File::open(dir.join(bundle::STATE))?).lines().skip(1) {
+        let row: DumpLine = serde_json::from_str(&line?)?;
+        accounts += 1;
+        slots += row.account.storage.map_or(0, |s| s.len() as u64);
+    }
+    let mut files_sha256 = std::collections::BTreeMap::new();
+    for name in [bundle::STATE, bundle::HEADER, bundle::QMDB, bundle::NEXT_HEADER, bundle::COMMIT_QC, bundle::BLOCK] {
+        if dir.join(name).exists() {
+            files_sha256.insert(name.to_owned(), bundle::sha256_file(&dir.join(name))?);
+        }
+    }
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert("root_label".to_owned(), serde_json::json!("post_state_root is the state after executing pivot_number; it equals header(pivot_number+1).Root (deferred depth 1); header(pivot_number).Root is the state after pivot_number-1"));
+    extra.insert("anchor_domain".to_owned(), serde_json::json!("H2-v4 commit (phase 3, changesHash 0), genesis validator set, >= n-f signers"));
+    extra.insert("accounts".to_owned(), serde_json::json!(accounts));
+    extra.insert("storage_slots".to_owned(), serde_json::json!(slots));
+    extra.insert("qmdb_live_leaves".to_owned(), serde_json::json!(verified.live_count));
+    extra.insert("qmdb_next_slot".to_owned(), serde_json::json!(verified.next_slot));
+    let manifest = bundle::Manifest {
+        format: bundle::FORMAT.to_owned(),
+        chain_id: chain.chain().id(),
+        genesis_hash: chain.genesis_hash(),
+        pivot_number: head.0,
+        pivot_hash: head.1,
+        post_state_root: next.state_root,
+        deferred_depth: 1,
+        anchor_qc_view: wire.view,
+        anchor_block_number: named,
+        anchor_block_hash: wire.block_hash,
+        anchor_lowest_header: lowest,
+        files_sha256,
+        extra,
+    };
+    fs::write(dir.join(bundle::MANIFEST), serde_json::to_vec_pretty(&manifest)?)?;
+    println!(
+        "anchor: pivot {} next {} QC view {} on block {named}, headers {named}..{lowest} -> {}",
+        head.0,
+        next.hash_slow(),
+        wire.view,
+        dir.display()
+    );
     Ok(())
 }
 

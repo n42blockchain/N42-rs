@@ -15,13 +15,14 @@
 #
 #   snapshot-join <i> <from>  member i (initialised, not running) joins from a state
 #                         snapshot of member <from> (docs/PROFILE1_SNAPSHOT_JOIN.md):
-#                         <from> is stopped, `n42-init-snapshot export`ed (state JSONL,
-#                         header N, portable QMDB) and restarted; once the chain is past
-#                         N+P1_ANCHOR_HEADERS, headers N+1.. are read (debug_getRawHeader)
-#                         from a running member as the anchor; member i's datadirs are
-#                         wiped, its EL is `init`ed from the bundle (k=1: checked against
-#                         N+1's root under a CommitQC), and it is started. Bundle and
-#                         logs in P1_DIR/snap-<i>.
+#                         <from> is stopped, `n42-init-snapshot export --bundle`ed (gov5's
+#                         bundle layout) and restarted; once the chain is past
+#                         N+P1_ANCHOR_HEADERS, headers max(N-255,1).. are read
+#                         (debug_getRawHeader) from a running member and `anchor` adds
+#                         next-header.rlp, commit-qc.bin and bundle.json; member i's
+#                         datadirs are wiped, its EL is `init --bundle`ed (k=1: checked
+#                         against N+1's root under a CommitQC), and it is started.
+#                         Bundle and logs in P1_DIR/snap-<i>.
 #
 #   P1_MEMBERS="0 1 2 3"  validator indices this script runs ("2 3" in the mixed round);
 #                         `up` may start a subset while other members of P1_DIR run
@@ -436,7 +437,7 @@ cmd_snapshot_join() {
   echo "snapshot-join: stopping member $sj_from to export at $(date -u +%H:%M:%S)"
   P1_MEMBERS=$sj_from cmd_stop
   taskset -c "$P1_CPUS" "$init_bin" export --datadir "$(mdir "$sj_from")/el" --chain "$G" \
-    --out "$snap/state.jsonl" --qmdb-out "$snap/state.qmdb" > "$snap/export.log" 2>&1
+    --bundle "$snap/bundle" > "$snap/export.log" 2>&1
   local rc=$?
   P1_MEMBERS=$sj_from cmd_up > "$snap/restart-$sj_from.log" 2>&1
   echo "member $sj_from restarted at $(date -u +%H:%M:%S)"
@@ -450,18 +451,24 @@ cmd_snapshot_join() {
   [ -n "$src" ] || { echo "no running member to read the anchor from" >&2; exit 1; }
   for _ in $(seq 1 ${P1_ANCHOR_WAIT:-600}); do [ "$(height "$src")" -ge "$want" ] 2>/dev/null && break; sleep 1; done
   [ "$(height "$src")" -ge "$want" ] || { echo "member $src did not reach block $want" >&2; exit 1; }
-  : > "$snap/anchor.hex"
-  for k in $(seq $((n + 1)) "$want"); do
-    rpc "$(http_port "$src")" debug_getRawHeader "[\"$(printf '0x%x' "$k")\"]" \
-      | python3 -I -c "import sys,json;print(json.load(sys.stdin)['result'])" >> "$snap/anchor.hex" || exit 1
-  done
-  echo "anchor: headers $((n + 1))..$want from member $src"
+  # Headers max(N-255,1)..N+P1_ANCHOR_HEADERS: the anchor (N+1 and a later header
+  # embedding its CommitQC) and the ancestors gov5's bundle carries.
+  python3 -I - "$(http_port "$src")" $(( n > 256 ? n - 255 : 1 )) "$want" > "$snap/anchor.hex" <<'PY' || exit 1
+import json, sys, urllib.request
+port, a, b = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+reqs = [{"jsonrpc": "2.0", "id": k, "method": "debug_getRawHeader", "params": [hex(k)]} for k in range(a, b + 1)]
+r = urllib.request.Request(f"http://127.0.0.1:{port}", json.dumps(reqs).encode(), {"content-type": "application/json"})
+for x in sorted(json.load(urllib.request.urlopen(r, timeout=30)), key=lambda x: x["id"]):
+    print(x["result"])
+PY
+  taskset -c "$P1_CPUS" "$init_bin" anchor --chain "$G" --bundle "$snap/bundle" --headers "$snap/anchor.hex" \
+    > "$snap/anchor.log" 2>&1 || { echo "anchor failed: $snap/anchor.log" >&2; tail -5 "$snap/anchor.log" >&2; exit 1; }
+  echo "$(strip "$snap/anchor.log" | /usr/bin/grep -a '^anchor:') (headers from member $src)"
   local d; d=$(mdir "$sj_i")
   rm -rf "$d/el" "$d/consensus"
-  taskset -c "$P1_CPUS" "$init_bin" init --datadir "$d/el" --chain "$G" --state "$snap/state.jsonl" \
-    --header "$snap/state.jsonl.header.rlp" --qmdb "$snap/state.qmdb" --anchor "$snap/anchor.hex" \
+  taskset -c "$P1_CPUS" "$init_bin" init --datadir "$d/el" --chain "$G" --bundle "$snap/bundle" \
     > "$snap/init.log" 2>&1 || { echo "init failed: $snap/init.log" >&2; tail -5 "$snap/init.log" >&2; exit 1; }
-  echo "init: $(strip "$snap/init.log" | /usr/bin/grep -aE '^(head|anchor|state|QMDB)' | tr '\n' ';')"
+  echo "init: $(strip "$snap/init.log" | /usr/bin/grep -aE '^(bundle|head|anchor|state|QMDB)' | tr '\n' ';')"
   echo "$n" > "$snap/height"
   P1_MEMBERS=$sj_i cmd_up
 }

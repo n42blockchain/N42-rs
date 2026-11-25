@@ -35,7 +35,8 @@ B1 extraData layout `N42H || view u64 LE || [QC] || seal(96)`, at most 4096 byte
 QC is zero bytes; the QC is a commit-domain QC of the genesis set, below the header's view,
 naming an ancestor. B2 seal by the leader of the view over sealHash. B3 difficulty, nonce,
 mixHash, ommersHash zero (the empty-list hash is refused), coinbase = leader. B4
-parent.time <= time (import) and time <= floor(now)+2 (vote time only). B6 withdrawalsRoot
+(AM27) (time - G) mod 8 = 0 and time >= parent.time + 8 (import), time <= floor(now)+2
+(vote time only). B6 withdrawalsRoot
 present and equal to keccak(concat(rlp([address, amount]))) of the rewards. B8 requestsHash
 present (its value is a deferred field, AM25; genesis and block 1 carry sha256("") =
 0xe3b0c442...b855). B9 blobGasUsed = excessBlobGas = 0. B12 element 22 = 0x80.
@@ -45,23 +46,3 @@ Deferred fields (A10/B13: stateRoot, receiptsRoot, logsBloom, gasUsed; AM25: req
 blocks 1 and 2 are genesis's (an idle chain); their checks belong to V5. parentBeaconRoot is zero on block 1
 (B5) and Blake3 of block 1's committee evidence (the genesis committee pool) on block 2; the
 evidence derivation itself is vector V2.
-
-## AM24 (2026-11-24)
-
-Republished from gov5 feat/profile1 at 96974101 (origin/main merged, AM24 merged).
-AM24 replaces AM3: requestsHash on every profile-1 header, genesis included, is
-EIP-7685's hash of no requests, sha256("") =
-0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855; the
-empty-trie root 0x56e81f17...b421 is refused. Standard genesis hash:
-0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc
-(was 0x6f733745...7e4f). V1 regenerated (header_profile_v1.json); genesis_8s.json unchanged (the JSON carries no requestsHash).
-
-## AM25 (2026-11-24)
-
-Republished from gov5 fix/profile1-requests-deferred at f8f15075 (on feat/profile1 df2763b5).
-AM25 makes requestsHash a deferred field (header N carries block N-1's EIP-7685 requests hash;
-genesis and block 1 carry sha256("")), so its value is no longer a header-only rule. The two
-B8 value refusals ("requestsHash empty-trie root", "requestsHash empty-ommers hash", check
-import) are replaced by one presence refusal "requestsHash absent" (check import,
-ErrProfile1RequestsHash). The value refusals moved to V5 (check deferred). Genesis, blocks 1-2
-and every other refusal are byte-identical; the genesis hash 0x188e9d93...90dc is unchanged.

@@ -257,8 +257,13 @@ fn v5_blocks_execute_to_gov5s_results_and_are_accepted() {
     assert_eq!(chain.blocks[7].header.requests_hash, Some(chain.blocks[6].ours.requests_hash), "block 8 carries block 7's requests hash");
     assert_ne!(chain.blocks[6].ours.requests_hash, alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
 
-    // B4: blocks 1 and 2 share a timestamp.
-    assert_eq!(chain.blocks[0].header.timestamp, chain.blocks[1].header.timestamp);
+    // B4 (AM27): every block is one slot after its parent on the genesis'
+    // grid (gov5's AM27 regeneration moved block 2 off block 1's slot).
+    let mut parent_time = chain.genesis.timestamp;
+    for block in &chain.blocks {
+        assert_eq!(block.header.timestamp, parent_time + 8, "{}: one slot after the parent", block.name);
+        parent_time = block.header.timestamp;
+    }
     // B14: every base fee is EIP-1559's over the parent's gasUsed as written.
     let mut parent = &chain.genesis;
     for block in &chain.blocks {
@@ -324,7 +329,7 @@ fn judge(chain: &Chain, refusal: &Value) -> Stage {
 fn v5_refusals_are_refused_at_gov5s_stage() {
     let chain = run_chain();
     let refusals = v5()["refusals"].as_array().expect("refusals");
-    assert_eq!(refusals.len(), 15);
+    assert_eq!(refusals.len(), 17);
     let mut differences = Vec::new();
     for refusal in refusals {
         let name = refusal["name"].as_str().expect("name");

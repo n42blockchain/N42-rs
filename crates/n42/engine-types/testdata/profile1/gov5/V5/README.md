@@ -28,7 +28,7 @@ refunds") and n42-rs.
 | Block | Case | executed: regular / state / receipts -> gasUsed |
 | --- | --- | --- |
 | 1 | `contract-create` | 48852 / 293760 / 332612 -> 293760 (state gas larger) |
-| 2 | `sstore-clear-equal-timestamp` | 27380 / 0 / 21904 -> 27380 (refund ignored) |
+| 2 | `sstore-clear` | 27380 / 0 / 21904 -> 27380 (refund ignored) |
 | 3 | `new-account-transfer` | 21000 / 183600 / 204600 -> 183600 (state gas larger) |
 | 4 | `plain-transfer` | 21000 / 0 / 21000 -> 21000 |
 | 5 | `idle` | 0 -> 0 |
@@ -57,13 +57,13 @@ consolidation request (source 0xa1 x 48, target 0xb2 x 48); its end-of-block cal
 - `0x02 || source address || source pubkey || target pubkey`
 
 requestsHash of block 7 = `0x9f1fcb7b3b6e10fad1344d450d67c357d0b1f510ab20d21fe87245441395a2c4`, carried by block 8
-(`0xa189a6c3...a7a9`). Block 8's own queues are empty: it produces sha256("").
+(`0xf2b73c40...fb6a`). Block 8's own queues are empty: it produces sha256("").
 
-## B4: equal timestamps
+## B4: slot grid (AM27)
 
-Blocks 1 and 2 have the same timestamp (`parent.time == time` is valid, on import and at vote time). Both run the
-EIP-4788 system call with that timestamp; block 2's write lands in the same ring-buffer index and is part of block
-2's executed stateRoot, which block 3 carries.
+Every block is stamped one slot after its parent on the genesis grid, `time = G + s*8`. Import and vote refuse a
+timestamp off the grid (`(time - G) mod 8 != 0`) or below `parent.time + 8`; equal timestamps are invalid (rc4
+supersedes the rc3 equal-timestamp case, so blocks 2-8 differ from the rc3 vector).
 
 ## Refusals
 
@@ -78,7 +78,7 @@ one; `gov5Message` is its full message.
 | B13 | deferred | block 3 carrying block 2's post-refund receipts gas (21904) |
 | B13 | deferred | block 4 carrying block 3's regular + state gas (204600) |
 | B13 | import | gasUsed = gasLimit + 1 (above the parent's gasLimit) |
-| B4 | import | time = parent.time - 1 |
+| B4 | import | time = parent.time - 8 (on the grid, earlier slot) |
 | B4 | vote | time > floor(now) + 2 |
 | B9 | import | blobGasUsed = 1; excessBlobGas = 1 |
 | B14 | import | baseFee derived from a parent gasUsed equal to the receipts' gas; baseFee + 1 |
@@ -87,15 +87,33 @@ one; `gov5Message` is its full message.
 | AM25 | deferred | block 7 carrying its own requestsHash instead of block 6's sha256("") |
 | B8 | deferred | block 3 carrying the empty-trie root 0x56e81f17...b421 (AM3) instead of block 2's sha256("") |
 | B8 | import | requestsHash absent |
+| B4 | import | time = parent.time (same slot, AM27) |
+| B4 | import | time = parent.time + 9 (off the grid, AM27) |
 
 The four AM25/B8 refusals follow the earlier ones (appended; the earlier order is unchanged).
 
 V1 has the remaining header-profile rules (B1-B3, B6, B12, B8 presence).
 
-## AM25 (2026-11-24)
+## Builder request contracts (EIP-8282): `builder_request_contracts.json`
 
-Republished from gov5 fix/profile1-requests-deferred at f8f15075. Additions only: blocks 7
-(EIP-7002 withdrawal + EIP-7251 consolidation request) and 8 (carries their requests hash
-0x9f1fcb7b...a2c4), executed.requests / executed.requestsHash on every block, the top-level
-requestsHashRule, and four refusals appended at the end. Blocks 1-6 (headers, RLP, hashes)
-and the earlier refusals are unchanged.
+Case `builder-request-contract-code-no-call`: code at the EIP-8282 builder deposit
+(`0x0000BFF46984E3725691FA540A8C7589300D8282`) and exit request (`0x000064D678505AD48F8CCB093BC65613800E8282`)
+addresses on a native profile-1 chain. Native chains make no end-of-block EIP-8282 call (gov5:
+`UsesEIP8282BuilderRequests` is off), so the code never runs: no storage write, no request, state and results as without the calls.
+A client that makes the calls (evm2 on an AMSTERDAM spec id) splits from this vector.
+
+The code is placed through `allocAdditions` (V1 `genesis_8s.json` + the V5 sender + both addresses with nonce 1, balance 0, code
+`5f546001015f5500` = PUSH0 SLOAD PUSH1 1 ADD PUSH0 SSTORE STOP, codeHash
+`0x7229351fba5bacfb493ac7423bbd736f88bb0debc78b192bd1ec041c4fbdf39f`), not mid-chain: the real contracts come from a keyless pre-signed
+CREATE (Nick's method) that a test cannot sign. Two unsealed blocks, each with its executed `stateRoot`, `receiptsRoot`, `gasUsed`, `requests`,
+`requestsHash` and QMDB write set:
+
+| Block | Case | stateRoot | receiptsRoot | gasUsed | requestsHash |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `idle-with-builder-code` | `0x959b5e91...538b` | empty | 0 | sha256("") |
+| 2 | `requests-with-builder-code` (V5 block 7's two txs) | `0x63456d12...0ed8` | `0x1ac6d164...1066` | 1077120 | `0x9f1fcb7b...a2c4` (types 0x01, 0x02 only) |
+
+Asserted by gov5: neither address nor its storage is in any block's write set; slot 0 of both stays 0 and code, nonce unchanged.
+Control: the same genesis without the two accounts and the same blocks give the same account and storage writes (but the EIP-2935 parent-hash slot),
+receiptsRoot, gasUsed, requests and requestsHash; only stateRoot differs, by the two static accounts.
+Sensitivity: the same blocks executed with the config made non-native write slot 0 of both addresses and change stateRoot.

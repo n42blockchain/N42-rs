@@ -23,8 +23,11 @@
 //!   [`crate::seal_hash`] under the H2-v4 proof-of-possession DST.
 //! - **B3** difficulty 0, nonce 0, mix hash zero, ommers hash exactly zero
 //!   (the empty-list hash is invalid), coinbase the proposer's address.
-//! - **B4 / O7** `parent.time <= time`, equal allowed; `time <= now + 2 s`
-//!   only when voting ([`check_profile1_vote_time`]), never on import.
+//! - **B4 / AM27** on the slot grid ([`SlotGrid`]): `(time - G) mod I = 0`
+//!   and `time >= parent.time + I`; `time <= now + 2 s` only when voting
+//!   ([`check_profile1_vote_time`]), never on import. Without a grid (rules
+//!   built by a caller that does not know the genesis) the pre-AM27 lower
+//!   bound `parent.time <= time` is what is checked.
 //! - **B5 / B6** a parent beacon root and a withdrawals root are present
 //!   (their values are the committee and rewards checks of the caller).
 //! - **A23** the gas limit is the chain's constant.
@@ -73,6 +76,71 @@ pub const PROFILE1_FUTURE_SLACK_SECS: u64 = 2;
 /// 64 MiB of decoded RLP.
 pub const PROFILE1_MAX_BLOCK_BYTES: u64 = 64 << 20;
 
+/// A17 / AM27: profile 1's slot grid. Slot `s` starts at
+/// `genesis_time + s * interval_secs`, counted from the genesis timestamp
+/// as on the Ethereum beacon chain, so there is no per-block drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotGrid {
+    /// The genesis header's timestamp G, unix seconds.
+    pub genesis_time: u64,
+    /// The block interval I in whole seconds, at least 1.
+    pub interval_secs: u64,
+}
+
+impl SlotGrid {
+    /// The grid of a chain with genesis timestamp `genesis_time` and
+    /// `blockIntervalMs` = `interval_ms`; `None` when the interval is not a
+    /// positive whole number of seconds (no grid can carry it).
+    pub const fn from_interval_ms(genesis_time: u64, interval_ms: u64) -> Option<Self> {
+        if interval_ms == 0 || interval_ms % 1000 != 0 {
+            return None;
+        }
+        Some(Self { genesis_time, interval_secs: interval_ms / 1000 })
+    }
+
+    /// The start of slot `slot`, unix seconds.
+    pub const fn slot_start(&self, slot: u64) -> u64 {
+        self.genesis_time.saturating_add(slot.saturating_mul(self.interval_secs))
+    }
+
+    /// The slot `time` starts, or `None` when it is off the grid (before
+    /// genesis, or not on a boundary).
+    pub const fn slot_of(&self, time: u64) -> Option<u64> {
+        if time < self.genesis_time || self.interval_secs == 0 {
+            return None;
+        }
+        let offset = time - self.genesis_time;
+        if offset % self.interval_secs != 0 {
+            return None;
+        }
+        Some(offset / self.interval_secs)
+    }
+
+    /// A17: the slot a leader holding a parent stamped `parent_time` proposes
+    /// in at `now_ms` (unix milliseconds): `max(sP + 1, ceil((now - G) / I))`,
+    /// the first boundary after the parent's slot that is not in the past.
+    /// An off-grid parent (the genesis is slot 0 by definition) counts as the
+    /// slot it falls in.
+    pub const fn proposal_slot(&self, parent_time: u64, now_ms: u64) -> u64 {
+        let interval_ms = self.interval_secs.saturating_mul(1000);
+        if interval_ms == 0 {
+            return 0;
+        }
+        let parent_slot = parent_time.saturating_sub(self.genesis_time) / self.interval_secs;
+        let since_ms = now_ms.saturating_sub(self.genesis_time.saturating_mul(1000));
+        let now_slot = since_ms.div_ceil(interval_ms);
+        let next = parent_slot.saturating_add(1);
+        if now_slot > next { now_slot } else { next }
+    }
+
+    /// A17 / B4, the producer's side: the timestamp a leader stamps, the
+    /// start of [`Self::proposal_slot`]. Known before the wait for the
+    /// boundary, so a build started ahead of it stamps the same value.
+    pub const fn proposal_time(&self, parent_time: u64, now_ms: u64) -> u64 {
+        self.slot_start(self.proposal_slot(parent_time, now_ms))
+    }
+}
+
 /// Who proposes which view on a profile-1 chain: the genesis validator set
 /// (AM5: the set never changes on profile 1) and the leader tenure.
 /// `leader(v) = validators[(v / tenure) mod n]` (A15), the rule
@@ -114,12 +182,21 @@ pub struct HeaderRules {
     /// schedule, the embedded QC is verified as a commit-domain QC of the
     /// genesis set (B1, E13). `None` leaves that to the caller.
     pub chain: Option<n42_h2_primitives::consensus::H2V4ChainIdentity>,
+    /// The chain's slot grid (A17, B4 as amended by AM27). `None` keeps the
+    /// pre-AM27 timestamp rule (`parent.time <= time`).
+    pub slot_grid: Option<SlotGrid>,
 }
 
 impl HeaderRules {
     /// Profile 1 with these chain constants.
     pub const fn profile1(gas_limit: u64, max_block_bytes: u64, proposers: Option<ProposerSchedule>) -> Self {
-        Self { profile1: true, gas_limit, max_block_bytes, proposers, chain: None }
+        Self { profile1: true, gas_limit, max_block_bytes, proposers, chain: None, slot_grid: None }
+    }
+
+    /// The same rules on the slot grid `grid` (A17, AM27).
+    pub const fn with_slot_grid(mut self, grid: Option<SlotGrid>) -> Self {
+        self.slot_grid = grid;
+        self
     }
 
     /// Whether the chain runs profile 1.
@@ -229,7 +306,11 @@ impl HeaderRules {
         if !self.profile1 {
             return Ok(());
         }
-        validate_profile1_against_parent(header, parent, parent_hash)
+        validate_profile1_against_parent(header, parent, parent_hash)?;
+        if let Some(grid) = self.slot_grid {
+            check_profile1_slot(&grid, header.timestamp, parent.timestamp)?;
+        }
+        Ok(())
     }
 }
 
@@ -279,6 +360,26 @@ pub enum Profile1Error {
         time: u64,
         /// The parent's.
         parent: u64,
+    },
+    /// B4 (AM27): the timestamp is not on the slot grid.
+    #[error("B4: timestamp {time} is off the slot grid (genesis {genesis}, interval {interval} s)")]
+    TimestampOffGrid {
+        /// The header's timestamp.
+        time: u64,
+        /// The genesis timestamp G.
+        genesis: u64,
+        /// The block interval I, seconds.
+        interval: u64,
+    },
+    /// B4 (AM27): the timestamp is not in a later slot than the parent's.
+    #[error("B4: timestamp {time} is not a later slot than the parent's {parent} (interval {interval} s)")]
+    TimestampSameSlot {
+        /// The header's timestamp.
+        time: u64,
+        /// The parent's.
+        parent: u64,
+        /// The block interval I, seconds.
+        interval: u64,
     },
     /// B4: at vote time, the timestamp is past this node's clock plus 2 s.
     #[error("B4: timestamp {time} is past now {now} + 2 s")]
@@ -562,8 +663,24 @@ pub const fn check_profile1_vote_time(header_time: u64, now_secs: u64) -> Result
     Ok(())
 }
 
-/// B4, the producer's side: the timestamp a leader stamps, `max(parent.time,
-/// floor(now))`.
+/// B4 as amended by AM27, checked on import: `(time - G) mod I = 0` and
+/// `time >= parent.time + I`.
+pub const fn check_profile1_slot(grid: &SlotGrid, time: u64, parent_time: u64) -> Result<(), Profile1Error> {
+    if grid.slot_of(time).is_none() {
+        return Err(Profile1Error::TimestampOffGrid {
+            time,
+            genesis: grid.genesis_time,
+            interval: grid.interval_secs,
+        });
+    }
+    if time < parent_time.saturating_add(grid.interval_secs) {
+        return Err(Profile1Error::TimestampSameSlot { time, parent: parent_time, interval: grid.interval_secs });
+    }
+    Ok(())
+}
+
+/// B4 before AM27, the producer's side: `max(parent.time, floor(now))`.
+/// Superseded on a chain with a slot grid by [`SlotGrid::proposal_time`].
 pub fn profile1_timestamp(parent_time: u64, now_secs: u64) -> u64 {
     parent_time.max(now_secs)
 }

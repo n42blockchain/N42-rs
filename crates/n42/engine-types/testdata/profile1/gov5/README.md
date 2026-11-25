@@ -16,8 +16,8 @@ Byte-exact contracts: compare by SHA-256 of the raw bytes, never edit. Checked b
 | `127cc0006ee7671209e2bc283d3c0d7675d9ae7ae119851af733b9860541f0d3` | `V3/system_address_live.json` |
 | `0c3f7add34f3f75ec41ef05fe09b8f9f47718751e6906828d2a907f5516a7dda` | `V4/README.md` |
 | `a68635cf58031de3852c99d6914eac2a0ba817b072c3f1e402fd9a891bcc3ca4` | `V4/transactions.json` |
-| `3e620e044c2b7a8b6a0732eb3dbef123d837f47e6b5fc3b65655352b9b21b76b` | `V5/README.md` |
-| `02c957da2c0bd025c7043db118a1b2359014c86ac4b84285f75994a86465107d` | `V5/header_validity.json` |
+| `c6290b60877a7711d6b65c8890e2839634ae258a5335f7b5170bbc662927e2dc` | `V5/README.md` |
+| `aeeb8357911471bdc83755bbb231aa6bf86deeb284d9d9618b3105e1b53d2060` | `V5/header_validity.json` |
 
 V5 (header validity: B4, B9, B13, B14, A23; gov5's `TestProfile1VectorV5`) was copied unchanged
 from the same directory on 2026-11-24. It runs on V1's `genesis_8s.json` itself plus its

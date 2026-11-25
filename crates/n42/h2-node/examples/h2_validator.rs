@@ -777,6 +777,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // one at all.
                     context.head_header.as_ref().map(|header| header.number + 1),
                     profile1,
+                    context.slot_time,
                 )
                 .map(|mut attributes| {
                     attributes.mobile_registry_root = n42_h2_node::mobile::registry_root_for_build(
@@ -879,6 +880,7 @@ fn block_attributes(
     head_seen: Option<std::time::Instant>,
     slot_number: Option<u64>,
     profile1: bool,
+    slot_time: Option<u64>,
 ) -> Option<PayloadAttributes> {
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     let now_ms = SystemTime::now()
@@ -892,15 +894,23 @@ fn block_attributes(
     // stamp. Those are different clocks: a Go leader stamps `parent + period`
     // however early it proposed, so waiting for the wall clock to reach that
     // stamp after a Go block lost every such view to the timeout.
-    match (head_timestamp, head_seen) {
-        (Some(_), Some(seen)) if (seen.elapsed().as_millis() as u64) < period_ms => return None,
-        (Some(_), _) => {}
+    //
+    // Profile 1 on a slot grid (A17 / AM27): the proposal waits for its
+    // slot's boundary, and a prepared build (`period_ms` 0) does not.
+    match (slot_time, head_timestamp, head_seen) {
+        (Some(slot), _, _) if profile1 => {
+            if period_ms > 0 && now_ms < slot.saturating_mul(1000) {
+                return None;
+            }
+        }
+        (_, Some(_), Some(seen)) if (seen.elapsed().as_millis() as u64) < period_ms => return None,
+        (_, Some(_), _) => {}
         // No parent — a restart, or a head this node never saw the body of —
         // so pace against this node's own last proposal. In milliseconds,
         // because `period_ms` is: keeping this in seconds and adding a
         // millisecond period to it disables the guard by a factor of a
         // thousand rather than loosening it.
-        (None, _) => {
+        (_, None, _) => {
             if now_ms < LAST_MS.load(Ordering::Relaxed).saturating_add(period_ms) {
                 return None;
             }
@@ -936,6 +946,9 @@ fn block_attributes(
         // Profile 1 (B4, O7): `max(parent.time, floor(now))`, which every
         // member's vote bounds by its own clock plus two seconds; equal
         // timestamps are valid there.
+        // Profile 1 on a slot grid (A17 / AM27): the slot's start, chosen
+        // before the wait for its boundary.
+        Some(_) if profile1 && slot_time.is_some() => slot_time.unwrap_or_default(),
         Some(parent) if profile1 => n42_h2_consensus::profile1_timestamp(parent, now_ms / 1000),
         Some(parent) => parent.saturating_add(period_secs.max(1)),
         // Genesis is the only block with no parent to derive from.

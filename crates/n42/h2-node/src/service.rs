@@ -295,6 +295,11 @@ pub struct H2Service<E> {
     /// per process; it captures the attributes builder and the seal key,
     /// which are both set before the first build ahead.
     chain_sealer_installed: bool,
+    /// A17 / AM27: the slot each (parent, view) proposes in, chosen the first
+    /// time it is asked for and kept, so a build started ahead of the
+    /// boundary and the proposal at the boundary stamp the same slot (a
+    /// fresh `ceil(now)` just past the boundary would name the slot after).
+    proposal_slots: ProposalSlots,
     /// How long to wait before asking the builder again; see [`PROPOSE_RETRY`].
     propose_retry: Duration,
     /// The block pacing ([`Self::with_block_pacing`]): the attribute builder
@@ -1534,6 +1539,68 @@ pub struct ProposalContext {
     /// `parent + period` however early it proposes), while this is when the
     /// block actually happened here.
     pub head_seen: Option<std::time::Instant>,
+    /// A17 / AM27, profile 1 on a slot grid: the start of the slot this
+    /// proposal is in, unix seconds -- the header's timestamp, and the
+    /// instant before which the leader must not publish. Known before the
+    /// wait, so a build prepared ahead stamps it too. `None` on a chain
+    /// without a grid or when the head's timestamp is not known.
+    pub slot_time: Option<u64>,
+}
+
+/// The slot chosen per (parent, view) (A17 / AM27), shared with the chain
+/// sealer.
+#[derive(Debug, Clone, Default)]
+pub struct ProposalSlots(Arc<std::sync::Mutex<std::collections::HashMap<(B256, u64), u64>>>);
+
+impl ProposalSlots {
+    /// The slot start a leader holding `head` (stamped `parent_time`) stamps
+    /// in `view` on `grid`: the remembered one, else
+    /// [`n42_h2_consensus::SlotGrid::proposal_time`] at this instant,
+    /// remembered.
+    pub fn slot_time(
+        &self,
+        grid: Option<n42_h2_consensus::SlotGrid>,
+        head: B256,
+        view: u64,
+        parent_time: Option<u64>,
+    ) -> Option<u64> {
+        let grid = grid?;
+        let parent_time = parent_time?;
+        let mut slots = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(time) = slots.get(&(head, view)) {
+            return Some(*time);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        let time = grid.proposal_time(parent_time, now_ms);
+        if slots.len() >= 1024 {
+            slots.retain(|(_, kept), _| kept.saturating_add(64) >= view);
+        }
+        slots.insert((head, view), time);
+        Some(time)
+    }
+
+    /// The slot remembered for (`head`, `view`), if one was chosen.
+    pub fn remembered(&self, head: &B256, view: u64) -> Option<u64> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(*head, view)).copied()
+    }
+}
+
+/// The `Instant` at which the unix second `time` begins on this node's clock.
+fn instant_of_unix_secs(time: u64) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let target_ms = time.saturating_mul(1000);
+    if target_ms >= now_ms {
+        now + Duration::from_millis(target_ms - now_ms)
+    } else {
+        now.checked_sub(Duration::from_millis(now_ms - target_ms)).unwrap_or(now)
+    }
 }
 
 /// Persists the engine's state. Called before a commit reaches the execution
@@ -1747,6 +1814,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             chain_seal_key: None,
             header_qc: Arc::default(),
             chain_sealer_installed: false,
+            proposal_slots: ProposalSlots::default(),
             propose_retry: PROPOSE_RETRY,
             block_pacing: None,
             declined_view: None,
@@ -3966,6 +4034,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             );
             return;
         }
+        let head_timestamp = self.block_timestamps.get(&parent).copied().or(Some(header.timestamp));
+        let slot_time = self.proposal_slots.slot_time(self.header_rules.slot_grid, parent, next, head_timestamp);
         let context = ProposalContext {
             view: next,
             preparing: true,
@@ -3973,6 +4043,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             head_timestamp: self.block_timestamps.get(&parent).copied(),
             head_header: Some(header.clone()),
             head_seen: self.block_seen.get(&parent).copied(),
+            slot_time,
         };
         // The builder declines while pacing; that is a "not yet", not a "no",
         // and the proposal will ask again. Nothing to prepare in that case.
@@ -4020,6 +4091,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             return false;
         }
         let header_qc = Arc::clone(&self.header_qc);
+        let slots = self.proposal_slots.clone();
+        let grid = self.header_rules.slot_grid;
         let sealer: n42_h2_execution::ChainSealer = Arc::new(move |built, built_with, view| {
             // The withdrawals are the block's rewards and live in the
             // attributes it was built with; the header carries only their
@@ -4040,6 +4113,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 })
                 .ok()?;
             let head = sealed.hash_slow();
+            let slot_time = slots.slot_time(grid, head, view.saturating_add(1), Some(sealed.timestamp));
             // `preparing` is what tells the builder to leave the pacing to
             // the proposal, exactly as a build ahead asks for it; and with
             // it the "when was the head seen" pacing input is unread, which
@@ -4051,6 +4125,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 head_timestamp: Some(sealed.timestamp),
                 head_header: Some(sealed.clone()),
                 head_seen: None,
+                slot_time,
             })?;
             Some((sealed, next))
         });
@@ -4063,7 +4138,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// seen, which is the instant the attribute builder stops declining (it
     /// compares `head_seen.elapsed()` with the pacing). `None` when the pacing
     /// or the head's arrival is not known here.
-    fn pacing_tick(&self, head: &B256) -> Option<std::time::Instant> {
+    fn pacing_tick(&self, head: &B256, view: u64) -> Option<std::time::Instant> {
+        // A17 / AM27: on a slot grid the tick is the slot's boundary.
+        if self.header_rules.slot_grid.is_some() {
+            return self.proposal_slots.remembered(head, view).map(instant_of_unix_secs);
+        }
         let pacing = self.block_pacing?;
         let seen = self.block_seen.get(head)?;
         seen.checked_add(pacing)
@@ -4111,7 +4190,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             return None;
         }
         let head = self.proposal_parent();
-        let tick = self.pacing_tick(&head)?;
+        let tick = self.pacing_tick(&head, view)?;
         (tick > std::time::Instant::now()).then(|| tokio::time::Instant::from_std(tick))
     }
 
@@ -4299,6 +4378,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // retried on every subsequent event in the same view, which would pin
         // the loop against a broken execution layer.
         let head_timestamp = head_stamp(self.block_timestamps.get(&head).copied(), head_header.as_ref());
+        let slot_time = self.proposal_slots.slot_time(self.header_rules.slot_grid, head, view, head_timestamp);
         let context = ProposalContext {
             view,
             preparing: false,
@@ -4306,6 +4386,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             head_timestamp,
             head_header,
             head_seen: self.block_seen.get(&head).copied(),
+            slot_time,
         };
         let header_at = decided.elapsed();
         let Some(attrs) = build_attributes(context) else {
@@ -4335,7 +4416,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // for this view the proposal waited for the pacing tick, and the
         // clock starts at the tick; otherwise at the decision above (the
         // quorum, the seal or the parent's import came after the tick).
-        let tick = (self.declined_view == Some(view)).then(|| self.pacing_tick(&head)).flatten();
+        let tick = (self.declined_view == Some(view)).then(|| self.pacing_tick(&head, view)).flatten();
         let tick_late_us = tick.map_or(0, |tick| decided.saturating_duration_since(tick).as_micros() as u64);
         let timeline_from = tick.unwrap_or(decided);
         self.proposal_deferred = false;

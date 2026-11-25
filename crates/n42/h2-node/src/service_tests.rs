@@ -349,12 +349,38 @@ async fn a_service_describes_itself_for_logs() {
 async fn the_pacing_tick_is_the_head_seen_plus_the_pacing() {
     let mut rig = node(1, 0, None).await;
     let head = B256::repeat_byte(9);
-    assert_eq!(rig.svc.pacing_tick(&head), None, "no pacing is configured");
+    assert_eq!(rig.svc.pacing_tick(&head, 1), None, "no pacing is configured");
     rig.svc = rig.svc.with_block_pacing(Duration::from_millis(400));
-    assert_eq!(rig.svc.pacing_tick(&head), None, "the head has not been seen");
+    assert_eq!(rig.svc.pacing_tick(&head, 1), None, "the head has not been seen");
     let seen = std::time::Instant::now();
     rig.svc.block_seen.insert(head, seen);
-    assert_eq!(rig.svc.pacing_tick(&head), Some(seen + Duration::from_millis(400)));
+    assert_eq!(rig.svc.pacing_tick(&head, 1), Some(seen + Duration::from_millis(400)));
+}
+
+#[tokio::test]
+async fn on_a_slot_grid_the_tick_is_the_remembered_slot_boundary() {
+    // A17 / AM27: the slot is chosen once per (parent, view) and kept, so a
+    // build prepared ahead and the proposal at the boundary stamp the same
+    // slot; the pacing tick is that slot's start.
+    let mut rig = node(1, 0, None).await;
+    let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let grid = n42_h2_consensus::SlotGrid { genesis_time: now_secs - 800, interval_secs: 8 };
+    rig.svc.header_rules = n42_h2_consensus::HeaderRules::profile1(1, 1, None).with_slot_grid(Some(grid));
+    rig.svc = rig.svc.with_block_pacing(Duration::from_millis(8_000));
+    let head = B256::repeat_byte(9);
+    assert_eq!(rig.svc.pacing_tick(&head, 7), None, "no slot chosen yet");
+    // A parent of the slot just begun or ending: the slot after it.
+    let parent_time = grid.slot_start((now_secs - grid.genesis_time) / 8);
+    let slots = rig.svc.proposal_slots.clone();
+    let time = slots.slot_time(Some(grid), head, 7, Some(parent_time)).expect("a slot");
+    assert_eq!(time, parent_time + 8);
+    assert_eq!(slots.slot_time(Some(grid), head, 7, Some(parent_time)), Some(time), "kept");
+    let tick = rig.svc.pacing_tick(&head, 7).expect("the boundary");
+    let ahead = tick.saturating_duration_since(std::time::Instant::now());
+    assert!(ahead <= Duration::from_secs(8), "{ahead:?}");
+    // Another view on the same parent chooses afresh.
+    assert_eq!(slots.slot_time(None, head, 8, Some(parent_time)), None, "no grid, no slot");
+    assert_eq!(rig.svc.pacing_tick(&head, 8), None);
 }
 
 #[tokio::test]

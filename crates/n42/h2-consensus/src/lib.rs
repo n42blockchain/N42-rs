@@ -63,9 +63,9 @@ pub use header_profile::{
     MAX_HEADER_EXTRA_LEN,
 };
 pub use header_rules::{
-    check_profile1_vote_time, decode_profile1_extra, profile1_base_fee, profile1_timestamp,
+    check_profile1_slot, check_profile1_vote_time, decode_profile1_extra, profile1_base_fee, profile1_timestamp,
     validate_profile1_against_parent, validate_profile1_genesis_header, validate_profile1_header,
-    verify_profile1_seal, HeaderRules, Profile1Error, ProposerSchedule, PROFILE1_FUTURE_SLACK_SECS,
+    verify_profile1_seal, HeaderRules, Profile1Error, ProposerSchedule, SlotGrid, PROFILE1_FUTURE_SLACK_SECS,
     PROFILE1_MAX_BLOCK_BYTES, PROFILE1_REQUESTS_HASH,
 };
 pub use protocol::quorum::{

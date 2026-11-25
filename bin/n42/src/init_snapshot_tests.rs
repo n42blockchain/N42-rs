@@ -633,3 +633,16 @@ fn init_takes_the_anchor_and_the_commit_qc_as_options() {
     let args = InitArgs::parse_from(["init", "--chain", "dev", "--datadir", "/d", "--state", "s", "--header", "h", "--qmdb", "q"]);
     assert_eq!((args.anchor, args.commit_qc), (None, None));
 }
+
+#[test]
+fn profile_1_snapshots_are_0x03_only() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/n42/qmdb-reth/testdata/profile1/gov5/V1/genesis_8s.json");
+    let p1: alloy_genesis::Genesis = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(profile1_format(&p1, None).unwrap(), Some(PortableFormat::V2));
+    assert_eq!(profile1_format(&p1, Some(PortableFormat::V2)).unwrap(), Some(PortableFormat::V2));
+    assert!(profile1_format(&p1, Some(PortableFormat::V1)).unwrap_err().to_string().contains("0x01"));
+    let other: alloy_genesis::Genesis = serde_json::from_str(&genesis_json(Some("qmdb"))).unwrap();
+    assert_eq!(profile1_format(&other, None).unwrap(), None);
+    assert_eq!(profile1_format(&other, Some(PortableFormat::V1)).unwrap(), Some(PortableFormat::V1));
+}

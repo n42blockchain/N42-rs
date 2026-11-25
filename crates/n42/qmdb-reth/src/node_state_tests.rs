@@ -115,6 +115,31 @@ fn a_portable_snapshot_started_node_continues_to_the_same_roots_in_both_storage_
     }
 }
 
+/// A heap-mode node's `0x03` export carries its dead slots as tombstones,
+/// which only the file mode holds: imported in file mode, the directory is
+/// then reopened by [`QmdbNodeState::new`] in file mode without
+/// `N42_QMDB_ENTRY_FILE` (the profile-1 snapshot join, whose members run with
+/// every `N42_*` unset), and extends to the source's root.
+#[test]
+fn a_tombstoned_snapshot_restored_in_file_mode_reopens_in_file_mode() {
+    use n42_twig_core::qmdb_compat::PortableFormat;
+    let (source, chain, _, head, root) = node_at("tomb-source", false, 3);
+    let bytes = source.portable_export_as(1143, chain.genesis_hash(), Some(PortableFormat::V2)).expect("export");
+    let target_dir = scratch("tomb-target");
+    let heap = QmdbNodeState::new_with_entry_file(chain.clone(), &target_dir, false);
+    assert!(heap.initialize_from_portable(&bytes, 1143, chain.genesis_hash(), (3, head), root).is_err(), "heap mode holds no tombstone");
+    let target = QmdbNodeState::new_with_entry_file(chain.clone(), &target_dir, true);
+    target.initialize_from_portable(&bytes, 1143, chain.genesis_hash(), (3, head), root).expect("import");
+    drop(target);
+    let reopened = QmdbNodeState::new(chain.clone(), &target_dir);
+    assert!(reopened.uses_entry_file(), "a file-mode checkpoint keeps the file mode");
+    reopened.initialize((3, head)).expect("reopen");
+    assert_eq!(reopened.state_root(), root);
+    let (_, source_root) = advance(&source, 4, head);
+    let (_, target_root) = advance(&reopened, 4, head);
+    assert_eq!(source_root, target_root);
+}
+
 /// The cross-client kind-3 fixture (`n42-twig-core` `testdata/portable_v2/v2.bin`,
 /// its twig 0 a whole dead twig carried as its leaf root): a node with the
 /// entry file starts from it, reads its live keys, re-exports it byte for

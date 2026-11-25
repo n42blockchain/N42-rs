@@ -26,6 +26,7 @@ use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, B256};
 use clap::{Parser, Subcommand};
 use eyre::{bail, Context as _};
+use n42::snapshot_bundle as bundle;
 use n42_engine_types::N42Node;
 use n42_qmdb_reth::{state_scheme, N42ChainSpecParser, QmdbNodeState, StateScheme};
 use n42_twig_core::qmdb_compat::{
@@ -97,14 +98,19 @@ struct InitArgs {
     #[command(flatten)]
     env: EnvironmentArgs<SnapshotChainSpecParser>,
     /// reth `init-state` JSONL: `{"root": ...}` then one account per line.
-    #[arg(long, value_name = "STATE_JSONL")]
-    state: PathBuf,
+    #[arg(long, value_name = "STATE_JSONL", required_unless_present = "bundle")]
+    state: Option<PathBuf>,
     /// The head's header, RLP (raw or hex).
-    #[arg(long, value_name = "HEADER_RLP")]
-    header: PathBuf,
+    #[arg(long, value_name = "HEADER_RLP", required_unless_present = "bundle")]
+    header: Option<PathBuf>,
     /// The cross-client portable QMDB snapshot at the same head.
-    #[arg(long, value_name = "SNAPSHOT")]
-    qmdb: PathBuf,
+    #[arg(long, value_name = "SNAPSHOT", required_unless_present = "bundle")]
+    qmdb: Option<PathBuf>,
+    /// A profile-1 snapshot bundle directory (gov5's layout,
+    /// `bin/n42/src/snapshot_bundle.rs`): stands for the four files and the
+    /// CommitQC, and its manifest is checked.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["state", "header", "qmdb", "anchor", "commit_qc"])]
+    bundle: Option<PathBuf>,
     /// Under deferred execution (depth 1): the head's child N+1 and the
     /// headers after it, RLP (raw, concatenated, or one hex string per line;
     /// e.g. `debug_getRawHeader` of N+1..N+4 from a member). Header N carries
@@ -198,10 +204,21 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     let Environment { provider_factory, data_dir, .. } =
         args.env.init::<N42Node>(AccessRights::RW, runtime)?;
 
-    let header = read_header_from_file(&args.header)?;
+    let (state_path, header_path, qmdb_path) = match &args.bundle {
+        Some(dir) => (dir.join(bundle::STATE), dir.join(bundle::HEADER), dir.join(bundle::QMDB)),
+        None => (
+            args.state.clone().ok_or_else(|| eyre::eyre!("--state"))?,
+            args.header.clone().ok_or_else(|| eyre::eyre!("--header"))?,
+            args.qmdb.clone().ok_or_else(|| eyre::eyre!("--qmdb"))?,
+        ),
+    };
+    let header = read_header_from_file(&header_path)?;
     let hash = header.hash_slow();
     let number = header.number;
-    let anchor = anchor_for(&chain, &header, args.anchor.as_deref(), args.commit_qc.as_deref())?;
+    let anchor = match &args.bundle {
+        Some(dir) => Some(bundle_anchor(&chain, dir, &header)?),
+        None => anchor_for(&chain, &header, args.anchor.as_deref(), args.commit_qc.as_deref())?,
+    };
     // The state after the head: its own header's root before deferred
     // execution, its child's past it (SYNC §5.3.1).
     let root = anchor.as_ref().map_or(header.state_root, |anchor| anchor.state_root);
@@ -235,7 +252,7 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
             bail!("the datadir uses reth's legacy storage layout; only the current layout is supported");
         }
     }
-    let reader = BufReader::new(fs::File::open(&args.state).wrap_err("state file")?);
+    let reader = BufReader::new(fs::File::open(&state_path).wrap_err("state file")?);
     let mut lines = reader.lines();
     let first = lines.next().ok_or_else(|| eyre::eyre!("state file is empty"))??;
     let dump_root: RootLine = serde_json::from_str(&first).wrap_err("first line must be {\"root\": ...}")?;
@@ -245,7 +262,9 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     // The dump's first line is its own word; the portable snapshot, checked
     // against the header, is what authenticates each row (audit 2026-10
     // round 3, R3-P1).
-    let portable = fs::read(&args.qmdb).wrap_err("portable snapshot")?;
+    let portable = fs::read(&qmdb_path).wrap_err("portable snapshot")?;
+    // Profile 1 refuses a 0x01 snapshot; any unknown layout fails verification below.
+    profile1_format(&chain.genesis, PortableFormat::detect(&portable))?;
     let tree = authenticated_tree(&portable, &chain, (number, hash), root)?;
     let mut check = DumpCheck::new(&tree);
     let (accounts, slots) = write_state_v2(&provider_factory, number, lines, |address, account| {
@@ -256,7 +275,11 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     println!("state: {accounts} accounts, {slots} slots, every one a leaf of the snapshot");
 
     // The forest, from the portable snapshot, checked against the header.
-    let qmdb = QmdbNodeState::new(chain.inner().clone(), data_dir.data_dir().join("qmdb"));
+    // A 0x03 snapshot carries dead slots as tombstones (leaf hash only),
+    // which only the file mode holds; the node keeps that mode at start
+    // (`QmdbNodeState::new` reads the checkpoint it leaves).
+    let file_mode = PortableFormat::detect(&portable) == Some(PortableFormat::V2);
+    let qmdb = QmdbNodeState::new_with_entry_file(chain.inner().clone(), data_dir.data_dir().join("qmdb"), file_mode);
     qmdb.initialize_from_portable(&portable, chain.chain().id(), chain.genesis_hash(), (number, hash), root)?;
     if let Some(anchor) = anchor {
         let mut rlp = Vec::new();
@@ -267,6 +290,18 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     }
     println!("QMDB forest restored at block {number}; the node can start");
     Ok(())
+}
+
+/// The portable layout on this chain: on profile 1 only `0x03` (P5 removes
+/// `0x01`, MIXED_PRODUCTION_STANDARD_V1_RC §3), so an unset format is V2 and
+/// V1 is refused; elsewhere `format` as given.
+fn profile1_format(genesis: &alloy_genesis::Genesis, format: Option<PortableFormat>) -> eyre::Result<Option<PortableFormat>> {
+    let profile1 = n42_qmdb_reth::profile1::profile1(genesis).map_err(|e| eyre::eyre!("{e}"))?.is_some();
+    match (profile1, format) {
+        (true, Some(PortableFormat::V1)) => bail!("profile 1 has no portable 0x01 snapshot (P5); use the 0x03 layout (v2)"),
+        (true, _) => Ok(Some(PortableFormat::V2)),
+        (false, format) => Ok(format),
+    }
 }
 
 /// Header RLPs from a file: one hex string per line, or raw RLP items back
@@ -303,6 +338,54 @@ fn read_bytes_or_hex(path: &std::path::Path) -> eyre::Result<Vec<u8>> {
         }
         _ => Ok(bytes),
     }
+}
+
+/// The anchor of a bundle (`dir`) at `header`: the manifest (format, chain,
+/// genesis, sha256 of every file, pivot), `commit-qc.bin`'s headers linking
+/// from the QC's block down (to genesis when they reach block 1) and holding
+/// header P and `next-header.rlp` as P+1, and [`check_anchor_chain`] on
+/// P+1.. with the payload's QC. Returns header P+1.
+fn bundle_anchor(
+    chain: &n42_header::N42ChainSpec,
+    dir: &std::path::Path,
+    header: &n42_header::N42Header,
+) -> eyre::Result<n42_header::N42Header> {
+    let genesis = chain.genesis();
+    if !reth_chainspec::qmdb::deferred_execution_active_at(genesis, header.timestamp)
+        || reth_chainspec::qmdb::deferred_execution_depth_at(genesis, header.timestamp) != 1
+    {
+        bail!("a snapshot bundle is for a chain under deferred execution at depth 1");
+    }
+    let manifest = bundle::check_manifest(dir, chain.chain().id(), chain.genesis_hash())?;
+    let hash = header.hash_slow();
+    if (manifest.pivot_number, manifest.pivot_hash) != (header.number, hash) {
+        bail!("bundle manifest pivot {} {} is not header {} {hash}", manifest.pivot_number, manifest.pivot_hash, header.number);
+    }
+    let next = read_header_from_file(&dir.join(bundle::NEXT_HEADER))?;
+    let (qc, descending) = bundle::decode_commit_qc_payload(&fs::read(dir.join(bundle::COMMIT_QC))?)?;
+    bundle::check_descending_links(&descending, chain.genesis_hash())?;
+    if descending.iter().find(|h| h.number == header.number + 1) != Some(&next) {
+        bail!("commit-qc.bin does not hold next-header.rlp as block {}", header.number + 1);
+    }
+    if let Some(p) = descending.iter().find(|h| h.number == header.number) {
+        if p != header {
+            bail!("commit-qc.bin's block {} is not the bundle's header", header.number);
+        }
+    }
+    let mut anchors: Vec<_> = descending.into_iter().filter(|h| h.number > header.number).collect();
+    anchors.reverse();
+    let rules = n42_engine_types::hotstuff_consensus::chain_header_rules(chain);
+    let named = check_anchor_chain(&rules, (header.number, hash), &anchors, Some(&qc))?;
+    if (named, manifest.post_state_root) != (manifest.anchor_block_number, next.state_root) {
+        bail!(
+            "bundle manifest: anchor block {} / root {}, the payload certifies block {named} / root {}",
+            manifest.anchor_block_number,
+            manifest.post_state_root,
+            next.state_root
+        );
+    }
+    println!("bundle: pivot {} certified by a CommitQC on block {named}", header.number);
+    Ok(next)
 }
 
 /// The anchor a snapshot at `header` needs: `None` before deferred execution
@@ -631,7 +714,8 @@ fn export(args: ExportArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     println!("header -> {}", header_path.display());
 
     let qmdb = QmdbNodeState::new(chain.inner().clone(), data_dir.data_dir().join("qmdb"));
-    let portable = qmdb.portable_export_as(chain.chain().id(), chain.genesis_hash(), args.format)?;
+    let format = profile1_format(&chain.genesis, args.format)?;
+    let portable = qmdb.portable_export_as(chain.chain().id(), chain.genesis_hash(), format)?;
     // The forest's persisted head must be the database's: the snapshot and
     // the state rows describe one block. A running node's forest settles
     // ahead of its database; export from a stopped one.

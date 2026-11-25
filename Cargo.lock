@@ -7025,6 +7025,7 @@ dependencies = [
  "reth-trie",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "similar-asserts",
  "tempfile",
  "tokio",

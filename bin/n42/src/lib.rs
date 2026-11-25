@@ -54,6 +54,7 @@ pub mod queue_prune;
 pub mod queue_reorg;
 pub mod road_runtime;
 pub mod snapshot_anchor;
+pub mod snapshot_bundle;
 pub mod stacks;
 
 /// Re-exported utils.

@@ -971,6 +971,29 @@ fn anchor(args: AnchorArgs) -> eyre::Result<()> {
     Ok(())
 }
 
+/// An account's dump row, or `None` for an EIP-161 empty account (no nonce,
+/// balance, code or storage): the plain state gov5 dumps from drops those,
+/// and QMDB holds none for a zero-balance genesis entry, which reth's hashed
+/// state keeps (devnet-fleet LATE_SNAPSHOT on `n42_devnet.json`). `init`
+/// accepts a dump without the empty leaves QMDB does retain.
+fn dump_account(
+    nonce: u64,
+    balance: U256,
+    code: Option<alloy_primitives::Bytes>,
+    storage: std::collections::BTreeMap<B256, B256>,
+) -> Option<GenesisAccount> {
+    if nonce == 0 && balance.is_zero() && code.is_none() && storage.is_empty() {
+        return None;
+    }
+    Some(GenesisAccount {
+        nonce: Some(nonce),
+        balance,
+        code,
+        storage: (!storage.is_empty()).then_some(storage),
+        private_key: None,
+    })
+}
+
 /// One account line of the JSONL this node writes (reth `init-state`'s, as
 /// gov5's `n42-reth-state-dump` writes it).
 #[derive(Debug, serde::Serialize)]
@@ -1034,14 +1057,8 @@ where
                 storage.insert(slot, B256::from(value.to_be_bytes::<32>()));
             }
         }
-        slots += storage.len() as u64;
-        let account = GenesisAccount {
-            nonce: Some(account.nonce),
-            balance: account.balance,
-            code,
-            storage: (!storage.is_empty()).then_some(storage),
-            private_key: None,
-        };
+        let Some(account) = dump_account(account.nonce, account.balance, code, storage) else { continue };
+        slots += account.storage.as_ref().map_or(0, |s| s.len() as u64);
         serde_json::to_writer(&mut file, &DumpRow { address, account: &account })?;
         writeln!(file)?;
         accounts += 1;

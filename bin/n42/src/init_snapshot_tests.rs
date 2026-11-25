@@ -721,3 +721,15 @@ fn init_writes_the_real_ancestor_headers_so_blockhash_reads_them() {
     assert_eq!(provider.block_hash(5).unwrap(), Some(header.hash_slow()));
     assert_eq!(provider.last_block_number().unwrap(), 5);
 }
+
+#[test]
+fn the_dump_leaves_out_empty_accounts_only() {
+    let none = BTreeMap::new();
+    assert!(dump_account(0, U256::ZERO, None, none.clone()).is_none(), "a zero-balance genesis entry");
+    assert!(dump_account(1, U256::ZERO, None, none.clone()).is_some());
+    assert!(dump_account(0, U256::from(1), None, none.clone()).is_some());
+    assert!(dump_account(0, U256::ZERO, Some(Bytes::from_static(&[0x00])), none).is_some());
+    let slots = BTreeMap::from([(B256::with_last_byte(1), B256::with_last_byte(2))]);
+    let row = dump_account(0, U256::ZERO, None, slots.clone()).unwrap();
+    assert_eq!(row.storage, Some(slots));
+}

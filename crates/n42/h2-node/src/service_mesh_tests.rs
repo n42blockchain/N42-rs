@@ -409,3 +409,40 @@ async fn a_repeated_timeout_reaches_a_late_peer_over_the_direct_protocol() {
     .await
     .expect("a gossip duplicate must still retransmit the signed timeout directly");
 }
+
+#[tokio::test]
+async fn a_relayed_timeout_already_on_the_topic_is_not_fanned_out_to_every_peer() {
+    // Gate 5: a relay of a timeout this node already holds in its gossip
+    // cache must not go to every connected peer directly, or one view change
+    // costs each of n nodes n^2 direct sends. Its own repeated timeout still
+    // does (the test above).
+    let (keys, set) = keys(4);
+    let mut a = node_in(&keys, &set, 0, None).await;
+    a.svc = a.svc.with_gov5_h2_profile(keys[0].clone());
+    a.svc.engine.on_timeout().unwrap();
+    let mut events = Vec::new();
+    within(a.svc.drain_outputs(&mut events)).await.unwrap();
+    let timeout = a.svc.outbox.last().unwrap().clone();
+    let mut b = node_in(&keys, &set, 1, Some(a.addr.clone())).await;
+    b.svc = b.svc.with_gov5_h2_profile(keys[1].clone());
+    pump(&mut a, &mut b, (false, false), &mut events, |a, b, _| {
+        a.svc.transport.native_mesh_size() > 0 && b.svc.transport.native_mesh_size() > 0
+    })
+    .await;
+    a.svc.flush_outbox(&mut events);
+    pump(&mut a, &mut b, (false, false), &mut events, |_, b, _| b.seen.contains(&"native")).await;
+    let mut late = node_in(&keys, &set, 2, Some(a.addr.clone())).await;
+    late.svc = late.svc.with_gov5_h2_profile(keys[2].clone());
+    pump(&mut a, &mut late, (false, false), &mut events, |a, late, _| {
+        a.svc.transport.connected_peer_ids().contains(late.svc.transport.local_peer_id())
+            && late.svc.transport.native_mesh_size() > 0
+    })
+    .await;
+    a.svc.send_to_validator(2, timeout, &mut events);
+    let fanned_out = tokio::time::timeout(
+        Duration::from_secs(3),
+        pump(&mut a, &mut late, (false, false), &mut events, |_, late, _| late.seen.contains(&"direct_vote")),
+    )
+    .await;
+    assert!(fanned_out.is_err(), "a relayed duplicate timeout went to a peer directly");
+}

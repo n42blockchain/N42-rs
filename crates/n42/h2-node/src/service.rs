@@ -4857,7 +4857,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
         }
-        self.publish(message, events);
+        // Not fanned out again when the gossip layer already holds it: a
+        // relayed timeout is one this node received from the topic, which
+        // carries it to the target too. Fanning every relay out to every
+        // connected peer made a view change cost each node O(n^2) direct
+        // sends (gate 5, docs/PROFILE1_100_VALIDATORS.md).
+        self.publish_with(message, events, false);
     }
 
     /// Encodes `message` as its gossip bytes and sends it to `peer` over the
@@ -4892,6 +4897,20 @@ impl<E: ExecutionLayer> H2Service<E> {
         &mut self,
         message: n42_h2_primitives::consensus::ConsensusMessage,
         events: &mut Vec<ServiceEvent>,
+    ) {
+        self.publish_with(message, events, false);
+    }
+
+    /// [`Self::publish`]; `retransmit_duplicate_timeout` says whether a
+    /// timeout the gossip layer refuses as a duplicate is sent to every
+    /// connected peer directly. That is for this node's own timeout, re-sent
+    /// while its view stays timed out (a late subscriber may have missed the
+    /// first copy); a relay of a peer's timeout passes `false`.
+    fn publish_with(
+        &mut self,
+        message: n42_h2_primitives::consensus::ConsensusMessage,
+        events: &mut Vec<ServiceEvent>,
+        retransmit_duplicate_timeout: bool,
     ) {
         let view = message.view();
         if self.safety_halt.is_some() {
@@ -4935,7 +4954,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Local gossip de-duplication does not mean late subscribers
                 // received this timeout. Retries must remain deliverable after
                 // the gossip history has expired while its id is still cached.
-                if matches!(message, n42_h2_primitives::consensus::ConsensusMessage::Timeout(_)) {
+                if retransmit_duplicate_timeout
+                    && matches!(message, n42_h2_primitives::consensus::ConsensusMessage::Timeout(_))
+                {
                     let peers = self.transport.connected_peer_ids();
                     debug!(target: "n42.h2.node", view, peers = peers.len(),
                            "duplicate timeout gossip; retransmitting directly");

@@ -98,7 +98,7 @@ fn through_the_node(spec: &Arc<N42ChainSpec>, name: &str, rlp: &Value, hash: B25
     converted.header().parent_hash
 }
 
-/// V1's blocks 1 and 2 and V5's six blocks keep gov5's hashes through the
+/// V1's blocks 1 and 2 and V5's eight blocks (AM25 republication) keep gov5's hashes through the
 /// node's build, engine and storage paths, each naming its predecessor (the
 /// first, the parsed genesis).
 #[test]
@@ -126,5 +126,5 @@ fn gov5_blocks_keep_their_hashes_through_the_node() {
         parent = hash;
         count += 1;
     }
-    assert_eq!(count, 6);
+    assert_eq!(count, 8);
 }

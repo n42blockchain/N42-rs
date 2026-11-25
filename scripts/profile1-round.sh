@@ -424,27 +424,29 @@ cmd_down() {
 
 # snapshot-join <i> <from>: see the header.
 cmd_snapshot_join() {
-  local i=${1:?member} from=${2:?from member} snap="$P1_DIR/snap-$1" n src j
+  # cmd_stop / cmd_up loop over a global `i`: this function names its members
+  # sj_i / sj_from so their calls cannot change them (bash scoping is dynamic).
+  local sj_i=${1:?member} sj_from=${2:?from member} snap="$P1_DIR/snap-$1" n src j
   local init_bin=$P1_BIN/n42-init-snapshot
   [ -x "$init_bin" ] || { echo "missing $init_bin" >&2; exit 1; }
-  [ -f "$(mdir "$i")/peer-id" ] || { echo "member $i is not initialised in $P1_DIR" >&2; exit 1; }
-  [ "$(member_alive "$i")" = 0 ] || { echo "member $i is running; stop it first" >&2; exit 1; }
-  el_alive "$from" || { echo "member $from is not running" >&2; exit 1; }
+  [ -f "$(mdir "$sj_i")/peer-id" ] || { echo "member $sj_i is not initialised in $P1_DIR" >&2; exit 1; }
+  [ "$(member_alive "$sj_i")" = 0 ] || { echo "member $sj_i is running; stop it first" >&2; exit 1; }
+  el_alive "$sj_from" || { echo "member $sj_from is not running" >&2; exit 1; }
   rm -rf "$snap"; mkdir -p "$snap"
-  echo "snapshot-join: stopping member $from to export at $(date -u +%H:%M:%S)"
-  P1_MEMBERS=$from cmd_stop
-  taskset -c "$P1_CPUS" "$init_bin" export --datadir "$(mdir "$from")/el" --chain "$G" \
+  echo "snapshot-join: stopping member $sj_from to export at $(date -u +%H:%M:%S)"
+  P1_MEMBERS=$sj_from cmd_stop
+  taskset -c "$P1_CPUS" "$init_bin" export --datadir "$(mdir "$sj_from")/el" --chain "$G" \
     --out "$snap/state.jsonl" --qmdb-out "$snap/state.qmdb" > "$snap/export.log" 2>&1
   local rc=$?
-  P1_MEMBERS=$from cmd_up > "$snap/restart-$from.log" 2>&1
-  echo "member $from restarted at $(date -u +%H:%M:%S)"
+  P1_MEMBERS=$sj_from cmd_up > "$snap/restart-$sj_from.log" 2>&1
+  echo "member $sj_from restarted at $(date -u +%H:%M:%S)"
   [ $rc = 0 ] || { echo "export failed: $snap/export.log" >&2; tail -5 "$snap/export.log" >&2; exit 1; }
   n=$(strip "$snap/export.log" | /usr/bin/grep -aoE '^head: block [0-9]+' | awk '{print $3}')
   echo "export: $(strip "$snap/export.log" | /usr/bin/grep -aE '^(head|state|QMDB)' | tr '\n' ';')"
   # The anchor: N+1 and the headers after it, from a running member other than i.
   local want=$((n + ${P1_ANCHOR_HEADERS:-4}))
   src=
-  for j in $(members_all); do [ "$j" != "$i" ] && el_alive "$j" && { src=$j; break; }; done
+  for j in $(members_all); do [ "$j" != "$sj_i" ] && el_alive "$j" && { src=$j; break; }; done
   [ -n "$src" ] || { echo "no running member to read the anchor from" >&2; exit 1; }
   for _ in $(seq 1 ${P1_ANCHOR_WAIT:-600}); do [ "$(height "$src")" -ge "$want" ] 2>/dev/null && break; sleep 1; done
   [ "$(height "$src")" -ge "$want" ] || { echo "member $src did not reach block $want" >&2; exit 1; }
@@ -454,14 +456,14 @@ cmd_snapshot_join() {
       | python3 -I -c "import sys,json;print(json.load(sys.stdin)['result'])" >> "$snap/anchor.hex" || exit 1
   done
   echo "anchor: headers $((n + 1))..$want from member $src"
-  local d; d=$(mdir "$i")
+  local d; d=$(mdir "$sj_i")
   rm -rf "$d/el" "$d/consensus"
   taskset -c "$P1_CPUS" "$init_bin" init --datadir "$d/el" --chain "$G" --state "$snap/state.jsonl" \
     --header "$snap/state.jsonl.header.rlp" --qmdb "$snap/state.qmdb" --anchor "$snap/anchor.hex" \
     > "$snap/init.log" 2>&1 || { echo "init failed: $snap/init.log" >&2; tail -5 "$snap/init.log" >&2; exit 1; }
   echo "init: $(strip "$snap/init.log" | /usr/bin/grep -aE '^(head|anchor|state|QMDB)' | tr '\n' ';')"
   echo "$n" > "$snap/height"
-  P1_MEMBERS=$i cmd_up
+  P1_MEMBERS=$sj_i cmd_up
 }
 
 case ${1:-} in

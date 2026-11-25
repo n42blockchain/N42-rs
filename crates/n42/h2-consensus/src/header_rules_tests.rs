@@ -231,10 +231,14 @@ fn b4_timestamps_equal_allowed_before_parent_refused_future_only_at_vote() {
 
 /// A grid whose genesis is 10 slots of 8 s before `PARENT_TIME`, so the
 /// fixture's parent sits on slot 10.
-const GRID: SlotGrid = SlotGrid { genesis_time: PARENT_TIME - 80, interval_secs: 8 };
+const GRID: SlotGrid = SlotGrid { genesis_time: PARENT_TIME - 80, interval_ms: 8_000 };
 
 fn check_on_grid(header: &N42Header) -> Result<(), Profile1Error> {
-    let rules = rules().with_slot_grid(Some(GRID));
+    check_on(GRID, header)
+}
+
+fn check_on(grid: SlotGrid, header: &N42Header) -> Result<(), Profile1Error> {
+    let rules = rules().with_slot_grid(Some(grid));
     rules.check_header(header)?;
     let parent = parent();
     rules.check_against_parent(header, &parent, parent.hash_slow())
@@ -242,9 +246,12 @@ fn check_on_grid(header: &N42Header) -> Result<(), Profile1Error> {
 
 #[test]
 fn am27_grid_from_interval_ms() {
-    assert_eq!(SlotGrid::from_interval_ms(100, 8_000), Some(SlotGrid { genesis_time: 100, interval_secs: 8 }));
+    assert_eq!(SlotGrid::from_interval_ms(100, 8_000), Some(SlotGrid { genesis_time: 100, interval_ms: 8_000 }));
     assert_eq!(SlotGrid::from_interval_ms(100, 0), None);
-    assert_eq!(SlotGrid::from_interval_ms(100, 500), None);
+    // AM27a: any positive interval has a grid.
+    assert_eq!(SlotGrid::from_interval_ms(100, 500), Some(SlotGrid { genesis_time: 100, interval_ms: 500 }));
+    assert_eq!(GRID.interval_secs(), Some(8));
+    assert_eq!(SlotGrid::from_interval_ms(100, 1_500).and_then(|g| g.interval_secs()), None);
     assert_eq!(GRID.slot_of(PARENT_TIME), Some(10));
     assert_eq!(GRID.slot_of(PARENT_TIME + 3), None);
     assert_eq!(GRID.slot_of(GRID.genesis_time - 8), None);
@@ -323,6 +330,115 @@ fn am27_b4_on_the_grid() {
     // The error names B4.
     let err = check_on_grid(&edited(|h| h.timestamp = PARENT_TIME + 9)).unwrap_err();
     assert!(err.to_string().starts_with("B4"), "{err}");
+}
+
+/// AM27a grids: 30 ms (the performance line), 1500 ms, and profile 1's
+/// 8000 ms, each with the fixture's parent at the start of a slot.
+const GRID_30: SlotGrid = SlotGrid { genesis_time: PARENT_TIME - 3, interval_ms: 30 };
+const GRID_1500: SlotGrid = SlotGrid { genesis_time: PARENT_TIME - 3, interval_ms: 1_500 };
+
+#[test]
+fn am27a_8000_ms_is_am27() {
+    // The whole-second path is AM27's arithmetic, value for value.
+    assert_eq!(SlotGrid::from_interval_ms(PARENT_TIME - 80, 8_000), Some(GRID));
+    for now_ms in [PARENT_TIME * 1000 - 2_000, PARENT_TIME * 1000 + 300, (PARENT_TIME + 8) * 1000, (PARENT_TIME + 8) * 1000 + 1]
+    {
+        let slot = GRID.proposal_slot(PARENT_TIME, now_ms);
+        let am27 = core::cmp::max(10 + 1, (now_ms - GRID.genesis_time * 1000).div_ceil(8_000));
+        assert_eq!(slot, am27, "{now_ms}");
+        assert_eq!(GRID.proposal_time(PARENT_TIME, now_ms), GRID.genesis_time + 8 * am27);
+        assert_eq!(GRID.slot_start_ms(slot), GRID.proposal_time(PARENT_TIME, now_ms) * 1000);
+    }
+    // An off-grid parent counts as the slot it falls in (floor), as in AM27.
+    assert_eq!(GRID.parent_slot(PARENT_TIME + 7), 10);
+    assert_eq!(GRID.parent_slot(GRID.genesis_time), 0);
+}
+
+#[test]
+fn am27a_30_ms_proposal_selection() {
+    let g = GRID_30;
+    let parent_ms = PARENT_TIME * 1000; // slot 100 starts exactly here
+    assert_eq!(g.slot_of(PARENT_TIME), Some(100));
+    assert_eq!(g.parent_slot(PARENT_TIME), 100);
+    // The parent of slot 100, known locally, arrives 10 ms into its slot:
+    // the next slot, 30 ms on; the stamp stays in the same second.
+    assert_eq!(g.proposal_slot_after(100, parent_ms + 10), 101);
+    assert_eq!(g.slot_start_ms(101), parent_ms + 30);
+    assert_eq!(g.slot_start(101), PARENT_TIME);
+    // A chained build sealed before its parent's slot began still takes the
+    // slot after the parent's (the local slot, not the timestamp's bound).
+    assert_eq!(g.proposal_slot_after(120, parent_ms + 100), 121);
+    // A late leader takes the first slot not in the past.
+    assert_eq!(g.proposal_slot_after(100, parent_ms + 1_000), 134);
+    assert_eq!(g.proposal_slot_after(100, parent_ms + 1_001), 134);
+    assert_eq!(g.slot_start(134), PARENT_TIME + 1);
+    // From the timestamp alone the parent's slot is a lower bound: the first
+    // slot starting in its second.
+    assert_eq!(g.parent_slot(PARENT_TIME + 1), 134);
+    assert_eq!(g.proposal_slot(PARENT_TIME + 1, parent_ms + 500), 135);
+    // A steady chain at 30 ms: 34 or 33 slots a second, stamps never fall.
+    let (mut slot, mut stamp) = (100, PARENT_TIME);
+    for step in 0..200u64 {
+        let next = g.proposal_slot_after(slot, g.slot_start_ms(slot) + 7);
+        assert_eq!(next, slot + 1, "{step}");
+        assert!(g.slot_start(next) >= stamp);
+        check_profile1_slot(&g, g.slot_start(next), stamp).expect("non-decreasing");
+        (slot, stamp) = (next, g.slot_start(next));
+    }
+    assert_eq!(stamp, PARENT_TIME + 6);
+}
+
+#[test]
+fn am27a_1500_ms_proposal_selection() {
+    let g = GRID_1500;
+    // G = PARENT_TIME - 3: slot 2 starts at PARENT_TIME, slot 3 at +1.5 s,
+    // slot 4 at +3 s; second PARENT_TIME + 2 holds no slot start.
+    assert_eq!(g.slot_of(PARENT_TIME), Some(2));
+    assert_eq!(g.slot_of(PARENT_TIME + 1), None);
+    assert_eq!(g.slot_start_ms(3), PARENT_TIME * 1000 + 1_500);
+    assert_eq!(g.slot_start(3), PARENT_TIME + 1);
+    assert_eq!(g.proposal_slot(PARENT_TIME, PARENT_TIME * 1000 + 300), 3);
+    assert_eq!(g.proposal_time(PARENT_TIME, PARENT_TIME * 1000 + 300), PARENT_TIME + 1);
+    // The stamp of slot 3 (second +1) read back is a lower bound of slot 3.
+    assert_eq!(g.parent_slot(PARENT_TIME + 1), 3);
+    assert_eq!(g.proposal_time(PARENT_TIME + 1, PARENT_TIME * 1000 + 1_600), PARENT_TIME + 3);
+    // Mid-slot entry waits for the next boundary.
+    assert_eq!(g.proposal_slot_after(2, PARENT_TIME * 1000 + 1_501), 4);
+    // Deltas alternate 1 s and 2 s, the grid has no drift.
+    let stamps: Vec<u64> = (2..8).map(|s| g.slot_start(s) - PARENT_TIME).collect();
+    assert_eq!(stamps, [0, 1, 3, 4, 6, 7]);
+}
+
+#[test]
+fn am27a_b4_on_sub_second_grids() {
+    for grid in [GRID_30, GRID_1500] {
+        // Equal seconds are allowed, and any later second: no grid check.
+        check_on(grid, &valid()).expect("equal seconds");
+        check_on(grid, &edited(|h| h.timestamp = PARENT_TIME + 1)).expect("next second");
+        check_on(grid, &edited(|h| h.timestamp = PARENT_TIME + 2)).expect("no slot starts in it, still accepted");
+        check_on(grid, &edited(|h| h.timestamp = PARENT_TIME + 997)).expect("a later second");
+        assert!(matches!(
+            check_on(grid, &edited(|h| h.timestamp = PARENT_TIME - 1)),
+            Err(Profile1Error::TimestampBeforeParent { .. })
+        ));
+        assert!(matches!(
+            check_profile1_slot(&grid, PARENT_TIME - 1, PARENT_TIME),
+            Err(Profile1Error::TimestampBeforeParent { .. })
+        ));
+        // The clock bound is unchanged and vote-only.
+        check_profile1_vote_time(PARENT_TIME + 2, PARENT_TIME).expect("within 2 s");
+        assert!(matches!(
+            check_profile1_vote_time(PARENT_TIME + 3, PARENT_TIME),
+            Err(Profile1Error::TimestampInFuture { .. })
+        ));
+    }
+    // 8000 ms keeps AM27's exact checks.
+    assert!(matches!(check_on(GRID, &valid()), Err(Profile1Error::TimestampSameSlot { .. })));
+    assert!(matches!(
+        check_on(GRID, &edited(|h| h.timestamp = PARENT_TIME + 9)),
+        Err(Profile1Error::TimestampOffGrid { .. })
+    ));
+    check_on(GRID, &edited(|h| h.timestamp = PARENT_TIME + 8)).expect("next slot");
 }
 
 #[test]

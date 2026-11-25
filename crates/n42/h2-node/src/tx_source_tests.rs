@@ -168,12 +168,87 @@ async fn the_pool_is_polled_through_a_filter_and_each_new_hash_is_fetched_raw() 
     let task = tokio::spawn(poll_pending_transactions(rpc.url.clone(), sink));
     let batch = tokio::time::timeout(Duration::from_secs(20), batches.recv()).await.expect("a batch in time").expect("open");
     assert_eq!(batch, vec![Bytes::from_static(&[0x01, 0xaa]), Bytes::from_static(&[0x02, 0xbb])], "the empty raw transaction is skipped");
-    assert_eq!(rpc.methods().iter().filter(|m| *m == "eth_newPendingTransactionFilter").count(), 1, "one filter");
     assert_eq!(rpc.methods().iter().filter(|m| *m == "eth_getRawTransactionByHash").count(), 3);
 
     // The receiver going away ends the task.
     drop(batches);
     tokio::time::timeout(Duration::from_secs(10), task).await.expect("ends once the sink is closed").expect("no panic");
+}
+
+/// A pool behind reth's filter rules: a pending-transaction filter hears
+/// every hash admitted after it was installed, and `eth_getFilterChanges`
+/// answers it on its first poll and then only after a new block -- which this
+/// chain never makes.
+#[tokio::test]
+async fn transactions_admitted_between_blocks_are_handed_over_without_waiting_for_one() {
+    #[derive(Default)]
+    struct Pool {
+        admitted: Vec<B256>,
+        // Per filter id: where its hashes start, and whether it was polled.
+        filters: Vec<(usize, bool)>,
+    }
+    let pool = Arc::new(Mutex::new(Pool::default()));
+    let state = Arc::clone(&pool);
+    let rpc = MockRpc::start(move |req| {
+        let mut pool = state.lock().expect("pool");
+        let result = match req["method"].as_str().unwrap_or_default() {
+            "eth_newPendingTransactionFilter" => {
+                // Start one hash early, as a hash admitted between installing
+                // this filter and reading the previous one would: the
+                // overlap must not be handed over twice.
+                let from = pool.admitted.len().saturating_sub(1);
+                pool.filters.push((from, false));
+                json!(format!("{:#x}", pool.filters.len() - 1))
+            }
+            "eth_getFilterChanges" => {
+                let id = req["params"][0].as_str().and_then(|id| usize::from_str_radix(id.trim_start_matches("0x"), 16).ok());
+                let admitted = pool.admitted.clone();
+                match id.and_then(|id| pool.filters.get_mut(id)) {
+                    // No block since the last poll: nothing, whatever arrived.
+                    Some((_, true)) => json!([]),
+                    Some((from, polled)) => {
+                        *polled = true;
+                        json!(admitted[*from..])
+                    }
+                    None => Value::Null,
+                }
+            }
+            "eth_uninstallFilter" => json!(true),
+            "eth_getRawTransactionByHash" => {
+                let hash: B256 = serde_json::from_value(req["params"][0].clone()).expect("a hash");
+                json!(Bytes::copy_from_slice(&hash[..4]))
+            }
+            _ => Value::Null,
+        };
+        json!({"jsonrpc": "2.0", "id": req["id"], "result": result})
+    })
+    .await;
+    let (sink, mut batches) = mpsc::channel(16);
+    let task = tokio::spawn(poll_pending_transactions(rpc.url.clone(), sink));
+    eventually("a filter", || !pool.lock().expect("pool").filters.is_empty()).await;
+
+    // Three admissions, each after the source has seen the previous one; a
+    // long-lived filter would hand over the first and then nothing more.
+    let mut received = Vec::new();
+    for i in 1..=3u8 {
+        pool.lock().expect("pool").admitted.push(B256::repeat_byte(i));
+        let want = Bytes::from(vec![i; 4]);
+        while !received.contains(&want) {
+            let batch = tokio::time::timeout(Duration::from_secs(20), batches.recv())
+                .await
+                .expect("the admission is handed over without a block")
+                .expect("open");
+            received.extend(batch);
+        }
+    }
+    assert_eq!(received, (1..=3u8).map(|i| Bytes::from(vec![i; 4])).collect::<Vec<_>>(), "each once, in order");
+    let methods = rpc.methods();
+    let installed = methods.iter().filter(|m| *m == "eth_newPendingTransactionFilter").count();
+    let removed = methods.iter().filter(|m| *m == "eth_uninstallFilter").count();
+    assert!(removed + 1 >= installed, "a filter that was read is uninstalled ({installed} made, {removed} removed)");
+
+    drop(batches);
+    tokio::time::timeout(Duration::from_secs(10), task).await.expect("ends").expect("no panic");
 }
 
 #[tokio::test]

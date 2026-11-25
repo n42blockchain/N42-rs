@@ -1539,63 +1539,87 @@ pub struct ProposalContext {
     /// `parent + period` however early it proposes), while this is when the
     /// block actually happened here.
     pub head_seen: Option<std::time::Instant>,
-    /// A17 / AM27, profile 1 on a slot grid: the start of the slot this
-    /// proposal is in, unix seconds -- the header's timestamp, and the
-    /// instant before which the leader must not publish. Known before the
-    /// wait, so a build prepared ahead stamps it too. `None` on a chain
-    /// without a grid or when the head's timestamp is not known.
+    /// A17 / AM27, profile 1 on a slot grid: the header timestamp of the
+    /// slot this proposal is in, `floor(slot start / 1000)` unix seconds.
+    /// Known before the wait, so a build prepared ahead stamps it too.
+    /// `None` on a chain without a grid or when the head's timestamp is not
+    /// known.
     pub slot_time: Option<u64>,
+    /// A17 / `AM27a`: the start of that slot in unix milliseconds, the instant
+    /// before which the leader must not publish (`slot_time * 1000` on a
+    /// whole-second grid).
+    pub slot_start_ms: Option<u64>,
 }
 
 /// The slot chosen per (parent, view) (A17 / AM27), shared with the chain
-/// sealer.
+/// sealer. Kept as the slot's start in unix milliseconds (`AM27a`).
 #[derive(Debug, Clone, Default)]
 pub struct ProposalSlots(Arc<std::sync::Mutex<std::collections::HashMap<(B256, u64), u64>>>);
 
 impl ProposalSlots {
-    /// The slot start a leader holding `head` (stamped `parent_time`) stamps
-    /// in `view` on `grid`: the remembered one, else
-    /// [`n42_h2_consensus::SlotGrid::proposal_time`] at this instant,
+    /// The start (unix ms) of the slot a leader holding `head` (stamped
+    /// `parent_time`, whose own parent is `head_parent`) proposes in for
+    /// `view` on `grid`: the remembered one, else the slot chosen now and
     /// remembered.
-    pub fn slot_time(
+    ///
+    /// On a whole-second grid the head's slot is read from its timestamp,
+    /// exactly as AM27. On any other grid the timestamp only bounds it from
+    /// below, so when this node chose the head's slot itself (a block it
+    /// built: an entry under `head_parent` whose seconds are the head's
+    /// stamp) that slot is used (`AM27a`: the parent's slot tracked locally).
+    pub fn slot_start_ms(
         &self,
         grid: Option<n42_h2_consensus::SlotGrid>,
         head: B256,
         view: u64,
         parent_time: Option<u64>,
+        head_parent: Option<B256>,
     ) -> Option<u64> {
         let grid = grid?;
         let parent_time = parent_time?;
         let mut slots = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(time) = slots.get(&(head, view)) {
-            return Some(*time);
+        if let Some(start) = slots.get(&(head, view)) {
+            return Some(*start);
         }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default();
-        let time = grid.proposal_time(parent_time, now_ms);
+        let mut parent_slot = grid.parent_slot(parent_time);
+        if grid.interval_secs().is_none()
+            && let Some(grandparent) = head_parent
+        {
+            let genesis_ms = grid.genesis_time.saturating_mul(1000);
+            let chosen = slots
+                .iter()
+                .filter(|((parent, _), start)| *parent == grandparent && **start / 1000 == parent_time)
+                .map(|(_, start)| start.saturating_sub(genesis_ms) / grid.interval_ms)
+                .max();
+            parent_slot = parent_slot.max(chosen.unwrap_or_default());
+        }
+        let start = grid.slot_start_ms(grid.proposal_slot_after(parent_slot, now_ms));
         if slots.len() >= 1024 {
             slots.retain(|(_, kept), _| kept.saturating_add(64) >= view);
         }
-        slots.insert((head, view), time);
-        Some(time)
+        slots.insert((head, view), start);
+        Some(start)
     }
 
-    /// The slot remembered for (`head`, `view`), if one was chosen.
+    /// The slot start (unix ms) remembered for (`head`, `view`), if one was
+    /// chosen.
     pub fn remembered(&self, head: &B256, view: u64) -> Option<u64> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(*head, view)).copied()
     }
 }
 
-/// The `Instant` at which the unix second `time` begins on this node's clock.
-fn instant_of_unix_secs(time: u64) -> std::time::Instant {
+/// The `Instant` at which the unix millisecond `target_ms` falls on this
+/// node's clock.
+fn instant_of_unix_ms(target_ms: u64) -> std::time::Instant {
     let now = std::time::Instant::now();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default();
-    let target_ms = time.saturating_mul(1000);
     if target_ms >= now_ms {
         now + Duration::from_millis(target_ms - now_ms)
     } else {
@@ -4035,7 +4059,13 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         }
         let head_timestamp = self.block_timestamps.get(&parent).copied().or(Some(header.timestamp));
-        let slot_time = self.proposal_slots.slot_time(self.header_rules.slot_grid, parent, next, head_timestamp);
+        let slot_start_ms = self.proposal_slots.slot_start_ms(
+            self.header_rules.slot_grid,
+            parent,
+            next,
+            head_timestamp,
+            Some(header.parent_hash),
+        );
         let context = ProposalContext {
             view: next,
             preparing: true,
@@ -4043,7 +4073,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             head_timestamp: self.block_timestamps.get(&parent).copied(),
             head_header: Some(header.clone()),
             head_seen: self.block_seen.get(&parent).copied(),
-            slot_time,
+            slot_time: slot_start_ms.map(|ms| ms / 1000),
+            slot_start_ms,
         };
         // The builder declines while pacing; that is a "not yet", not a "no",
         // and the proposal will ask again. Nothing to prepare in that case.
@@ -4113,7 +4144,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                 })
                 .ok()?;
             let head = sealed.hash_slow();
-            let slot_time = slots.slot_time(grid, head, view.saturating_add(1), Some(sealed.timestamp));
+            let slot_start_ms = slots.slot_start_ms(
+                grid,
+                head,
+                view.saturating_add(1),
+                Some(sealed.timestamp),
+                Some(sealed.parent_hash),
+            );
             // `preparing` is what tells the builder to leave the pacing to
             // the proposal, exactly as a build ahead asks for it; and with
             // it the "when was the head seen" pacing input is unread, which
@@ -4125,7 +4162,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                 head_timestamp: Some(sealed.timestamp),
                 head_header: Some(sealed.clone()),
                 head_seen: None,
-                slot_time,
+                slot_time: slot_start_ms.map(|ms| ms / 1000),
+                slot_start_ms,
             })?;
             Some((sealed, next))
         });
@@ -4141,7 +4179,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn pacing_tick(&self, head: &B256, view: u64) -> Option<std::time::Instant> {
         // A17 / AM27: on a slot grid the tick is the slot's boundary.
         if self.header_rules.slot_grid.is_some() {
-            return self.proposal_slots.remembered(head, view).map(instant_of_unix_secs);
+            return self.proposal_slots.remembered(head, view).map(instant_of_unix_ms);
         }
         let pacing = self.block_pacing?;
         let seen = self.block_seen.get(head)?;
@@ -4378,7 +4416,13 @@ impl<E: ExecutionLayer> H2Service<E> {
         // retried on every subsequent event in the same view, which would pin
         // the loop against a broken execution layer.
         let head_timestamp = head_stamp(self.block_timestamps.get(&head).copied(), head_header.as_ref());
-        let slot_time = self.proposal_slots.slot_time(self.header_rules.slot_grid, head, view, head_timestamp);
+        let slot_start_ms = self.proposal_slots.slot_start_ms(
+            self.header_rules.slot_grid,
+            head,
+            view,
+            head_timestamp,
+            head_header.as_ref().map(|header| header.parent_hash),
+        );
         let context = ProposalContext {
             view,
             preparing: false,
@@ -4386,7 +4430,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             head_timestamp,
             head_header,
             head_seen: self.block_seen.get(&head).copied(),
-            slot_time,
+            slot_time: slot_start_ms.map(|ms| ms / 1000),
+            slot_start_ms,
         };
         let header_at = decided.elapsed();
         let Some(attrs) = build_attributes(context) else {

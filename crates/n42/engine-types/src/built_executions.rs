@@ -95,6 +95,22 @@ pub fn undersized_stores(depth: usize, caps: &[(&'static str, usize)]) -> Vec<St
         .collect()
 }
 
+/// The leader layers a chain's leader schedule lets a chained build stack:
+/// `N42_LEADER_LAYERS` (`layers`), bounded by the views one leader holds in a
+/// row. A build chains on an own block only when consensus names this node
+/// leader of the next view too (the tenure), so with `tenure` consecutive
+/// views among `validators > 1` members at most `tenure` own blocks are ever
+/// in flight; with one validator every view is its own and the knob stands.
+/// What the start-up check ([`undersized_stores`]) compares the stores with
+/// on a chain whose schedule is known (profile 1: tenure 1 among four
+/// members, so 1).
+pub fn scheduled_layer_depth(layers: usize, tenure: u64, validators: usize) -> usize {
+    if validators <= 1 || tenure == 0 {
+        return layers;
+    }
+    layers.min(usize::try_from(tenure).unwrap_or(usize::MAX)).max(1)
+}
+
 /// How far a build that was sealed before it finished has come
 /// (docs/PHASE_D_DEFERRED_EXECUTION.md section 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1402,6 +1418,20 @@ mod tests {
         assert_eq!(super::undersized_stores(2, &caps).len(), 1);
         assert_eq!(super::undersized_stores(1, &caps), Vec::<String>::new());
         assert_eq!(super::undersized_stores(6, &caps).len(), 2);
+    }
+
+    #[test]
+    fn a_tenure_of_one_bounds_the_layers_to_one() {
+        // Profile 1: tenure 1 among four members never chains an own build,
+        // so the default keep of 3 is not below its layers + 2.
+        let depth = super::scheduled_layer_depth(2, 1, 4);
+        assert_eq!(depth, 1);
+        assert_eq!(super::undersized_stores(depth, &super::store_caps()), Vec::<String>::new());
+        // The knob stands where the schedule allows it.
+        assert_eq!(super::scheduled_layer_depth(6, 8, 7), 6);
+        assert_eq!(super::scheduled_layer_depth(6, 3, 7), 3);
+        assert_eq!(super::scheduled_layer_depth(2, 1, 1), 2, "a lone validator leads every view");
+        assert_eq!(super::scheduled_layer_depth(2, 0, 4), 2);
         assert_eq!(super::store_caps().len(), 3);
     }
 

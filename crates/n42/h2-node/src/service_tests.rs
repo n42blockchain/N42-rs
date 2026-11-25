@@ -364,7 +364,7 @@ async fn on_a_slot_grid_the_tick_is_the_remembered_slot_boundary() {
     // slot; the pacing tick is that slot's start.
     let mut rig = node(1, 0, None).await;
     let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let grid = n42_h2_consensus::SlotGrid { genesis_time: now_secs - 800, interval_secs: 8 };
+    let grid = n42_h2_consensus::SlotGrid { genesis_time: now_secs - 800, interval_ms: 8_000 };
     rig.svc.header_rules = n42_h2_consensus::HeaderRules::profile1(1, 1, None).with_slot_grid(Some(grid));
     rig.svc = rig.svc.with_block_pacing(Duration::from_millis(8_000));
     let head = B256::repeat_byte(9);
@@ -372,15 +372,50 @@ async fn on_a_slot_grid_the_tick_is_the_remembered_slot_boundary() {
     // A parent of the slot just begun or ending: the slot after it.
     let parent_time = grid.slot_start((now_secs - grid.genesis_time) / 8);
     let slots = rig.svc.proposal_slots.clone();
-    let time = slots.slot_time(Some(grid), head, 7, Some(parent_time)).expect("a slot");
-    assert_eq!(time, parent_time + 8);
-    assert_eq!(slots.slot_time(Some(grid), head, 7, Some(parent_time)), Some(time), "kept");
+    let start = slots.slot_start_ms(Some(grid), head, 7, Some(parent_time), None).expect("a slot");
+    assert_eq!(start, (parent_time + 8) * 1000);
+    assert_eq!(slots.slot_start_ms(Some(grid), head, 7, Some(parent_time), None), Some(start), "kept");
     let tick = rig.svc.pacing_tick(&head, 7).expect("the boundary");
     let ahead = tick.saturating_duration_since(std::time::Instant::now());
     assert!(ahead <= Duration::from_secs(8), "{ahead:?}");
     // Another view on the same parent chooses afresh.
-    assert_eq!(slots.slot_time(None, head, 8, Some(parent_time)), None, "no grid, no slot");
+    assert_eq!(slots.slot_start_ms(None, head, 8, Some(parent_time), None), None, "no grid, no slot");
     assert_eq!(rig.svc.pacing_tick(&head, 8), None);
+}
+
+#[tokio::test]
+async fn on_a_sub_second_grid_the_parent_slot_is_tracked_in_milliseconds() {
+    // AM27a: at 30 ms a second holds ~33 slots, so a block this node built
+    // names its slot only locally. A chained build sealed before its own
+    // slot began must still take the slot after it, not one read from the
+    // parent's seconds.
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let grid = n42_h2_consensus::SlotGrid { genesis_time: now_ms / 1000 - 100, interval_ms: 30 };
+    let slots = ProposalSlots::default();
+    let (grandparent, parent) = (B256::repeat_byte(1), B256::repeat_byte(2));
+    // The slot this node proposes the parent in, chosen as usual: the first
+    // slot not in the past, on the millisecond grid.
+    let first = slots.slot_start_ms(Some(grid), grandparent, 4, Some(now_ms / 1000), None).expect("a slot");
+    assert!(first >= now_ms && first < now_ms + 30 + 1_000, "{first} vs {now_ms}");
+    assert_eq!((first - grid.genesis_time * 1000) % 30, 0, "on the ms grid");
+    // A parent the chain sealed for a slot 2 s ahead (a pipelined build),
+    // in the middle of its second: the child is the very next slot, 30 ms
+    // later, not one derived from the parent's seconds or from now.
+    let genesis_ms = grid.genesis_time * 1000;
+    let slot = (now_ms + 2_000 - genesis_ms) / 30;
+    let slot = if (genesis_ms + slot * 30) % 1000 < 30 { slot + 2 } else { slot };
+    let parent_start = genesis_ms + slot * 30;
+    slots.0.lock().unwrap().insert((grandparent, 5), parent_start);
+    let parent_stamp = parent_start / 1000;
+    let child = slots.slot_start_ms(Some(grid), parent, 6, Some(parent_stamp), Some(grandparent)).expect("a slot");
+    assert_eq!(child, parent_start + 30);
+    assert!(child / 1000 >= parent_stamp, "B4: non-decreasing seconds");
+    // Without the local slot only the seconds bound it: still never before
+    // the parent's second.
+    let blind = ProposalSlots::default()
+        .slot_start_ms(Some(grid), parent, 6, Some(parent_stamp), None)
+        .expect("a slot");
+    assert!(blind / 1000 >= parent_stamp);
 }
 
 #[tokio::test]

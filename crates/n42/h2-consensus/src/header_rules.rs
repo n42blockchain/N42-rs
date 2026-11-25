@@ -23,8 +23,9 @@
 //!   [`crate::seal_hash`] under the H2-v4 proof-of-possession DST.
 //! - **B3** difficulty 0, nonce 0, mix hash zero, ommers hash exactly zero
 //!   (the empty-list hash is invalid), coinbase the proposer's address.
-//! - **B4 / AM27** on the slot grid ([`SlotGrid`]): `(time - G) mod I = 0`
-//!   and `time >= parent.time + I`; `time <= now + 2 s` only when voting
+//! - **B4 / AM27 / `AM27a`** on a whole-second slot grid ([`SlotGrid`]):
+//!   `(time - G) mod I = 0` and `time >= parent.time + I`; on a sub-second
+//!   grid `parent.time <= time`; `time <= now + 2 s` only when voting
 //!   ([`check_profile1_vote_time`]), never on import. Without a grid (rules
 //!   built by a caller that does not know the genesis) the pre-AM27 lower
 //!   bound `parent.time <= time` is what is checked.
@@ -76,66 +77,116 @@ pub const PROFILE1_FUTURE_SLACK_SECS: u64 = 2;
 /// 64 MiB of decoded RLP.
 pub const PROFILE1_MAX_BLOCK_BYTES: u64 = 64 << 20;
 
-/// A17 / AM27: profile 1's slot grid. Slot `s` starts at
-/// `genesis_time + s * interval_secs`, counted from the genesis timestamp
-/// as on the Ethereum beacon chain, so there is no per-block drift.
+/// A17 / AM27 / `AM27a`: profile 1's slot grid, kept in milliseconds. Slot `s`
+/// starts at `genesis_time * 1000 + s * interval_ms` ms, counted from the
+/// genesis timestamp as on the Ethereum beacon chain, so there is no
+/// per-block drift; a header carries `floor(slot start / 1000)`.
+///
+/// When the interval is a whole number of seconds a slot is named by its
+/// header's seconds, and the grid is exactly AM27's. Otherwise a second can
+/// hold several slots (or none), so a parent's slot is not readable from its
+/// timestamp and a producer tracks it locally (`AM27a`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotGrid {
     /// The genesis header's timestamp G, unix seconds.
     pub genesis_time: u64,
-    /// The block interval I in whole seconds, at least 1.
-    pub interval_secs: u64,
+    /// The block interval I in milliseconds, at least 1.
+    pub interval_ms: u64,
 }
 
 impl SlotGrid {
     /// The grid of a chain with genesis timestamp `genesis_time` and
-    /// `blockIntervalMs` = `interval_ms`; `None` when the interval is not a
-    /// positive whole number of seconds (no grid can carry it).
+    /// `blockIntervalMs` = `interval_ms`; `None` when the interval is zero.
+    /// Any positive interval is accepted (`AM27a`).
     pub const fn from_interval_ms(genesis_time: u64, interval_ms: u64) -> Option<Self> {
-        if interval_ms == 0 || interval_ms % 1000 != 0 {
-            return None;
-        }
-        Some(Self { genesis_time, interval_secs: interval_ms / 1000 })
-    }
-
-    /// The start of slot `slot`, unix seconds.
-    pub const fn slot_start(&self, slot: u64) -> u64 {
-        self.genesis_time.saturating_add(slot.saturating_mul(self.interval_secs))
-    }
-
-    /// The slot `time` starts, or `None` when it is off the grid (before
-    /// genesis, or not on a boundary).
-    pub const fn slot_of(&self, time: u64) -> Option<u64> {
-        if time < self.genesis_time || self.interval_secs == 0 {
-            return None;
-        }
-        let offset = time - self.genesis_time;
-        if offset % self.interval_secs != 0 {
-            return None;
-        }
-        Some(offset / self.interval_secs)
-    }
-
-    /// A17: the slot a leader holding a parent stamped `parent_time` proposes
-    /// in at `now_ms` (unix milliseconds): `max(sP + 1, ceil((now - G) / I))`,
-    /// the first boundary after the parent's slot that is not in the past.
-    /// An off-grid parent (the genesis is slot 0 by definition) counts as the
-    /// slot it falls in.
-    pub const fn proposal_slot(&self, parent_time: u64, now_ms: u64) -> u64 {
-        let interval_ms = self.interval_secs.saturating_mul(1000);
         if interval_ms == 0 {
+            return None;
+        }
+        Some(Self { genesis_time, interval_ms })
+    }
+
+    /// The interval in whole seconds, or `None` when it is not a whole
+    /// number of seconds (the exact grid checks of B4 apply only then).
+    pub const fn interval_secs(&self) -> Option<u64> {
+        if self.interval_ms == 0 || !self.interval_ms.is_multiple_of(1000) {
+            return None;
+        }
+        Some(self.interval_ms / 1000)
+    }
+
+    const fn genesis_ms(&self) -> u64 {
+        self.genesis_time.saturating_mul(1000)
+    }
+
+    /// The start of slot `slot`, unix milliseconds.
+    pub const fn slot_start_ms(&self, slot: u64) -> u64 {
+        self.genesis_ms().saturating_add(slot.saturating_mul(self.interval_ms))
+    }
+
+    /// The header timestamp of slot `slot`: its start in whole seconds,
+    /// `floor(slot start / 1000)`.
+    pub const fn slot_start(&self, slot: u64) -> u64 {
+        self.slot_start_ms(slot) / 1000
+    }
+
+    /// The slot that starts exactly at the unix second `time`, or `None`
+    /// when no slot does (before genesis, or not on a boundary).
+    pub const fn slot_of(&self, time: u64) -> Option<u64> {
+        if time < self.genesis_time || self.interval_ms == 0 {
+            return None;
+        }
+        let offset_ms = (time - self.genesis_time).saturating_mul(1000);
+        if !offset_ms.is_multiple_of(self.interval_ms) {
+            return None;
+        }
+        Some(offset_ms / self.interval_ms)
+    }
+
+    /// The slot of a parent stamped `parent_time`, as far as its timestamp
+    /// tells. On a whole-second grid that is exact (an off-grid parent, such
+    /// as the genesis, counts as the slot it falls in). Otherwise it is a
+    /// lower bound: the first slot whose start lies in second `parent_time`
+    /// or later, so the slot after it starts no earlier than the parent's
+    /// second.
+    pub const fn parent_slot(&self, parent_time: u64) -> u64 {
+        if self.interval_ms == 0 {
             return 0;
         }
-        let parent_slot = parent_time.saturating_sub(self.genesis_time) / self.interval_secs;
-        let since_ms = now_ms.saturating_sub(self.genesis_time.saturating_mul(1000));
-        let now_slot = since_ms.div_ceil(interval_ms);
+        let offset_ms = parent_time.saturating_sub(self.genesis_time).saturating_mul(1000);
+        if self.interval_ms.is_multiple_of(1000) {
+            offset_ms / self.interval_ms
+        } else {
+            offset_ms.div_ceil(self.interval_ms)
+        }
+    }
+
+    /// A17: the slot a leader proposes in at `now_ms` (unix milliseconds)
+    /// when its parent is in slot `parent_slot`: `max(sP + 1, ceil((now - G)
+    /// / I))`, the first boundary after the parent's slot that is not in the
+    /// past.
+    pub const fn proposal_slot_after(&self, parent_slot: u64, now_ms: u64) -> u64 {
+        if self.interval_ms == 0 {
+            return 0;
+        }
+        let since_ms = now_ms.saturating_sub(self.genesis_ms());
+        let now_slot = since_ms.div_ceil(self.interval_ms);
         let next = parent_slot.saturating_add(1);
         if now_slot > next { now_slot } else { next }
     }
 
+    /// A17: the slot a leader holding a parent stamped `parent_time`
+    /// proposes in at `now_ms`, with the parent's slot read from its
+    /// timestamp ([`Self::parent_slot`]). On a sub-second grid a producer
+    /// that knows the parent's slot better uses
+    /// [`Self::proposal_slot_after`].
+    pub const fn proposal_slot(&self, parent_time: u64, now_ms: u64) -> u64 {
+        self.proposal_slot_after(self.parent_slot(parent_time), now_ms)
+    }
+
     /// A17 / B4, the producer's side: the timestamp a leader stamps, the
-    /// start of [`Self::proposal_slot`]. Known before the wait for the
-    /// boundary, so a build started ahead of it stamps the same value.
+    /// start of [`Self::proposal_slot`] in whole seconds. Known before the
+    /// wait for the boundary, so a build started ahead of it stamps the same
+    /// value.
     pub const fn proposal_time(&self, parent_time: u64, now_ms: u64) -> u64 {
         self.slot_start(self.proposal_slot(parent_time, now_ms))
     }
@@ -663,18 +714,22 @@ pub const fn check_profile1_vote_time(header_time: u64, now_secs: u64) -> Result
     Ok(())
 }
 
-/// B4 as amended by AM27, checked on import: `(time - G) mod I = 0` and
-/// `time >= parent.time + I`.
+/// B4 as amended by AM27 / `AM27a`, checked on import. On a whole-second grid
+/// `(time - G) mod I = 0` and `time >= parent.time + I`; on any other grid
+/// only `time >= parent.time` (equal seconds allowed: a second holds
+/// several slots).
 pub const fn check_profile1_slot(grid: &SlotGrid, time: u64, parent_time: u64) -> Result<(), Profile1Error> {
+    let Some(interval) = grid.interval_secs() else {
+        if time < parent_time {
+            return Err(Profile1Error::TimestampBeforeParent { time, parent: parent_time });
+        }
+        return Ok(());
+    };
     if grid.slot_of(time).is_none() {
-        return Err(Profile1Error::TimestampOffGrid {
-            time,
-            genesis: grid.genesis_time,
-            interval: grid.interval_secs,
-        });
+        return Err(Profile1Error::TimestampOffGrid { time, genesis: grid.genesis_time, interval });
     }
-    if time < parent_time.saturating_add(grid.interval_secs) {
-        return Err(Profile1Error::TimestampSameSlot { time, parent: parent_time, interval: grid.interval_secs });
+    if time < parent_time.saturating_add(interval) {
+        return Err(Profile1Error::TimestampSameSlot { time, parent: parent_time, interval });
     }
     Ok(())
 }

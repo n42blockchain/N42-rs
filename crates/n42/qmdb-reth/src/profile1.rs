@@ -372,14 +372,6 @@ pub fn profile1(genesis: &Genesis) -> Result<Option<Profile1Config>, Profile1Err
     if block_interval_ms == 0 {
         return Err(invalid(format!("{hs}.blockIntervalMs"), "must be at least 1 (A17)"));
     }
-    // A17 / AM27: the slot grid counts whole seconds from the genesis
-    // timestamp, so the interval must be a whole number of seconds.
-    if block_interval_ms % 1000 != 0 {
-        return Err(invalid(
-            format!("{hs}.blockIntervalMs"),
-            format!("{block_interval_ms} is not a whole number of seconds (A17)"),
-        ));
-    }
     let base_timeout_ms = u64_field(hotstuff, hs, "baseTimeoutMs")?;
     if base_timeout_ms == 0 {
         return Err(invalid(format!("{hs}.baseTimeoutMs"), "must be at least 1 (A16)"));
@@ -924,7 +916,6 @@ mod tests {
             ("refused_missing_state_scheme", "mandatory field config.stateScheme is missing"),
             ("refused_zero_leader_tenure", "config.hotstuff.leaderTenure must be at least 1"),
             ("refused_zero_epoch_length", "config.hotstuff.epochLength must be at least 1"),
-            ("refused_interval_not_whole_seconds", "config.hotstuff.blockIntervalMs 8500 is not a whole number of seconds"),
             ("refused_max_timeout_below_base", "config.hotstuff.maxTimeoutMs 1000 is below baseTimeoutMs 24000"),
             ("refused_depth_not_implemented", "deferredExecutionDepth must be 1 or 2, found 3"),
             ("refused_gas_limit_mismatch", "differs from the genesis header's gasLimit 480000000"),
@@ -951,6 +942,30 @@ mod tests {
             let message = format!("{err:#}");
             assert!(message.contains(cause), "{name}: {message}");
         }
+    }
+
+    /// A17 / `AM27a`: any positive block interval loads, sub-second and
+    /// non-whole seconds included, and the header rules carry its grid in
+    /// milliseconds; zero is still refused.
+    #[test]
+    fn any_positive_block_interval_is_accepted() {
+        let raw = std::fs::read_to_string(draft_path()).expect("the draft");
+        let with_interval = |interval: u64| -> String {
+            let mut json: Value = serde_json::from_str(&raw).expect("json");
+            json["config"]["hotstuff"]["blockIntervalMs"] = serde_json::json!(interval);
+            json.to_string()
+        };
+        for interval in [30, 1_500, 8_500, 8_000] {
+            let spec = crate::N42ChainSpecParser::parse(&with_interval(interval))
+                .unwrap_or_else(|e| panic!("{interval} ms loads: {e:#}"));
+            let config = profile1(&spec.genesis).expect("valid").expect("a profile-1 genesis");
+            assert_eq!(config.block_interval_ms, interval);
+            let grid = header_rules(&spec.genesis).slot_grid.expect("a grid");
+            assert_eq!((grid.genesis_time, grid.interval_ms), (spec.genesis.timestamp, interval));
+            assert_eq!(grid.interval_secs().is_some(), interval % 1000 == 0, "{interval}");
+        }
+        let err = crate::N42ChainSpecParser::parse(&with_interval(0)).expect_err("zero is refused");
+        assert!(format!("{err:#}").contains("blockIntervalMs must be at least 1"), "{err:#}");
     }
 
     // ------------------------------------------------ gov5's vectors (V1, V8) --

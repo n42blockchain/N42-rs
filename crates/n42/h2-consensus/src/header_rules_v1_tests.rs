@@ -77,7 +77,12 @@ fn rules(v1: &Value) -> HeaderRules {
         chain_id: v1["chainId"].as_u64().unwrap(),
         genesis_hash: b256(&v1["genesisHash"]),
     });
-    rules
+    // A17 / AM27: V1's blocks sit on the genesis' slot grid.
+    let genesis_time = match &genesis["timestamp"] {
+        Value::String(hex) => u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap(),
+        other => other.as_u64().unwrap(),
+    };
+    rules.with_slot_grid(SlotGrid::from_interval_ms(genesis_time, hotstuff["blockIntervalMs"].as_u64().unwrap()))
 }
 
 /// Import-time verdict of a header on top of `parent`, as a node with the

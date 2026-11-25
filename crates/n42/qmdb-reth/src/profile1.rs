@@ -582,7 +582,15 @@ fn expect_string(object: &Map<String, Value>, path: &str, key: &str, want: &str)
 /// ([`Profile1Config::header_rules`]) on a valid profile-1 genesis, the
 /// default (today's behaviour, nothing more checked) on every other.
 pub fn header_rules(genesis: &Genesis) -> n42_h2_consensus::HeaderRules {
-    profile1(genesis).ok().flatten().and_then(|config| config.header_rules()).unwrap_or_default()
+    profile1(genesis)
+        .ok()
+        .flatten()
+        .and_then(|config| {
+            // A17 / AM27: the slot grid counts from the genesis timestamp.
+            let grid = n42_h2_consensus::SlotGrid::from_interval_ms(genesis.timestamp, config.block_interval_ms);
+            config.header_rules().map(|rules| rules.with_slot_grid(grid))
+        })
+        .unwrap_or_default()
 }
 
 /// The fixed block gas limit of a profile-1 genesis (A23): what the builder

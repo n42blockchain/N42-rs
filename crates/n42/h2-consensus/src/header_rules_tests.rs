@@ -229,6 +229,102 @@ fn b4_timestamps_equal_allowed_before_parent_refused_future_only_at_vote() {
     assert_eq!(profile1_timestamp(PARENT_TIME, PARENT_TIME + 5), PARENT_TIME + 5);
 }
 
+/// A grid whose genesis is 10 slots of 8 s before `PARENT_TIME`, so the
+/// fixture's parent sits on slot 10.
+const GRID: SlotGrid = SlotGrid { genesis_time: PARENT_TIME - 80, interval_secs: 8 };
+
+fn check_on_grid(header: &N42Header) -> Result<(), Profile1Error> {
+    let rules = rules().with_slot_grid(Some(GRID));
+    rules.check_header(header)?;
+    let parent = parent();
+    rules.check_against_parent(header, &parent, parent.hash_slow())
+}
+
+#[test]
+fn am27_grid_from_interval_ms() {
+    assert_eq!(SlotGrid::from_interval_ms(100, 8_000), Some(SlotGrid { genesis_time: 100, interval_secs: 8 }));
+    assert_eq!(SlotGrid::from_interval_ms(100, 0), None);
+    assert_eq!(SlotGrid::from_interval_ms(100, 500), None);
+    assert_eq!(GRID.slot_of(PARENT_TIME), Some(10));
+    assert_eq!(GRID.slot_of(PARENT_TIME + 3), None);
+    assert_eq!(GRID.slot_of(GRID.genesis_time - 8), None);
+    assert_eq!(GRID.slot_start(11), PARENT_TIME + 8);
+}
+
+#[test]
+fn am27_slot_selection_normal_cadence() {
+    let ms = |secs: u64| secs * 1000;
+    // The parent of slot 10 arrives 300 ms into its slot: the next slot.
+    assert_eq!(GRID.proposal_slot(PARENT_TIME, ms(PARENT_TIME) + 300), 11);
+    assert_eq!(GRID.proposal_time(PARENT_TIME, ms(PARENT_TIME) + 300), PARENT_TIME + 8);
+    // Asked before the parent's own slot started (a chained build sealed
+    // ahead of its boundary): still the slot after the parent's.
+    assert_eq!(GRID.proposal_time(PARENT_TIME, ms(PARENT_TIME) - 2_000), PARENT_TIME + 8);
+    // Exactly on the next boundary: that boundary, not the one after.
+    assert_eq!(GRID.proposal_time(PARENT_TIME, ms(PARENT_TIME + 8)), PARENT_TIME + 8);
+    // A steady chain: each block's stamp is the next boundary, deltas of 8.
+    let mut parent_time = PARENT_TIME;
+    for _ in 0..5 {
+        let next = GRID.proposal_time(parent_time, ms(parent_time) + 450);
+        assert_eq!(next - parent_time, 8);
+        parent_time = next;
+    }
+}
+
+#[test]
+fn am27_leader_entering_mid_slot_waits_for_the_next_boundary() {
+    // A TC after a 24 s timeout: the new leader holds the slot-10 parent at
+    // slot 13 + 5 s; slots 11-13 are past, so it proposes in slot 14.
+    let now_ms = (PARENT_TIME + 3 * 8 + 5) * 1000 + 1;
+    assert_eq!(GRID.proposal_slot(PARENT_TIME, now_ms), 14);
+    assert_eq!(GRID.proposal_time(PARENT_TIME, now_ms), PARENT_TIME + 32);
+    // One millisecond past a boundary is mid-slot: the next one.
+    assert_eq!(GRID.proposal_time(PARENT_TIME, (PARENT_TIME + 8) * 1000 + 1), PARENT_TIME + 16);
+}
+
+#[test]
+fn am27_parent_arriving_late() {
+    // The slot-10 parent reached this leader 9.5 s after its slot began
+    // (after slot 11 started): slot 12, the boundary still ahead.
+    let now_ms = PARENT_TIME * 1000 + 9_500;
+    assert_eq!(GRID.proposal_time(PARENT_TIME, now_ms), PARENT_TIME + 16);
+    // The stamp passes B4 against the parent, with a delta of two slots.
+    check_profile1_slot(&GRID, PARENT_TIME + 16, PARENT_TIME).expect("two slots later");
+}
+
+#[test]
+fn am27_b4_on_the_grid() {
+    // Accept: the next slot, and a later one (a timeout in between).
+    check_on_grid(&edited(|h| h.timestamp = PARENT_TIME + 8)).expect("next slot");
+    check_on_grid(&edited(|h| h.timestamp = PARENT_TIME + 24)).expect("three slots later");
+    // Off the grid.
+    for time in [PARENT_TIME + 9, PARENT_TIME + 1, PARENT_TIME + 15] {
+        assert!(
+            matches!(check_on_grid(&edited(|h| h.timestamp = time)), Err(Profile1Error::TimestampOffGrid { .. })),
+            "{time}"
+        );
+    }
+    // The parent's own slot (equal timestamps are no longer valid).
+    assert!(matches!(check_on_grid(&valid()), Err(Profile1Error::TimestampSameSlot { .. })));
+    // Before the parent.
+    assert!(matches!(
+        check_on_grid(&edited(|h| h.timestamp = PARENT_TIME - 8)),
+        Err(Profile1Error::TimestampSameSlot { .. }) | Err(Profile1Error::TimestampBeforeParent { .. })
+    ));
+    // Future: import never reads a clock; only the vote does.
+    let future = edited(|h| h.timestamp = PARENT_TIME + 8 * 100);
+    check_on_grid(&future).expect("import ignores the clock");
+    let now = PARENT_TIME + 8;
+    check_profile1_vote_time(PARENT_TIME + 8, now).expect("in its slot");
+    assert!(matches!(
+        check_profile1_vote_time(future.timestamp, now),
+        Err(Profile1Error::TimestampInFuture { .. })
+    ));
+    // The error names B4.
+    let err = check_on_grid(&edited(|h| h.timestamp = PARENT_TIME + 9)).unwrap_err();
+    assert!(err.to_string().starts_with("B4"), "{err}");
+}
+
 #[test]
 fn b5_b6_roots_present() {
     assert!(matches!(

@@ -63,6 +63,13 @@ Codec and manifest: `bin/n42/src/snapshot_bundle.rs`.
    body, receipts or parent state for P. The validator pulls P+1.. by range, the EL's import of P+1
    compares its carried fields with those filed, and the member votes and leads.
 
+## Other chains
+
+The k = 1 anchor applies wherever deferred execution is active (a deferred chain could not be joined
+before: its snapshot never matched header P's root); the `0x03`-only rule and the file-mode restore apply
+to profile-1 chains only. On a native chain without deferral (`n42_devnet.json`, devnet-fleet
+`LATE_SNAPSHOT`) `init`/`export` behave as before, except that `export` now writes the state JSONL itself.
+
 ## Defects found on the way (each fixed with a test)
 
 - init compared the snapshot with header(P).stateRoot (k = 0) and checked no QC (SYNC W15).
@@ -71,14 +78,15 @@ Codec and manifest: `bin/n42/src/snapshot_bundle.rs`.
 - export wrote no state JSONL (it needed gov5's dump) and defaulted to `0x01`.
 - Every `0x03` restore failed in the default heap mode ("tombstoned slots … only a node with the QMDB
   entry file can hold"), gov5's bundle included.
+- export dumped zero-balance genesis entries reth keeps but QMDB has no leaf for (native devnet).
 - `--anchor` was parsed as a positional argument; the round script's join function had its member number
   overwritten by `cmd_stop`/`cmd_up` (bash dynamic scope) and wiped the source member's datadir.
 
 ## Known limits
 
-- **BLOCKHASH below P.** reth's `setup_without_evm` writes headers 0..P-1 as dummies with a zero hash, so
-  the `BLOCKHASH` opcode for P-255..P-1 in the first 256 blocks after P differs from a full node's. It fails
-  closed (the joiner refuses such a block on its state root; no wrong vote), and EIP-2935's contract holds
-  the right values. The bundle carries the real headers (`commit-qc.bin`); writing them into the static
-  files is the remaining step.
+- **Headers below P.** `init` stores the headers the bundle carries (`commit-qc.bin`, max(P-255,1)..P-1;
+  `--ancestors` without a bundle) with their own hashes and indexes them by hash, so `BLOCKHASH` over the
+  last 256 blocks reads what a full node reads (test
+  `init_writes_the_real_ancestor_headers_so_blockhash_reads_them`). Below them the headers stay reth's
+  zero-hash dummies.
 - **No history below P** (SYNC §5.3.8): the joiner serves bodies only from P+1.

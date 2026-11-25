@@ -38,7 +38,7 @@
 #   P1_CPUS=<list>        taskset CPU list (default skips the faulty core 99/227)
 #   P1_LOAD=<tx/s>        `up` also starts `load` at that rate for P1_LOAD_SECONDS (3600)
 #                         (P1_LOAD_MEMBERS, default the running ones of P1_MEMBERS)
-#   P1_LOAD_TOOL=gov5     gov5's gate-3 load.py (P1_LOAD_PY; funds its senders from the
+#   P1_LOAD_TOOL=gov5     gov5's gate-3 load_core.py (P1_LOAD_PY; funds its senders from the
 #                         V1 faucet, so the plain genesis works; 30 tx/s is the agreed rate)
 #                         or send_tx: P1_LOAD_SENDERS=64 derived senders split over the
 #                         members, which needs a genesis that funds them:
@@ -75,7 +75,7 @@ P1_LOAD=${P1_LOAD:-}
 P1_LOAD_SECONDS=${P1_LOAD_SECONDS:-3600}
 P1_LOAD_SENDERS=${P1_LOAD_SENDERS:-64}
 P1_LOAD_TOOL=${P1_LOAD_TOOL:-gov5}
-P1_LOAD_PY=${P1_LOAD_PY:-/data/blockchain/gov5-work/p1mixed/gate3/load.py}
+P1_LOAD_PY=${P1_LOAD_PY:-/data/blockchain/gov5-work/p1mixed/gate3/load_core.py}
 SEND_TX=$P1_BIN/examples/send_tx
 LOAD_TO=0x4242424242424242424242424242424242424242
 for v in $(compgen -e | /usr/bin/grep '^N42_'); do unset "$v"; done

@@ -410,7 +410,15 @@ pub fn sealed_genesis_header(
     genesis: &Genesis,
     hardforks: &ChainHardforks,
 ) -> reth_primitives_traits::SealedHeader<Header> {
-    let header = genesis_header(genesis, hardforks);
+    seal_genesis_header(genesis, genesis_header(genesis, hardforks))
+}
+
+/// Seals a genesis header of `genesis`'s chain: on a profile-1 genesis with
+/// the N42 header's hash (element 22 `0x80`, element 23 the slot number,
+/// element 24 a zero `mobileRegistryRoot`), on every other genesis as reth
+/// does. Any code that edits a genesis header (the QMDB state root, ...)
+/// must reseal it through here, never with alloy's hash.
+pub fn seal_genesis_header(genesis: &Genesis, header: Header) -> reth_primitives_traits::SealedHeader<Header> {
     if !is_profile1(genesis) {
         return reth_primitives_traits::SealedHeader::new_unhashed(header);
     }

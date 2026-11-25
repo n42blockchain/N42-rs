@@ -980,6 +980,32 @@ mod tests {
         assert_eq!(hotstuff.profile1(), Some(&config));
     }
 
+    /// The chain spec the CLI parses from a profile-1 genesis file carries
+    /// gov5's genesis hash (vector V1, and gov5's first mixed genesis, which
+    /// is V1 with another timestamp): the QMDB root rewrite reseals with the
+    /// N42 header's elements 22-24, not with alloy's hash.
+    #[test]
+    fn gov5_genesis_hash_through_the_parser() {
+        let v1 = gov5_dir().join("V1/genesis_8s.json");
+        let spec = parse(&v1).unwrap_or_else(|e| panic!("genesis_8s: {e:#}"));
+        let want: alloy_primitives::B256 =
+            "0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc".parse().expect("a hash");
+        assert_eq!(spec.genesis_hash(), want);
+
+        let mut json: Value = serde_json::from_str(&std::fs::read_to_string(&v1).expect("read V1")).expect("json");
+        json["timestamp"] = Value::String(format!("{:#x}", 1_795_528_800u64));
+        let dir = std::env::temp_dir().join(format!("n42-p1-mixed1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mixed = dir.join("genesis-mixed-1.json");
+        std::fs::write(&mixed, serde_json::to_vec(&json).expect("json")).expect("write");
+        let spec = parse(&mixed);
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = spec.unwrap_or_else(|e| panic!("mixed-1: {e:#}"));
+        let want: alloy_primitives::B256 =
+            "0x2a74856704e6c7284ac988bb853f583240de721bbe48bcb864643356f2f0c6e5".parse().expect("a hash");
+        assert_eq!(spec.genesis_hash(), want);
+    }
+
     /// Each of gov5's 14 refused geneses (V8 `refused/`) is refused here.
     #[test]
     fn gov5_refused_cases_are_refused() {

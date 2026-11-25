@@ -111,3 +111,5 @@ mod profile1_vectors;
 mod profile1_requests;
 #[cfg(test)]
 mod profile1_v5;
+#[cfg(test)]
+mod profile1_node_paths;

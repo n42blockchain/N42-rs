@@ -114,3 +114,7 @@ alloy-signer.workspace = true
 n42-twig-core.workspace = true
 # `parallel_build`'s import tests compare QMDB roots.
 n42-qmdb-state.workspace = true
+# `profile1_node_paths` parses a genesis file as the CLI does and stores
+# headers as the database does.
+reth-cli.workspace = true
+reth-codecs.workspace = true

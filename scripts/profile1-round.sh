@@ -238,6 +238,7 @@ cmd_load_stop() {
   local p
   for p in $(cat "$P1_DIR/load.pids"); do
     # Only a send_tx this run dir started.
+    [ -r "/proc/$p/cmdline" ] || continue
     if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | /usr/bin/grep -qE "^($SEND_TX |python3 -I $P1_LOAD_PY )"; then kill -TERM "$p"; fi
   done
   rm -f "$P1_DIR/load.pids"

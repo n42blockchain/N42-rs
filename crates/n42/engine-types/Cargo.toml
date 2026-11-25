@@ -108,6 +108,8 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 # `claimed_build`'s tests sign the transactions they check the claim of.
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
 secp256k1.workspace = true
+# `profile1_requests` signs its request calls.
+alloy-signer.workspace = true
 # `fields_at_seal`'s tests read QMDB operations.
 n42-twig-core.workspace = true
 # `parallel_build`'s import tests compare QMDB roots.

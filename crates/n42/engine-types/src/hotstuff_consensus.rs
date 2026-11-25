@@ -33,7 +33,7 @@ use alloy_primitives::{logs_bloom, Address, B256, U256};
 use n42_consensus_traits::{AposError, AposResult, SignerManager};
 use n42_h2_consensus::{
     gov5_receipts_root, gov5_rewards_root, validate_gov5_h2_header, validate_gov5_header_tail, HeaderTailRules,
-    withdrawals_to_rewards, HeaderRules, PROFILE1_REQUESTS_HASH,
+    withdrawals_to_rewards, HeaderRules,
     HeaderExtra, ReceiptView, SimulatedCommitteePool,
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -172,6 +172,27 @@ pub enum DeferredExecutionError {
     },
 }
 
+/// Whether the chain's `requestsHash` is a deferred field (AM25,
+/// `docs/MIXED_PRODUCTION_STANDARD.md`): on a profile-1 chain header N carries
+/// the EIP-7685 requests hash of block N-1's execution. On every other chain
+/// a header carries its own requests hash, checked after execution, and the
+/// deferred fields' requests hash is the neutral
+/// [`crate::executed_fields::NO_REQUESTS_HASH`].
+pub fn requests_hash_deferred(genesis: &alloy_genesis::Genesis) -> bool {
+    reth_chainspec::qmdb::is_profile1(genesis)
+}
+
+/// The requests hash a block's execution files among its deferred fields:
+/// EIP-7685's hash of `requests` on a profile-1 chain (AM25), the neutral
+/// [`crate::executed_fields::NO_REQUESTS_HASH`] on every other chain.
+pub fn executed_requests_hash(genesis: &alloy_genesis::Genesis, requests: &alloy_eips::eip7685::Requests) -> B256 {
+    if requests_hash_deferred(genesis) {
+        requests.requests_hash()
+    } else {
+        crate::executed_fields::NO_REQUESTS_HASH
+    }
+}
+
 /// The execution result a header past the fork must carry for `parent`:
 /// the parent's own header if the parent is before the fork (its header
 /// carries its own execution), the registry otherwise.
@@ -218,7 +239,12 @@ pub fn ancestor_executed_fields(
     // The genesis header carries the genesis state by definition, whatever
     // the fork time says; so does every header before the fork.
     if parent.number == 0 || !reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp) {
-        return Some(crate::executed_fields::fields_from_child_header(parent.header()));
+        // On profile 1 the genesis header's requests hash (B8: sha256 of no
+        // requests) is what block 1 carries.
+        return Some(crate::executed_fields::fields_from_child_header_deferring_requests(
+            parent.header(),
+            requests_hash_deferred(genesis),
+        ));
     }
     crate::executed_fields::get(&parent.hash())
 }
@@ -446,7 +472,11 @@ where
             let ancestor = ancestor_hash(parent, depth);
             let expected = ancestor_executed_fields(self.chain_spec.genesis(), parent, depth)
                 .ok_or_else(|| ConsensusError::Other(Arc::new(DeferredExecutionError::ParentUnknown(ancestor))))?;
-            let got = crate::executed_fields::fields_from_child_header(header);
+            // On profile 1 the requests hash is among them (AM25).
+            let got = crate::executed_fields::fields_from_child_header_deferring_requests(
+                header,
+                requests_hash_deferred(self.chain_spec.genesis()),
+            );
             if got != expected {
                 return Err(ConsensusError::Other(Arc::new(DeferredExecutionError::Mismatch {
                     parent: ancestor,
@@ -621,7 +651,10 @@ where
             // The header describes the parent; this block's own result is
             // what its child's header will be checked against. The requests
             // hash is not deferred (section 9 of the proposal): it is this
-            // block's own and is held to the EIP here as before the fork.
+            // block's own and is held to the EIP here as before the fork --
+            // except on a profile-1 chain, where it is deferred too (AM25):
+            // this block's requests hash is filed with its receipts and its
+            // child's header is checked against it.
             // An execution that did not cover the block has nothing to say
             // about it: recording its partial receipts (empty, gas 0) over the
             // build's put every header the leader made afterwards on the
@@ -643,7 +676,13 @@ where
                 return self.validate_requests_hash(header, result);
             }
             let (receipts_root, logs_bloom) = gov5_receipt_root_bloom(&result.receipts);
-            crate::executed_fields::remember_receipts(block.hash(), receipts_root, logs_bloom, result.gas_used);
+            crate::executed_fields::remember_receipts_with_requests(
+                block.hash(),
+                receipts_root,
+                logs_bloom,
+                result.gas_used,
+                executed_requests_hash(self.chain_spec.genesis(), &result.requests),
+            );
             return self.validate_requests_hash(header, result);
         }
         if header.gas_used != result.gas_used {
@@ -700,14 +739,14 @@ where
         // EIP-7685, as on Ethereum: a Prague header carries the hash of the
         // requests its block produced, sha256 of nothing when there are none.
         if self.header_rules.is_profile1() {
-            // Profile 1 (B8, AM24): that hash of no requests, and no
-            // EIP-7685 requests on a native chain.
-            let header_hash = header.requests_hash.ok_or(ConsensusError::RequestsHashMissing)?;
-            if header_hash != PROFILE1_REQUESTS_HASH || !result.requests.is_empty() {
-                return Err(ConsensusError::BodyRequestsHashDiff(
-                    GotExpected { got: result.requests.requests_hash(), expected: header_hash }.into(),
-                ));
-            }
+            // Profile 1 (B8 as amended by AM25): the requests hash is a
+            // deferred field. A block that produces requests is valid; its
+            // requests hash is filed with its receipts and its child's header
+            // carries it (`validate_header_against_parent` checks the carried
+            // value). Here only the presence; the content is ignored, nothing
+            // is credited from a request on the native chain.
+            let _ = result;
+            header.requests_hash.ok_or(ConsensusError::RequestsHashMissing)?;
             return Ok(());
         }
         if self.chain_spec.is_prague_active_at_timestamp(header.timestamp) {
@@ -790,6 +829,7 @@ mod tests {
             receipts_root: B256::repeat_byte(byte + 1),
             logs_bloom: Default::default(),
             gas_used: 21_000,
+            requests_hash: crate::executed_fields::NO_REQUESTS_HASH,
         }
     }
 
@@ -1336,7 +1376,9 @@ mod tests {
 
     /// B3 and B8 on the execution layer: the empty-list ommers hash passes
     /// today's rules and not profile 1's; the empty trie root as the requests
-    /// hash (AM3's value, superseded by AM24) is refused by profile 1.
+    /// hash (AM3's value, superseded by AM24) is refused by profile 1 at
+    /// block 1, which carries the genesis's requests hash (AM25: a deferred
+    /// field; later headers are checked against the parent's execution).
     #[test]
     fn b3_b8_profile1_refuses_what_the_default_accepts() {
         let mut ommers = good_header(5, TS_PRAGUE);
@@ -1344,7 +1386,7 @@ mod tests {
         consensus().validate_header(&sealed(ommers.clone())).expect("today: either ommers spelling");
         let err = profile1_consensus().validate_header(&sealed(ommers)).unwrap_err();
         assert!(err.to_string().contains("B3"), "{err}");
-        let mut requests = good_header(5, TS_PRAGUE);
+        let mut requests = good_header(1, TS_PRAGUE);
         requests.requests_hash = Some(alloy_consensus::EMPTY_ROOT_HASH);
         let err = profile1_consensus().validate_header(&sealed(requests)).unwrap_err();
         assert!(err.to_string().starts_with("B8") || err.to_string().contains("B8"), "{err}");

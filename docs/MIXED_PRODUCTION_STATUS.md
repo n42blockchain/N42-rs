@@ -166,3 +166,14 @@ Sync (§3 of the standard; not item ids, not counted above):
   19 later cases are the equivalents of n42-rs's own 33 `refused_*.json`. Re-copy gov5's 33 to close it.
 - **Sync** (—): `block_by_hash` miss as `0x03`; `bodies_by_range/2`; `commit_qc/1`; the state-sync servers
   (gates 3 and 4).
+
+## Gate 3 PASSED (2026-11-25, round gate3d, T0 08:45 EST)
+
+Mixed catch-up on the AM27 binaries of all three clients (gov5 586e74ce, n42-rs 04ff7b45f, n42-26 follower 5679751):
+heights 0..378 equal across n42-rs v2/v3, gov5's five nodes and n42-26's follower; n42-26 equal to n42-rs's
+heads up to 700. Every header on the AM27 slot grid (deltas 8 x350, 32 x26, 40 x1, every non-8 inside an
+absent-member window). 3a fresh join (15 blocks in 0.1 s, voting after 16 s), 3b/3d gov5 member down twice,
+3c n42-rs member restarted under load (18 blocks in 0.4 s, voting after 26 s), 3e n42-26 follower from genesis.
+0 block refusals, no halt, 52,248 transactions. Open, not a gate criterion: transactions entering at one
+n42-rs member rarely reach the other n42-rs member (fix/profile1-tx-relay).
+

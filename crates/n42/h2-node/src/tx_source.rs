@@ -5,11 +5,22 @@
 //! JSON-RPC so they can be gossiped to the fleet.
 //!
 //! The Engine API's auth endpoint takes transactions but cannot list them,
-//! so this polls the public endpoint: `eth_newPendingTransactionFilter` once,
-//! `eth_getFilterChanges` every half second, `eth_getRawTransactionByHash`
-//! for each new hash. A filter the node forgot (a restart) is made again.
+//! so this polls the public endpoint every half second: a fresh
+//! `eth_newPendingTransactionFilter`, one `eth_getFilterChanges` on the
+//! previous one, `eth_uninstallFilter` for it, and `eth_getRawTransactionByHash`
+//! for each new hash.
+//!
+//! One filter per poll, not one for the life of the task, because reth answers
+//! `eth_getFilterChanges` with nothing -- for a pending-transaction filter too --
+//! until a block has arrived since that filter's last poll
+//! (`filter.block > best_number` in its `EthFilter::filter_changes`); a filter
+//! it has just installed is always answered. A long-lived filter therefore
+//! handed over this pool's transactions once per block, just after the block
+//! committed, and the member that led the next view never had them in time
+//! (profile-1 mixed round gate3d: the member following a Rust member sealed
+//! 3-8 of the 120 transactions submitted at that member).
 
-use alloy_primitives::{Bytes, B256};
+use alloy_primitives::{map::B256HashSet, Bytes, B256};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,29 +104,42 @@ pub async fn poll_pending_transactions(rpc_url: url::Url, sink: mpsc::Sender<Vec
             response.get("result").cloned()
         }
     };
+    // The filter this poll reads, installed by the previous poll.
     let mut filter: Option<Value> = None;
+    // What the previous poll handed over: a transaction admitted between
+    // installing the next filter and reading the current one is in both.
+    let mut previous = B256HashSet::default();
     loop {
         tokio::time::sleep(POLL).await;
         if sink.is_closed() {
             return;
         }
-        if filter.is_none() {
-            filter = call("eth_newPendingTransactionFilter", vec![]).await.filter(|id| !id.is_null());
-            if filter.is_none() {
-                continue;
-            }
-        }
-        let Some(changes) = call("eth_getFilterChanges", vec![filter.clone().expect("set above")]).await
-        else {
-            // The node forgot the filter, or is gone; start over.
-            filter = None;
+        // Installed before the current one is read, so nothing admitted in
+        // between is missed; see the module documentation for why a filter
+        // is read only once.
+        let next = call("eth_newPendingTransactionFilter", vec![]).await.filter(|id| !id.is_null());
+        let Some(current) = filter.take() else {
+            filter = next;
             continue;
         };
-        if changes.is_null() {
-            filter = None;
-            continue;
+        let changes = call("eth_getFilterChanges", vec![current.clone()]).await.filter(|changes| !changes.is_null());
+        if next.is_some() {
+            // Read once; reth would answer it again only after a block.
+            let _ = call("eth_uninstallFilter", vec![current]).await;
+            filter = next;
+        } else if changes.is_some() {
+            // The node took no new filter: keep reading this one, which still
+            // answers once a block.
+            filter = Some(current);
         }
+        let Some(changes) = changes else {
+            // The node forgot the filter (a restart), or is gone; a new one is
+            // made on the next poll.
+            continue;
+        };
         let hashes: Vec<B256> = serde_json::from_value(changes).unwrap_or_default();
+        let hashes: Vec<B256> = hashes.into_iter().filter(|hash| !previous.contains(hash)).collect();
+        previous = hashes.iter().copied().collect();
         let mut batch = Vec::with_capacity(hashes.len());
         for hash in hashes {
             if let Some(raw) = call("eth_getRawTransactionByHash", vec![json!(hash)]).await

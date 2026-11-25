@@ -1,4 +1,4 @@
-# N42 mixed block production standard, profile 1 — v1.0-rc3, frozen 2026-11-24
+# N42 mixed block production standard, profile 1 — v1.0-rc4, frozen 2026-11-24 (rc4: AM27, 2026-11-25)
 
 This is the single normative text of profile 1. It consolidates `docs/MIXED_PRODUCTION_STANDARD.md`
 (v0.2 + decisions O1-O10 of 2026-11-23 + the `0x50`-`0x5F` reservation + amendments AM1-AM23) and the pins
@@ -125,8 +125,14 @@ rotates it (A22).
 `maxTimeoutMs ≥ baseTimeoutMs`. Standard values: **24000** and **96000**. The view timer runs from view start;
 the base timeout exceeds the slot plus a block's build plus two network hops.
 
-**A17. Block interval.** `config.hotstuff.blockIntervalMs`, mandatory: a leader proposes no earlier than this
-long after it first held the parent. It is pacing, not a timestamp step (B4). Standard value: **8000**.
+**A17. Block interval and slot grid (AM27).** `config.hotstuff.blockIntervalMs` = I, mandatory; standard value
+**8000**. Time is divided into slots counted from the genesis timestamp G, as on the Ethereum beacon chain
+(slot s starts at `G + s·I`; geth `beacon/light/committee_chain.go:499-500` uses the same arithmetic):
+there is no per-block drift. A leader holding parent P (slot `sP = (P.time − G)/I`) proposes in slot
+`s = max(sP + 1, ceil((now − G)/I))` — the first slot boundary that is after the parent's slot and not in
+the past — publishes no earlier than `G + s·I`, and stamps `header.time = G + s·I` (so the timestamp is
+known before the wait and a pipelined build can use it). A leader that enters its view mid-slot (after a
+TC, or a late parent) waits for the next boundary.
 
 **A18. Epochs.** `config.hotstuff.epochLength` E, mandatory, `E ≥ 1` views (missing or 0 refuses the genesis);
 `epoch(v) = (v−1)/E`; boundary b: `b > 1` and `(b−1) mod E = 0`. Standard value: **10800** (about 24 h). With a
@@ -167,10 +173,10 @@ or a seal by any key but the view's leader makes the header invalid.
 hash is invalid), no ommers, `coinbase` = the proposer's address. All checked, in every header including
 genesis.
 
-**B4. Timestamp.** `parent.time ≤ header.time` is checked on import; `header.time ≤ floor(local_now) + 2` is
-checked only before voting (never on import of a committed block). The leader stamps
-`max(parent.time, floor(now))`. Equal timestamps are valid (Ethereum's strict `>` does not apply). How a
-leader caches its stamp across a restart is local.
+**B4. Timestamp (AM27).** Checked on import: `(header.time − G) mod I = 0` (on the slot grid) and
+`header.time ≥ parent.time + I` (a later slot). Checked only before voting (never on import of a committed
+block): `header.time ≤ floor(local_now) + 2`. The leader's stamp is A17's slot start. Supersedes AM26
+(stamp at proposal time) and the rc3 rule `max(parent.time, floor(now))`.
 
 **B5. parentBeaconRoot.** `Blake3(committee evidence(parent.number, parent.hash, parent.receiptsRoot))` from
 the committee pool (A19); zero for block 1.
@@ -613,6 +619,7 @@ that settled them).
 | AM23 | gov5 agrees AM19; fallback adopted; committee pool kept, no security meaning | A13, B11, I2, A19 |
 | AM24 | owner decision: requestsHash = EIP-7685's `sha256("")`; genesis hash and V1/V3/V4/V6 regenerated (rc2) | B8, A6, §4, §5 |
 | AM25 | owner decision: requests produced as on Ethereum and ignored; requestsHash carried as a deferred field (rc3) | A10, B8, A13, §5 (V5) |
+| AM27 | owner decision 2026-11-25: slots counted from the genesis timestamp (beacon-chain style, no cumulative drift); timestamp = slot start; B4 grid + later-slot checks; supersedes AM26 | A17, B4 |
 | gov5 02:55 readings (accepted in v0.2.1) | D3 caller only if changed; D5 gap; C6 no exemption; ommers zero in genesis; B15 gossip; J4 extra entries | D3, D5, C6, B3, B15, J4 |
 | gov5 02:55 | type `0x05` refused | C4 |
 | PN gov5 03:46 (V1 readings, unobjected; V1 equal both ways 04:09/04:28) | QC ancestry checked when known; "QC absent only while none" not enforced; stamp cache local | B1, B4 |

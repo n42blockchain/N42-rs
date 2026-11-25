@@ -930,3 +930,8 @@ again. Any user could trigger it.
   block carrying their hash.
 - gov5: CHANGE (record the requests hash with the executed result, carry it, check it; stop refusing requests).
   n42-rs: CHANGE (same; `validate_requests_hash` on profile 1). n42-26: CHANGE when it implements A10.
+
+## Amendment AM27 (2026-11-25, owner decision): slot grid from the genesis timestamp
+
+The owner ruled that block timing is an offset from genesis and must not accumulate drift ("区块链计时规则是从创世块起计算偏移，不累计偏差，看下geth"). Evidence that prompted it: gate-2 and pre-run deltas 0/16/8/8 (AM26 stamping) and the occasional 9 s from "first held the parent + I" pacing. geth references: beacon slots `GenesisTime + slot·12` (beacon/light/committee_chain.go:499-500); clique `parent.Time + Period`, raised to now only when late (consensus/clique/clique.go:567-569). AM27 takes the beacon form: slot s starts at G + s·I; the leader proposes in the first slot after the parent's that is not in the past, publishes at its start and stamps that start; B4 adds on-grid and later-slot checks on import. Text: V1_RC rc4 A17/B4. Supersedes AM26.
+

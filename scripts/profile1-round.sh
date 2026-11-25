@@ -8,6 +8,7 @@
 #   scripts/profile1-round.sh init | up | status | headers <from> <to> | catchup <i> |
 #                             load <tx/s> <seconds> | load-genesis <out> | stop | down |
 #                             snapshot-join <i> <from>
+#                             snapshot-export <from> <dir> | snapshot-import <i> <bundle dir>
 #
 #   stop                  SIGTERM P1_MEMBERS (validator, then EL), datadirs kept; `up`
 #                         restarts them and catches up from where they stopped (the
@@ -423,31 +424,29 @@ cmd_down() {
 }
 
 
-# snapshot-join <i> <from>: see the header.
-cmd_snapshot_join() {
-  # cmd_stop / cmd_up loop over a global `i`: this function names its members
-  # sj_i / sj_from so their calls cannot change them (bash scoping is dynamic).
-  local sj_i=${1:?member} sj_from=${2:?from member} snap="$P1_DIR/snap-$1" n src j
+# snapshot-export <from> <dir>: a complete bundle of member <from>'s state in <dir>/bundle
+# (stop <from>, `n42-init-snapshot export --bundle`, restart, anchor, genesis.json).
+# Prints the bundle height; usable by gov5's importer and by snapshot-import.
+cmd_snapshot_export() {
+  local sx_from=${1:?from member} snap=${2:?out dir} n src j sx_skip=${3:-}
   local init_bin=$P1_BIN/n42-init-snapshot
   [ -x "$init_bin" ] || { echo "missing $init_bin" >&2; exit 1; }
-  [ -f "$(mdir "$sj_i")/peer-id" ] || { echo "member $sj_i is not initialised in $P1_DIR" >&2; exit 1; }
-  [ "$(member_alive "$sj_i")" = 0 ] || { echo "member $sj_i is running; stop it first" >&2; exit 1; }
-  el_alive "$sj_from" || { echo "member $sj_from is not running" >&2; exit 1; }
+  el_alive "$sx_from" || { echo "member $sx_from is not running" >&2; exit 1; }
   rm -rf "$snap"; mkdir -p "$snap"
-  echo "snapshot-join: stopping member $sj_from to export at $(date -u +%H:%M:%S)"
-  P1_MEMBERS=$sj_from cmd_stop
-  taskset -c "$P1_CPUS" "$init_bin" export --datadir "$(mdir "$sj_from")/el" --chain "$G" \
+  echo "snapshot-export: stopping member $sx_from to export at $(date -u +%H:%M:%S)"
+  P1_MEMBERS=$sx_from cmd_stop
+  taskset -c "$P1_CPUS" "$init_bin" export --datadir "$(mdir "$sx_from")/el" --chain "$G" \
     --bundle "$snap/bundle" > "$snap/export.log" 2>&1
   local rc=$?
-  P1_MEMBERS=$sj_from cmd_up > "$snap/restart-$sj_from.log" 2>&1
-  echo "member $sj_from restarted at $(date -u +%H:%M:%S)"
+  P1_MEMBERS=$sx_from cmd_up > "$snap/restart-$sx_from.log" 2>&1
+  echo "member $sx_from restarted at $(date -u +%H:%M:%S)"
   [ $rc = 0 ] || { echo "export failed: $snap/export.log" >&2; tail -5 "$snap/export.log" >&2; exit 1; }
   n=$(strip "$snap/export.log" | /usr/bin/grep -aoE '^head: block [0-9]+' | awk '{print $3}')
   echo "export: $(strip "$snap/export.log" | /usr/bin/grep -aE '^(head|state|QMDB)' | tr '\n' ';')"
-  # The anchor: N+1 and the headers after it, from a running member other than i.
+  # The anchor: N+1 and the headers after it, from a running member (not the joiner).
   local want=$((n + ${P1_ANCHOR_HEADERS:-4}))
   src=
-  for j in $(members_all); do [ "$j" != "$sj_i" ] && el_alive "$j" && { src=$j; break; }; done
+  for j in $(members_all); do [ "$j" != "$sx_skip" ] && el_alive "$j" && { src=$j; break; }; done
   [ -n "$src" ] || { echo "no running member to read the anchor from" >&2; exit 1; }
   for _ in $(seq 1 ${P1_ANCHOR_WAIT:-600}); do [ "$(height "$src")" -ge "$want" ] 2>/dev/null && break; sleep 1; done
   [ "$(height "$src")" -ge "$want" ] || { echo "member $src did not reach block $want" >&2; exit 1; }
@@ -466,13 +465,34 @@ PY
   echo "$(strip "$snap/anchor.log" | /usr/bin/grep -a '^anchor:') (headers from member $src)"
   # gov5's bundle carries the genesis too (its validator set checks the QC).
   cp "$G" "$snap/bundle/genesis.json"
-  local d; d=$(mdir "$sj_i")
-  rm -rf "$d/el" "$d/consensus"
-  taskset -c "$P1_CPUS" "$init_bin" init --datadir "$d/el" --chain "$G" --bundle "$snap/bundle" \
-    > "$snap/init.log" 2>&1 || { echo "init failed: $snap/init.log" >&2; tail -5 "$snap/init.log" >&2; exit 1; }
-  echo "init: $(strip "$snap/init.log" | /usr/bin/grep -aE '^(bundle|head|anchor|state|QMDB)' | tr '\n' ';')"
   echo "$n" > "$snap/height"
-  P1_MEMBERS=$sj_i cmd_up
+  echo "bundle ready: $snap/bundle (block $n)"
+}
+
+# snapshot-import <i> <bundle dir>: wipe member i (not running), `init --bundle` its EL
+# from <bundle dir> (ours or gov5's; k=1, checked against N+1's root under a CommitQC), start it.
+cmd_snapshot_import() {
+  local si_i=${1:?member} bundle=${2:?bundle dir} d
+  local init_bin=$P1_BIN/n42-init-snapshot
+  [ -x "$init_bin" ] || { echo "missing $init_bin" >&2; exit 1; }
+  [ -f "$(mdir "$si_i")/peer-id" ] || { echo "member $si_i is not initialised in $P1_DIR" >&2; exit 1; }
+  [ "$(member_alive "$si_i")" = 0 ] || { echo "member $si_i is running; stop it first" >&2; exit 1; }
+  [ -d "$bundle" ] || { echo "no bundle at $bundle" >&2; exit 1; }
+  d=$(mdir "$si_i"); mkdir -p "$P1_DIR/import-$si_i"
+  rm -rf "$d/el" "$d/consensus"
+  taskset -c "$P1_CPUS" "$init_bin" init --datadir "$d/el" --chain "$G" --bundle "$bundle" \
+    > "$P1_DIR/import-$si_i/init.log" 2>&1 || { echo "init failed: $P1_DIR/import-$si_i/init.log" >&2; tail -5 "$P1_DIR/import-$si_i/init.log" >&2; exit 1; }
+  echo "init: $(strip "$P1_DIR/import-$si_i/init.log" | /usr/bin/grep -aE '^(bundle|head|anchor|state|QMDB)' | tr '\n' ';')"
+  P1_MEMBERS=$si_i cmd_up
+}
+
+# snapshot-join <i> <from>: see the header (export from <from>, import into i).
+cmd_snapshot_join() {
+  local sj_i=${1:?member} sj_from=${2:?from member}
+  [ -f "$(mdir "$sj_i")/peer-id" ] || { echo "member $sj_i is not initialised in $P1_DIR" >&2; exit 1; }
+  [ "$(member_alive "$sj_i")" = 0 ] || { echo "member $sj_i is running; stop it first" >&2; exit 1; }
+  ( cmd_snapshot_export "$sj_from" "$P1_DIR/snap-$sj_i" "$sj_i" ) || exit 1
+  cmd_snapshot_import "$sj_i" "$P1_DIR/snap-$sj_i/bundle"
 }
 
 case ${1:-} in
@@ -485,6 +505,8 @@ case ${1:-} in
   load-genesis) shift; cmd_load_genesis "$@" ;;
   stop) cmd_stop ;;
   snapshot-join) shift; cmd_snapshot_join "$@" ;;
+  snapshot-export) shift; cmd_snapshot_export "$@" ;;
+  snapshot-import) shift; cmd_snapshot_import "$@" ;;
   down) cmd_down ;;
   *) sed -n '2,40p' "$0"; exit 2 ;;
 esac

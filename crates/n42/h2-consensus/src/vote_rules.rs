@@ -16,6 +16,7 @@
 //! | Vote transport | `N42_VOTE_TRANSPORT=direct` may skip the consensus topic | every vote is published on the consensus topic |
 //! | `N42_VOTE_BEFORE_SLOT` | the vote may go out with the block's execution held | off |
 //! | Settlement tags | `split` or `legacy` | `split` only; `finalized` needs a reported persisted height |
+//! | Genesis justify | passes the extends rule whatever the parent | the block's parent has to be the genesis block |
 //! | `mobileRegistryRoot` without a mobileverify service | the build carries none (and fails on a MobileAnchor chain) | the parent's root is repeated (AM21/AM23) |
 //!
 //! The rules are local switches set once before a node runs; what maps a
@@ -75,6 +76,15 @@ impl VoteRules {
         self.profile1
     }
 
+    /// A Round 1 vote on a proposal justified by the genesis QC needs the
+    /// block's parent to be the genesis block (E6: a proposal extends the
+    /// block its justify certifies; gov5 refuses "block justified by the
+    /// genesis QC does not extend genesis" on profile 1). Off, a genesis
+    /// justify passes the extends rule whatever the parent.
+    pub const fn genesis_justify_extends_genesis(self) -> bool {
+        self.profile1
+    }
+
     /// A leader without a mobileverify service repeats its parent's
     /// `mobileRegistryRoot` instead of building without one.
     pub const fn repeat_parent_registry_root(self) -> bool {
@@ -98,6 +108,7 @@ mod tests {
         assert!(today.legacy_settlement_allowed());
         assert!(!today.finalized_needs_reported_persistence());
         assert!(!today.repeat_parent_registry_root());
+        assert!(!today.genesis_justify_extends_genesis());
         let p1 = VoteRules::PROFILE1;
         assert!(p1.round1_needs_check());
         assert!(p1.commit_vote_needs_own_import());
@@ -107,5 +118,6 @@ mod tests {
         assert!(!p1.legacy_settlement_allowed());
         assert!(p1.finalized_needs_reported_persistence());
         assert!(p1.repeat_parent_registry_root());
+        assert!(p1.genesis_justify_extends_genesis());
     }
 }

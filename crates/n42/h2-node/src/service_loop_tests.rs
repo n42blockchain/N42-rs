@@ -367,6 +367,41 @@ async fn a_leader_builds_publishes_and_marks_the_view_proposed() {
     assert_eq!(builds(rig.el.calls()), before, "no second build for a proposed view");
 }
 
+/// The first mixed profile-1 round (p1mixed-2): view 2's block 1 was
+/// refused by every voter, yet the leaders' execution layers imported it;
+/// after the timeout certificate the next leader -- still on the genesis QC
+/// -- built view 3's block on that block 1 because the genesis QC left "the
+/// head" in charge, and the fleet refused it ("block justified by the genesis
+/// QC does not extend genesis"). Under the genesis QC the parent is the
+/// genesis block, whatever the execution layer imported since.
+#[tokio::test]
+async fn under_the_genesis_qc_a_leader_builds_on_genesis_not_on_an_uncertified_import() {
+    let rig = node(1, 0, None).await;
+    let mut svc = rig.svc.with_payload_attributes(|context| Some(attributes_for(&context)));
+    let uncertified = MockExecutionLayer::built_block_on(1, ID.genesis_hash);
+    within(svc.driver.import_own_block(&uncertified)).await.expect("block 1 imported");
+    assert_eq!(svc.driver.head(), uncertified.hash, "the execution layer's head is the uncertified block");
+    assert_eq!(svc.engine().locked_qc().view, 0, "no QC formed");
+    let view = svc.engine().current_view();
+    let mut events = Vec::new();
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert_eq!(svc.proposed_view, Some(view));
+    let parents: Vec<B256> = rig
+        .el
+        .calls()
+        .iter()
+        .filter_map(|c| match c {
+            ElCall::ForkchoiceUpdatedWithAttrs(state) => Some(state.head_block_hash),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parents, vec![ID.genesis_hash], "built on genesis, not on block 1");
+    assert!(
+        svc.outbox.iter().any(|m| matches!(m, Msg::Proposal(p) if p.view == view && p.justify_qc.view == 0)),
+        "the proposal carries the genesis QC it extends"
+    );
+}
+
 #[tokio::test]
 async fn a_failed_build_is_not_retried_inside_the_same_view() {
     let rig = node(1, 0, None).await;

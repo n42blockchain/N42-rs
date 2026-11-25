@@ -449,6 +449,10 @@ pub struct ConsensusEngine {
     /// Parent hash of every imported block still in `imported_blocks`, as the
     /// orchestrator reported it; what the extends rule reads.
     pub(super) imported_parents: HashMap<B256, B256>,
+    /// The genesis block's hash: the block the genesis QC certifies, which
+    /// the extends rule reads under profile 1 (zero: not known, see
+    /// [`Self::set_genesis_block`]).
+    pub(super) genesis_block: B256,
     /// A signature or certificate in the message being processed that did
     /// not verify where the message is dropped quietly; reported as
     /// [`ConsensusError::Unauthenticated`] once the message is done.
@@ -601,6 +605,7 @@ impl ConsensusEngine {
             vote_before_import: false,
             two_phase_vote_gate: false,
             vote_rules: crate::VoteRules::TODAY,
+            genesis_block: B256::ZERO,
             executed_blocks: HashSet::new(),
             held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
@@ -727,6 +732,7 @@ impl ConsensusEngine {
             vote_before_import: false,
             two_phase_vote_gate: false,
             vote_rules: crate::VoteRules::TODAY,
+            genesis_block: B256::ZERO,
             executed_blocks: HashSet::new(),
             held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
@@ -1124,6 +1130,13 @@ impl ConsensusEngine {
         }
     }
 
+    /// Names the genesis block, the block the genesis QC certifies: under
+    /// profile 1 a proposal justified by the genesis QC has to be its child
+    /// ([`crate::VoteRules::genesis_justify_extends_genesis`]).
+    pub fn set_genesis_block(&mut self, genesis: B256) {
+        self.genesis_block = genesis;
+    }
+
     /// The vote rules in force; see [`Self::set_vote_rules`].
     pub const fn vote_rules(&self) -> crate::VoteRules {
         self.vote_rules
@@ -1318,6 +1331,17 @@ impl ConsensusEngine {
 
     pub fn locked_qc(&self) -> &QuorumCertificate {
         self.round_state.locked_qc()
+    }
+
+    /// The block this node's next proposal has to extend: the block its
+    /// highest QC -- the justify the proposal will carry, a TC's high QC
+    /// included -- certifies (E6). The genesis QC certifies the genesis
+    /// block ([`Self::set_genesis_block`]); zero when that is not named.
+    /// Never the head of the execution layer: a block it imported without a
+    /// QC is not certified, and a proposal on it does not extend its justify.
+    pub fn proposal_parent(&self) -> B256 {
+        let certified = self.round_state.locked_qc().block_hash;
+        if certified == B256::ZERO { self.genesis_block } else { certified }
     }
 
     pub fn last_committed_qc(&self) -> &QuorumCertificate {

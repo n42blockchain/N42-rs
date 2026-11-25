@@ -44,6 +44,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", keypair.public().to_peer_id());
                 return Ok(());
             }
+            // The 48-byte public key of each hex BLS secret that follows, one
+            // per line: what a genesis lists as a validator's `blsKey`.
+            "--bls-public-key" => {
+                let secrets: Vec<String> = args.collect();
+                if secrets.is_empty() {
+                    return Err("--bls-public-key needs at least one hex BLS secret".into());
+                }
+                for secret in secrets {
+                    let bytes: [u8; 32] = hex::decode(secret.trim().trim_start_matches("0x"))?
+                        .try_into()
+                        .map_err(|_| "a BLS secret is 32 bytes")?;
+                    let key = BlsSecretKey::from_bytes(&bytes)?;
+                    println!("0x{}", hex::encode(key.public_key().to_bytes()));
+                }
+                return Ok(());
+            }
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 return Ok(());
@@ -111,4 +127,6 @@ h2_keygen — generate BLS validator keys and a fleet's validator list
   --count <n>       how many validators to generate (default 4)
   --out-dir <path>  where to write them (default .)
   --seed <label>    derive keys from the label instead of randomness (dev only)
+  --libp2p-peer-id <hex>       print the peer id of a secp256k1 node key
+  --bls-public-key <hex>...    print the BLS public key of each secret, one per line
 ";

@@ -1,5 +1,7 @@
 # Mixed production standard, profile 1: status per client
 
+**2026-11-24 21:15 EST — gate 2 PASSED.** Mixed round 3 (gov5 v0/v1 + n42-rs v2/v3, genesis-mixed-3 0xe6b358e8…): heights 0..227 byte-equal on all four, each validator led 57-58 blocks, 0 refusals, timeouts only at startup. Round 2 (12:00) was void and found the n42-rs justify-extension defect (fixed, main d8185220d) and a gov5 rebuild-on-genesis defect (fixed, gov5 1d72bf1b). Open from round 3: A17 timestamp stamping point (gov5 stamps at build start, n42-rs at publication), proposal AM26.
+
 As of 2026-11-24 (after the 05:05 EST post). Rules: `docs/MIXED_PRODUCTION_STANDARD_V1_RC.md` (v1.0-rc2).
 
 Levels: `—` not done · `impl` implemented · `vec` the item's vector passes · `mix` a profile-1 mixed round

@@ -467,7 +467,7 @@ fn init_refuses_a_dump_the_snapshot_does_not_authenticate() {
     assert!(format!("{err:#}").contains("ascending"), "repeated account: {err:#}");
 }
 
-/// HEADER_FIELD_PARITY.md 7.1: a head sealed under MobileAnchor and
+/// `HEADER_FIELD_PARITY.md` 7.1: a head sealed under `MobileAnchor` and
 /// Glamsterdam carries `mobileRegistryRoot` at element 24. Decoded as
 /// Ethereum's header it was refused (alloy stops at `slot_number`); decoded as
 /// `N42Header` it keeps the root, so the head hashes to the chain's hash, the
@@ -510,7 +510,7 @@ fn init_starts_at_a_head_that_carries_a_registry_root() {
     assert_eq!(provider.block_hash(1).unwrap(), Some(header.hash_slow()));
 }
 
-/// A four-member set, its rules (the CommitQC check only: `profile1` off so
+/// A four-member set, its rules (the `CommitQC` check only: `profile1` off so
 /// the plain test headers need no seal) and its secret keys.
 fn qc_rules() -> (n42_h2_consensus::HeaderRules, Vec<n42_h2_primitives::BlsSecretKey>) {
     let keys: Vec<_> = (1u8..=4).map(|i| n42_h2_primitives::BlsSecretKey::from_bytes(&[i; 32]).unwrap()).collect();
@@ -602,7 +602,7 @@ fn a_snapshot_anchor_is_trusted_only_under_a_commit_qc_of_the_set() {
     let embedded = anchor_chain(head, 2, |_| profile1_extra(100, &[]));
     let n2 = embedded[1].hash_slow();
     let qc2 = commit_qc(&rules, &keys, 102, n2, &[1, 2, 3]);
-    let mut chain = embedded.clone();
+    let mut chain = embedded;
     let third = n42_header::N42Header::from(Header {
         number: 43,
         parent_hash: n2,
@@ -613,7 +613,7 @@ fn a_snapshot_anchor_is_trusted_only_under_a_commit_qc_of_the_set() {
     assert_eq!(check_anchor_chain(&rules, head, &chain, None).unwrap(), 42);
     // The anchor must be the head's child, and the chain must link.
     assert!(check_anchor_chain(&rules, (41, head.1), &headers, Some(&qc)).is_err());
-    let mut broken = headers.clone();
+    let mut broken = headers;
     broken[1].parent_hash = B256::ZERO;
     assert!(check_anchor_chain(&rules, head, &broken, Some(&qc)).unwrap_err().to_string().contains("does not follow"));
 }

@@ -75,7 +75,7 @@ enum Command {
     /// Writes a datadir's head state as a snapshot.
     Export(ExportArgs),
     /// Completes an exported bundle with its anchor: header P+1, the
-    /// CommitQC on P+1 or later and the headers below it (`commit-qc.bin`),
+    /// `CommitQC` on P+1 or later and the headers below it (`commit-qc.bin`),
     /// and the manifest.
     Anchor(AnchorArgs),
 }
@@ -88,7 +88,7 @@ struct AnchorArgs {
     /// The bundle directory `export --bundle` wrote.
     #[arg(long, value_name = "DIR")]
     bundle: PathBuf,
-    /// Headers max(P-255, 1)..P+k, k past the first one embedding a CommitQC
+    /// Headers max(P-255, 1)..P+k, k past the first one embedding a `CommitQC`
     /// on P+1 or later (hex lines, e.g. `debug_getRawHeader`, or raw RLP).
     #[arg(long, value_name = "HEADERS")]
     headers: PathBuf,
@@ -126,7 +126,7 @@ struct InitArgs {
     qmdb: Option<PathBuf>,
     /// A profile-1 snapshot bundle directory (gov5's layout,
     /// `bin/n42/src/snapshot_bundle.rs`): stands for the four files and the
-    /// CommitQC, and its manifest is checked.
+    /// `CommitQC`, and its manifest is checked.
     #[arg(long, value_name = "DIR", conflicts_with_all = ["state", "header", "qmdb", "anchor", "commit_qc"])]
     bundle: Option<PathBuf>,
     /// Under deferred execution (depth 1): the head's child N+1 and the
@@ -134,7 +134,7 @@ struct InitArgs {
     /// e.g. `debug_getRawHeader` of N+1..N+4 from a member). Header N carries
     /// the state after N-1; the state after N, which the snapshot holds, is
     /// certified by N+1, and so are N's receipts root, bloom, gas used and
-    /// requests hash. N+1 is trusted only once a CommitQC names it or a
+    /// requests hash. N+1 is trusted only once a `CommitQC` names it or a
     /// descendant: one embedded in a later header of this file, or `--commit-qc`.
     #[arg(long, value_name = "HEADERS_RLP")]
     anchor: Option<PathBuf>,
@@ -143,7 +143,7 @@ struct InitArgs {
     /// the right hashes; a bundle supplies them from `commit-qc.bin`.
     #[arg(long, value_name = "HEADERS_RLP", conflicts_with = "bundle")]
     ancestors: Option<PathBuf>,
-    /// A CommitQC (gov5's wire encoding, raw or hex) naming N+1 or a later
+    /// A `CommitQC` (gov5's wire encoding, raw or hex) naming N+1 or a later
     /// header of `--anchor`, when no anchor header embeds one.
     #[arg(long, value_name = "QC")]
     commit_qc: Option<PathBuf>,
@@ -345,7 +345,7 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
 }
 
 /// The portable layout on this chain: on profile 1 only `0x03` (P5 removes
-/// `0x01`, MIXED_PRODUCTION_STANDARD_V1_RC §3), so an unset format is V2 and
+/// `0x01`, `MIXED_PRODUCTION_STANDARD_V1_RC` §3), so an unset format is V2 and
 /// V1 is refused; elsewhere `format` as given.
 fn profile1_format(genesis: &alloy_genesis::Genesis, format: Option<PortableFormat>) -> eyre::Result<Option<PortableFormat>> {
     let profile1 = n42_qmdb_reth::profile1::profile1(genesis).map_err(|e| eyre::eyre!("{e}"))?.is_some();
@@ -419,10 +419,8 @@ fn bundle_anchor(
     if descending.iter().find(|h| h.number == header.number + 1) != Some(&next) {
         bail!("commit-qc.bin does not hold next-header.rlp as block {}", header.number + 1);
     }
-    if let Some(p) = descending.iter().find(|h| h.number == header.number) {
-        if p != header {
-            bail!("commit-qc.bin's block {} is not the bundle's header", header.number);
-        }
+    if descending.iter().any(|h| h.number == header.number && h != header) {
+        bail!("commit-qc.bin's block {} is not the bundle's header", header.number);
     }
     let mut ancestors: Vec<_> = descending.iter().filter(|h| h.number < header.number).cloned().collect();
     ancestors.reverse();
@@ -551,9 +549,9 @@ fn anchor_for(
 /// Checks the anchor chain of a snapshot at `head`: `headers` start at the
 /// head's child and link parent to child; each passes the chain's header
 /// rules (on profile 1: the fields, the proposer's seal and any embedded QC,
-/// a commit-domain QC of the genesis set, B1/B2/E13); and a CommitQC names
+/// a commit-domain QC of the genesis set, B1/B2/E13); and a `CommitQC` names
 /// one of them -- `commit_qc` if given, else one embedded in a later header
-/// (SYNC §5.3.1: a CommitQC on a block at or past P+k). Returns the number of
+/// (SYNC §5.3.1: a `CommitQC` on a block at or past P+k). Returns the number of
 /// the block the QC names.
 fn check_anchor_chain(
     rules: &n42_h2_consensus::HeaderRules,

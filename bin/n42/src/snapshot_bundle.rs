@@ -54,7 +54,7 @@ pub struct Manifest {
     pub post_state_root: B256,
     /// 1 on profile 1.
     pub deferred_depth: u64,
-    /// The anchoring CommitQC's view.
+    /// The anchoring `CommitQC`'s view.
     pub anchor_qc_view: u64,
     /// The block the QC names.
     pub anchor_block_number: u64,
@@ -164,10 +164,8 @@ pub fn check_descending_links(headers: &[N42Header], genesis_hash: B256) -> eyre
             eyre::bail!("commit_qc headers: {} does not extend {}", pair[0].number, pair[1].number);
         }
     }
-    if let Some(lowest) = headers.last() {
-        if lowest.number == 1 && lowest.parent_hash != genesis_hash {
-            eyre::bail!("commit_qc headers: block 1 does not extend the genesis {genesis_hash}");
-        }
+    if let Some(lowest) = headers.last().filter(|lowest| lowest.number == 1 && lowest.parent_hash != genesis_hash) {
+        eyre::bail!("commit_qc headers: block {} does not extend the genesis {genesis_hash}", lowest.number);
     }
     Ok(())
 }
@@ -197,7 +195,7 @@ mod tests {
         let bytes = encode_commit_qc_payload(&qc, &headers).unwrap();
         assert_eq!(decode_commit_qc_payload(&bytes).unwrap(), (qc, headers.clone()));
         assert!(decode_commit_qc_payload(&bytes[..bytes.len() - 1]).is_err());
-        let mut longer = bytes.clone();
+        let mut longer = bytes;
         longer.push(0);
         assert!(decode_commit_qc_payload(&longer).is_err());
         check_descending_links(&headers, B256::repeat_byte(1)).unwrap();

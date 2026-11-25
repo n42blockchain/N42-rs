@@ -29,7 +29,7 @@ pub fn anchor_path(qmdb_dir: &Path) -> PathBuf {
 /// Checks that `anchor` is the child of the head `(number, hash)` and carries
 /// `root`, the state after the head. The anchor's own seal and QC are not
 /// checked here: the first pulled block the node imports is the anchor
-/// itself or its descendant, executed only once a CommitQC names it (SYNC
+/// itself or its descendant, executed only once a `CommitQC` names it (SYNC
 /// §3.3), and that import compares the carried fields with the ones filed.
 pub fn check(anchor: &N42Header, head: (u64, B256), root: B256) -> eyre::Result<()> {
     check_child(anchor, head)?;

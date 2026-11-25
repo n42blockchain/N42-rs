@@ -108,3 +108,18 @@ would have sent each relayed timeout to its 98 connected peers (~66 relays x 98 
   (`timeout.go:137-195`), so its TC path is linear per node. Nothing in its wire format has to change.
 - **Timing.** 100 validators on one host cost ~1.5 cores idle; a mixed round adds gov5's processes. The
   killed leader costs one `baseTimeoutMs` (24 s) view, and 33 absent members leave exactly q = 67.
+
+## 7. Follow-up rounds (2026-11-25, before merge)
+
+- **r100x, 33 absent at n = 100** (`/data/n42-build/p1-many/r100x.out`): validators 1, 4, ..., 97 SIGTERMed at
+  06:31:51Z for 4 min. The other 67 (exactly q) committed on: height 12 -> 29, and each absent leader's view
+  (16, 19, ..., 37: 8 views) timed out and ended in a TC formed by all 67. They came back at 06:35:56Z; all 33
+  voted from view 38 (06:36:13Z, 17 s later), and height reached 50 with equal heads on the four layers. 52 views
+  led by 52 leaders, build -> PrepareQC p50 41 ms, 0 refusals, 0 halts.
+- **Native devnet** (`scripts/devnet-fleet.sh`, `ABSENT_VALIDATOR=3 ABSENT_AT=60 ABSENT_FOR=60`, 180 s,
+  `/data/n42-build/p1-many/devnet.out`): 56 commits; the 10 timeouts were member 3's views while it was away.
+  Member 3 came back, pulled 21 -> 36, committed from view 43, and its block 56 hash equals main's.
+- **Four-member profile-1 round** (`scripts/profile1-round.sh`, member 3 stopped for 120 s,
+  `/data/n42-build/p1-many/p1r4.out`): equal heads at 37 on all four. Member 3 pulled 8 blocks in 0.1 s,
+  voted 10 s after its start and led view 27. The others timed out 3 times, on member 3's views. 0 non-benign
+  refusals: the round script now treats a late batched vote as benign (453b9c1ad).

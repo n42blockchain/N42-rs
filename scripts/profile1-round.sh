@@ -231,7 +231,7 @@ cmd_load_stop() {
 # view after that, and every refusal / timeout / halt.
 cmd_catchup() {
   local i=${1:?member}; local d; d=$(mdir "$i")
-  strip "$d/v.log" | python3 -I - "$REFUSAL_RE" "$BENIGN_RE" <<'PY2'
+  python3 -I - "$REFUSAL_RE" "$BENIGN_RE" <(strip "$d/v.log") <<'PY2'
 import re, sys
 refusal, benign = re.compile(sys.argv[1]), re.compile(sys.argv[2])
 ts = re.compile(r"^(\S+Z)\s")
@@ -239,7 +239,7 @@ kv = lambda ln, k: (re.search(r"\b" + k + r"=(\S+)", ln) or [None, None])[1]
 first = {}
 start = None; pulls = []; finished = []; refusals = []; timeouts = []
 live_at = None
-for ln in sys.stdin:
+for ln in open(sys.argv[3], errors="replace"):
     m = ts.match(ln)
     if not m:
         continue
@@ -269,7 +269,7 @@ for f in finished:
     print(f"catch-up finished    : {f[0]} from {f[1]} height {f[2]} target {f[3]} complete {f[4]}")
 if pulls and finished:
     print(f"blocks pulled        : {int(finished[-1][2]) - int(pulls[0][1])}")
-print(f"reached the head     : {live_at or 'no sync mode: live line'}")
+print(f"sync mode: live      : {live_at or 'none'}")
 for k in ("vote", "commit vote", "led"):
     v = first.get(k)
     print(f"first {k:<15}: {v[0] + ' view ' + str(v[1]) if v else 'none'}")

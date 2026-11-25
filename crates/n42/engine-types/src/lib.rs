@@ -105,6 +105,8 @@ mod tests;
 //     handle.node_exit_future.await
 // }
 
+pub mod head_reexecution;
+
 #[cfg(test)]
 mod profile1_vectors;
 #[cfg(test)]

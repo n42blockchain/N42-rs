@@ -1395,12 +1395,10 @@ where
     Provider: reth_provider::BlockReader<Block = n42_tx_types::Block> + reth_provider::StateProviderFactory,
     Evm: reth_evm::ConfigureEvm<Primitives = n42_tx_types::N42Primitives>,
 {
-    use reth_evm::execute::Executor as _;
     let block = provider
         .recovered_block(hash.into(), reth_provider::TransactionVariant::WithHash)?
         .ok_or_else(|| eyre::eyre!("no block {hash}"))?;
     let state = provider.state_by_block_hash(block.parent_hash)?;
     let db = reth_evm::database::StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state));
-    let output = evm_config.executor(db).execute_one(&block)?;
-    Ok((output.requests.requests_hash(), output.gas_used))
+    Ok(n42_engine_types::head_reexecution::reexecute_block(evm_config, db, &block)?)
 }

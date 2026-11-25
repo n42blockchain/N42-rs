@@ -85,7 +85,18 @@ struct Ran {
     receipts_gas: u64,
     /// The EIP-7685 requests this node's execution produced, `type || data`.
     requests: Vec<Vec<u8>>,
+    /// The EIP-8282 builder predeploys the execution's bundle touched (none when the calls change no state).
+    touched_8282: Vec<alloy_primitives::Address>,
+    /// The block and the state it executed on, for re-execution.
+    recovered: RecoveredBlock<n42_tx_types::Block>,
+    pre_state: evm2::evm::CacheDB<evm2::evm::EmptyDB>,
 }
+
+/// EIP-8282 builder deposit and exit request predeploys.
+const BUILDER_PREDEPLOYS: [alloy_primitives::Address; 2] = [
+    alloy_primitives::address!("0x0000BFF46984E3725691FA540A8C7589300D8282"),
+    alloy_primitives::address!("0x000064D678505AD48F8CCB093BC65613800E8282"),
+];
 
 /// The V5 chain imported on this node: the consensus, and every block.
 struct Chain {
@@ -155,6 +166,7 @@ fn run_chain() -> Chain {
         consensus.validate_block_pre_execution(&sealed).unwrap_or_else(|e| panic!("{name}: pre-execution: {e}"));
         let recovered = RecoveredBlock::new_sealed(sealed, senders);
 
+        let pre_state = db.clone();
         let output = c.executor(db.clone()).execute(&recovered).unwrap_or_else(|e| panic!("{name}: execution: {e}"));
         consensus
             .validate_block_post_execution(&recovered, &output.result, None, None)
@@ -186,6 +198,9 @@ fn run_chain() -> Chain {
             theirs: executed(block),
             receipts_gas: output.result.receipts.last().map(|r| r.cumulative_gas_used).unwrap_or_default(),
             requests: output.result.requests.iter().map(|r| r.to_vec()).collect(),
+            touched_8282: BUILDER_PREDEPLOYS.into_iter().filter(|a| output.state.state.contains_key(a)).collect(),
+            recovered: recovered.clone(),
+            pre_state,
         });
         parent = header;
     }
@@ -342,4 +357,52 @@ fn v5_refusals_are_refused_at_gov5s_stage() {
         }
     }
     assert!(differences.is_empty(), "V5 refusals differ:\n{}", differences.join("\n"));
+}
+
+/// EIP-8282 on profile 1: Amsterdam is active from genesis, so alloy-evm runs
+/// the two builder-request system calls after every block, but the genesis
+/// deploys no code at the predeploys: the calls return empty output, push no
+/// request and leave no account in the bundle. A node with the calls switched
+/// off (n42-26 on a native chain) therefore computes the same stateRoot,
+/// requests and requestsHash for every V5 block. Prints the evidence.
+#[test]
+fn v5_eip8282_calls_change_nothing_on_profile1() {
+    let spec = chain(&v5()["allocAdditions"]);
+    let evm = config(&spec);
+    for (i, b) in run_chain().blocks.iter().enumerate() {
+        assert_eq!(evm.spec_at(b.header.timestamp, b.header.number), evm2::SpecId::AMSTERDAM, "block {} runs the Amsterdam spec id, so evm2 makes the 8282 calls", i + 1);
+    }
+    for a in BUILDER_PREDEPLOYS {
+        assert!(!spec.genesis.alloc.contains_key(&a), "no contract at {a}");
+    }
+    let chain = run_chain();
+    for (i, b) in chain.blocks.iter().enumerate() {
+        println!("{:40} 8282 accounts in bundle {:?} request types {:?}", b.name, b.touched_8282, b.requests.iter().map(|r| r[0]).collect::<Vec<_>>());
+        assert!(b.touched_8282.is_empty(), "{}: the 8282 calls wrote state", b.name);
+        assert!(b.requests.iter().all(|r| r[0] < 3), "{}: an 8282 request", b.name);
+        assert_eq!(b.ours, b.theirs, "block {} equals gov5's result with the calls as they run", i + 1);
+    }
+}
+
+/// B (07b3e7ed3): a profile-1 restart re-executes the head and files the
+/// block's gas used, not the receipts' cumulative gas. V5 block 3 is an
+/// account-creating transfer: under EIP-8037 the two differ.
+#[test]
+fn head_reexecution_returns_the_blocks_gas_not_the_receipts() {
+    let chain = run_chain();
+    let b = &chain.blocks[2];
+    assert_eq!(b.name, "new-account-transfer");
+    assert_ne!(b.receipts_gas, b.ours.gas_used, "receipts' cumulative gas differs from the block's gas used");
+    assert_eq!((b.receipts_gas, b.ours.gas_used), (204600, 183600));
+    let spec = chain_spec_for_tests();
+    let c = config(&spec);
+    let (requests_hash, gas_used) =
+        crate::head_reexecution::reexecute_block(&c, b.pre_state.clone(), &b.recovered).expect("re-executes");
+    assert_eq!(gas_used, 183600, "the block's gas used");
+    assert_eq!(gas_used, b.theirs.gas_used);
+    assert_eq!(requests_hash, b.ours.requests_hash);
+}
+
+fn chain_spec_for_tests() -> Arc<reth_chainspec::ChainSpec> {
+    chain(&v5()["allocAdditions"])
 }

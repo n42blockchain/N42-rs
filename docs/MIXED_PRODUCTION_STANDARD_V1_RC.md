@@ -125,8 +125,9 @@ rotates it (A22).
 `maxTimeoutMs ≥ baseTimeoutMs`. Standard values: **24000** and **96000**. The view timer runs from view start;
 the base timeout exceeds the slot plus a block's build plus two network hops.
 
-**A17. Block interval and slot grid (AM27).** `config.hotstuff.blockIntervalMs` = I, mandatory; standard value
-**8000**. Time is divided into slots counted from the genesis timestamp G, as on the Ethereum beacon chain
+**A17. Block interval and slot grid (AM27).** `config.hotstuff.blockIntervalMs` = I, mandatory, a whole
+number of seconds (`blockIntervalMs mod 1000 = 0`, checked when the genesis is loaded; a node refuses to
+start otherwise); standard value **8000**. Time is divided into slots counted from the genesis timestamp G, as on the Ethereum beacon chain
 (slot s starts at `G + s·I`; geth `beacon/light/committee_chain.go:499-500` uses the same arithmetic):
 there is no per-block drift. A leader holding parent P (slot `sP = (P.time − G)/I`) proposes in slot
 `s = max(sP + 1, ceil((now − G)/I))` — the first slot boundary that is after the parent's slot and not in

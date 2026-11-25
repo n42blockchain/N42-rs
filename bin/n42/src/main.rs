@@ -221,8 +221,20 @@ fn main() {
             // plus the build in flight and the one ahead means entries are
             // evicted while a later build may still look for them (the
             // fallback is a re-execution, not a fault, so this warns).
+            //
+            // On profile 1 the genesis fixes the leader schedule, and a build
+            // chains on an own block only within one leader's tenure: the
+            // layers that can be in flight are bounded by it (tenure 1: one),
+            // not by the knob's default of 2.
             {
-                let depth = n42_engine_types::direct_build::leader_layers::depth();
+                let mut depth = n42_engine_types::direct_build::leader_layers::depth();
+                if let Ok(Some(profile)) = n42_qmdb_reth::profile1::profile1(builder.config().chain.genesis()) {
+                    depth = n42_engine_types::built_executions::scheduled_layer_depth(
+                        depth,
+                        profile.leader_tenure,
+                        profile.validators.len(),
+                    );
+                }
                 let mut caps = n42_engine_types::built_executions::store_caps();
                 caps.extend(n42::follower_import::store_caps());
                 for line in n42_engine_types::built_executions::undersized_stores(depth, &caps) {

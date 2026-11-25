@@ -131,8 +131,14 @@ fn a_tombstoned_snapshot_restored_in_file_mode_reopens_in_file_mode() {
     let target = QmdbNodeState::new_with_entry_file(chain.clone(), &target_dir, true);
     target.initialize_from_portable(&bytes, 1143, chain.genesis_hash(), (3, head), root).expect("import");
     drop(target);
-    let reopened = QmdbNodeState::new(chain.clone(), &target_dir);
-    assert!(reopened.uses_entry_file(), "a file-mode checkpoint keeps the file mode");
+    // Off profile 1 the environment alone decides, as before.
+    assert!(!QmdbNodeState::new(chain.clone(), &target_dir).uses_entry_file() || super::entry_file_enabled());
+    // The same chain marked profile 1 (`n42Profile` only feeds `is_profile1` here).
+    let mut spec = (*chain).clone();
+    spec.genesis.config.extra_fields.insert("n42Profile".to_owned(), serde_json::json!(1));
+    let p1 = Arc::new(spec);
+    let reopened = QmdbNodeState::new(p1, &target_dir);
+    assert!(reopened.uses_entry_file(), "on profile 1 a file-mode checkpoint keeps the file mode");
     reopened.initialize((3, head)).expect("reopen");
     assert_eq!(reopened.state_root(), root);
     let (_, source_root) = advance(&source, 4, head);

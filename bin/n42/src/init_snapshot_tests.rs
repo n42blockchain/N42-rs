@@ -347,6 +347,19 @@ fn write_snapshot_files_at(
     code: &[u8],
     registry_root: Option<B256>,
 ) -> n42_header::N42Header {
+    write_snapshot_files_on(scratch, alice, bob, code, registry_root, 1, B256::ZERO)
+}
+
+/// [`write_snapshot_files_at`] at block `number` on `parent_hash`.
+fn write_snapshot_files_on(
+    scratch: &Scratch,
+    alice: Address,
+    bob: Address,
+    code: &[u8],
+    registry_root: Option<B256>,
+    number: u64,
+    parent_hash: B256,
+) -> n42_header::N42Header {
     use n42_twig_core::qmdb_compat::{
         encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbPortableSnapshot,
         QmdbSlotEntry, QmdbSlotSnapshot,
@@ -364,9 +377,10 @@ fn write_snapshot_files_at(
     tree.set(gov5_account_key(&Address::repeat_byte(0xEE).0 .0), vec![0]).unwrap();
     let header = n42_header::N42Header {
         inner: Header {
-            number: 1,
+            number,
+            parent_hash,
             state_root: B256::from(tree.root()),
-            slot_number: registry_root.map(|_| 1),
+            slot_number: registry_root.map(|_| number),
             // A root-carrying head is a post-Prague gov5 header: every
             // Prague field is set; the BAL hash is gov5's gap (native chains).
             ..if registry_root.is_some() {
@@ -393,7 +407,7 @@ fn write_snapshot_files_at(
     let portable = QmdbPortableSnapshot {
         chain_id: chain.chain().id(),
         genesis_hash: chain.genesis_hash().0,
-        block_number: 1,
+        block_number: number,
         block_hash: header.hash_slow().0,
         root: tree.root(),
         slots: QmdbSlotSnapshot {
@@ -645,4 +659,65 @@ fn profile_1_snapshots_are_0x03_only() {
     let other: alloy_genesis::Genesis = serde_json::from_str(&genesis_json(Some("qmdb"))).unwrap();
     assert_eq!(profile1_format(&other, None).unwrap(), None);
     assert_eq!(profile1_format(&other, Some(PortableFormat::V1)).unwrap(), Some(PortableFormat::V1));
+}
+
+#[test]
+fn init_writes_the_real_ancestor_headers_so_blockhash_reads_them() {
+    let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
+    let code = [0x60u8, 0x00, 0x60, 0x00];
+    let scratch = Scratch::new();
+    let genesis_hash = init_args(&scratch, Some("qmdb")).env.chain.genesis_hash();
+    // Blocks 1..=4 above the genesis; the snapshot is at 5, ancestors 2..=4
+    // given (block 1 stays a dummy, as below max(P-255, 1) on a long chain).
+    let mut parent = genesis_hash;
+    let chain: Vec<n42_header::N42Header> = (1..=4)
+        .map(|number| {
+            let h = n42_header::N42Header::from(Header { number, parent_hash: parent, timestamp: number, ..Default::default() });
+            parent = h.hash_slow();
+            h
+        })
+        .collect();
+    let header = write_snapshot_files_on(&scratch, alice, bob, &code, None, 5, parent);
+    let dump = format!(
+        "{}{}\n{}\n",
+        root_line(header.state_root),
+        account_line(alice, 1_000, None, &[]),
+        account_line(bob, 5, Some(&code), &[(1, 11), (2, 22)])
+    );
+    fs::write(scratch.path("state.jsonl"), dump).unwrap();
+    let hex: String = chain[1..]
+        .iter()
+        .map(|h| {
+            let mut rlp = Vec::new();
+            alloy_rlp::Encodable::encode(h, &mut rlp);
+            format!("{}\n", hex::encode(rlp))
+        })
+        .collect();
+    fs::write(scratch.path("ancestors.hex"), hex).unwrap();
+    // Ancestors that do not end at the head's parent are refused.
+    fs::write(scratch.path("bad.hex"), {
+        let mut rlp = Vec::new();
+        alloy_rlp::Encodable::encode(&chain[1], &mut rlp);
+        hex::encode(rlp)
+    })
+    .unwrap();
+    let mut args = init_args(&scratch, Some("qmdb"));
+    args.ancestors = Some(scratch.path("bad.hex"));
+    assert!(init(args, reth_tasks::Runtime::test()).unwrap_err().to_string().contains("not the parent"));
+
+    let mut args = init_args(&scratch, Some("qmdb"));
+    args.ancestors = Some(scratch.path("ancestors.hex"));
+    init(args, reth_tasks::Runtime::test()).expect("init with ancestors");
+    let args = init_args(&scratch, Some("qmdb"));
+    let Environment { provider_factory, .. } =
+        args.env.init::<N42Node>(AccessRights::RO, reth_tasks::Runtime::test()).unwrap();
+    let provider = provider_factory.provider().unwrap();
+    // What the EVM's BLOCKHASH reads (`BlockHashReader`): the real hashes.
+    for h in &chain[1..] {
+        assert_eq!(provider.block_hash(h.number).unwrap(), Some(h.hash_slow()), "block {}", h.number);
+        assert_eq!(provider.header_by_number(h.number).unwrap().as_ref(), Some(h));
+        assert_eq!(provider.header(h.hash_slow()).unwrap().as_ref(), Some(h), "found by hash");
+    }
+    assert_eq!(provider.block_hash(5).unwrap(), Some(header.hash_slow()));
+    assert_eq!(provider.last_block_number().unwrap(), 5);
 }

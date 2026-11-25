@@ -7017,6 +7017,7 @@ dependencies = [
  "reth-rpc-eth-api",
  "reth-rpc-eth-types",
  "reth-rpc-server-types",
+ "reth-stages-types",
  "reth-static-file-types",
  "reth-tasks",
  "reth-tokio-util",

@@ -63,6 +63,7 @@ alloy-rlp.workspace = true
 alloy-genesis.workspace = true
 reth-db-api.workspace = true
 reth-static-file-types.workspace = true
+reth-stages-types.workspace = true
 reth-db-common.workspace = true
 reth-cli-commands.workspace = true
 reth-cli.workspace = true

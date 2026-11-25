@@ -138,6 +138,11 @@ struct InitArgs {
     /// descendant: one embedded in a later header of this file, or `--commit-qc`.
     #[arg(long, value_name = "HEADERS_RLP")]
     anchor: Option<PathBuf>,
+    /// Headers below the head, up to max(N-255, 1)..N-1 (hex lines or raw
+    /// RLP): written as the real headers of those numbers, so BLOCKHASH reads
+    /// the right hashes; a bundle supplies them from `commit-qc.bin`.
+    #[arg(long, value_name = "HEADERS_RLP", conflicts_with = "bundle")]
+    ancestors: Option<PathBuf>,
     /// A CommitQC (gov5's wire encoding, raw or hex) naming N+1 or a later
     /// header of `--anchor`, when no anchor header embeds one.
     #[arg(long, value_name = "QC")]
@@ -239,10 +244,24 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     let header = read_header_from_file(&header_path)?;
     let hash = header.hash_slow();
     let number = header.number;
-    let anchor = match &args.bundle {
-        Some(dir) => Some(bundle_anchor(&chain, dir, &header)?),
-        None => anchor_for(&chain, &header, args.anchor.as_deref(), args.commit_qc.as_deref())?,
+    let (anchor, ancestors) = match &args.bundle {
+        Some(dir) => {
+            let (anchor, ancestors) = bundle_anchor(&chain, dir, &header)?;
+            (Some(anchor), ancestors)
+        }
+        None => (
+            anchor_for(&chain, &header, args.anchor.as_deref(), args.commit_qc.as_deref())?,
+            match &args.ancestors {
+                Some(path) => {
+                    let mut headers = read_headers_from_file(path)?;
+                    headers.sort_by_key(|h| h.number);
+                    headers
+                }
+                None => Vec::new(),
+            },
+        ),
     };
+    check_ancestors(&header, &ancestors, chain.genesis_hash())?;
     // The state after the head: its own header's root before deferred
     // execution, its child's past it (SYNC §5.3.1).
     let root = anchor.as_ref().map_or(header.state_root, |anchor| anchor.state_root);
@@ -256,9 +275,13 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
         if last == 0 && number > 0 {
             // The head is stored as read, registry root included; the dummy
             // headers below it are Ethereum's and carry none.
-            setup_without_evm(&provider_rw, SealedHeader::new(header, hash), |n| {
-                n42_header::N42Header::from(Header { number: n, ..Default::default() })
-            })?;
+            if ancestors.is_empty() {
+                setup_without_evm(&provider_rw, SealedHeader::new(header, hash), |n| {
+                    n42_header::N42Header::from(Header { number: n, ..Default::default() })
+                })?;
+            } else {
+                setup_with_ancestors(&provider_rw, SealedHeader::new(header, hash), &ancestors)?;
+            }
             provider_factory.static_file_provider().commit()?;
         } else if last != number {
             bail!("the datadir is at block {last}, the snapshot at {number}; init needs an empty datadir");
@@ -302,7 +325,12 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     // A 0x03 snapshot carries dead slots as tombstones (leaf hash only),
     // which only the file mode holds; the node keeps that mode at start
     // (`QmdbNodeState::new` reads the checkpoint it leaves).
-    let file_mode = PortableFormat::detect(&portable) == Some(PortableFormat::V2);
+    // Profile 1 only: elsewhere the mode stays `N42_QMDB_ENTRY_FILE`'s, as before.
+    let file_mode = if n42_qmdb_reth::profile1::is_profile1(&chain.genesis) {
+        PortableFormat::detect(&portable) == Some(PortableFormat::V2)
+    } else {
+        n42_env::flag("N42_QMDB_ENTRY_FILE", false)
+    };
     let qmdb = QmdbNodeState::new_with_entry_file(chain.inner().clone(), data_dir.data_dir().join("qmdb"), file_mode);
     qmdb.initialize_from_portable(&portable, chain.chain().id(), chain.genesis_hash(), (number, hash), root)?;
     if let Some(anchor) = anchor {
@@ -373,7 +401,7 @@ fn bundle_anchor(
     chain: &n42_header::N42ChainSpec,
     dir: &std::path::Path,
     header: &n42_header::N42Header,
-) -> eyre::Result<n42_header::N42Header> {
+) -> eyre::Result<(n42_header::N42Header, Vec<n42_header::N42Header>)> {
     let genesis = chain.genesis();
     if !reth_chainspec::qmdb::deferred_execution_active_at(genesis, header.timestamp)
         || reth_chainspec::qmdb::deferred_execution_depth_at(genesis, header.timestamp) != 1
@@ -396,6 +424,8 @@ fn bundle_anchor(
             bail!("commit-qc.bin's block {} is not the bundle's header", header.number);
         }
     }
+    let mut ancestors: Vec<_> = descending.iter().filter(|h| h.number < header.number).cloned().collect();
+    ancestors.reverse();
     let mut anchors: Vec<_> = descending.into_iter().filter(|h| h.number > header.number).collect();
     anchors.reverse();
     let rules = n42_engine_types::hotstuff_consensus::chain_header_rules(chain);
@@ -409,7 +439,77 @@ fn bundle_anchor(
         );
     }
     println!("bundle: pivot {} certified by a CommitQC on block {named}", header.number);
-    Ok(next)
+    Ok((next, ancestors))
+}
+
+/// Checks that `ancestors` (ascending) are the headers right below `header`:
+/// contiguous, ending at its parent, linked, and extending the genesis when
+/// they reach block 1. Empty is allowed (dummy headers, zero hashes).
+fn check_ancestors(header: &n42_header::N42Header, ancestors: &[n42_header::N42Header], genesis_hash: B256) -> eyre::Result<()> {
+    let mut child = (header.number, header.parent_hash);
+    for ancestor in ancestors.iter().rev() {
+        if ancestor.number + 1 != child.0 || ancestor.hash_slow() != child.1 {
+            bail!("ancestor header {} is not the parent of block {}", ancestor.number, child.0);
+        }
+        child = (ancestor.number, ancestor.parent_hash);
+    }
+    if !ancestors.is_empty() && child.0 == 1 && child.1 != genesis_hash {
+        bail!("ancestor header 1 does not extend the genesis {genesis_hash}");
+    }
+    Ok(())
+}
+
+/// reth's `setup_without_evm` with real headers: blocks 1..P-1 empty in
+/// every segment, but the headers `ancestors` (contiguous, ending at P-1)
+/// stored with their own hashes, so `BLOCKHASH` over them reads what a full
+/// node reads; dummy headers (zero hash) only below them. Then the head and
+/// the stage checkpoints, as upstream does.
+fn setup_with_ancestors<Provider>(
+    provider_rw: &Provider,
+    head: SealedHeader<n42_header::N42Header>,
+    ancestors: &[n42_header::N42Header],
+) -> eyre::Result<()>
+where
+    Provider: StaticFileProviderFactory<Primitives = n42_tx_types::N42Primitives>
+        + DBProvider<Tx: DbTxMut>
+        + reth_provider::StageCheckpointWriter
+        + reth_provider::BlockWriter<Block = n42_tx_types::Block>,
+{
+    let sf = provider_rw.static_file_provider();
+    let last = head.number - 1;
+    for segment in [StaticFileSegment::Transactions, StaticFileSegment::Receipts, StaticFileSegment::TransactionSenders] {
+        if sf.get_highest_static_file_block(segment).is_none() {
+            continue;
+        }
+        let mut writer = sf.latest_writer(segment)?;
+        for number in 1..=last {
+            writer.increment_block(number)?;
+        }
+    }
+    {
+        let lowest = ancestors.first().map_or(head.number, |h| h.number);
+        let mut writer = sf.latest_writer(StaticFileSegment::Headers)?;
+        for number in 1..lowest {
+            writer.append_header(&n42_header::N42Header::from(Header { number, ..Default::default() }), &B256::ZERO)?;
+        }
+        for ancestor in ancestors {
+            writer.append_header(ancestor, &ancestor.hash_slow())?;
+        }
+    }
+    // The hash -> number index, so the ancestors are found by hash too
+    // (RPC, block_by_hash lookups); the dummies below stay unindexed.
+    for ancestor in ancestors {
+        provider_rw.tx_ref().put::<tables::HeaderNumbers>(ancestor.hash_slow(), ancestor.number)?;
+    }
+    let block = reth_primitives_traits::SealedBlock::<n42_tx_types::Block>::from_sealed_parts(head.clone(), Default::default())
+        .try_recover()
+        .map_err(|e| eyre::eyre!("{e}"))?;
+    provider_rw.insert_block(&block)?;
+    sf.latest_writer(StaticFileSegment::Receipts)?.increment_block(head.number)?;
+    for stage in reth_stages_types::StageId::ALL {
+        provider_rw.save_stage_checkpoint(stage, reth_stages_types::StageCheckpoint::new(head.number))?;
+    }
+    Ok(())
 }
 
 /// The anchor a snapshot at `header` needs: `None` before deferred execution

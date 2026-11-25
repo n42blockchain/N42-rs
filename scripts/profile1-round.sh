@@ -21,10 +21,13 @@
 #   P1_BIN=<dir>          release dir holding n42 and examples/h2_validator, h2_keygen
 #   P1_CPUS=<list>        taskset CPU list (default skips the faulty core 99/227)
 #   P1_LOAD=<tx/s>        `up` also starts `load` at that rate for P1_LOAD_SECONDS (3600)
-#   P1_LOAD_SENDERS=64    derived senders (send_tx --senders), split over the members
-#                         loaded (P1_LOAD_MEMBERS, default the running ones of P1_MEMBERS)
+#                         (P1_LOAD_MEMBERS, default the running ones of P1_MEMBERS)
+#   P1_LOAD_TOOL=gov5     gov5's gate-3 load.py (P1_LOAD_PY; funds its senders from the
+#                         V1 faucet, so the plain genesis works; 30 tx/s is the agreed rate)
+#                         or send_tx: P1_LOAD_SENDERS=64 derived senders split over the
+#                         members, which needs a genesis that funds them:
 #
-# Load needs a genesis that funds the senders: `load-genesis <out>` writes P1_GENESIS
+# `load-genesis <out>` (send_tx only) writes P1_GENESIS
 # plus alloc entries for the P1_LOAD_SENDERS accounts (tx_flood / gov5 cmd/txflood
 # derivation, offset 0) and the recipient 0x4242..42 (funded, so a transfer to it is
 # 21,000 gas even under Amsterdam's EIP-8037); nothing else changes.
@@ -55,6 +58,8 @@ G=$P1_DIR/genesis.json
 P1_LOAD=${P1_LOAD:-}
 P1_LOAD_SECONDS=${P1_LOAD_SECONDS:-3600}
 P1_LOAD_SENDERS=${P1_LOAD_SENDERS:-64}
+P1_LOAD_TOOL=${P1_LOAD_TOOL:-gov5}
+P1_LOAD_PY=${P1_LOAD_PY:-/data/blockchain/gov5-work/p1mixed/gate3/load.py}
 SEND_TX=$P1_BIN/examples/send_tx
 LOAD_TO=0x4242424242424242424242424242424242424242
 for v in $(compgen -e | /usr/bin/grep '^N42_'); do unset "$v"; done
@@ -200,10 +205,22 @@ PY2
 # own slice of the derived senders (disjoint nonce sequences), recorded in load.pids.
 cmd_load() {
   local rate=${1:?tx/s} secs=${2:?seconds}
-  [ -x "$SEND_TX" ] || { echo "missing $SEND_TX" >&2; exit 1; }
   local targets=() i
   for i in ${P1_LOAD_MEMBERS:-$P1_MEMBERS}; do el_alive "$i" && targets+=("$i"); done
   [ ${#targets[@]} -gt 0 ] || { echo "no running member to load" >&2; exit 1; }
+  if [ "$P1_LOAD_TOOL" != send_tx ]; then
+    # gov5's gate-3 load (read-only, run in place): funds its senders from the
+    # genesis faucet, so it runs on the plain V1 genesis; one process, round
+    # robin over the members' RPCs. The same workload gov5 runs.
+    [ -f "$P1_LOAD_PY" ] || { echo "missing $P1_LOAD_PY" >&2; exit 1; }
+    local urls=() ; for i in "${targets[@]}"; do urls+=("http://127.0.0.1:$(http_port "$i")"); done
+    setsid python3 -I "$P1_LOAD_PY" --rpc "$(IFS=,; echo "${urls[*]}")" --rate "$rate" --duration "$secs" \
+      --log "$P1_DIR/load-tx.log" >> "$P1_DIR/load.log" 2>&1 < /dev/null &
+    echo $! >> "$P1_DIR/load.pids"
+    echo "load: $rate tx/s for ${secs}s via $P1_LOAD_PY over members ${targets[*]}; log $P1_DIR/load.log"
+    return
+  fi
+  [ -x "$SEND_TX" ] || { echo "missing $SEND_TX" >&2; exit 1; }
   local k=${#targets[@]} per=$((P1_LOAD_SENDERS / ${#targets[@]})) chain n=0
   chain=$(python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))['config']['chainId'])" "$G")
   for i in "${targets[@]}"; do
@@ -221,7 +238,7 @@ cmd_load_stop() {
   local p
   for p in $(cat "$P1_DIR/load.pids"); do
     # Only a send_tx this run dir started.
-    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | /usr/bin/grep -q "^$SEND_TX "; then kill -TERM "$p"; fi
+    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | /usr/bin/grep -qE "^($SEND_TX |python3 -I $P1_LOAD_PY )"; then kill -TERM "$p"; fi
   done
   rm -f "$P1_DIR/load.pids"
 }

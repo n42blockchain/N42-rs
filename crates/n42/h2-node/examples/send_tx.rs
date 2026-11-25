@@ -25,9 +25,16 @@
 //! costs EIP-8037's new-account state gas (~204,600 gas in all), so pair it with
 //! `--gas 210000`.
 //!
-//! One key is one nonce sequence, so one process is one sender. Load comes from
-//! running several against different funded accounts; two processes sharing a
-//! key race its nonce and most of what they send is rejected.
+//! One key is one nonce sequence, so one process with `--key` is one sender.
+//! Two processes sharing a key race its nonce and most of what they send is
+//! rejected.
+//!
+//! `--senders <n>` (instead of `--key`) sends from n accounts derived the way
+//! `tx_flood` and gov5's `cmd/txflood` derive them (`--offset <k>` shifts the
+//! set), round robin at `--rate`, so a steady modest load stays a few
+//! transactions per account per block, under any pool's per-account limit.
+//! `--senders <n> --print-addresses` prints the accounts and exits without a
+//! node: a genesis can fund them in its alloc, with no funding phase.
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
@@ -50,6 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut value = U256::from(1_000_000_000_000_000u64);
     let mut gas_limit = 21_000u64;
     let mut fresh_to = false;
+    let mut senders = 0usize;
+    let mut offset = 0u64;
+    let mut print_addresses = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -67,11 +77,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--value" => value = args.next().ok_or("--value needs a number of wei")?.parse()?,
             "--gas" => gas_limit = args.next().ok_or("--gas needs a number")?.parse()?,
             "--fresh-to" => fresh_to = true,
+            "--senders" => senders = args.next().ok_or("--senders needs a number")?.parse()?,
+            "--offset" => offset = args.next().ok_or("--offset needs a number")?.parse()?,
+            "--print-addresses" => print_addresses = true,
             "--alg" => alg = args.next().ok_or("--alg needs secp256k1 or ed25519")?,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
-    let key = key.ok_or("--key is required")?;
+    if senders > 0 {
+        let keys: Vec<PrivateKeySigner> = (0..senders).map(|i| derive(offset, i)).collect();
+        if print_addresses {
+            for k in &keys {
+                println!("{}", k.address());
+            }
+            return Ok(());
+        }
+        let to: Address = to.ok_or("--to is required")?.parse()?;
+        return run_derived(&rpc, &keys, to, chain_id, rate, seconds.ok_or("--senders needs --seconds")?, tip, value, gas_limit, fresh_to);
+    }
+    let key = key.ok_or("--key (or --senders) is required")?;
     // `--alg ed25519`: the 32-byte hex key is an Ed25519 seed, the account is
     // keccak256(0x01 || pubkey)[12..], and the transfers are 0x50 transactions.
     let ed25519 = match alg.as_str() {
@@ -192,5 +216,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let elapsed = started.elapsed().as_secs_f64();
         println!("sent {sent} in {elapsed:.1}s ({:.1}/s), {rejected} rejected", sent as f64 / elapsed);
     }
+    Ok(())
+}
+
+/// gov5 `deriveKey` / `tx_flood`'s `derive`: `keccak256("n42-txflood-sender-v1"
+/// ‖ be64(offset+i+1))`, hashed again until it is a valid secp256k1 scalar.
+fn derive(offset: u64, index: usize) -> PrivateKeySigner {
+    let mut input = b"n42-txflood-sender-v1".to_vec();
+    input.extend_from_slice(&(offset + index as u64 + 1).to_be_bytes());
+    let mut seed = alloy_primitives::keccak256(input);
+    loop {
+        match PrivateKeySigner::from_bytes(&seed) {
+            Ok(signer) => return signer,
+            Err(_) => seed = alloy_primitives::keccak256(seed),
+        }
+    }
+}
+
+/// `--senders`: round robin over the derived accounts at `rate` for `seconds`.
+/// A refused transaction keeps its sender's nonce and is signed again on that
+/// sender's next turn, so a refusal never leaves a gap.
+#[allow(clippy::too_many_arguments)]
+fn run_derived(
+    rpc: &str,
+    keys: &[PrivateKeySigner],
+    to: Address,
+    chain_id: u64,
+    rate: Option<f64>,
+    seconds: u64,
+    tip: u128,
+    value: U256,
+    gas_limit: u64,
+    fresh_to: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
+    let call = |method: &str, params: Vec<Value>| -> Result<Value, Box<dyn std::error::Error>> {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let response: Value = client.post(rpc).json(&body).send()?.json()?;
+        if let Some(error) = response.get("error") {
+            return Err(format!("{method}: {error}").into());
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    };
+    let mut nonces = Vec::with_capacity(keys.len());
+    for k in keys {
+        let hex = call("eth_getTransactionCount", vec![json!(k.address()), json!("pending")])?;
+        nonces.push(u64::from_str_radix(hex.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16)?);
+    }
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(seconds);
+    let gap = rate.filter(|r| *r > 0.0).map(|r| std::time::Duration::from_secs_f64(1.0 / r));
+    let (mut sent, mut rejected, mut index) = (0u64, 0u64, 0u64);
+    let mut last_report = started;
+    while std::time::Instant::now() < deadline {
+        if let Some(gap) = gap {
+            let due = started + gap.mul_f64(index as f64);
+            if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
+        let slot = (index % keys.len() as u64) as usize;
+        index += 1;
+        let nonce = nonces[slot];
+        let to = if fresh_to {
+            Address::from_slice(
+                &alloy_primitives::keccak256([to.as_slice(), keys[slot].address().as_slice(), &nonce.to_be_bytes()].concat())[12..],
+            )
+        } else {
+            to
+        };
+        let tx = TxEip1559 {
+            chain_id,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: 5_000_000_000,
+            max_priority_fee_per_gas: tip,
+            to: TxKind::Call(to),
+            value,
+            ..Default::default()
+        };
+        let signature = keys[slot].sign_hash_sync(&tx.signature_hash())?;
+        let envelope: TxEnvelope = tx.into_signed(signature).into();
+        match call("eth_sendRawTransaction", vec![json!(alloy_primitives::hex::encode_prefixed(envelope.encoded_2718()))]) {
+            Ok(_) => {
+                sent += 1;
+                nonces[slot] += 1;
+            }
+            Err(err) => {
+                rejected += 1;
+                if rejected % 100 == 1 {
+                    eprintln!("rejected: {err}");
+                }
+            }
+        }
+        if last_report.elapsed() >= std::time::Duration::from_secs(60) {
+            last_report = std::time::Instant::now();
+            println!("progress: {sent} sent, {rejected} rejected after {:.0}s", started.elapsed().as_secs_f64());
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    println!("sent {sent} in {elapsed:.1}s ({:.1}/s), {rejected} rejected, {} senders", sent as f64 / elapsed, keys.len());
     Ok(())
 }

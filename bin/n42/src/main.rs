@@ -452,7 +452,28 @@ fn main() {
                         // header carries it; past the fork the forest holds the root
                         // and the database the receipts.
                         {
-                            if reth_chainspec::qmdb::deferred_execution_active_at(genesis, head.timestamp) {
+                            // A head initialised from a state snapshot has no body, receipts
+                            // or parent state: its fields are those its child, the anchor
+                            // `n42-init-snapshot init --anchor` kept, carries.
+                            let snapshot_head = if reth_chainspec::qmdb::deferred_execution_active_at(genesis, head.timestamp) {
+                                let qmdb_dir = qmdb.snapshot_path().parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+                                n42::snapshot_anchor::head_fields(
+                                    &qmdb_dir,
+                                    (head.number, head.hash()),
+                                    n42_engine_types::hotstuff_consensus::requests_hash_deferred(genesis),
+                                )?
+                            } else {
+                                None
+                            };
+                            if let Some(fields) = snapshot_head {
+                                let root = qmdb.root_of(&head.hash())
+                                    .ok_or_else(|| eyre::eyre!("missing QMDB root for snapshot head {}", head.number))?;
+                                if root != fields.state_root {
+                                    return Err(eyre::eyre!("snapshot head {}: the forest's root {root} is not the anchor's carried root {}", head.number, fields.state_root));
+                                }
+                                info!(target: "reth::cli", block = head.number, gas_used = fields.gas_used, "snapshot head: executed fields filed from the anchor");
+                                n42_engine_types::executed_fields::remember(head.hash(), fields);
+                            } else if reth_chainspec::qmdb::deferred_execution_active_at(genesis, head.timestamp) {
                                 let receipts = match node.provider.receipts_by_block(head.hash().into())? {
                                     Some(receipts) => receipts,
                                     None if head.transactions_root == alloy_consensus::EMPTY_ROOT_HASH => Vec::new(),

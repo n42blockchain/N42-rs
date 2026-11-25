@@ -53,6 +53,7 @@ pub mod qmdb_proof_ext;
 pub mod queue_prune;
 pub mod queue_reorg;
 pub mod road_runtime;
+pub mod snapshot_anchor;
 pub mod stacks;
 
 /// Re-exported utils.

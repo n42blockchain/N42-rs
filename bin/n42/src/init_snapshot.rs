@@ -105,15 +105,26 @@ struct InitArgs {
     /// The cross-client portable QMDB snapshot at the same head.
     #[arg(long, value_name = "SNAPSHOT")]
     qmdb: PathBuf,
+    /// Under deferred execution (depth 1): the head's child N+1 and the
+    /// headers after it, RLP (raw, concatenated, or one hex string per line;
+    /// e.g. `debug_getRawHeader` of N+1..N+4 from a member). Header N carries
+    /// the state after N-1; the state after N, which the snapshot holds, is
+    /// certified by N+1, and so are N's receipts root, bloom, gas used and
+    /// requests hash. N+1 is trusted only once a CommitQC names it or a
+    /// descendant: one embedded in a later header of this file, or `--commit-qc`.
+    anchor: Option<PathBuf>,
+    /// A CommitQC (gov5's wire encoding, raw or hex) naming N+1 or a later
+    /// header of `--anchor`, when no anchor header embeds one.
+    #[arg(long, value_name = "QC")]
+    commit_qc: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
 struct ExportArgs {
     #[command(flatten)]
     env: EnvironmentArgs<SnapshotChainSpecParser>,
-    /// The state JSONL's path, for naming: the header goes to
-    /// `<out>.header.rlp`. The JSONL itself comes from gov5's
-    /// `n42-reth-state-dump` at the same block.
+    /// Where the state JSONL (reth `init-state`, gov5's `n42-reth-state-dump`
+    /// format) goes; the head's header goes to `<out>.header.rlp`.
     #[arg(long, value_name = "STATE_JSONL")]
     out: PathBuf,
     /// Where the portable QMDB snapshot goes.
@@ -189,7 +200,10 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     let header = read_header_from_file(&args.header)?;
     let hash = header.hash_slow();
     let number = header.number;
-    let root = header.state_root;
+    let anchor = anchor_for(&chain, &header, args.anchor.as_deref(), args.commit_qc.as_deref())?;
+    // The state after the head: its own header's root before deferred
+    // execution, its child's past it (SYNC §5.3.1).
+    let root = anchor.as_ref().map_or(header.state_root, |anchor| anchor.state_root);
     println!("head: block {number} {hash} state root {root}");
 
     // The chain up to the head: dummy headers below it, the head itself, and
@@ -243,8 +257,136 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     // The forest, from the portable snapshot, checked against the header.
     let qmdb = QmdbNodeState::new(chain.inner().clone(), data_dir.data_dir().join("qmdb"));
     qmdb.initialize_from_portable(&portable, chain.chain().id(), chain.genesis_hash(), (number, hash), root)?;
+    if let Some(anchor) = anchor {
+        let mut rlp = Vec::new();
+        alloy_rlp::Encodable::encode(&anchor, &mut rlp);
+        let path = n42::snapshot_anchor::anchor_path(&data_dir.data_dir().join("qmdb"));
+        fs::write(&path, &rlp).wrap_err("anchor file")?;
+        println!("anchor: block {} {} -> {}", anchor.number, anchor.hash_slow(), path.display());
+    }
     println!("QMDB forest restored at block {number}; the node can start");
     Ok(())
+}
+
+/// Header RLPs from a file: one hex string per line, or raw RLP items back
+/// to back.
+fn read_headers_from_file(path: &std::path::Path) -> eyre::Result<Vec<n42_header::N42Header>> {
+    let bytes = fs::read(path).wrap_err_with(|| format!("{}", path.display()))?;
+    let text = std::str::from_utf8(&bytes).ok().filter(|text| {
+        let t = text.trim();
+        !t.is_empty() && t.split_whitespace().all(|w| w.trim_start_matches("0x").chars().all(|c| c.is_ascii_hexdigit()))
+    });
+    let blobs: Vec<Vec<u8>> = match text {
+        Some(text) => text
+            .split_whitespace()
+            .map(|w| alloy_primitives::hex::decode(w).wrap_err("header hex"))
+            .collect::<eyre::Result<_>>()?,
+        None => vec![bytes],
+    };
+    let mut headers = Vec::new();
+    for blob in blobs {
+        let mut cursor = blob.as_slice();
+        while !cursor.is_empty() {
+            headers.push(<n42_header::N42Header as alloy_rlp::Decodable>::decode(&mut cursor).wrap_err("header RLP")?);
+        }
+    }
+    Ok(headers)
+}
+
+/// A file holding bytes, raw or as hex.
+fn read_bytes_or_hex(path: &std::path::Path) -> eyre::Result<Vec<u8>> {
+    let bytes = fs::read(path).wrap_err_with(|| format!("{}", path.display()))?;
+    match std::str::from_utf8(&bytes).map(str::trim) {
+        Ok(text) if !text.is_empty() && text.trim_start_matches("0x").chars().all(|c| c.is_ascii_hexdigit()) => {
+            Ok(alloy_primitives::hex::decode(text)?)
+        }
+        _ => Ok(bytes),
+    }
+}
+
+/// The anchor a snapshot at `header` needs: `None` before deferred execution
+/// (the head's own header certifies its state), the head's child at depth 1,
+/// once [`check_anchor_chain`] holds. A depth-2 chain is refused, as is a
+/// missing anchor.
+fn anchor_for(
+    chain: &n42_header::N42ChainSpec,
+    header: &n42_header::N42Header,
+    anchor: Option<&std::path::Path>,
+    commit_qc: Option<&std::path::Path>,
+) -> eyre::Result<Option<n42_header::N42Header>> {
+    let genesis = chain.genesis();
+    if !reth_chainspec::qmdb::deferred_execution_active_at(genesis, header.timestamp) {
+        if anchor.is_some() || commit_qc.is_some() {
+            bail!("--anchor is for a chain under deferred execution; at block {} this one is not", header.number);
+        }
+        return Ok(None);
+    }
+    let depth = reth_chainspec::qmdb::deferred_execution_depth_at(genesis, header.timestamp);
+    if depth != 1 {
+        bail!("deferred execution depth {depth}: a snapshot join supports depth 1 only");
+    }
+    let Some(path) = anchor else {
+        bail!(
+            "the chain defers execution: the state after block {} is certified by block {}'s header; pass it as --anchor",
+            header.number,
+            header.number + 1
+        );
+    };
+    let headers = read_headers_from_file(path)?;
+    let qc = commit_qc.map(read_bytes_or_hex).transpose()?;
+    let rules = n42_engine_types::hotstuff_consensus::chain_header_rules(chain);
+    let named = check_anchor_chain(&rules, (header.number, header.hash_slow()), &headers, qc.as_deref())?;
+    println!("anchor: block {} certified by a CommitQC on block {named}", header.number + 1);
+    Ok(headers.into_iter().next())
+}
+
+/// Checks the anchor chain of a snapshot at `head`: `headers` start at the
+/// head's child and link parent to child; each passes the chain's header
+/// rules (on profile 1: the fields, the proposer's seal and any embedded QC,
+/// a commit-domain QC of the genesis set, B1/B2/E13); and a CommitQC names
+/// one of them -- `commit_qc` if given, else one embedded in a later header
+/// (SYNC §5.3.1: a CommitQC on a block at or past P+k). Returns the number of
+/// the block the QC names.
+fn check_anchor_chain(
+    rules: &n42_h2_consensus::HeaderRules,
+    head: (u64, B256),
+    headers: &[n42_header::N42Header],
+    commit_qc: Option<&[u8]>,
+) -> eyre::Result<u64> {
+    let Some(first) = headers.first() else { bail!("--anchor holds no header") };
+    n42::snapshot_anchor::check_child(first, head)?;
+    let hashes: Vec<B256> = headers.iter().map(|h| h.hash_slow()).collect();
+    for (i, h) in headers.iter().enumerate() {
+        if i > 0 && (h.number != headers[i - 1].number + 1 || h.parent_hash != hashes[i - 1]) {
+            bail!("--anchor: header {} does not follow header {}", h.number, headers[i - 1].number);
+        }
+        rules.check_header(h).map_err(|e| eyre::eyre!("--anchor: header {}: {e}", h.number))?;
+    }
+    let (Some(schedule), Some(identity)) = (&rules.proposers, rules.chain) else {
+        bail!("the chain has no profile-1 validator set to check a CommitQC against");
+    };
+    let verify = |qc: &[u8]| -> eyre::Result<Option<u64>> {
+        let extra = n42_h2_consensus::HeaderExtra { view: 0, qc: qc.to_vec(), seal: None };
+        n42_h2_consensus::header_rules::verify_profile1_qc(&extra, schedule, identity).map_err(|e| eyre::eyre!("CommitQC: {e}"))?;
+        let wire = n42_h2_wire::h2_wire::decode_h2_qc(qc).map_err(|e| eyre::eyre!("CommitQC: {e}"))?;
+        Ok(hashes.iter().position(|hash| *hash == wire.block_hash).map(|i| headers[i].number))
+    };
+    if let Some(qc) = commit_qc {
+        return verify(qc)?.ok_or_else(|| eyre::eyre!("--commit-qc names no header of --anchor"));
+    }
+    for h in &headers[1..] {
+        let extra = n42_h2_consensus::decode_profile1_extra(&h.extra_data).map_err(|e| eyre::eyre!("{e}"))?;
+        if extra.qc.is_empty() {
+            continue;
+        }
+        if let Some(number) = verify(&extra.qc)? {
+            return Ok(number);
+        }
+    }
+    bail!(
+        "no CommitQC names block {} or a later header of --anchor: pass more headers after it, or --commit-qc",
+        first.number
+    )
 }
 
 /// The portable snapshot's tree, once it is known to be at `head` on this
@@ -485,18 +627,108 @@ fn export(args: ExportArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     let header_path = args.out.with_extension("jsonl.header.rlp");
     fs::write(&header_path, &header_rlp)?;
 
-    // reth 2.5 keeps the state hashed — no addresses, no slot keys — so this
-    // node cannot write the plain-state JSONL gov5's `n42-reth-state-dump`
-    // does; the header goes out, the state comes from a gov5 node at the
-    // same block.
     println!("header -> {}", header_path.display());
 
     let qmdb = QmdbNodeState::new(chain.inner().clone(), data_dir.data_dir().join("qmdb"));
     let portable = qmdb.portable_export_as(chain.chain().id(), chain.genesis_hash(), args.format)?;
+    // The forest's persisted head must be the database's: the snapshot and
+    // the state rows describe one block. A running node's forest settles
+    // ahead of its database; export from a stopped one.
+    let verified = verify_portable_stream(portable.as_slice(), chain.chain().id(), &chain.genesis_hash().0)
+        .map_err(|e| eyre::eyre!("portable snapshot: {e}"))?;
+    if (verified.block_number, B256::from(verified.block_hash)) != (number, hash) {
+        bail!(
+            "the QMDB forest is at block {} {}, the database at {number} {hash}: export from a stopped node",
+            verified.block_number,
+            B256::from(verified.block_hash)
+        );
+    }
+    let root = B256::from(verified.root);
     fs::write(&args.qmdb_out, &portable)?;
+    let (accounts, slots) = write_state_dump(&provider, &provider_factory.latest()?, &chain.genesis, number, root, &args.out)?;
+    println!("state: {accounts} accounts, {slots} slots at block {number} (root {root}) -> {}", args.out.display());
     let format = PortableFormat::detect(&portable).map_or_else(|| "?".to_owned(), |format| format.to_string());
     println!("QMDB snapshot ({format}): {} bytes -> {}", portable.len(), args.qmdb_out.display());
     Ok(())
+}
+
+/// One account line of the JSONL this node writes (reth `init-state`'s, as
+/// gov5's `n42-reth-state-dump` writes it).
+#[derive(Debug, serde::Serialize)]
+struct DumpRow<'a> {
+    address: Address,
+    #[serde(flatten)]
+    account: &'a GenesisAccount,
+}
+
+/// Writes the state at `block` as reth `init-state` JSONL: `{"root": root}`
+/// (the state root after `block`: under deferred execution header N+1's, not
+/// header N's) then one line per account in ascending address order. The
+/// database keeps the state hashed, so the preimages come from the genesis
+/// allocation and the changesets of blocks 1..=block, which name every
+/// address and plain slot key ever written (a snapshot-initialised node has
+/// one changeset entry per account and slot at its snapshot block); the
+/// values from the state at `block`. `init` proves each row against the
+/// portable snapshot and refuses a dump that misses a live key.
+fn write_state_dump<P>(
+    provider: &P,
+    state: &dyn reth_provider::StateProvider,
+    genesis: &alloy_genesis::Genesis,
+    block: u64,
+    root: B256,
+    out: &std::path::Path,
+) -> eyre::Result<(u64, u64)>
+where
+    P: reth_provider::ChangeSetReader + reth_provider::StorageChangeSetReader,
+{
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Write as _;
+    let mut keys: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
+    for (address, account) in &genesis.alloc {
+        keys.entry(*address).or_default().extend(account.storage.iter().flatten().map(|(slot, _)| *slot));
+    }
+    for number in 1..=block {
+        for change in provider.account_block_changeset(number)? {
+            keys.entry(change.address).or_default();
+        }
+        for (key, entry) in provider.storage_changeset(number)? {
+            keys.entry(key.address()).or_default().insert(entry.key);
+        }
+    }
+    let mut file = std::io::BufWriter::new(fs::File::create(out).wrap_err("state file")?);
+    writeln!(file, "{}", serde_json::json!({ "root": root }))?;
+    let (mut accounts, mut slots) = (0u64, 0u64);
+    for (address, slot_keys) in keys {
+        let Some(account) = state.basic_account(&address)? else { continue };
+        let code = match account.bytecode_hash {
+            Some(hash) if hash != alloy_primitives::KECCAK256_EMPTY => Some(
+                state
+                    .bytecode_by_hash(&hash)?
+                    .ok_or_else(|| eyre::eyre!("no bytecode {hash} for {address}"))?
+                    .original_bytes(),
+            ),
+            _ => None,
+        };
+        let mut storage = std::collections::BTreeMap::new();
+        for slot in slot_keys {
+            if let Some(value) = state.storage(address, slot)?.filter(|value| !value.is_zero()) {
+                storage.insert(slot, B256::from(value.to_be_bytes::<32>()));
+            }
+        }
+        slots += storage.len() as u64;
+        let account = GenesisAccount {
+            nonce: Some(account.nonce),
+            balance: account.balance,
+            code,
+            storage: (!storage.is_empty()).then_some(storage),
+            private_key: None,
+        };
+        serde_json::to_writer(&mut file, &DumpRow { address, account: &account })?;
+        writeln!(file)?;
+        accounts += 1;
+    }
+    file.flush()?;
+    Ok((accounts, slots))
 }
 
 #[cfg(test)]

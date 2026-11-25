@@ -495,3 +495,129 @@ fn init_starts_at_a_head_that_carries_a_registry_root() {
     assert_eq!(stored, header);
     assert_eq!(provider.block_hash(1).unwrap(), Some(header.hash_slow()));
 }
+
+/// A four-member set, its rules (the CommitQC check only: `profile1` off so
+/// the plain test headers need no seal) and its secret keys.
+fn qc_rules() -> (n42_h2_consensus::HeaderRules, Vec<n42_h2_primitives::BlsSecretKey>) {
+    let keys: Vec<_> = (1u8..=4).map(|i| n42_h2_primitives::BlsSecretKey::from_bytes(&[i; 32]).unwrap()).collect();
+    let validators = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| n42_h2_consensus::ValidatorInfo {
+            address: Address::repeat_byte(i as u8 + 1),
+            bls_public_key: key.public_key(),
+            p2p_peer_id: None,
+        })
+        .collect();
+    let rules = n42_h2_consensus::HeaderRules {
+        proposers: Some(n42_h2_consensus::ProposerSchedule { validators, leader_tenure: 1 }),
+        chain: Some(n42_h2_primitives::consensus::H2V4ChainIdentity { chain_id: 1144, genesis_hash: B256::repeat_byte(9) }),
+        ..Default::default()
+    };
+    (rules, keys)
+}
+
+/// A commit-domain QC on `block` by the members `signers`, gov5's encoding.
+fn commit_qc(rules: &n42_h2_consensus::HeaderRules, keys: &[n42_h2_primitives::BlsSecretKey], view: u64, block: B256, signers: &[usize]) -> Vec<u8> {
+    let profile = n42_h2_consensus::protocol::quorum::ConsensusSigningProfile::H2V4(rules.chain.unwrap());
+    let message = profile.commit_message(view, block, B256::ZERO);
+    let signatures: Vec<_> = signers.iter().map(|i| profile.sign(&keys[*i], &message)).collect();
+    let aggregate = n42_h2_primitives::bls::AggregateSignature::aggregate(&signatures.iter().collect::<Vec<_>>()).unwrap();
+    let mut bitmap = vec![4, 0, 0];
+    for i in signers {
+        bitmap[2] |= 1 << i;
+    }
+    n42_h2_wire::h2_wire::encode_h2_qc(&n42_h2_wire::h2_wire::H2QuorumCertificate {
+        view,
+        block_hash: block,
+        aggregate_signature: aggregate.to_bytes().to_vec(),
+        signers_bitmap: bitmap,
+    })
+    .unwrap()
+}
+
+/// Headers N+1.. after the head `(number, hash)`, linked; `extra(i)` is the
+/// i-th one's extra data.
+fn anchor_chain(head: (u64, B256), count: usize, extra: impl Fn(usize) -> Vec<u8>) -> Vec<n42_header::N42Header> {
+    let mut parent = head.1;
+    (0..count)
+        .map(|i| {
+            let header = n42_header::N42Header::from(Header {
+                number: head.0 + 1 + i as u64,
+                parent_hash: parent,
+                state_root: B256::repeat_byte(0x50 + i as u8),
+                extra_data: extra(i).into(),
+                ..Default::default()
+            });
+            parent = header.hash_slow();
+            header
+        })
+        .collect()
+}
+
+fn profile1_extra(view: u64, qc: &[u8]) -> Vec<u8> {
+    let mut extra = n42_h2_consensus::GOV5_HEADER_EXTRA_MAGIC.to_vec();
+    extra.extend_from_slice(&view.to_le_bytes());
+    extra.extend_from_slice(qc);
+    extra.extend_from_slice(&[0u8; n42_h2_consensus::EXTRA_SEAL_LEN]);
+    extra
+}
+
+#[test]
+fn a_snapshot_anchor_is_trusted_only_under_a_commit_qc_of_the_set() {
+    let (rules, keys) = qc_rules();
+    let head = (40, B256::repeat_byte(4));
+    let headers = anchor_chain(head, 3, |i| profile1_extra(100 + i as u64, &[]));
+    let n1 = headers[0].hash_slow();
+    // A separate CommitQC on N+1 by a quorum anchors it.
+    let qc = commit_qc(&rules, &keys, 101, n1, &[0, 1, 3]);
+    assert_eq!(check_anchor_chain(&rules, head, &headers, Some(&qc)).unwrap(), 41);
+    // Short of a quorum, or signed in another chain's domain: refused.
+    let short = commit_qc(&rules, &keys, 101, n1, &[0, 1]);
+    assert!(check_anchor_chain(&rules, head, &headers, Some(&short)).is_err());
+    let mut other = rules.clone();
+    other.chain = Some(n42_h2_primitives::consensus::H2V4ChainIdentity { chain_id: 1, genesis_hash: B256::ZERO });
+    let foreign = commit_qc(&other, &keys, 101, n1, &[0, 1, 2]);
+    assert!(check_anchor_chain(&rules, head, &headers, Some(&foreign)).is_err());
+    // A QC on a block outside the anchor chain anchors nothing.
+    let elsewhere = commit_qc(&rules, &keys, 101, B256::repeat_byte(1), &[0, 1, 2]);
+    assert!(check_anchor_chain(&rules, head, &headers, Some(&elsewhere)).unwrap_err().to_string().contains("names no header"));
+    // No QC at all: refused, naming what to pass.
+    assert!(check_anchor_chain(&rules, head, &headers, None).unwrap_err().to_string().contains("no CommitQC names"));
+    // A QC embedded in a later header of the anchor chain, on N+2, anchors N+1 too.
+    let embedded = anchor_chain(head, 2, |_| profile1_extra(100, &[]));
+    let n2 = embedded[1].hash_slow();
+    let qc2 = commit_qc(&rules, &keys, 102, n2, &[1, 2, 3]);
+    let mut chain = embedded.clone();
+    let third = n42_header::N42Header::from(Header {
+        number: 43,
+        parent_hash: n2,
+        extra_data: profile1_extra(103, &qc2).into(),
+        ..Default::default()
+    });
+    chain.push(third);
+    assert_eq!(check_anchor_chain(&rules, head, &chain, None).unwrap(), 42);
+    // The anchor must be the head's child, and the chain must link.
+    assert!(check_anchor_chain(&rules, (41, head.1), &headers, Some(&qc)).is_err());
+    let mut broken = headers.clone();
+    broken[1].parent_hash = B256::ZERO;
+    assert!(check_anchor_chain(&rules, head, &broken, Some(&qc)).unwrap_err().to_string().contains("does not follow"));
+}
+
+#[test]
+fn an_anchor_file_holds_headers_as_hex_lines_or_raw_rlp() {
+    let scratch = Scratch::new();
+    let headers = anchor_chain((40, B256::repeat_byte(4)), 3, |_| Vec::new());
+    let mut raw = Vec::new();
+    let mut hex = String::new();
+    for h in &headers {
+        let mut rlp = Vec::new();
+        alloy_rlp::Encodable::encode(h, &mut rlp);
+        raw.extend_from_slice(&rlp);
+        hex.push_str(&format!("0x{}\n", alloy_primitives::hex::encode(&rlp)));
+    }
+    fs::write(scratch.path("raw"), &raw).unwrap();
+    fs::write(scratch.path("hex"), &hex).unwrap();
+    assert_eq!(read_headers_from_file(&scratch.path("raw")).unwrap(), headers);
+    assert_eq!(read_headers_from_file(&scratch.path("hex")).unwrap(), headers);
+}

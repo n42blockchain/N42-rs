@@ -6971,6 +6971,8 @@ dependencies = [
  "n42-env",
  "n42-h2-consensus",
  "n42-h2-execution",
+ "n42-h2-primitives",
+ "n42-h2-wire",
  "n42-header",
  "n42-primitives",
  "n42-qmdb-reth",

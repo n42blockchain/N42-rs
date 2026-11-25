@@ -459,25 +459,35 @@ fn main() {
                                     None => return Err(eyre::eyre!("missing receipts for deferred recovery head {}", head.number)),
                                 };
                                 let (receipts_root, logs_bloom) = n42_engine_types::hotstuff_consensus::gov5_receipt_root_bloom(&receipts);
-                                let gas_used = receipts.last().map_or(0, |r| r.cumulative_gas_used);
+                                // The receipts' cumulative gas is what the transactions paid; the
+                                // block's gas used, the deferred field, can differ from it (on
+                                // Amsterdam EIP-8037's state gas makes an account-creating
+                                // transfer pay ~205k while the block counts less): the
+                                // re-execution below gives the block's own value where it runs.
+                                let receipts_gas_used = receipts.last().map_or(0, |r| r.cumulative_gas_used);
                                 {
                                     let state_root = qmdb.root_of(&head.hash())
                                         .ok_or_else(|| eyre::eyre!("missing QMDB root for recovery head {}", head.number))?;
                                     // AM25: on a profile-1 chain the head's requests hash is a
                                     // deferred field its child carries. No table keeps requests,
                                     // so the head is executed once more on its parent's state.
-                                    let requests_hash = if head.number > 0
+                                    let (requests_hash, gas_used) = if head.number > 0
                                         && n42_engine_types::hotstuff_consensus::requests_hash_deferred(genesis)
                                     {
-                                        match head_requests_hash(&node.provider, node.evm_config(), head.hash()) {
-                                            Ok(hash) => hash,
+                                        match head_reexecution(&node.provider, node.evm_config(), head.hash()) {
+                                            Ok((hash, gas_used)) => {
+                                                if gas_used != receipts_gas_used {
+                                                    info!(target: "reth::cli", block = head.number, gas_used, receipts_gas_used, "recovery head: the block's gas used is not its receipts' cumulative gas; filing the block's");
+                                                }
+                                                (hash, gas_used)
+                                            }
                                             Err(err) => {
                                                 error!(target: "reth::cli", %err, block = head.number, "could not re-execute the recovery head for its requests hash; filing the hash of no requests");
-                                                n42_engine_types::executed_fields::NO_REQUESTS_HASH
+                                                (n42_engine_types::executed_fields::NO_REQUESTS_HASH, receipts_gas_used)
                                             }
                                         }
                                     } else {
-                                        n42_engine_types::executed_fields::NO_REQUESTS_HASH
+                                        (n42_engine_types::executed_fields::NO_REQUESTS_HASH, receipts_gas_used)
                                     };
                                     n42_engine_types::executed_fields::remember(
                                         head.hash(),
@@ -1378,7 +1388,9 @@ mod tests {
 /// The EIP-7685 requests hash of block `hash`'s execution, by executing it
 /// once more on its parent's state: a profile-1 restart's head (AM25), whose
 /// requests hash its child carries and no table keeps.
-fn head_requests_hash<Provider, Evm>(provider: &Provider, evm_config: &Evm, hash: alloy_primitives::B256) -> eyre::Result<alloy_primitives::B256>
+/// Re-executes a recovery head on its parent's state: its requests hash and
+/// the block's gas used (the deferred field, not the receipts' cumulative gas).
+fn head_reexecution<Provider, Evm>(provider: &Provider, evm_config: &Evm, hash: alloy_primitives::B256) -> eyre::Result<(alloy_primitives::B256, u64)>
 where
     Provider: reth_provider::BlockReader<Block = n42_tx_types::Block> + reth_provider::StateProviderFactory,
     Evm: reth_evm::ConfigureEvm<Primitives = n42_tx_types::N42Primitives>,
@@ -1390,5 +1402,5 @@ where
     let state = provider.state_by_block_hash(block.parent_hash)?;
     let db = reth_evm::database::StateProviderDatabase::new(reth_provider::StateProvider::into_evm_state_provider(&state));
     let output = evm_config.executor(db).execute_one(&block)?;
-    Ok(output.requests.requests_hash())
+    Ok((output.requests.requests_hash(), output.gas_used))
 }

@@ -253,3 +253,26 @@ caught up ~300 blocks in 18 s and voted 0.3 s later; n42-26 304 blocks in 13 s, 
 gov5 member 15 at the head 30 s after restart, voting after 27 s. Heights 0..410 equal on all eight dumps, deltas
 8 x335 / 32 x74 (absent leaders) / 48 x1 (startup), 0 refusals, 45,000 transactions with 0 errors.
 
+
+## v1.1 gate 4b — join by full block sync from genesis (2026-11-26, PASSED)
+
+Mixed round T0 04:42:00 EST, genesis `genesis-gate4b.json` (sha256 ee123441…ffe14, hash 0x62829812…e9dd), gate-6 set:
+gov5 v0, v1 + verifier 4 (main fe5e02ed, binary 00aa020a…, byte-identical to ecaa51f7), n42-rs v2 (main 004ac1167,
+h2_validator 5326bb5e…), n42-26 v3 (64b5b10 + PR #48 + e3d22dd, c20104ef…). Load 25,800 tx, 0 errors.
+Each member wiped once (keys kept, genesis re-initialised, restarted at once), one down at a time:
+
+| Wipe | Range pulled (/2) | Served by | commit_qc/1 anchor | At head | First vote (after head) |
+| --- | --- | --- | --- | --- | --- |
+| n42-rs v2, 04:52:00 | 1..71, 617 KB | gov5 v1 | #71, gov5 v1 | 04:52:04.3 | 04:52:08 (4 s) |
+| gov5 v1, 05:02:00 | 1..146, 1.39 MB | gov5 v0 | #146, gov5 v0 | 05:02:08 | 05:02:24 (16 s) |
+| n42-26 v3, 05:12:01 | 1..220, 2.15 MB | gov5 v1 | #220, gov5 v1 | 05:12:29 | 05:13:04 (35 s) |
+
+Headers 0..368 equal on all seven dumps (gov5 node0..4, n42-rs v2, n42-26 v3), 0 mismatches, 0 off-grid; one slot
+missed (block 222, v3's own slot during its wipe). No `/1` used. The pre-run (04:02, `genesis-pre4b.json`) found the
+n42-26 tail-release stall (range timer deadline slid under tx gossip; fixed in e3d22dd with tests) and the n42-rs
+`/2` busy code (0x02 -> 0x04 "1000", 004ac1167).
+
+Open for v1.1: (a) every `/2` and `commit_qc/1` in this round was served by gov5 — n42-rs and n42-26 as SERVERS to
+another client are covered only by vectors and same-client loopback tests, a mixed leg with gov5 serving disabled is
+still due; (b) the scale leg (long history; chain-94 shared state `gov5-work/p1scale/out/`); (c) n42-26's 35 s from head
+to first vote and gov5's repeated `/2 145..146` asks are noted, not failures.

@@ -33,6 +33,7 @@ pub mod node_state;
 mod recovery_frontier;
 pub mod occupancy;
 pub mod profile1;
+pub mod profile1_memory;
 pub mod read_view;
 pub mod state_reader;
 pub mod strategy;

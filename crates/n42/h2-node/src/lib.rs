@@ -20,7 +20,9 @@
 
 pub mod build_throttle;
 pub mod direct_votes;
+pub mod equivocations;
 pub mod mobile;
+pub mod ops;
 pub mod persistence;
 pub mod safety_halt;
 pub mod service;

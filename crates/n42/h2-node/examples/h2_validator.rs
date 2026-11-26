@@ -140,6 +140,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut propose = false;
     let mut observer = false;
     let mut mobile_http: Option<std::net::SocketAddr> = None;
+    let mut metrics_addr: Option<std::net::SocketAddr> = None;
+    let mut rpc_http: Option<std::net::SocketAddr> = None;
     let mut mobile_pow_bits: u32 = 0;
     let mut mobile_packet_window: u64 = 256;
     let mut mobile_collect_window_sec: u64 = 45;
@@ -197,6 +199,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 worker_threads =
                     Some(args.next().ok_or("--worker-threads needs a value")?.parse()?)
             }
+            "--metrics" => metrics_addr = Some(args.next().ok_or("--metrics needs an address")?.parse()?),
+            "--rpc.http" => rpc_http = Some(args.next().ok_or("--rpc.http needs an address")?.parse()?),
             "--mobileverify.http" => {
                 mobile_http = Some(args.next().ok_or("--mobileverify.http needs an address")?.parse()?)
             }
@@ -645,6 +649,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("SAFETY HALT  : {} present; this node will not vote, propose or import (move it away to resume)", path.display());
             }
         }
+        // Observed equivocations (E15): the signed pairs, kept in the datadir.
+        if let Some(dir) = &datadir {
+            let log = n42_h2_node::equivocations::EquivocationLog::open(std::path::Path::new(dir))?;
+            if !log.is_empty() {
+                println!("equivocations: {} recorded in {}", log.len(), n42_h2_node::equivocations::evidence_path(std::path::Path::new(dir)).display());
+            }
+            service = service.with_equivocation_log(log);
+        }
+        // The operations surface (J1/J2): Prometheus metrics and the
+        // validator's JSON-RPC, one server per address given.
+        {
+            let prometheus = metrics_addr.and_then(|_| n42_h2_node::ops::install_prometheus());
+            let state = n42_h2_node::ops::OpsState { equivocations: service.equivocation_log(), metrics: prometheus };
+            let mut addrs = Vec::new();
+            for addr in [metrics_addr, rpc_http].into_iter().flatten() {
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+            for addr in addrs {
+                let listener = tokio::net::TcpListener::bind(addr).await?;
+                println!("ops          : http://{addr}/metrics and JSON-RPC n42_equivocations at http://{addr}/");
+                tokio::spawn(n42_h2_node::ops::serve_on(listener, state.clone()));
+            }
+        }
         if gov5_profile {
             service = service.with_gov5_h2_profile(seal_key);
         }
@@ -1039,6 +1068,8 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --listen <multiaddr>      address to listen on (repeatable)
   --propose                 build blocks when leader (default: vote only)
   --observer                follow and verify only; --bls-key must not be in the set
+  --metrics <addr>          serve Prometheus metrics at http://<addr>/metrics (n42_head_number, ...)
+  --rpc.http <addr>         serve the validator's JSON-RPC (n42_equivocations) at http://<addr>/
   --mobileverify.http <addr>
                             serve gov5's /mobileverify phone surface here (e.g. 127.0.0.1:21010)
                             and relay the mobile-verification gossip topics

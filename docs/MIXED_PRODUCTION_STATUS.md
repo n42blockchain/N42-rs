@@ -213,3 +213,10 @@ exactly q = 67. Heights 0..147 equal on every dump, 0 refusals, every absent mem
 Six consecutive absent leaders (views 57..62) cost one 464 s gap (TC backoff 24/48/96/96/96/96 s): a liveness cost,
 not a safety one, recorded as a v1.1 risk. With 5c (killed leaders) and 5d, gate 5 is complete as written.
 
+## Mixed transaction re-check PASSED (2026-11-25, round txcheck2, T0 23:45 EST)
+
+With all three fixes in (gov5's speculative-fill rebuild, n42-rs's pool relay, n42-26's transaction_v2 ingest),
+four leaders (gov5 v0/v1, n42-rs v2, n42-26 v3) sealed 158.5-161.5 transactions per block in steady state (spread
+1.8%), and transactions submitted to any client's RPC were included with p90 7.2-7.4 s (within one slot); 17,602
+sent, all included. Heights 0..146 equal, 0 refusals. The block-quality items opened after gates 3-6 are closed.
+

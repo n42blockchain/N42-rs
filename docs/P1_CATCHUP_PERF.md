@@ -360,6 +360,73 @@ per-block verdict), `import_range_is_null_when_not_offered_*`,
 `an_import_range_answer_is_read`; end to end, the catch-up legs below, which
 check the joiner's head hash against the servers'.
 
+**Only small blocks go in runs** (`BATCH_BLOCK_MAX_BYTES`, 16 KiB of
+transactions). Per block, `newPayload` was as fast as or faster than the run
+on small, medium and large blocks: the engine overlaps execution with its
+root and receipt tasks, and the run executes serially. The run wins only on
+near-empty blocks, so a bigger block goes alone through `newPayload`.
+
+**Memory bounds** (validator side). The importer's queue is bounded by
+transaction bytes (`IMPORT_QUEUE_BYTES`, 64 MiB) as well as by count. A call
+carries at most 4 MiB (`BATCH_IMPORT_BYTES`) and 256 blocks. The byte bound
+is checked once, when the service asks for room. An earlier version also
+refused in `try_send`. The service dropped the refused block, the next run
+had a gap, and the EL refused the run ("not the child of"). Leg p1ba on ba5
+showed this: 362 s. With the fix, the same leg takes 114 s and no run is
+refused.
+
+**Measured** (ba6 = this branch at the fix; joiner EL unpinned; servers on
+CPUs 64-95,192-223; 2026-11-26 15:19-15:59 UTC, S1 hold running; foreign
+tests by the memory agent drove the load to 180-460 from 15:25 to 15:47, and
+every leg that overlapped them was rerun. Load is noted per leg.)
+
+| leg | chain | profile-1 memory defaults | import | wall | rate | EL cores | load before / after |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| p1pb6r | bench, 2,277 blocks | on | per block | 116.8 s | 127k tx/s, 15.2 MB/s | 7.4 | 33 / 19 |
+| p1ba6 / p1ba6r | bench | on | runs (small blocks) | 114.3 / 115.3 s | 130k / 129k tx/s | 7.8 | 10 / 12; 12 / 13 |
+| p1nopw6r | bench | on, `--engine.disable-prewarming` | per block | 116.8 s | 127k tx/s | 6.7 | 30 / 15 |
+| p0pb6r | bench | off (`N42_P1_MEMORY=0`) | per block | 142.5 s | 104k tx/s | 121 | 42 / 168 (own EL) |
+| p0ba6r | bench | off | runs | 137.1 s | 109k tx/s | 128 | 15 / 217 (own EL) |
+| ep1pb6 | empty, 12,584 blocks | on | per block | 26.6 s | 473 blocks/s | | 12 / 11 |
+| ep1ba6 | empty | on | runs | 17.6 s | 716 blocks/s | 2.1 | 18 / 15 |
+| ep0ba6r | empty | off | runs | 25.6 s | 489 blocks/s | 199 | 13 / 76 |
+| ep1pblazy6r | empty, lazy screening | on | per block | 26.1 s | 482 blocks/s | 1.6 | 22 / 15 |
+| ep1balazy6r | empty, lazy screening | on | runs | 3.6 s | **3,541 blocks/s**, 3.4 MB/s | 4.3 | 25 / 25 |
+
+What one near-empty block costs inside a run (EL log, ms):
+
+| leg | checks | execute | root | rest | whole call | blocks a call |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ep1ba6 | 0.90 | 0.07 | 0.12 | 0.07 | 1.18 | 2 |
+| ep1balazy6r | 0.05 | 0.02 | 0.12 | 0.03 | **0.23** | 247 |
+| ep0ba6r (defaults off) | 0.31 | 0.07 | 1.45 | 0.13 | 1.96 | 9 |
+| per block, `newPayload` (ep1pb6) | | | 0.13 | | 2.0 (cycle) | 1 |
+
+- *The run reaches 0.23 ms a block, but only when it is fed.* With eager
+  screening, the validator verifies every pulled block's QC before queuing
+  it, about 1.15 ms a block. The importer then finds two blocks waiting per
+  call (5,407 of 5,438 calls). The last block's full checks (embedded QC and
+  seal, about 1.2 ms) are paid per call, i.e. per two blocks. With lazy
+  screening (step 3, off by default) the runs are 247 blocks long, and the
+  EL's per-block cost is the QMDB root (0.12 ms) plus 0.1 ms. The eager
+  screening is now the bound on empty blocks.
+- *Against the link.* 3,541 blocks/s of ~970-byte blocks is 3.4 MB/s, about
+  28 Mbit/s: still short of 100 Mbit/s (12.9k blocks/s at this size, 17.6k
+  at chain 94's 710 bytes). The EL could do about 4.4k blocks/s at 0.23 ms;
+  past that the per-block QMDB root is the floor. Eager screening caps it at
+  ~720 blocks/s.
+- *The thread pools* (task 2b). `--cpu-cores` sizes reth's pools and, since
+  this branch, rayon's global pool (`RAYON_NUM_THREADS`, when unset), the one
+  QMDB's root and the committee-link prefetch run on. Main's profile-1
+  defaults pass `--cpu-cores 8`. With them, the bench chain runs 18-20%
+  faster on 7-8 EL cores instead of 120-130. An empty block's root is 0.12 ms
+  instead of 1.45 ms. A run of empty blocks is 1.7x faster.
+- *Prewarm and receipt-root tasks* (task 2c). A run executes on one cache
+  carried across its blocks, with no prewarm and no per-block receipt-root
+  task. On the per-block path, `--engine.disable-prewarming` changes nothing
+  measurable on this chain with the profile-1 pools (116.8 s either way),
+  so it is not made a default.
+
 ## 5. Throughput against link speed
 
 Best configuration measured (pin2e: branch, EL on 32 CPUs) against what each
@@ -414,7 +481,16 @@ batch, next newPayload). On full blocks the engine's per-block tasks dominate
 payload-convert 12 ms, post-execution validation 9 ms, persistence 194 ms
 per cycle of ~5.5 blocks.
 
-Next steps, largest first:
+Status after step 6 (2026-11-26): item 1 is built (`n42Engine_importRange`,
+off by default) and reaches 0.23 ms per empty block when the runs are long.
+Item 2 is main's profile-1 defaults plus rayon following `--cpu-cores`. Item
+3's prewarm is irrelevant at those pool sizes, and a run skips it anyway. On
+empty blocks the bound is now the validator's eager QC screening, about
+1.15 ms a block. Next: screen a pulled range's QCs in parallel, or rely on
+the anchor's QC when the run is anchored. Then the per-block QMDB root at
+0.12 ms.
+
+Next steps, largest first (as written before step 6):
 
 1. **Batch import for committed ranges** (an Engine extension such as
    `n42Engine_importRange(blocks)`). It would execute a run of

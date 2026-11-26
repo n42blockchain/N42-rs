@@ -614,6 +614,12 @@ pub struct H2Service<E> {
     /// Header QCs that verified as sync anchors (commit domain, the set of
     /// their exact view), so the catch-up checks each once.
     sync_anchor_qcs: std::cell::RefCell<VerifiedHeaderQcs>,
+    /// Eager screening's BLS checks done ahead for one range reply, in
+    /// parallel ([`Self::prescreen_reply`]): the header QCs that verified as
+    /// anchors, by the hash of their bytes, and the blocks whose profile-1
+    /// seal verified. Taken by the per-block screening; cleared per reply.
+    prescreened_qcs: std::cell::RefCell<std::collections::HashMap<B256, QuorumCertificate>>,
+    prescreened_seals: std::cell::RefCell<std::collections::HashSet<B256>>,
     /// How the catch-up treats blocks no verified anchor covers
     /// (`N42_SYNC_ANCHOR`, see [`crate::sync_anchor`]).
     sync_anchor_mode: SyncAnchorMode,
@@ -1314,6 +1320,10 @@ const PULLED_BLOCKS_PER_STEP: usize = 32;
 /// ([`crate::sync_anchor::MAX_TAIL_BLOCKS`]), which a pull therefore never
 /// reaches for want of a verification.
 const LAZY_VERIFY_TAIL: usize = crate::sync_anchor::MAX_TAIL_BLOCKS / 2;
+
+/// Entries [`H2Service::prescreen_reply`]'s memos hold before they are
+/// cleared: a few replies' worth.
+const PRESCREEN_MEMO: usize = 2048;
 
 /// How far past the committed height a pull may import blocks nothing proves
 /// (no header QC this node can verify): past it the pull ends at the first
@@ -2042,6 +2052,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             fill_bytes: FillBudget::new(MAX_FILL_SERVE_BYTES >> 10),
             verified_header_qcs: std::cell::RefCell::default(),
             sync_anchor_qcs: std::cell::RefCell::default(),
+            prescreened_qcs: std::cell::RefCell::default(),
+            prescreened_seals: std::cell::RefCell::default(),
             sync_anchor_mode: SyncAnchorMode::from_env(),
             sync_pipeline: crate::sync_pipeline::pipeline_from_env(),
             sync_lazy_verify: crate::sync_pipeline::lazy_verify_from_env(),
@@ -5590,6 +5602,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                 continue;
             }
             let mut chunks = std::collections::VecDeque::from(chunks);
+            if enforce {
+                let prescreen_at = std::time::Instant::now();
+                self.prescreen_reply(&chunks);
+                if let Some(c) = self.catch_up.as_mut() {
+                    c.times.verify += prescreen_at.elapsed();
+                }
+            }
             // Pipelined, the importer's queue bounds the screening too:
             // what does not fit waits here, in order.
             while budget > 0 && (!pipelined || self.import_room()) {
@@ -6542,6 +6561,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         if let Some(qc) = self.sync_anchor_qcs.borrow().get(&key) {
             return Ok(Some(qc));
         }
+        if let Some(qc) = self.prescreened_qcs.borrow_mut().remove(&key) {
+            return Ok(Some(qc));
+        }
         match self.engine.verify_sync_anchor_qc(&wire) {
             n42_h2_consensus::SyncQcVerdict::Anchor(qc) => {
                 self.sync_anchor_qcs.borrow_mut().insert(key, (*qc).clone());
@@ -6563,6 +6585,103 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             n42_h2_consensus::SyncQcVerdict::Invalid(reason) => Err(format!("header QC does not verify: {reason}")),
         }
+    }
+
+    /// The screening's BLS checks for the blocks of one range reply that
+    /// will be verified, done ahead and in parallel on rayon's global pool
+    /// (`RAYON_NUM_THREADS`; profile 1 sizes it to its cores): each header
+    /// QC against the set of its view, and on profile 1 the proposer's seal.
+    /// Eager screening checks every block; lazy screening the reply's last
+    /// block and every [`LAZY_VERIFY_TAIL`]-th. What verified is left in
+    /// [`Self::prescreened_qcs`] / [`Self::prescreened_seals`] for the
+    /// per-block screening, which runs every other rule in order as before;
+    /// what did not is not recorded, so the per-block check finds it again
+    /// and refuses it in its place. Nothing is decided here.
+    fn prescreen_reply(&self, chunks: &std::collections::VecDeque<BlockChunk>) {
+        use rayon::prelude::*;
+        // Bounded: what a reply left unused (a block refused before its turn)
+        // does not pile up. A reply cut by the screening budget comes back in
+        // pieces, so the memos are not cleared per call.
+        if self.prescreened_qcs.borrow().len() > PRESCREEN_MEMO {
+            self.prescreened_qcs.borrow_mut().clear();
+        }
+        if self.prescreened_seals.borrow().len() > PRESCREEN_MEMO {
+            self.prescreened_seals.borrow_mut().clear();
+        }
+        let last = chunks.len().saturating_sub(1);
+        let picked: Vec<&BlockChunk> = chunks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.sync_lazy_verify || *i == last || (i + 1) % LAZY_VERIFY_TAIL == 0)
+            .map(|(_, chunk)| chunk)
+            .collect();
+        if picked.len() < 2 {
+            return;
+        }
+        let profile = self.header_profile;
+        let headers: Vec<(B256, Header)> = picked
+            .par_iter()
+            .filter_map(|chunk| n42_h2_consensus::decode_block_body_header(&chunk.rlp, profile).ok())
+            .collect();
+        // The engine's part, in order: the set of each QC's view, the
+        // proposer of each view.
+        enum Seal<'a> {
+            Info(&'a n42_h2_consensus::ValidatorInfo),
+            Key(n42_h2_primitives::BlsPublicKey),
+        }
+        let rules = &self.header_rules;
+        let mut qc_jobs = Vec::with_capacity(headers.len());
+        let mut seal_jobs = Vec::new();
+        for (_, header) in &headers {
+            if let Ok(Some((key, wire))) = self.header_qc_wire(header)
+                && self.sync_anchor_qcs.borrow().get(&key).is_none()
+                && !self.prescreened_qcs.borrow().contains_key(&key)
+            {
+                qc_jobs.push((key, self.engine.sync_anchor_qc_job(&wire)));
+            }
+            if rules.is_profile1()
+                && header.number > 0
+                && let Ok(extra) = n42_h2_consensus::validate_profile1_header(header, rules)
+            {
+                // Keyed as the per-block check reads it.
+                let hash = header.hash_slow();
+                if self.prescreened_seals.borrow().contains(&hash) {
+                    continue;
+                }
+                let seal = match &rules.proposers {
+                    Some(schedule) => schedule.proposer(extra.view).map(Seal::Info),
+                    None => self.engine.leader_public_key_for_view(extra.view).map(Seal::Key),
+                };
+                if let Some(seal) = seal {
+                    seal_jobs.push((hash, header, seal));
+                }
+            }
+        }
+        let (anchors, seals) = rayon::join(
+            || {
+                qc_jobs
+                    .into_par_iter()
+                    .filter_map(|(key, job)| match job.verify() {
+                        n42_h2_consensus::SyncQcVerdict::Anchor(qc) => Some((key, *qc)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            },
+            || {
+                seal_jobs
+                    .into_par_iter()
+                    .filter_map(|(hash, header, seal)| {
+                        let ok = match seal {
+                            Seal::Info(proposer) => n42_h2_consensus::verify_profile1_seal(header, proposer).is_ok(),
+                            Seal::Key(key) => n42_h2_consensus::verify_seal(header, &key).is_ok(),
+                        };
+                        ok.then_some(hash)
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        self.prescreened_qcs.borrow_mut().extend(anchors);
+        self.prescreened_seals.borrow_mut().extend(seals);
     }
 
     /// What a range-pulled block has to show before it is imported.
@@ -6790,8 +6909,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         // The seal (B2) and the coinbase (B3) against the proposer the
         // rules name; without a schedule, the seal against the leader key
         // the engine knows for the view.
+        let prescreened = check_seal && {
+            let mut seals = self.prescreened_seals.borrow_mut();
+            !seals.is_empty() && seals.remove(&header.hash_slow())
+        };
         let sealed = match &rules.proposers {
-            _ if !check_seal => Ok(()),
+            _ if !check_seal || prescreened => Ok(()),
             Some(schedule) => match schedule.proposer(extra.view) {
                 Some(proposer) => n42_h2_consensus::verify_profile1_seal(header, proposer).map_err(|err| err.to_string()),
                 None => Err(format!("B2: no proposer for view {}", extra.view)),

@@ -540,6 +540,33 @@ async fn lazy_screening_and_batch_import_are_on_by_default() {
     }
 }
 
+/// The parallel prescreen of a reply records the header QCs that verify and
+/// nothing of a forged chain, so a forged block still meets the per-block
+/// check; eager screening of a reply needs no further BLS work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_prescreen_records_verified_qcs_and_nothing_forged() {
+    let (keys, set) = keys(1);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    rig.svc.sync_lazy_verify = false;
+    let count = 40;
+    let honest = anchored_chain(&rig, count);
+    let forged = forged_from(&rig, &honest, 2, count);
+    let reply = |blocks: &[(B256, Header, alloy_primitives::Bytes)]| -> std::collections::VecDeque<BlockChunk> {
+        chunks(blocks).into()
+    };
+    rig.svc.prescreen_reply(&reply(&forged[1..]));
+    assert!(rig.svc.prescreened_qcs.borrow().is_empty(), "a forged QC is not recorded");
+    rig.svc.prescreen_reply(&reply(&honest[1..]));
+    assert_eq!(rig.svc.prescreened_qcs.borrow().len(), count as usize - 1, "every honest QC, checked ahead");
+    for (_, header, _) in &forged[1..] {
+        assert!(rig.svc.sync_anchor_of(header).is_err(), "the per-block check still refuses a forged block");
+    }
+    for (_, header, _) in &honest[1..] {
+        assert!(rig.svc.sync_anchor_of(header).expect("verifies").is_some());
+    }
+    assert!(rig.svc.prescreened_qcs.borrow().is_empty(), "each taken once");
+}
+
 /// The puller with the defaults (lazy screening, batched import) and an
 /// execution layer that offers range imports.
 async fn default_puller(keys: &[BlsSecretKey], set: &ValidatorSet, servers: &mut [Rig]) -> Rig {

@@ -72,7 +72,8 @@ pub use protocol::quorum::{
     validator_changes_hash, verify_commit_qc, verify_commit_qc_with_profile, verify_qc, verify_tc,
 };
 pub use protocol::state_machine::{
-    AuthenticatedConsensusMessage, DEFAULT_VOTE_LOG_FATAL_AFTER, FUTURE_VIEW_WINDOW, SyncQcVerdict, VOTERS_SEEN_WINDOW,
+    AuthenticatedConsensusMessage, DEFAULT_VOTE_LOG_FATAL_AFTER, FUTURE_VIEW_WINDOW, SyncQcJob, SyncQcVerdict,
+    VOTERS_SEEN_WINDOW,
 };
 pub use protocol::equivocation::{EquivocationEvidence, EquivocationKind, SignedValue};
 pub use protocol::{ConsensusEngine, ConsensusEvent, EngineOutput, Pacemaker, Phase, RoundState,

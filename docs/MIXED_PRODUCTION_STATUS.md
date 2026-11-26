@@ -177,3 +177,21 @@ absent-member window). 3a fresh join (15 blocks in 0.1 s, voting after 16 s), 3b
 0 block refusals, no halt, 52,248 transactions. Open, not a gate criterion: transactions entering at one
 n42-rs member rarely reach the other n42-rs member (fix/profile1-tx-relay).
 
+## Gate 4a PASSED (2026-11-25, round gate4a, T0 11:30 EST)
+
+Snapshot join in both directions on the AM27 binaries: gov5's live bundle (P=73, CommitQC on 74) imported into an
+n42-rs member, which voted after 8 s and led after 24 s; n42-rs's bundle (P=143) imported into a gov5 member,
+which then voted and sealed. Heights 0..252 equal on every node, 0 refusals.
+
+## Gate 6 PASSED (2026-11-25, round gate6c, T0 19:00 EST)
+
+n42-26 as a producing validator (index 3) beside two gov5 validators and one n42-rs validator: heights 0..182
+equal on every node; n42-26 led all of its 44 slots and every block was accepted; it rejoined after a 3-minute
+outage and led again; all headers on the AM27 grid (8 x173, 32 x8, the 32 s only while a member was down);
+0 refusals, no halt.
+
+Open after gates 3-6 (block quality, not gate criteria): n42-26 does not yet take gossiped transactions into its
+pool (its blocks are empty); a gov5 member that follows another gov5 member builds speculatively against a pool
+that has not yet dropped the previous block's transactions (near-empty blocks); n42-rs's pool gossip ran once per
+block (fixed on main cbdb5ba5d). A mixed re-check with all three fixes must show an even per-leader transaction split.
+

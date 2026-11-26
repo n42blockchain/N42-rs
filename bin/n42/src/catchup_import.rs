@@ -150,143 +150,270 @@ where
     )));
     // Every block's header check links it to its parent's committee
     // evidence, a pure function of the parent header that takes ~0.5 ms to
-    // compute: all of the run's computed at once, on the worker pool.
-    let at = std::time::Instant::now();
+    // compute: the run's are computed on the worker pool beside the run, in
+    // order, a chunk at a time, so they stay ahead of the checks (a check
+    // that gets there first computes its own, as without the prefetch).
     let parents: Vec<(u64, B256, B256)> = std::iter::once((parent.number, parent.hash(), parent.receipts_root))
         .chain(blocks[..blocks.len() - 1].iter().map(|b| (b.number, b.hash(), b.receipts_root)))
         .collect();
-    prefetch(&parents);
-    times_us[T_CHECKS] += us(at);
+    let stop_prefetch = std::sync::atomic::AtomicBool::new(false);
     let last = blocks.len() - 1;
     let mut ready: Vec<Executed> = Vec::with_capacity(blocks.len());
-    for (index, sealed) in blocks.into_iter().enumerate() {
-        let block_at = std::time::Instant::now();
-        let number = sealed.number;
-        let hash = sealed.hash();
-        let refuse = |out: &mut RangeImport, why: String| {
-            out.refused = Some(format!("block {number} ({hash}): {why}"));
+    // The QMDB roots are computed on a worker, in block order, beside the
+    // execution: block `n`'s root while block `n + 1` executes. The roots
+    // are a chain (each filed on its parent's) and the header check of
+    // block `n + 1` reads block `n`'s filed results under deferred
+    // execution, so that check waits for the root before it; execution does
+    // not need it (the state is the run's cache). A refusal anywhere ends
+    // the run before the hand-off, as before.
+    std::thread::scope(|scope| {
+        let stop_prefetch = &stop_prefetch;
+        let parents = &parents;
+        scope.spawn(move || {
+            for chunk in parents.chunks(PREFETCH_CHUNK) {
+                if stop_prefetch.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                // On a pool of its own: on rayon's global one it took the
+                // threads the QMDB root runs on and slowed the root chain,
+                // which bounds the run, by a third (ep1ba7c).
+                match prefetch_pool() {
+                    Some(pool) => pool.install(|| prefetch(chunk)),
+                    None => prefetch(chunk),
+                }
+            }
+        });
+        // Whatever way the run ends, the prefetch stops at its next chunk.
+        struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _stop = StopOnDrop(stop_prefetch);
+        let (root_tx, root_rx) = std::sync::mpsc::channel::<RootJob>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(u64, B256, Result<(), String>)>();
+        scope.spawn(move || {
+            for job in root_rx {
+                let (number, hash) = (job.number, job.hash);
+                let at = std::time::Instant::now();
+                let result = job.run(qmdb);
+                ROOT_WORK_US.fetch_add(us(at), std::sync::atomic::Ordering::Relaxed);
+                if done_tx.send((number, hash, result)).is_err() {
+                    break;
+                }
+            }
+        });
+        // The root in flight: waited for before the next block's parent check,
+        // and after the last block.
+        let mut in_flight = false;
+        let wait_root = |out: &mut RangeImport, times_us: &mut [u64; 7], in_flight: &mut bool| -> bool {
+            if !std::mem::take(in_flight) {
+                return true;
+            }
+            let at = std::time::Instant::now();
+            let done = done_rx.recv();
+            times_us[T_ROOT] += us(at);
+            match done {
+                Ok((_, _, Ok(()))) => true,
+                Ok((number, hash, Err(why))) => {
+                    out.refused = Some(format!("block {number} ({hash}): {why}"));
+                    false
+                }
+                Err(_) => {
+                    out.unavailable = Some("the root worker stopped".to_string());
+                    false
+                }
+            }
         };
-        // The header and body by the consensus rules; the transactions root
-        // was computed by the payload's conversion, which built the header
-        // whose hash the payload names.
-        let at = std::time::Instant::now();
-        let rules = if index == last { full } else { lean };
-        let checked = rules
-            .validate_header(sealed.sealed_header())
-            .map_err(|err| format!("header: {err}"))
-            .and_then(|()| {
-                rules
-                    .validate_header_against_parent(sealed.sealed_header(), &parent)
-                    .map_err(|err| format!("header against parent: {err}"))
-            })
-            .and_then(|()| {
+        for (index, sealed) in blocks.into_iter().enumerate() {
+            let block_at = std::time::Instant::now();
+            let number = sealed.number;
+            let hash = sealed.hash();
+            let refuse = |out: &mut RangeImport, why: String| {
+                out.refused = Some(format!("block {number} ({hash}): {why}"));
+            };
+            // The header and body by the consensus rules; the transactions root
+            // was computed by the payload's conversion, which built the header
+            // whose hash the payload names. The rules against the parent come
+            // after execution, once the parent's root is filed.
+            let at = std::time::Instant::now();
+            let rules = if index == last { full } else { lean };
+            let checked = rules.validate_header(sealed.sealed_header()).map_err(|err| format!("header: {err}")).and_then(|()| {
                 rules
                     .validate_block_pre_execution_with_tx_root(&sealed, Some(sealed.transactions_root))
                     .map_err(|err| format!("body: {err}"))
             });
-        times_us[T_CHECKS] += us(at);
-        if let Err(why) = checked {
-            refuse(&mut out, why);
-            return out;
-        }
-        let at = std::time::Instant::now();
-        let recovered = match sealed.try_recover() {
-            Ok(recovered) => recovered,
-            Err(err) => {
-                refuse(&mut out, format!("senders: {err}"));
+            times_us[T_CHECKS] += us(at);
+            if let Err(why) = checked {
+                refuse(&mut out, why);
                 return out;
             }
-        };
-        let output = match evm_config.executor(&mut db).execute(&recovered) {
-            Ok(output) => output,
-            Err(err) => {
-                refuse(&mut out, format!("execution: {err}"));
+            let at = std::time::Instant::now();
+            let recovered = match sealed.try_recover() {
+                Ok(recovered) => recovered,
+                Err(err) => {
+                    refuse(&mut out, format!("senders: {err}"));
+                    return out;
+                }
+            };
+            let output = match evm_config.executor(&mut db).execute(&recovered) {
+                Ok(output) => output,
+                Err(err) => {
+                    refuse(&mut out, format!("execution: {err}"));
+                    return out;
+                }
+            };
+            db.commit_source(&BundleSource(&output.state));
+            times_us[T_EXECUTE] += us(at);
+            let at = std::time::Instant::now();
+            if let Err(err) = rules.validate_block_post_execution(&recovered, &output.result, None, None) {
+                refuse(&mut out, format!("post-execution: {err}"));
                 return out;
             }
-        };
-        db.commit_source(&BundleSource(&output.state));
-        times_us[T_EXECUTE] += us(at);
-        let at = std::time::Instant::now();
-        if let Err(err) = rules.validate_block_post_execution(&recovered, &output.result, None, None) {
-            refuse(&mut out, format!("post-execution: {err}"));
-            return out;
-        }
-        times_us[T_POST] += us(at);
-        // The QMDB root, filed under the block as the engine's own root job
-        // files it: persistence and the forest's history read it per block.
-        let at = std::time::Instant::now();
-        let prague = n42_qmdb_reth::system_caller_leaf_at(chain_spec, recovered.timestamp);
-        let ops = n42_qmdb_reth::sorted_operations_from_execution(&output.state, prague);
-        if reth_chainspec::qmdb::deferred_execution_active_at(genesis, recovered.timestamp) {
+            times_us[T_POST] += us(at);
+            // The QMDB root, filed under the block as the engine's own root job
+            // files it (persistence and the forest's history read it per block),
+            // on the worker. The ops are built here: they borrow the output.
+            let at = std::time::Instant::now();
+            let prague = n42_qmdb_reth::system_caller_leaf_at(chain_spec, recovered.timestamp);
+            let ops = n42_qmdb_reth::sorted_operations_from_execution(&output.state, prague);
             // Deferred execution: the header carries an ancestor's root, which
-            // the header check above compared with this node's result. This
-            // block's own root is filed for its child's header to be checked
-            // against, as the engine's and the follower's imports file it.
-            match qmdb.insert_block_operations(parent.hash(), hash, number, ops) {
-                Ok(root) => n42_engine_types::executed_fields::remember_state_root(hash, root),
-                Err(err) => {
-                    refuse(&mut out, format!("state root: {err}"));
-                    return out;
-                }
+            // the parent check compares with this node's result; this block's own
+            // root is filed for its child's header, as the engine's and the
+            // follower's imports file it. Otherwise the header's own root.
+            let check = (!reth_chainspec::qmdb::deferred_execution_active_at(genesis, recovered.timestamp))
+                .then_some(recovered.state_root);
+            times_us[T_ROOT] += us(at);
+            // The parent's root first: the worker files roots in order and the
+            // parent check below reads it.
+            if !wait_root(&mut out, times_us, &mut in_flight) {
+                return out;
             }
-        } else {
-            match qmdb.validate_block_operations(parent.hash(), hash, number, ops, recovered.state_root) {
-                Ok(root) if root == recovered.state_root => {}
-                Ok(root) => {
-                    refuse(&mut out, format!("state root {root} is not the header's {}", recovered.state_root));
-                    return out;
-                }
-                Err(err) => {
-                    refuse(&mut out, format!("state root: {err}"));
-                    return out;
-                }
+            if root_tx.send(RootJob { parent: parent.hash(), hash, number, ops, check }).is_err() {
+                out.unavailable = Some("the root worker stopped".to_string());
+                return out;
             }
+            in_flight = true;
+            let at = std::time::Instant::now();
+            if let Err(err) = rules.validate_header_against_parent(recovered.sealed_header(), &parent) {
+                refuse(&mut out, format!("header against parent: {err}"));
+                return out;
+            }
+            times_us[T_CHECKS] += us(at);
+            let at = std::time::Instant::now();
+            let hashed_state = if crate::follower_import::hashed_state_enabled() {
+                match state.hashed_post_state(&output.state) {
+                    Ok(hashed) => hashed,
+                    Err(err) => {
+                        refuse(&mut out, format!("hashed state: {err}"));
+                        return out;
+                    }
+                }
+            } else {
+                reth_trie::HashedPostState::default()
+            };
+            times_us[T_HASHED] += us(at);
+            let next_parent = recovered.clone_sealed_header();
+            let txs = recovered.body().transactions.len();
+            let at = std::time::Instant::now();
+            let executed = BuiltPayloadExecutedBlock {
+                recovered_block: Arc::new(recovered),
+                execution_output: Arc::new(output),
+                hashed_state: Arc::new(hashed_state),
+                trie_updates: Arc::new(TrieUpdates::default()),
+            };
+            ready.push(executed);
+            times_us[T_HANDOFF] += us(at);
+            tracing::debug!(target: "n42.catchup", number, txs, us = us(block_at), "range block imported");
+            out.imported += 1;
+            out.head = Some(hash);
+            parent = next_parent;
         }
-        times_us[T_ROOT] += us(at);
-        let at = std::time::Instant::now();
-        let hashed_state = if crate::follower_import::hashed_state_enabled() {
-            match state.hashed_post_state(&output.state) {
-                Ok(hashed) => hashed,
-                Err(err) => {
-                    refuse(&mut out, format!("hashed state: {err}"));
-                    return out;
-                }
-            }
-        } else {
-            reth_trie::HashedPostState::default()
-        };
-        times_us[T_HASHED] += us(at);
-        let next_parent = recovered.clone_sealed_header();
-        let txs = recovered.body().transactions.len();
-        let at = std::time::Instant::now();
-        let executed = BuiltPayloadExecutedBlock {
-            recovered_block: Arc::new(recovered),
-            execution_output: Arc::new(output),
-            hashed_state: Arc::new(hashed_state),
-            trie_updates: Arc::new(TrieUpdates::default()),
-        };
-        ready.push(executed);
-        times_us[T_HANDOFF] += us(at);
-        tracing::debug!(target: "n42.catchup", number, txs, us = us(block_at), "range block imported");
-        out.imported += 1;
-        out.head = Some(hash);
-        parent = next_parent;
-    }
-    // Every block passed, the last with the profile-1 signatures: only now
-    // does anything reach the engine. A run refused above leaves nothing in
-    // the tree (its matching QMDB roots are non-canonical forest entries,
-    // as a fork block's are, never persisted).
-    let at = std::time::Instant::now();
-    for executed in ready {
-        if let Err(why) = hand_off(executed) {
-            out.unavailable = Some(format!("hand-off: {why}"));
+        if !wait_root(&mut out, times_us, &mut in_flight) {
             out.imported = 0;
             out.head = None;
-            break;
+            return out;
+        }
+        // Every block passed, the last with the profile-1 signatures: only now
+        // does anything reach the engine. A run refused above leaves nothing in
+        // the tree (its matching QMDB roots are non-canonical forest entries,
+        // as a fork block's are, never persisted).
+        let at = std::time::Instant::now();
+        for executed in ready {
+            if let Err(why) = hand_off(executed) {
+                out.unavailable = Some(format!("hand-off: {why}"));
+                out.imported = 0;
+                out.head = None;
+                break;
+            }
+        }
+        times_us[T_HANDOFF] += us(at);
+        out
+    })
+}
+
+/// Committee links the run's prefetch computes per step: enough to keep the
+/// worker pool busy, small enough to stay just ahead of the checks.
+const PREFETCH_CHUNK: usize = 32;
+
+/// Threads of the committee-link prefetch's pool: at ~0.5 ms a link, four
+/// keep ahead of a run of empty blocks (~0.15 ms each).
+const PREFETCH_THREADS: usize = 4;
+
+/// The committee-link prefetch's own pool (`None` if it cannot be built:
+/// the prefetch then runs on rayon's global pool).
+fn prefetch_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(PREFETCH_THREADS)
+            .thread_name(|i| format!("catchup-link-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// The root worker's own time, summed over a call (one call runs at a
+/// time): against `root` (the import's wait for it), what the roots cost and
+/// what the overlap with execution hid.
+static ROOT_WORK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One block's QMDB root, for the run's root worker.
+struct RootJob {
+    parent: B256,
+    hash: B256,
+    number: u64,
+    ops: n42_twig_core::qmdb_compat::QmdbOps,
+    /// The header's state root to compare with; `None` under deferred
+    /// execution, where the root is filed for the child's header.
+    check: Option<B256>,
+}
+
+impl RootJob {
+    /// Computes and files the root: under deferred execution it is
+    /// remembered for the child's header check; otherwise it must be the
+    /// header's (and only then is it filed).
+    fn run(self, qmdb: &n42_qmdb_reth::QmdbNodeState) -> Result<(), String> {
+        let ops = self.ops;
+        match self.check {
+            None => {
+                let root = qmdb
+                    .insert_block_operations(self.parent, self.hash, self.number, ops)
+                    .map_err(|err| format!("state root: {err}"))?;
+                n42_engine_types::executed_fields::remember_state_root(self.hash, root);
+                Ok(())
+            }
+            Some(header_root) => {
+                match qmdb.validate_block_operations(self.parent, self.hash, self.number, ops, header_root) {
+                    Ok(root) if root == header_root => Ok(()),
+                    Ok(root) => Err(format!("state root {root} is not the header's {header_root}")),
+                    Err(err) => Err(format!("state root: {err}")),
+                }
+            }
         }
     }
-    times_us[T_HANDOFF] += us(at);
-    out
 }
 
 /// Moves the engine's head to a block it holds; set once the engine runs
@@ -434,6 +561,7 @@ where
                 total_us = us(call_at),
                 decode, checks, execute, post, root, hashed, handoff,
                 forkchoice_us = us(fcu_at),
+                root_work_us = ROOT_WORK_US.swap(0, std::sync::atomic::Ordering::Relaxed),
                 refused = out.refused.as_deref(),
                 unavailable = out.unavailable.as_deref(),
                 "range import"

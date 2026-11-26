@@ -41,6 +41,31 @@ pub const SYNC_PIPELINE_ENV: &str = "N42_SYNC_PIPELINE";
 /// The pipeline's default when [`SYNC_PIPELINE_ENV`] is unset.
 pub const SYNC_PIPELINE_DEFAULT: bool = true;
 
+/// The environment variable for lazy screening of an anchored pull (`1` on,
+/// `0` off): only a reply's last block, and every 32nd unanchored block,
+/// has its header QC and seal verified; the blocks between are parent-linked
+/// to it and execute only under a verified anchor at or above them, as
+/// every pulled block does (docs/P1_CATCHUP_PERF.md, section 4).
+pub const SYNC_LAZY_VERIFY_ENV: &str = "N42_SYNC_LAZY_VERIFY";
+
+/// Lazy screening's default when [`SYNC_LAZY_VERIFY_ENV`] is unset.
+pub const SYNC_LAZY_VERIFY_DEFAULT: bool = false;
+
+/// Whether lazy screening is on ([`SYNC_LAZY_VERIFY_ENV`]); a value that is
+/// not 0 or 1 keeps the default, with a warning.
+pub fn lazy_verify_from_env() -> bool {
+    let raw = std::env::var(SYNC_LAZY_VERIFY_ENV).ok();
+    match raw.as_deref().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => SYNC_LAZY_VERIFY_DEFAULT,
+        Some("1" | "on" | "true") => true,
+        Some("0" | "off" | "false") => false,
+        Some(_) => {
+            tracing::warn!(target: "n42.h2.node", value = ?raw, "{SYNC_LAZY_VERIFY_ENV} is not 0 or 1; keeping the default");
+            SYNC_LAZY_VERIFY_DEFAULT
+        }
+    }
+}
+
 /// The environment variable for the stall watchdog, in seconds.
 pub const SYNC_STALL_ENV: &str = "N42_SYNC_STALL_SECS";
 
@@ -139,6 +164,9 @@ pub(crate) struct CatchUpTimes {
     pub(crate) executed: u64,
     /// Bytes of pulled blocks received.
     pub(crate) bytes: u64,
+    /// Pulled blocks whose header QC and seal were verified (every one of
+    /// them unless lazy screening is on).
+    pub(crate) checked: u64,
 }
 
 impl CatchUpTimes {
@@ -156,6 +184,7 @@ impl CatchUpTimes {
             forkchoices: 0,
             executed: 0,
             bytes: 0,
+            checked: 0,
         }
     }
 
@@ -192,6 +221,7 @@ impl CatchUpTimes {
             new_payload_ms = ms(self.new_payload),
             forkchoice_ms = ms(self.forkchoice),
             forkchoices = self.forkchoices,
+            checked = self.checked,
             "catch-up timing"
         );
     }

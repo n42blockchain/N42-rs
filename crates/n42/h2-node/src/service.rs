@@ -615,6 +615,10 @@ pub struct H2Service<E> {
     /// peers, execution on [`crate::sync_pipeline::PulledImporter`]). Turned
     /// off for the rest of the run by the stall watchdog.
     sync_pipeline: bool,
+    /// `N42_SYNC_LAZY_VERIFY`: an anchored pull verifies the certificates of
+    /// a reply's last block (and every [`LAZY_VERIFY_TAIL`]-th unanchored
+    /// one) only; see [`crate::sync_pipeline::lazy_verify_from_env`].
+    sync_lazy_verify: bool,
     /// `N42_SYNC_STALL_SECS`: how long the executed head may stand still
     /// while pulled blocks wait for execution before the pipeline is given up.
     sync_stall: Duration,
@@ -1268,6 +1272,13 @@ const MAX_TRANSPORT_DRAIN: usize = 256;
 /// batches the loop polls the transport and reads consensus, which the
 /// guards on far-ahead blocks and unimported commits make safe.
 const PULLED_BLOCKS_PER_STEP: usize = 32;
+
+/// Under lazy screening (`N42_SYNC_LAZY_VERIFY`), a block's certificates are
+/// verified when this many pulled blocks wait unanchored with it, whether or
+/// not it ends its reply: half the unanchored-tail bound
+/// ([`crate::sync_anchor::MAX_TAIL_BLOCKS`]), which a pull therefore never
+/// reaches for want of a verification.
+const LAZY_VERIFY_TAIL: usize = crate::sync_anchor::MAX_TAIL_BLOCKS / 2;
 
 /// How far past the committed height a pull may import blocks nothing proves
 /// (no header QC this node can verify): past it the pull ends at the first
@@ -1980,6 +1991,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             sync_anchor_qcs: std::cell::RefCell::default(),
             sync_anchor_mode: SyncAnchorMode::from_env(),
             sync_pipeline: crate::sync_pipeline::pipeline_from_env(),
+            sync_lazy_verify: crate::sync_pipeline::lazy_verify_from_env(),
             sync_stall: crate::sync_pipeline::stall_from_env(),
             pulled_importer: None,
             pulled_reports: None,
@@ -5490,7 +5502,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // `buffer_pulled` releases what an anchor covers; the
                     // execution inside it is timed apart and taken out.
                     let executing_before = self.catch_up.as_ref().map(|c| c.times.new_payload + c.times.forkchoice);
-                    if !self.buffer_pulled(peer, block, chunk.rlp, events).await {
+                    // Lazy screening verifies the certificates of a reply's
+                    // last block, and of every LAZY_VERIFY_TAIL-th unanchored
+                    // one, only (docs/P1_CATCHUP_PERF.md, section 4).
+                    let verify = !self.sync_lazy_verify
+                        || chunks.is_empty()
+                        || self.catch_up.as_ref().is_none_or(|c| c.anchored.tail().0 + 1 >= LAZY_VERIFY_TAIL);
+                    if verify && let Some(c) = self.catch_up.as_mut() {
+                        c.times.checked += 1;
+                    }
+                    if !self.buffer_pulled(peer, block, chunk.rlp, events, verify).await {
                         // A pipelined pull goes on without the peer.
                         if self.catch_up.is_some() {
                             self.requeue_after_fault(peer, chunks.len() as u64, replies.collect());
@@ -5666,11 +5687,20 @@ impl<E: ExecutionLayer> H2Service<E> {
         block: n42_h2_net::RawGossipBlock,
         rlp: Bytes,
         events: &mut Vec<ServiceEvent>,
+        verify: bool,
     ) -> bool {
         let (hash, number) = (block.block_hash, block.header.number);
         // The header's own QC first: a forged one is this peer's fault
-        // whatever came before it.
-        let anchor = match self.sync_anchor_of(&block.header) {
+        // whatever came before it. Lazy screening (`verify` false) decodes it
+        // and checks its view, but neither verifies it nor harvests an
+        // anchor from it: the block waits, parent-linked in the buffer, for
+        // a verified anchor at or above it.
+        let anchor = if verify {
+            self.sync_anchor_of(&block.header)
+        } else {
+            self.header_qc_wire(&block.header).map(|_| None)
+        };
+        let anchor = match anchor {
             Ok(anchor) => anchor,
             Err(reason) => {
                 warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block whose certificate does not verify; the rest of its range is dropped");
@@ -5699,7 +5729,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // the parent rules against the block pulled before it, before
         // anything is buffered for execution. A refusal is the peer's fault,
         // as a forged certificate is.
-        if let Some(reason) = self.profile1_pulled_refusal(&block.header, Some(rlp.len())) {
+        if let Some(reason) = self.profile1_pulled_refusal(&block.header, Some(rlp.len()), verify) {
             warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block profile 1 refuses; the rest of its range is dropped");
             self.pull_fault(peer, number, events);
             return false;
@@ -6404,7 +6434,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn check_pulled_block(&self, header: &Header) -> Result<Option<u64>, String> {
         // Profile 1: every header rule but the clock, seal included (AM4:
         // import of a committed block is checked too, B4's bound is not).
-        if let Some(reason) = self.profile1_pulled_refusal(header, None) {
+        if let Some(reason) = self.profile1_pulled_refusal(header, None, true) {
             return Err(reason);
         }
         if let Some(prev) = self.catch_up.as_ref().and_then(|c| c.prev_hash)
@@ -6544,8 +6574,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// before it executes: its parent is the block pulled before it, whose
     /// header is not remembered yet, so the parent rules (B4's lower bound,
     /// B13, B14) are checked against that one.
-    fn profile1_pulled_refusal(&self, header: &Header, block_bytes: Option<usize>) -> Option<String> {
-        if let Some(reason) = self.profile1_import_refusal(header, block_bytes) {
+    ///
+    /// `check_seal` false leaves out the seal (B2/B3), the one BLS
+    /// verification of the rules: the lazy screening (`N42_SYNC_LAZY_VERIFY`)
+    /// does so for a block that executes only once a verified commit QC of a
+    /// descendant authenticates it (docs/P1_CATCHUP_PERF.md, section 4).
+    fn profile1_pulled_refusal(&self, header: &Header, block_bytes: Option<usize>, check_seal: bool) -> Option<String> {
+        if let Some(reason) = self.profile1_header_refusal(header, block_bytes, check_seal) {
             return Some(reason);
         }
         if let Some(parent) = self.last_pulled_header.as_ref()
@@ -6565,6 +6600,12 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// block's decoded size when the caller has it (B15). `None` on every
     /// other chain.
     fn profile1_import_refusal(&self, header: &Header, block_bytes: Option<usize>) -> Option<String> {
+        self.profile1_header_refusal(header, block_bytes, true)
+    }
+
+    /// [`Self::profile1_import_refusal`], the seal left out when
+    /// `check_seal` is false.
+    fn profile1_header_refusal(&self, header: &Header, block_bytes: Option<usize>, check_seal: bool) -> Option<String> {
         let rules = &self.header_rules;
         if !rules.is_profile1() {
             return None;
@@ -6585,6 +6626,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // rules name; without a schedule, the seal against the leader key
         // the engine knows for the view.
         let sealed = match &rules.proposers {
+            _ if !check_seal => Ok(()),
             Some(schedule) => match schedule.proposer(extra.view) {
                 Some(proposer) => n42_h2_consensus::verify_profile1_seal(header, proposer).map_err(|err| err.to_string()),
                 None => Err(format!("B2: no proposer for view {}", extra.view)),

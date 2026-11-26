@@ -14,7 +14,7 @@
 #                                               the chain does not move), member 3 pulls from 0;
 #                                               heights sampled every CB_SAMPLE_S, CPU per process,
 #                                               the EL's metrics before/after; then all down.
-#                                               CB_ENV="K=V .." goes to member 3 only.
+#                                               CB_ENV="K=V,K=V" (comma or space) goes to member 3 only.
 #   scripts/catchup-bench.sh report <name>      blocks/s, txs/s, bytes/s overall and per segment
 #
 # Everything lives under CB_DIR (default /data/n42-build/p1-catchup); the
@@ -159,7 +159,7 @@ cmd_leg() {
     "$CB_BIN" "$P1_DIR" "$out" &
   local sampler=$!
   P1_CPUS="${CB_CPUS:-$DEF_CPUS}" P1_MEMBERS=3 P1_MEMBERS_ALL="0 1 3" P1_EL_ARGS="$EL_POOL --metrics 127.0.0.1:$CB_METRICS_PORT ${CB_EL_ARGS:-}" \
-    P1_MEMBER_ENV="${CB_ENV:-}" P1_RUST_LOG=info,n42=debug "$P1" up > "$out/up-m3.log" 2>&1 || { kill $sampler; exit 1; }
+    P1_MEMBER_ENV="$(echo "${CB_ENV:-}" | tr , " ")" P1_RUST_LOG=info,n42=debug "$P1" up > "$out/up-m3.log" 2>&1 || { kill $sampler; exit 1; }
   wait $sampler
   sleep 2
   curl -s "http://127.0.0.1:$CB_METRICS_PORT" > "$out/metrics-after.txt"

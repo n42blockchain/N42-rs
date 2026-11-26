@@ -619,6 +619,12 @@ pub struct H2Service<E> {
     /// a reply's last block (and every [`LAZY_VERIFY_TAIL`]-th unanchored
     /// one) only; see [`crate::sync_pipeline::lazy_verify_from_env`].
     sync_lazy_verify: bool,
+    /// `N42_SYNC_BATCH_IMPORT`: pulled blocks go to the execution layer in
+    /// runs (`n42Engine_importRange`). Only ever under
+    /// `N42_SYNC_ANCHOR=enforce`, where every block the importer gets is
+    /// covered by a verified commit QC at or above it and parent-linked to
+    /// it and to the executed head (`docs/P1_CATCHUP_PERF.md` step 6).
+    sync_batch_import: bool,
     /// `N42_SYNC_STALL_SECS`: how long the executed head may stand still
     /// while pulled blocks wait for execution before the pipeline is given up.
     sync_stall: Duration,
@@ -2032,6 +2038,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             sync_anchor_mode: SyncAnchorMode::from_env(),
             sync_pipeline: crate::sync_pipeline::pipeline_from_env(),
             sync_lazy_verify: crate::sync_pipeline::lazy_verify_from_env(),
+            sync_batch_import: crate::sync_pipeline::batch_import_from_env(),
             sync_stall: crate::sync_pipeline::stall_from_env(),
             pulled_importer: None,
             pulled_reports: None,
@@ -6241,7 +6248,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         proven: Option<Option<u64>>,
     ) {
         if self.pulled_importer.is_none() {
-            let (importer, reports) = crate::sync_pipeline::PulledImporter::spawn(self.driver.execution_layer_arc());
+            // Runs only under the enforced anchor rule: there every block
+            // queued here is authenticated by a verified commit QC.
+            let batched = self.sync_batch_import && self.sync_anchor_mode == SyncAnchorMode::Enforce;
+            let el = self.driver.execution_layer_arc();
+            let (importer, reports) = if batched {
+                crate::sync_pipeline::PulledImporter::spawn_batched(el)
+            } else {
+                crate::sync_pipeline::PulledImporter::spawn_per_block(el)
+            };
             self.pulled_importer = Some(importer);
             self.pulled_reports = Some(reports);
         }

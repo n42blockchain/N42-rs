@@ -332,6 +332,83 @@ async fn lazy_screening_executes_nothing_a_forger_served() {
     }
 }
 
+/// The batched import (`N42_SYNC_BATCH_IMPORT`, `docs/P1_CATCHUP_PERF.md`
+/// step 6) beside a forger: the honest chain goes to the execution layer in
+/// runs, in order, and no forged block is ever in a run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_import_runs_the_honest_chain_and_nothing_a_forger_served() {
+    for lazy in [false, true] {
+        let (keys, set) = keys(1);
+        let builder = node_in(&keys, &set, 0, None).await;
+        let count = 300;
+        let honest = anchored_chain(&builder, count);
+        let mut forged = honest[..149].to_vec();
+        let mut parent = forged[148].0;
+        for number in 150..=count {
+            let qc = header_qc(&builder.svc, &builder.keys, &[0], number - 1, parent, B256::repeat_byte(7));
+            let block = block_with_extra(number, parent, number, qc);
+            parent = block.0;
+            forged.push(block);
+        }
+        drop(builder);
+        let mut servers = vec![server_with(&keys, &set, &forged).await, server_with(&keys, &set, &honest).await];
+        let mut a = puller(&keys, &set, &mut servers, 0, 0, true).await;
+        a.svc.sync_lazy_verify = lazy;
+        a.svc.sync_batch_import = true;
+        a.el.set_behaviour(MockBehaviour { range_imports: true, new_payload_delay: Some(Duration::from_millis(2)), ..Default::default() });
+        let mut events = Vec::new();
+        pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| {
+            synced(events).is_some_and(|(height, complete)| complete && height == count - 1)
+        })
+        .await;
+        assert!(!a.el.range_imports().is_empty(), "the pull went in runs (lazy {lazy})");
+        let forged_hashes: HashSet<B256> = forged[149..].iter().map(|b| b.0).collect();
+        let ran = executed(&a);
+        assert!(ran.iter().all(|h| !forged_hashes.contains(h)), "a forged block reached the execution layer");
+        let hashes: Vec<B256> = honest[..count as usize - 1].iter().map(|b| b.0).collect();
+        let mut seen = HashSet::new();
+        let unique: Vec<B256> = ran.into_iter().filter(|h| seen.insert(*h)).collect();
+        assert_eq!(unique, hashes, "the honest chain, in order (lazy {lazy})");
+    }
+}
+
+/// A run whose top commit QC is forged (every block past the first carries a
+/// QC that does not verify) and no honest peer: under the batched import the
+/// execution layer is handed nothing -- no run, no block, no forkchoice to a
+/// forged block -- so its head and state are what they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_whose_top_qc_is_forged_leaves_the_el_head_and_state_unchanged() {
+    let (keys, set) = keys(1);
+    let builder = node_in(&keys, &set, 0, None).await;
+    let count = 200;
+    let honest = anchored_chain(&builder, count);
+    let mut forged = honest[..1].to_vec();
+    let mut parent = forged[0].0;
+    for number in 2..=count {
+        let qc = header_qc(&builder.svc, &builder.keys, &[0], number - 1, parent, B256::repeat_byte(7));
+        let block = block_with_extra(number, parent, number, qc);
+        parent = block.0;
+        forged.push(block);
+    }
+    drop(builder);
+    let mut servers = vec![server_with(&keys, &set, &forged).await];
+    let mut a = puller(&keys, &set, &mut servers, 0, 0, true).await;
+    a.svc.sync_lazy_verify = true;
+    a.svc.sync_batch_import = true;
+    a.el.set_behaviour(MockBehaviour { range_imports: true, ..Default::default() });
+    let before = a.el.calls().len();
+    let mut events = Vec::new();
+    pump_many(&mut a, &mut servers, &mut events, 30, |_, _| false, |_, events| synced(events).is_some()).await;
+    let forged_hashes: HashSet<B256> = forged.iter().map(|b| b.0).collect();
+    assert!(a.el.range_imports().is_empty(), "no run reached the execution layer");
+    assert!(executed(&a).is_empty(), "no block reached the execution layer: {:?}", executed(&a));
+    let heads: Vec<B256> = a.el.calls()[before..]
+        .iter()
+        .filter_map(|c| if let ElCall::ForkchoiceUpdated(s) = c { Some(s.head_block_hash) } else { None })
+        .collect();
+    assert!(heads.iter().all(|h| !forged_hashes.contains(h)), "a forkchoice moved to a pulled block: {heads:?}");
+}
+
 /// The stall watchdog: an execution layer that stops answering mid-pull
 /// leaves the executed head where it is while pulled blocks wait; the
 /// pipeline gives up, says so, and the next pull runs serially and

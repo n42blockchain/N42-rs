@@ -873,6 +873,9 @@ pub struct EngineApiClient<T> {
     /// Whether the execution layer answers `n42Engine_blocksByRange`, assumed
     /// until it says "method not found" once (as [`Self::raw_payloads`]).
     raw_ranges: std::sync::atomic::AtomicBool,
+    /// Whether the execution layer answers `n42Engine_importRange`, assumed
+    /// until it says "method not found" or `null` once.
+    range_imports: std::sync::atomic::AtomicBool,
     /// The loopback channel this repo's execution layer serves built blocks
     /// on as bytes (`payload_serve`), once its address has been asked for.
     raw_channel: tokio::sync::Mutex<RawChannel>,
@@ -917,6 +920,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             fcu_rung: std::sync::atomic::AtomicUsize::new(0),
             raw_payloads: std::sync::atomic::AtomicBool::new(true),
             raw_ranges: std::sync::atomic::AtomicBool::new(true),
+            range_imports: std::sync::atomic::AtomicBool::new(true),
             raw_channel: tokio::sync::Mutex::new(RawChannel::default()),
             raw_import: tokio::sync::Mutex::new(RawChannel::default()),
             raw_build: tokio::sync::Mutex::new(RawChannel::default()),
@@ -1504,6 +1508,28 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
             Err(TransportError::Rpc(err)) if err.code == METHOD_NOT_FOUND => {
                 debug!(target: "n42.h2.el", "execution layer has no n42Engine_blocksByRange; block by block");
                 self.raw_ranges.store(false, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            }
+            Err(err) => Err(ElError::new(err)),
+        }
+    }
+
+    async fn import_range(&self, payloads: Vec<ExecutionData>) -> Result<Option<n42_h2_execution::RangeImport>, ElError> {
+        if !self.range_imports.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let params = vec![json!(payloads)];
+        match self.transport.call("n42Engine_importRange", params).await {
+            Ok(Value::Null) => {
+                // The method exists but the node withdrew it
+                // (`N42_CATCHUP_IMPORT=0`, or not a HotStuff QMDB chain).
+                self.range_imports.store(false, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            }
+            Ok(value) => range_import_from(&value).map(Some),
+            Err(TransportError::Rpc(err)) if err.code == METHOD_NOT_FOUND => {
+                debug!(target: "n42.h2.el", "execution layer has no n42Engine_importRange; block by block");
+                self.range_imports.store(false, std::sync::atomic::Ordering::Relaxed);
                 Ok(None)
             }
             Err(err) => Err(ElError::new(err)),
@@ -3289,5 +3315,30 @@ mod ahead_gate_tests {
         assert!(state.deferred.is_none(), "a start deferred by the failed build cannot run");
         assert_eq!(state.slot.as_ref().map(|c| c.key()), Some(key(0, 5, 4)));
         assert_eq!(state.generation, 0);
+    }
+}
+
+/// An `n42Engine_importRange` answer (`{imported, head, refused,
+/// unavailable, timesUs}`), the fields the validator reads.
+pub fn range_import_from(value: &Value) -> Result<n42_h2_execution::RangeImport, ElError> {
+    let imported = value
+        .get("imported")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ElError::new(format!("unusable importRange answer: {value}")))?;
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    Ok(n42_h2_execution::RangeImport { imported, refused: text("refused"), unavailable: text("unavailable") })
+}
+
+#[cfg(test)]
+mod range_import_tests {
+    use super::*;
+
+    #[test]
+    fn an_import_range_answer_is_read() {
+        // The shape bin/n42's `RangeImport` serializes to (its test checks it).
+        let value = json!({"imported": 3, "head": B256::with_last_byte(3), "refused": "block 4: bad", "unavailable": null, "timesUs": [0, 0, 0, 0, 0, 0, 0]});
+        let read = range_import_from(&value).expect("read");
+        assert_eq!(read, n42_h2_execution::RangeImport { imported: 3, refused: Some("block 4: bad".into()), unavailable: None });
+        assert!(range_import_from(&json!({"head": null})).is_err(), "no count is not an answer");
     }
 }

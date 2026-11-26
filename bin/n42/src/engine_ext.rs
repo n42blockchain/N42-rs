@@ -83,7 +83,30 @@ pub trait N42EngineApi {
     /// block (`docs/P1_CATCHUP_PERF.md`).
     #[method(name = "blocksByRange")]
     async fn blocks_by_range(&self, start: u64, count: u64, max_bytes: u64) -> RpcResult<Option<Vec<Bytes>>>;
+
+    /// Executes a run of consecutive committed blocks in one call, the first
+    /// on the canonical head, and makes the last one imported the head
+    /// (`crate::catchup_import`). `null` when the node does not offer it.
+    /// For a validator catching up on a committed range only: the caller
+    /// vouches that every block is authenticated by a verified commit QC.
+    #[method(name = "importRange")]
+    async fn import_range(
+        &self,
+        payloads: Vec<alloy_rpc_types_engine::ExecutionData>,
+    ) -> RpcResult<Option<crate::catchup_import::RangeImport>>;
 }
+
+/// The most blocks one [`N42EngineApi::import_range`] call takes.
+pub const MAX_IMPORT_RANGE: usize = 1024;
+
+/// Runs one [`N42EngineApi::import_range`] call.
+pub type ImportRange = std::sync::Arc<
+    dyn Fn(
+            Vec<alloy_rpc_types_engine::ExecutionData>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::catchup_import::RangeImport> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// The most blocks one [`N42EngineApi::blocks_by_range`] call answers with.
 pub const MAX_BLOCKS_BY_RANGE: u64 = 1024;
@@ -110,6 +133,8 @@ pub struct N42EngineExt<T: PayloadTypes> {
     pub persisted_block: Option<PersistedBlock>,
     /// The canonical block reader by range, when the node offers it.
     pub blocks_by_range: Option<BlocksByRange>,
+    /// The committed-range import, when the node offers it.
+    pub import_range: Option<ImportRange>,
 }
 
 impl<T: PayloadTypes> std::fmt::Debug for N42EngineExt<T> {
@@ -164,6 +189,23 @@ where
             .await
             .map(Some)
             .map_err(|err| ErrorObject::owned(INTERNAL_ERROR_CODE, err.to_string(), Option::<()>::None))
+    }
+
+    async fn import_range(
+        &self,
+        payloads: Vec<alloy_rpc_types_engine::ExecutionData>,
+    ) -> RpcResult<Option<crate::catchup_import::RangeImport>> {
+        let Some(import) = self.import_range.clone() else {
+            return Ok(None);
+        };
+        if payloads.len() > MAX_IMPORT_RANGE {
+            return Err(ErrorObject::owned(
+                jsonrpsee::types::error::INVALID_PARAMS_CODE,
+                format!("{} blocks; at most {MAX_IMPORT_RANGE} a call", payloads.len()),
+                Option::<()>::None,
+            ));
+        }
+        Ok(Some(import(payloads).await))
     }
 }
 

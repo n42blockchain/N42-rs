@@ -358,7 +358,8 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_ROCKSDB_DIRECT_IO` | off | `1` (or the knob's own value; see code) | N42_ROCKSDB_DIRECT_IO=1: flushes and compactions bypass the page cache (direct I/O with a 1 MiB writable buffer), so the SST files RocksDB writ... | `storage/provider:providers/rocksdb/provider.rs:67` | unknown |
 | `N42_ROCKSDB_MAX_WAL_MB` | 256 MiB | integer | RocksDB max total WAL size. | `storage/provider:providers/rocksdb/provider.rs:202` | default |
 | `N42_ROCKSDB_NOSYNC` | off | `1` (or the knob's own value; see code) | Leave the RocksDB WAL write unsynced (bench knob). | `storage/provider:providers/rocksdb/provider.rs:56` | unsafe-bench |
-| `N42_ROCKSDB_WRITE_BUFFER_MB` | 4096 MiB | integer | RocksDB shared memtable budget. | `storage/provider:providers/rocksdb/provider.rs:181` | default |
+| `N42_ROCKSDB_WRITE_BUFFER_MB` | 4096 MiB | integer | RocksDB shared memtable budget. With the write stall on, 128 MiB stopped a heavy catch-up for good (docs/P1_MEMORY.md); pair a small budget with `N42_ROCKSDB_WRITE_BUFFER_STALL=0`. | `storage/provider:providers/rocksdb/provider.rs:181` | default |
+| `N42_ROCKSDB_WRITE_BUFFER_STALL` | on | `0`/`false`/`off`/`no` | Off: the memtable budget only triggers flushes and never makes a write wait. On (upstream): a write waits until memtable memory falls under the budget, which a flushed memtable pinned by a provider's history snapshot never does. | `storage/provider:providers/rocksdb/provider.rs` | experimental |
 | `N42_SF_BULK_APPEND` | off (1/on/true) | `1`/`on`/`true` | Append static-file rows in bulk. | `storage/provider:providers/static_file/n42_sf.rs:166` | adopted |
 | `N42_SF_DROP_CACHE` | off (1/on/true) | `1`/`on`/`true` | Ranged lagged DONTNEED of static-file pages after commit. | `storage/provider:providers/static_file/n42_sf.rs:72` | adopted |
 | `N42_SF_DROP_CACHE_KEEP_MB` | 256 | integer | N42_SF_DROP_CACHE_KEEP_MB (default 256), read once: the tail of a data file, in bytes, whose pages drop_cache_after_commit leaves cached. | `storage/provider:providers/static_file/n42_sf.rs:83` | default |
@@ -386,10 +387,11 @@ never reads them. Each sets a default the operator can still override with the f
 
 | Knob | Default | Values | Meaning | Where read | Status |
 |---|---|---|---|---|---|
-| `N42_P1_MEMORY` | on (profile 1 only) | `0` turns it off | Every profile-1 memory default: jemalloc `narenas`/`background_thread` (one `exec` of the process with `MALLOC_CONF`), `RAYON_NUM_THREADS`, `--cpu-cores`, blst's verification pool (`N42_P1_CORES` workers), the cross-block and RocksDB caches, and the QMDB prefault knobs `N42_TWIG_POOL_FLOOR=16`, `N42_QMDB_APPEND_AHEAD_MB=8`, `N42_QMDB_OFFSET_SEGMENTS_AHEAD=1`. A value the operator set always wins. | `qmdb-reth:profile1_memory.rs` | default |
+| `N42_P1_MEMORY` | on (profile 1 only) | `0` turns it off | Every profile-1 memory default: jemalloc `narenas`/`background_thread` (one `exec` of the process with `MALLOC_CONF`), `RAYON_NUM_THREADS`, `--cpu-cores`, blst's verification pool (`N42_P1_CORES` workers), the cross-block, RocksDB and RPC state caches, the QMDB prefault knobs `N42_TWIG_POOL_FLOOR=16`, `N42_QMDB_APPEND_AHEAD_MB=8`, `N42_QMDB_OFFSET_SEGMENTS_AHEAD=1`, and `N42_QMDB_ENTRY_FILE=1` (a migrated datadir stays in file mode). A value the operator set always wins. | `qmdb-reth:profile1_memory.rs` | default |
 | `N42_P1_CORES` | 8 | integer (`0` = the host's count) | Cores a profile-1 member sizes its pools and jemalloc arenas by (capped at the host's). `0` also leaves the allocator alone. | `qmdb-reth:profile1_memory.rs` | default |
 | `N42_P1_CROSS_BLOCK_CACHE_MB` | 256 | integer (MiB) | `--engine.cross-block-cache-size` of a profile-1 member when the flag is not given (reth: 4096). | `qmdb-reth:profile1_memory.rs` | default |
 | `N42_P1_ROCKSDB_CACHE_MB` | 32 | integer (MiB) | `--db.rocksdb-block-cache-size` of a profile-1 member when the flag is not given (reth: 128 MiB). | `qmdb-reth:profile1_memory.rs` | default |
+| `N42_P1_RPC_CACHE_MB` | 64 | integer (MiB) | Each of `--rpc-cache.max-blocks-bytes`, `--rpc-cache.max-receipts-bytes`, `--rpc-cache.max-bals-bytes` of a profile-1 member when its flag is not given (reth: 2 GiB, 1 GiB, 500 MiB). | `qmdb-reth:profile1_memory.rs` | default |
 
 ## Explorer RPC (bin/n42, engine-types)
 

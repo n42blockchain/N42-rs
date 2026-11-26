@@ -66,7 +66,7 @@ fn ext(script: Script, raw_endpoint: Option<std::net::SocketAddr>) -> N42EngineE
             }
         }
     });
-    N42EngineExt { payloads: PayloadBuilderHandle::new(tx), raw_endpoint, in_memory_blocks: None, persisted_block: None, blocks_by_range: None }
+    N42EngineExt { payloads: PayloadBuilderHandle::new(tx), raw_endpoint, in_memory_blocks: None, persisted_block: None, blocks_by_range: None, import_range: None }
 }
 
 #[tokio::test]
@@ -131,4 +131,34 @@ async fn blocks_by_range_is_served_capped_when_the_node_reads_it() {
     assert_eq!(got, vec![Bytes::from(vec![3u8]), Bytes::from(vec![4u8])]);
     let capped = ext.blocks_by_range(0, 5000, 1 << 20).await.unwrap().unwrap();
     assert_eq!(capped.len() as u64, crate::engine_ext::MAX_BLOCKS_BY_RANGE, "the count is capped");
+}
+
+#[tokio::test]
+async fn import_range_is_null_when_not_offered_and_refuses_an_oversized_run() {
+    let mut ext = ext(Script::Unknown, None);
+    assert_eq!(ext.import_range(Vec::new()).await.unwrap(), None, "a node that does not offer it says null");
+    ext.import_range = Some(Arc::new(|payloads: Vec<alloy_rpc_types_engine::ExecutionData>| {
+        Box::pin(async move { crate::catchup_import::RangeImport { imported: payloads.len() as u64, ..Default::default() } })
+    }));
+    assert_eq!(ext.import_range(Vec::new()).await.unwrap().map(|out| out.imported), Some(0));
+    let too_many = vec![n42_h2_execution::MockExecutionLayer::payload_for(Default::default(), 1); crate::engine_ext::MAX_IMPORT_RANGE + 1];
+    let err = ext.import_range(too_many).await.unwrap_err();
+    assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+}
+
+/// The answer's shape `n42_h2_el_rpc::engine::range_import_from` reads (its
+/// test reads this same JSON).
+#[test]
+fn a_range_import_answer_has_the_shape_the_validator_reads() {
+    let out = crate::catchup_import::RangeImport {
+        imported: 3,
+        head: Some(alloy_primitives::B256::with_last_byte(3)),
+        refused: Some("block 4: bad".into()),
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&out).unwrap();
+    assert_eq!(json["imported"], 3);
+    assert_eq!(json["refused"], "block 4: bad");
+    assert!(json["unavailable"].is_null());
+    assert!(json["timesUs"].is_array());
 }

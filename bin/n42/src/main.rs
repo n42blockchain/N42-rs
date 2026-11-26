@@ -649,12 +649,34 @@ fn main() {
                             }
                             out
                         });
+                    // A committed range in one call (`catchup_import`): on a
+                    // HotStuff chain with QMDB, unless `N42_CATCHUP_IMPORT=0`.
+                    let import_range = {
+                        use reth_provider::ChainSpecProvider;
+                        let chain_spec = ctx.provider().chain_spec();
+                        let lean = ctx.node().consensus().without_header_signatures();
+                        let offered = n42_env::flag(n42::catchup_import::CATCHUP_IMPORT_ENV, true);
+                        qmdb_for_rpc.clone().filter(|_| offered).zip(lean).map(|(qmdb, lean)| {
+                            let provider = ctx.provider().clone();
+                            let evm_config = ctx.node().evm_config().clone();
+                            let full: std::sync::Arc<dyn reth_consensus::FullConsensus<n42_tx_types::N42Primitives> + Send + Sync> =
+                                ctx.node().consensus().clone();
+                            let lean: std::sync::Arc<dyn reth_consensus::FullConsensus<n42_tx_types::N42Primitives> + Send + Sync> =
+                                std::sync::Arc::new(lean);
+                            let profile = n42_engine_types::engine_validator::header_profile_for(&chain_spec);
+                            let validator = std::sync::Arc::new(
+                                n42_engine_types::engine_validator::N42EngineValidator::new(chain_spec.clone(), profile),
+                            );
+                            n42::catchup_import::serve(provider, evm_config, qmdb, lean, full, chain_spec, validator)
+                        })
+                    };
                     let engine_ext = N42EngineExt {
                         payloads: ctx.node().payload_builder_handle().clone(),
                         raw_endpoint,
                         in_memory_blocks: Some(in_memory_blocks),
                         persisted_block: Some(persisted_block),
                         blocks_by_range: Some(blocks_by_range),
+                        import_range,
                     };
 
                     // A QMDB chain proves state from the forest: `n42_getProof`
@@ -932,6 +954,29 @@ fn main() {
                         }
                     }
                 });
+            }
+
+            // The head move `n42Engine_importRange` ends a run with
+            // (`catchup_import`): head only, the safe and finalized tags
+            // unchanged (zero); the validator's own forkchoice after the run
+            // sets them as it does for any pulled block.
+            {
+                let engine = node.add_ons_handle.beacon_engine_handle.clone();
+                n42::catchup_import::set_forkchoice(std::sync::Arc::new(move |head| {
+                    let engine = engine.clone();
+                    Box::pin(async move {
+                        let state = alloy_rpc_types_engine::ForkchoiceState {
+                            head_block_hash: head,
+                            safe_block_hash: alloy_primitives::B256::ZERO,
+                            finalized_block_hash: alloy_primitives::B256::ZERO,
+                        };
+                        match engine.fork_choice_updated(state, None).await {
+                            Ok(updated) if updated.payload_status.status.is_valid() => Ok(()),
+                            Ok(updated) => Err(format!("{:?}", updated.payload_status.status)),
+                            Err(err) => Err(err.to_string()),
+                        }
+                    })
+                }));
             }
 
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;

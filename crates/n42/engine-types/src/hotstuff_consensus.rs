@@ -139,6 +139,18 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> HotStuffConsensus<ChainSpec> {
         &self.header_rules
     }
 
+    /// The same rules without the profile-1 header's two signature checks
+    /// (the embedded QC and the proposer's seal, which the header rules make
+    /// only when they carry the proposer schedule). For a committed range the
+    /// caller has already authenticated by a verified commit QC
+    /// (`n42Engine_importRange`, `docs/P1_CATCHUP_PERF.md` step 6); every
+    /// other rule is the same.
+    pub fn without_header_signatures(&self) -> Self {
+        let mut rules = (*self.header_rules).clone();
+        rules.proposers = None;
+        Self::new(self.chain_spec.clone()).with_header_rules(rules)
+    }
+
     /// The committee pool the chain runs, if any.
     pub const fn committee_pool(&self) -> Option<&SimulatedCommitteePool> {
         self.committee.as_ref()

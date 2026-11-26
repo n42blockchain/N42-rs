@@ -2945,7 +2945,7 @@ fn fill_carry(
 ///
 /// With `N42_HASHED_TABLES=off` (stage 6c) the QMDB reader serves them and
 /// nothing writes the tables, so the pass is skipped on that setting.
-fn hashed_state_enabled() -> bool {
+pub(crate) fn hashed_state_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         n42_env::flag("N42_HASHED_STATE", true) && !n42_qmdb_reth::n42_state::hashed_tables_off()

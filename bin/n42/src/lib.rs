@@ -41,6 +41,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 pub mod cli;
 
 pub mod answer_at_insert;
+pub mod catchup_import;
 /// The RPC namespaces served on the public and authenticated transports.
 pub mod consensus_ext;
 pub mod engine_ext;

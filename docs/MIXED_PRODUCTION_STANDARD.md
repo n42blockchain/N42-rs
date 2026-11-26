@@ -956,3 +956,11 @@ join of gate 4a. v1 does not require any member to prune history, so a long-abse
 on its peers. Peer-to-peer state sync (`qmdb_*`, `code_by_hash`, SYNC section 3) becomes gate 4b of v1.1; until a
 client serves it, a member that cannot pull by range joins from a snapshot file (4a).
 
+## Amendment AM30 (2026-11-26, standard owner by delegation; gov5 agreed): v1 range sync is `bodies_by_range/1`
+
+The §3 wire table names `/rpc/bodies_by_range/2/ssz_snappy` and `/rpc/commit_qc/1/ssz_snappy` as required. No client
+speaks either on the wire: gov5 serves only `/rpc/bodies_by_range/1/ssz_snappy` (its `commit_qc/1` layout exists only
+inside the 4a snapshot bundle), and the gate-3 and gate-4c mixed rounds caught members up over `/1`, with anchors
+taken from the QC each profile-1 header carries and from Decide. For v1: range sync is `bodies_by_range/1`, committed
+blocks only (the §3 rule unchanged); `bodies_by_range/2` and `commit_qc/1` move to v1.1 together with gate 4b.
+

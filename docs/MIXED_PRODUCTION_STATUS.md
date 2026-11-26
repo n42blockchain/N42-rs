@@ -113,25 +113,25 @@ Alias rows (`A3 / E1` …) are one row: the second id is defined by the first.
 | E12 | impl | vec | ? | V6 `decide_valid`; conflict halt: gov5 g0409 (commit_conflict.go, safety_halt.go); n42-rs 5c7bc9562 (`h2-node/src/safety_halt.rs`, tests 8f3438971) |
 | E13 | impl | vec | ? | gov5 g0346b anchors enforced; n42-rs V6 + V1 QC refusals + strict anchor verifier (d1efe75da); n42-26 strict-anchor range client (AM13), not reported for profile 1 |
 | E14 | — | impl | ? | gov5 g0255 "finality tags aliased to latest (E14 fixed in M2)"; n42-rs split tags only on profile 1 (f31f32bc6, `h2-execution/src/settlement.rs`) |
-| E15 | — | — | ? | gov5 g0255 "equivocation evidence stores hashes only"; n42-rs detects in `h2-consensus/src/protocol/voting.rs`, no persisted pair, no `n42_equivocations` RPC, no metric |
+| E15 | impl | impl | ? | AM28 shape: n42-rs main 6413d13b2 (persisted pair, `n42_equivocations`, `n42_equivocations_total`); gov5 feat/p1-j2-e15 5eb5aba9 (vote/commit_vote kinds; merge pending) |
 | E16 | ? | impl | ? | n42-rs 4c818ee56 (every vote on the consensus topic), `N42_VOTE_TRANSPORT=direct` refused |
 | E17 | ? | vec | ? | V6 Decide wire / snappy gossip bytes |
 | F1 | impl | impl | — | gov5 g0346b; n42-rs cc71c34e2; n42-26 does not produce profile-1 blocks yet (n0505) |
 | F2 | ? | impl | ? | n42-rs proposes empty blocks |
 | F3 | impl | impl | — | gov5 g0346b "maxBlockBytes*0.9 - 32 KiB - header"; n42-rs `engine-types/src/payload.rs` 9/10 of the block bound (the −32 KiB term not checked here); n42-26 not producing |
 | F5 | ? | vec | ? | V6 `tc_leader_proposes_on_high_qc` |
-| F6 | ? | ? | ? | n42-rs: same-parent rebuild path not verified against F6 |
+| F6 | ? | impl | ? | n42-rs 2460fa4e6: one signed proposal per (view, proposer), tested incl. a restart inside the view |
 | F7 | ? | impl | — | n42-rs deferred execution + sealed own block; n42-26 not producing |
 | G1 | ? | impl | ? | n42-rs `h2-net` |
 | G2 | ? | impl | ? | n42-rs `h2-net` topics incl. mobileverify |
 | G3 | ? | impl | ? | n42-rs `h2-net` message id |
 | G4 | ? | impl | ? | V9 not published; n42-rs `gov5_gossipsub_config` |
-| G5 | impl | ? | ? | gov5 g0346b "consensus gossip messages capped at 64 KiB decoded"; n42-rs: 64 KiB on direct vote bodies (`h2-net/src/rpc.rs` MAX_VOTE_BODY), gossip-side cap not found |
+| G5 | impl | impl | ? | n42-rs: consensus gossip decoders refuse > ~8 KiB declared length before decompressing (stricter than 64 KiB; = gov5 v4 cap), pinned by 0c1f934b2 |
 | G6 | ? | impl | ? | n42-rs: no single-client protocol needed by another |
 | I1 | ? | impl | ? | n42-rs `crates/n42/mobileverify`, `h2-node/src/mobile.rs` (`docs/MOBILEVERIFY_V3_PARITY.md`) |
 | I2 | ? | impl | ? | gov5 g0316 "gov5 adds the repeat-parent fallback" (plan); n42-rs 9501762b0 |
-| J1 | ? | ? | ? | no evidence found for `eth_config` −32004 on profile 1 |
-| J2 | ? | — | ? | n42-rs: none of the seven metric names exists in `crates/` |
+| J1 | ? | impl | ? | n42-rs: `eth_config` −32004 and proof/witness refusals on a profile-1 genesis, pinned by 1486f03f4 |
+| J2 | impl | impl | ? | all seven `n42_*` metrics: n42-rs 02d187fd7 (`h2_validator --metrics`); gov5 feat/p1-j2-e15 5eb5aba9 (merge pending) |
 | J3 | vec | vec | vec | V8 `legacy_*` cases |
 | J4 | impl | impl | impl | gov5 g0331 (AM10, incl. `--miner.gasceil`, `--block-interval-ms`); n42-rs `profile1.rs` refuse_overrides / FORBIDDEN_ENV / FORBIDDEN_FLAGS (f31f32bc6); n42-26 n0505 (AM10) |
 
@@ -141,10 +141,10 @@ Sync (§3 of the standard; not item ids, not counted above):
 | --- | --- | --- | --- | --- |
 | anchors enforced | impl | impl | ? | gov5 g0346b "sync anchors pinned to enforce"; n42-rs e6f4efe59, `N42_SYNC_ANCHOR` refused unless enforce; n42-26 strict-anchor client (AM13), default not reported |
 | ranges committed-only | impl | impl | ? | gov5 g0346b; n42-rs 92b81a20e |
-| by-hash serves proposals, miss `0x03` | impl | — | ? | gov5 g0346b; n42-rs serves proposals but defines only codes 1 and 2 (`h2-net/src/rpc.rs`) |
-| `bodies_by_range/2` | — | — | — | gov5 g0252 "follow M1"; n42-rs none in `crates/`; n42-26 AM13 |
-| `commit_qc/1` | — | — | — | same |
-| state-sync servers (`qmdb_*`, `code_by_hash`) | — | — | — | same |
+| by-hash serves proposals, miss `0x03` | impl | impl | ? | gov5 g0346b; n42-rs `RESPONSE_CODE_RESOURCE_UNAVAILABLE` (`h2-net/src/rpc.rs`) |
+| range sync (`bodies_by_range/1`, AM30) | mix | mix | mix | gates 3 and 4c: members of all three clients caught up by range in mixed rounds; `/2` -> v1.1 |
+| `commit_qc/1` | — | — | — | v1.1 (AM30); v1 anchors from header QCs and Decide; gov5 uses the layout only inside the 4a bundle |
+| state-sync servers (`qmdb_*`, `code_by_hash`) | — | — | — | v1.1 gate 4b (AM29); v1 long absence = range pull (4c) or snapshot file (4a) |
 | conflict halt on the sync path | impl | impl | ? | gov5 g0409; n42-rs 643a83949, 50202ac13 |
 
 ## n42-rs items still at `—`, `impl` or `?`, and what is missing
@@ -157,15 +157,11 @@ Sync (§3 of the standard; not item ids, not counted above):
 - **B15** (impl): no vector; gate 2/3 exercise it.
 - **B16, C7, E5, E8, E9/F8, E16, G1-G4, G6, I1, I2** (impl): implemented; no profile-1 vector (G4 waits for V9).
 - **E14** (impl): split tags only on profile 1; no vector and no round yet.
-- **E15** (—): persist the signed pair, add the `n42_equivocations` RPC and `n42_equivocations_total`.
-- **J2** (—): none of the seven common metrics.
-- **J1** (?): check `eth_config` (−32004) and the witness/proof refusals on a profile-1 node.
-- **F6** (?): verify one signed proposal per (view, proposer) on the same-parent rebuild path.
-- **G5** (?): find or add the 64 KiB decoded cap on gossiped consensus messages.
-- **V8**: the test reads gov5's first 14 refused files (`qmdb-reth/testdata/profile1/gov5/V8/refused`); gov5's
-  19 later cases are the equivalents of n42-rs's own 33 `refused_*.json`. Re-copy gov5's 33 to close it.
-- **Sync** (—): `block_by_hash` miss as `0x03`; `bodies_by_range/2`; `commit_qc/1`; the state-sync servers
-  (gates 3 and 4).
+- **E15, J2, J1, F6, G5, V8, by-hash `0x03`: closed 2026-11-26** (main 47f1792b9, 70c39164d, 6413d13b2; rows above).
+- **Sync:** range sync on `/1` proven mixed (gates 3, 4c; AM30); `bodies_by_range/2`, `commit_qc/1` and the
+  state-sync servers are v1.1 (AM29, AM30).
+- **A17, F1-F3, F7, A22, B15, E14:** production behaviour now exercised by the mixed gates 2-6 and the transaction
+  re-check (txcheck2); still no dedicated vector.
 
 ## Gate 3 PASSED (2026-11-25, round gate3d, T0 08:45 EST)
 

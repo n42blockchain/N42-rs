@@ -115,8 +115,12 @@ async fn fetch_range(
     let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let mut server = H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback.clone())).unwrap();
     let server_addr = listening(&mut server).await;
+    // The `/1` protocol itself: the client does not prefer `/2`.
     let mut client = H2V4Transport::new(
-        TransportConfig::new(client_identity).with_listen_addr(loopback).with_peer(server_addr),
+        TransportConfig::new(client_identity)
+            .with_listen_addr(loopback)
+            .with_peer(server_addr)
+            .with_sync_v11_client(false),
     )
     .unwrap();
     let server_id = *server.local_peer_id();
@@ -198,8 +202,10 @@ async fn a_range_replys_guard_is_held_until_the_reply_is_sent() {
     let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let mut server = H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback.clone())).unwrap();
     let server_addr = listening(&mut server).await;
-    let mut client =
-        H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback).with_peer(server_addr)).unwrap();
+    let mut client = H2V4Transport::new(
+        TransportConfig::new(IDENTITY).with_listen_addr(loopback).with_peer(server_addr).with_sync_v11_client(false),
+    )
+    .unwrap();
     let server_id = *server.local_peer_id();
 
     let released = Arc::new(AtomicBool::new(false));
@@ -276,8 +282,10 @@ async fn guard_held_until_sent(fill: bool) {
     let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let mut server = H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback.clone())).unwrap();
     let server_addr = listening(&mut server).await;
-    let mut client =
-        H2V4Transport::new(TransportConfig::new(IDENTITY).with_listen_addr(loopback).with_peer(server_addr)).unwrap();
+    let mut client = H2V4Transport::new(
+        TransportConfig::new(IDENTITY).with_listen_addr(loopback).with_peer(server_addr).with_sync_v11_client(false),
+    )
+    .unwrap();
     let server_id = *server.local_peer_id();
 
     let released = Arc::new(AtomicBool::new(false));

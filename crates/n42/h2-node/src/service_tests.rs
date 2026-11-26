@@ -61,6 +61,17 @@ async fn node_with_vote_log(count: usize, index: usize, vote_log: Arc<dyn n42_h2
     node_in_with_vote_log(&keys, &set, index, None, vote_log).await
 }
 
+thread_local! {
+    /// Whether the next rig built on this thread asks (client) and serves
+    /// sync v1.1; both on, as a node runs, unless a test says otherwise.
+    static SYNC_V11: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((true, true)) };
+}
+
+/// Sets whether the rigs built next on this thread ask and serve sync v1.1.
+fn set_sync_v11(client: bool, serve: bool) {
+    SYNC_V11.with(|c| c.set((client, serve)));
+}
+
 async fn node_in_with_vote_log(
     keys: &[BlsSecretKey],
     set: &ValidatorSet,
@@ -68,7 +79,11 @@ async fn node_in_with_vote_log(
     dial: Option<libp2p::Multiaddr>,
     vote_log: Arc<dyn n42_h2_consensus::VoteLogWriter>,
 ) -> Rig {
-    let mut config = TransportConfig::new(ID).with_listen_addr("/ip4/127.0.0.1/tcp/0".parse().expect("addr"));
+    let (v11_client, v11_serve) = SYNC_V11.with(std::cell::Cell::get);
+    let mut config = TransportConfig::new(ID)
+        .with_listen_addr("/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+        .with_sync_v11_client(v11_client)
+        .with_sync_v11_serve(v11_serve);
     if let Some(addr) = dial {
         config = config.with_peer(addr);
     }

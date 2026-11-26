@@ -62,7 +62,8 @@ pub(super) async fn pump_many(
                 if who == usize::MAX {
                     a.svc.handle_transport_event(event).expect("a handles it");
                 } else {
-                    let kind = if matches!(event, TransportEvent::RangeRequest { .. }) {
+                    // A range request over `/1` or `/2` alike.
+                    let kind = if matches!(event, TransportEvent::RangeRequest { .. } | TransportEvent::RangeV2Request { .. }) {
                         "range_request"
                     } else {
                         transport_event_kind(&event)

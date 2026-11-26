@@ -38,6 +38,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+sha2.workspace = true
 hex.workspace = true
 snap.workspace = true
 n42-h2-consensus.workspace = true

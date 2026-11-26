@@ -1675,6 +1675,80 @@ async fn a_member_behind_its_peer_pulls_the_gap_and_finishes_level() {
     assert_eq!(a.svc.failed_peer, None);
 }
 
+/// A server holding an anchored chain of `held` blocks, `committed` of them
+/// committed and advertised, serving sync v1.1 or not; and a member behind
+/// it, asking over v1.1.
+async fn behind_a_server(held: u64, committed: u64, serve_v11: bool) -> (Rig, Rig, Vec<(B256, Header, alloy_primitives::Bytes)>) {
+    let (keys, set) = keys(1);
+    set_sync_v11(true, serve_v11);
+    let mut b = node_in(&keys, &set, 0, None).await;
+    let blocks = anchored_chain(&b, held);
+    {
+        use n42_h2_execution::ExecutionLayer;
+        for (hash, _, rlp) in &blocks {
+            let decoded = n42_h2_net::decode_block_rlp_raw(rlp, HeaderProfile::Ethereum).expect("decodes");
+            assert_eq!(decoded.block_hash, *hash);
+            within(b.el.new_payload(decoded.execution_data())).await.expect("accepted");
+        }
+    }
+    b.svc.transport.set_advertised_height(committed);
+    b.svc.committed_height = Some(committed);
+    set_sync_v11(true, true);
+    let a = node_in(&keys, &set, 0, Some(b.addr.clone())).await;
+    (a, b, blocks)
+}
+
+/// Sync v1.1 end to end between two n42-rs services: the member behind
+/// pulls the gap over `bodies_by_range/2`, and before the pull ends asks
+/// `commit_qc/1` for the block no pulled header anchors (the server's
+/// committed head). The server finds the commit QC in its next canonical
+/// header, the member verifies it, and the whole gap is executed -- where
+/// over `/1` the top block waits for a live commit.
+#[tokio::test]
+async fn over_sync_v11_a_member_behind_pulls_the_gap_and_its_top_is_anchored_by_commit_qc() {
+    let (mut a, mut b, blocks) = behind_a_server(5, 4, true).await;
+    let mut a_events = Vec::new();
+    pump(&mut a, &mut b, (true, true), &mut a_events, |_, _, events| {
+        events.iter().any(|e| matches!(e, ServiceEvent::Synced { .. }))
+    })
+    .await;
+    assert!(a_events.contains(&ServiceEvent::Syncing { from: 0, to: 4 }), "{a_events:?}");
+    assert!(a_events.contains(&ServiceEvent::Synced { height: 4, complete: true }), "{a_events:?}");
+    for (hash, _, _) in &blocks[..4] {
+        assert!(a.svc.imported.contains(hash), "block {hash} was pulled");
+    }
+    assert!(!a.svc.imported.contains(&blocks[4].0), "nothing above the committed head is served");
+    assert_eq!(a.svc.driver.head(), blocks[3].0);
+    assert_eq!(a.svc.sync_v11_anchors, 1);
+    assert!(b.seen.contains(&"range_v2_request"), "{:?}", b.seen);
+    assert!(b.seen.contains(&"commit_qc_request"), "{:?}", b.seen);
+    assert!(!b.seen.contains(&"range_request"), "{:?}", b.seen);
+    assert!(a.svc.catch_up.is_none());
+    assert_eq!(a.svc.failed_peer, None);
+}
+
+/// The same gap from a server that speaks only `/1` (gov5's main line,
+/// n42-26): the pull falls back to `bodies_by_range/1`, no commit QC is
+/// asked, and the top block waits for its anchor as before.
+#[tokio::test]
+async fn from_a_v1_only_server_the_pull_falls_back_to_bodies_by_range_1() {
+    let (mut a, mut b, blocks) = behind_a_server(5, 4, false).await;
+    let mut a_events = Vec::new();
+    pump(&mut a, &mut b, (true, true), &mut a_events, |_, _, events| {
+        events.iter().any(|e| matches!(e, ServiceEvent::Synced { .. }))
+    })
+    .await;
+    assert!(a_events.contains(&ServiceEvent::Synced { height: 3, complete: true }), "{a_events:?}");
+    for (hash, _, _) in &blocks[..3] {
+        assert!(a.svc.imported.contains(hash), "block {hash} was pulled");
+    }
+    assert!(!a.svc.imported.contains(&blocks[3].0), "the top block waits for its anchor");
+    assert_eq!(a.svc.sync_v11_anchors, 0);
+    assert!(b.seen.contains(&"range_request"), "{:?}", b.seen);
+    assert!(!b.seen.contains(&"range_v2_request"), "{:?}", b.seen);
+    assert!(!b.seen.contains(&"commit_qc_request"), "{:?}", b.seen);
+}
+
 // ---------------------------------------------------------------------------
 // Layout claims of compact frame descriptions (audit 2026-10 R2-X4)
 // ---------------------------------------------------------------------------

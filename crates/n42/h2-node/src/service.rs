@@ -665,6 +665,8 @@ pub struct H2Service<E> {
     range_rate: (f64, f64),
     /// Range requests refused because the peer's bucket was empty.
     range_rate_limited: u64,
+    /// Pulled tails a `commit_qc/1` answer anchored (sync v1.1).
+    sync_v11_anchors: u64,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -816,6 +818,26 @@ struct CatchUp {
     pending_qcs: std::collections::HashMap<B256, QuorumCertificate>,
     /// The peer that served the block `prev_hash` names.
     prev_peer: Option<PeerId>,
+    /// Sync v1.1: the `commit_qc/1` question a complete pull asks for its
+    /// unanchored tail before it ends.
+    commit_qc: CommitQcAsk,
+}
+
+/// Where a pull stands with the `commit_qc/1` question for its unanchored
+/// tail (sync v1.1 §5.2): asked once, at the end of a complete pull under
+/// `N42_SYNC_ANCHOR=enforce`, of the peer that served the tail's top.
+#[derive(Debug, Default)]
+enum CommitQcAsk {
+    /// Not asked (yet).
+    #[default]
+    NotAsked,
+    /// Asked; the pull waits for the answer before it ends.
+    Waiting(PeerId, n42_h2_net::sync_v11::commit_qc::CommitQcRequest),
+    /// Answered with a verified commit QC whose headers reach the asked
+    /// block: `hash` is anchored by `qc`, which names the block at `number`.
+    Verified { hash: B256, number: u64, qc: QuorumCertificate },
+    /// Answered, applied or not usable: the pull ends.
+    Answered,
 }
 
 /// The range bytes one peer is served per second, on average (sync
@@ -894,6 +916,7 @@ impl CatchUp {
             top_anchor: None,
             pending_qcs: std::collections::HashMap::new(),
             prev_peer: None,
+            commit_qc: CommitQcAsk::NotAsked,
         }
     }
 }
@@ -1382,6 +1405,23 @@ enum Served {
         request: n42_h2_net::RangeRequest,
         channel: n42_h2_net::RangeRequestChannel,
         range: ServedRange,
+        slot: ServeSlot,
+    },
+    /// A `bodies_by_range/2` reply (sync v1.1 §5.1), with what it holds as
+    /// [`Self::Range`] does (`range.rlps` is empty: the reply carries them).
+    RangeV2 {
+        peer: PeerId,
+        channel: n42_h2_net::sync_v11::peers::RangeV2Channel,
+        reply: n42_h2_net::sync_v11::bodies::RangeV2Reply,
+        range: ServedRange,
+        slot: ServeSlot,
+    },
+    /// A `commit_qc/1` answer (sync v1.1 §5.2).
+    CommitQc {
+        peer: PeerId,
+        channel: n42_h2_net::sync_v11::peers::CommitQcChannel,
+        reply: n42_h2_net::sync_v11::commit_qc::CommitQcReply,
+        restored: Option<(B256, u64)>,
         slot: ServeSlot,
     },
 }
@@ -2009,6 +2049,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             range_buckets: std::collections::HashMap::new(),
             range_rate: (RANGE_RATE_BYTES, RANGE_BURST_BYTES),
             range_rate_limited: 0,
+            sync_v11_anchors: 0,
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             elided_own: std::collections::HashMap::new(),
@@ -3144,6 +3185,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             TransportEvent::BlockFetched { .. } | TransportEvent::BlockFetchFailed { .. } => "body_fetched",
             TransportEvent::BlockPushed { .. } | TransportEvent::Block { .. } => "body_in",
             TransportEvent::RangeRequest { .. } | TransportEvent::RangeFetched { .. } => "range",
+            TransportEvent::RangeV2Request { .. } => "range_v2",
+            TransportEvent::CommitQcRequest { .. } | TransportEvent::CommitQcFetched { .. } => "commit_qc",
             TransportEvent::Transactions { .. } => "tx_gossip",
             TransportEvent::Native { .. } | TransportEvent::Rejected { .. } => "consensus_msg",
             _ => "transport_other",
@@ -3590,6 +3633,54 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.transport.respond_range_error(channel, "server busy".to_owned());
                 }
             }
+            TransportEvent::RangeV2Request { peer, request, channel } => {
+                // Sync v1.1 §5.1, under the same rate, slots, byte budget
+                // and committed ceiling as `/1`.
+                use n42_h2_net::sync_v11::{bodies::RangeV2Reply, frame};
+                if !self.range_bucket_allows(peer) {
+                    self.range_rate_limited += 1;
+                    debug!(target: "n42.h2.node", %peer, ?request, "peer over its range byte rate; bodies_by_range/2 refused");
+                    self.transport.respond_range_v2(channel, RangeV2Reply::Refused(sync_v11_rate_limited()), None);
+                } else if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
+                    let el = self.driver.execution_layer_arc();
+                    let back = self.served_txns.0.clone();
+                    let budget = self.serve_bytes.clone();
+                    let ceiling = self.serve_ceiling();
+                    let meter = self.range_buckets.get(&peer).map(|bucket| (Arc::clone(bucket), self.range_rate));
+                    tokio::spawn(async move {
+                        let (reply, range) = serve_range_v2_metered(&*el, request, &budget, ceiling, meter).await;
+                        let _ = back.send(Served::RangeV2 { peer, channel, reply, range, slot }).await;
+                    });
+                } else {
+                    debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; bodies_by_range/2 refused");
+                    // Spec §6.3: over quota is RATE_LIMITED with a decimal
+                    // retry_after_ms (gov5 sends "1000"), not SERVER_ERROR.
+                    let busy = frame::CodeError { code: frame::CODE_RATE_LIMITED, message: "1000".to_owned() };
+                    self.transport.respond_range_v2(channel, RangeV2Reply::Refused(busy), None);
+                }
+            }
+            TransportEvent::CommitQcRequest { peer, request, channel } => {
+                // Sync v1.1 §5.2: a commit QC reaching a committed block,
+                // from the execution layer's canonical headers and the
+                // engine's persisted commit QC. Shares the range slots.
+                if let Some(slot) = ServeSlot::take(&self.serve_slots, peer) {
+                    let el = self.driver.execution_layer_arc();
+                    let back = self.served_txns.0.clone();
+                    let ceiling = self.serve_ceiling();
+                    let last = self.engine.last_committed_qc();
+                    let last = (last.view > 0).then(|| wire_bridge::qc_to_wire(last).ok()).flatten();
+                    tokio::spawn(async move {
+                        let (head, restored) = resolve_serve_ceiling(&*el, ceiling).await;
+                        let source = ElCommitQcSource { el: &*el, head, last };
+                        let reply = n42_h2_net::sync_v11::commit_qc::serve_commit_qc(&source, request).await;
+                        let _ = back.send(Served::CommitQc { peer, channel, reply, restored, slot }).await;
+                    });
+                } else {
+                    debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; commit_qc/1 refused");
+                    self.transport.respond_commit_qc(channel, Err(sync_v11_rate_limited()));
+                }
+            }
+            TransportEvent::CommitQcFetched { peer, request, reply } => self.commit_qc_fetched(peer, request, reply),
             TransportEvent::RangeFetched { peer, request, reply } => {
               if let Some(c) = self.catch_up.as_mut()
                   && let Some(sent) = c.sent.remove(&(peer, request.start))
@@ -5436,6 +5527,22 @@ impl<E: ExecutionLayer> H2Service<E> {
         if pipelined {
             self.pipeline_tick(events);
         }
+        // A pull waiting on its tail's commit QC (sync v1.1): applied and
+        // ended once answered, nothing else done meanwhile.
+        if self
+            .catch_up
+            .as_ref()
+            .is_some_and(|c| matches!(c.commit_qc, CommitQcAsk::Waiting(..) | CommitQcAsk::Verified { .. }))
+        {
+            if matches!(self.catch_up.as_ref().map(|c| &c.commit_qc), Some(CommitQcAsk::Verified { .. })) {
+                self.apply_commit_qc_answer(events).await;
+            }
+            return;
+        }
+        if self.catch_up.as_ref().is_some_and(|c| matches!(c.commit_qc, CommitQcAsk::Answered) && c.end.is_none()) {
+            self.apply_commit_qc_answer(events).await;
+            return;
+        }
         // Pulled blocks a live commit anchored since the last step.
         if enforce && self.catch_up.is_some() && !self.release_anchored(events).await {
             return;
@@ -6758,6 +6865,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     fn finish_catch_up(&mut self, events: &mut Vec<ServiceEvent>, complete: bool) {
+        if complete && self.ask_commit_qc_before_finishing() {
+            return;
+        }
         let Some(catch_up) = self.catch_up.take() else {
             return;
         };
@@ -7353,7 +7463,153 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let rlps = std::mem::take(&mut range.rlps);
                 self.transport.respond_range_holding(channel, rlps, n42_h2_net::ServeGuard::new((range, slot)));
             }
+            Served::RangeV2 { peer, channel, reply, range, slot } => {
+                debug!(target: "n42.h2.node", %peer, ?reply, ceiling = range.ceiling, "peer asked for a range over bodies_by_range/2");
+                if let Some(restored) = range.restored {
+                    self.learn_restored_commit(restored);
+                }
+                self.transport.respond_range_v2(channel, reply, Some(n42_h2_net::ServeGuard::new((range, slot))));
+            }
+            Served::CommitQc { peer, channel, reply, restored, slot } => {
+                debug!(target: "n42.h2.node", %peer, answered = reply.is_ok(), "peer asked for a commit QC");
+                if let Some(restored) = restored {
+                    self.learn_restored_commit(restored);
+                }
+                drop(slot);
+                self.transport.respond_commit_qc(channel, reply);
+            }
         }
+    }
+
+    /// The answer to the `commit_qc/1` question a pull asked for its tail:
+    /// checked as gov5's `ReadCommitQC` checks it, the QC verified against
+    /// the validator set of its view (commit domain only), and kept for the
+    /// importer to apply as an anchor. Whatever comes back, the pull then
+    /// ends; a provable fault of the server keeps it out of the next pull.
+    fn commit_qc_fetched(
+        &mut self,
+        peer: PeerId,
+        request: n42_h2_net::sync_v11::commit_qc::CommitQcRequest,
+        reply: Result<Vec<u8>, String>,
+    ) {
+        let Some(c) = self.catch_up.as_ref() else {
+            return;
+        };
+        if !matches!(&c.commit_qc, CommitQcAsk::Waiting(asked, at) if *asked == peer && *at == request) {
+            debug!(target: "n42.h2.node", %peer, ?request, "commit QC answer not part of the pull; dropped");
+            return;
+        }
+        let answer = match reply {
+            Err(reason) => {
+                info!(target: "n42.h2.node", %peer, number = request.number, reason, "no commit QC for the pulled tail; it stays unexecuted");
+                CommitQcAsk::Answered
+            }
+            Ok(payload) => match n42_h2_net::sync_v11::commit_qc::check_commit_qc(&request, &payload) {
+                Err(fault) => {
+                    warn!(target: "n42.h2.node", %peer, number = request.number, fault, "commit_qc/1 reply is a provable fault; the peer is not asked for this gap again");
+                    self.refused_range_peers.insert(peer, request.number);
+                    CommitQcAsk::Answered
+                }
+                Ok(checked) if checked.headers.is_empty() => {
+                    info!(target: "n42.h2.node", %peer, number = request.number, "commit QC too far above the pulled tail to link; it stays unexecuted");
+                    CommitQcAsk::Answered
+                }
+                Ok(checked) => match self.engine.verify_sync_anchor_qc(&checked.qc) {
+                    n42_h2_consensus::SyncQcVerdict::Anchor(qc) => {
+                        let number = checked.headers[0].1.number;
+                        info!(target: "n42.h2.node", %peer, tail = request.number, qc_view = qc.view, certified = number, "commit_qc/1 anchors the pulled tail");
+                        CommitQcAsk::Verified { hash: request.hash, number, qc: *qc }
+                    }
+                    n42_h2_consensus::SyncQcVerdict::Invalid(reason) => {
+                        warn!(target: "n42.h2.node", %peer, number = request.number, reason, "commit_qc/1 QC does not verify; the peer is not asked for this gap again");
+                        self.refused_range_peers.insert(peer, request.number);
+                        CommitQcAsk::Answered
+                    }
+                    other => {
+                        info!(target: "n42.h2.node", %peer, number = request.number, verdict = ?other, "commit_qc/1 QC is not an anchor; the pulled tail stays unexecuted");
+                        CommitQcAsk::Answered
+                    }
+                },
+            },
+        };
+        if let Some(c) = self.catch_up.as_mut() {
+            c.commit_qc = answer;
+        }
+    }
+
+    /// Before a complete pull ends with an unanchored tail under the anchor
+    /// rule: asks the peer that served its top for a commit QC reaching it
+    /// (sync v1.1 §5.2), once. `true` while the pull waits for that answer
+    /// and must not end yet. A peer that does not speak `commit_qc/1` is not
+    /// asked, and the pull ends as it did before.
+    fn ask_commit_qc_before_finishing(&mut self) -> bool {
+        if self.sync_anchor_mode != SyncAnchorMode::Enforce {
+            return false;
+        }
+        let Some(c) = self.catch_up.as_mut() else {
+            return false;
+        };
+        match c.commit_qc {
+            CommitQcAsk::Waiting(..) | CommitQcAsk::Verified { .. } => return true,
+            CommitQcAsk::Answered => return false,
+            CommitQcAsk::NotAsked => {}
+        }
+        let Some((number, hash)) = c.anchored.unanchored_top() else {
+            return false;
+        };
+        let peer = c.prev_peer.unwrap_or(c.peer);
+        if !self.transport.speaks_commit_qc(&peer) {
+            // A `/1`-only peer (gov5's main line, n42-26): ends as before.
+            return false;
+        }
+        let request = n42_h2_net::sync_v11::commit_qc::CommitQcRequest { number, hash };
+        c.commit_qc = CommitQcAsk::Waiting(peer, request);
+        debug!(target: "n42.h2.node", %peer, number, "asking for a commit QC over the pulled tail before the pull ends");
+        self.transport.request_commit_qc(peer, request);
+        true
+    }
+
+    /// The importer's side of [`Self::commit_qc_fetched`]: a verified
+    /// answer anchors the tail (recorded against what is certified, sync
+    /// standard §3.3) and the anchored blocks are executed; any answer then
+    /// ends the pull that waited for it. `false` when the pull ended.
+    async fn apply_commit_qc_answer(&mut self, events: &mut Vec<ServiceEvent>) -> bool {
+        let Some(c) = self.catch_up.as_mut() else {
+            return false;
+        };
+        match std::mem::replace(&mut c.commit_qc, CommitQcAsk::Answered) {
+            CommitQcAsk::Verified { hash, number, qc } => {
+                let mark = c.anchored.authenticated_to();
+                if let Some(named) = c.anchored.anchor(hash)
+                    && mark.is_none_or(|mark| named >= mark)
+                {
+                    c.top_anchor = Some(qc.clone());
+                }
+                self.sync_v11_anchors += 1;
+                if let Err(halt) = self.sync_safety.note_anchor(Some(number), qc.block_hash, &qc) {
+                    self.halt_sync(halt, events);
+                    return false;
+                }
+                if !self.release_anchored(events).await {
+                    return false;
+                }
+            }
+            CommitQcAsk::Answered => {}
+            waiting => {
+                c.commit_qc = waiting;
+                return true;
+            }
+        }
+        let Some(c) = self.catch_up.as_mut() else {
+            return false;
+        };
+        if c.sched.is_some() && !self.in_import.is_empty() {
+            // The pipeline ends once the importer has reported the last.
+            c.end = Some(true);
+            return true;
+        }
+        self.finish_catch_up(events, true);
+        false
     }
 
     fn respond_served_txns(&mut self, served: ServedTxns) {
@@ -8109,6 +8365,124 @@ async fn serve_range<E: ExecutionLayer>(
     serve_range_metered(el, request, budget, ceiling, None).await
 }
 
+/// Sync v1.1's `RATE_LIMITED` answer, retry after gov5's default.
+fn sync_v11_rate_limited() -> n42_h2_net::sync_v11::frame::CodeError {
+    use n42_h2_net::sync_v11::frame;
+    frame::CodeError { code: frame::CODE_RATE_LIMITED, message: frame::DEFAULT_RETRY_AFTER_MS.to_string() }
+}
+
+/// The committed height a reply is capped at, and the restored commit's
+/// block and number when that had to be looked up (fail closed at genesis).
+async fn resolve_serve_ceiling<E: ExecutionLayer>(el: &E, ceiling: ServeCeiling) -> (u64, Option<(B256, u64)>) {
+    match ceiling {
+        ServeCeiling::Height(height) => (height, None),
+        ServeCeiling::Block(hash) => match el.block_by_hash(hash).await {
+            Ok(Some(block)) => (block.header.number, Some((hash, block.header.number))),
+            Ok(None) => (0, None),
+            Err(err) => {
+                debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not give the restored commit's number");
+                (0, None)
+            }
+        },
+    }
+}
+
+/// A `bodies_by_range/2` reply (sync v1.1 §5.1) from the execution layer's
+/// canonical chain up to the committed ceiling: gov5's `ServeRangeV2`
+/// ([`n42_h2_net::sync_v11::bodies::RangeV2Builder`]) under this node's own
+/// limits -- [`MAX_SERVED_RANGE_BLOCKS`] (`COUNT_CAP`), the shared byte budget
+/// and the peer's byte bucket (`RATE_LIMITED`).
+async fn serve_range_v2_metered<E: ExecutionLayer>(
+    el: &E,
+    request: n42_h2_net::sync_v11::bodies::RangeV2Request,
+    budget: &Arc<tokio::sync::Semaphore>,
+    ceiling: ServeCeiling,
+    meter: Option<(SharedBucket, (f64, f64))>,
+) -> (n42_h2_net::sync_v11::bodies::RangeV2Reply, ServedRange) {
+    use n42_h2_net::sync_v11::{bodies::RangeItem, bodies::RangeV2Builder, frame::EndReason};
+    let (ceiling, restored) = resolve_serve_ceiling(el, ceiling).await;
+    let mut builder = RangeV2Builder::new(request, ceiling);
+    let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    let mut short_of_budget = false;
+    let mut served = 0u64;
+    while let Some(number) = builder.wanted() {
+        if served >= MAX_SERVED_RANGE_BLOCKS {
+            builder.stop(EndReason::CountCap);
+            break;
+        }
+        let block = match el.block_by_number(number).await {
+            Ok(block) => block,
+            Err(err) => {
+                debug!(target: "n42.h2.node", number, %err, "execution layer could not serve a block");
+                None
+            }
+        };
+        let Some(block) = block else {
+            builder.offer(None);
+            break;
+        };
+        let payload = if request.headers_only() {
+            alloy_rlp::encode(&block.header)
+        } else {
+            n42_h2_net::encode_block_rlp_raw(
+                &block.header,
+                &block.transactions,
+                &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+                None,
+            )
+        };
+        let kib = u32::try_from(payload.len().div_ceil(1024).max(1)).unwrap_or(u32::MAX);
+        match budget.clone().try_acquire_many_owned(kib) {
+            Ok(permit) => match held.as_mut() {
+                Some(held) => held.merge(permit),
+                None => held = Some(permit),
+            },
+            Err(_) => {
+                short_of_budget = true;
+                builder.stop(EndReason::RateLimited);
+                break;
+            }
+        }
+        let len = payload.len();
+        let item = RangeItem { payload: payload.into(), hash: block.header.hash_slow(), parent: block.header.parent_hash };
+        if !builder.offer(Some(item)) {
+            break;
+        }
+        served += 1;
+        if meter.as_ref().is_some_and(|(bucket, rate)| !ByteBucket::spend(bucket, *rate, len)) {
+            builder.stop(EndReason::RateLimited);
+            break;
+        }
+    }
+    (builder.into_reply(), ServedRange { rlps: Vec::new(), held, short_of_budget, ceiling, restored })
+}
+
+/// What a `commit_qc/1` server reads, over the execution layer's canonical
+/// chain up to the committed ceiling and the engine's persisted commit QC.
+struct ElCommitQcSource<'a, E> {
+    el: &'a E,
+    head: u64,
+    last: Option<n42_h2_wire::h2_wire::H2QuorumCertificate>,
+}
+
+impl<E: ExecutionLayer> n42_h2_net::sync_v11::commit_qc::CommitQcSource for ElCommitQcSource<'_, E> {
+    fn committed_head(&self) -> u64 {
+        self.head
+    }
+
+    async fn canonical_header(&self, number: u64) -> Option<Header> {
+        self.el.block_by_number(number).await.ok().flatten().map(|block| block.header)
+    }
+
+    async fn header_by_hash(&self, hash: B256) -> Option<Header> {
+        self.el.block_by_hash(hash).await.ok().flatten().map(|block| block.header)
+    }
+
+    fn last_committed_qc(&self) -> Option<n42_h2_wire::h2_wire::H2QuorumCertificate> {
+        self.last.clone()
+    }
+}
+
 /// [`serve_range`], each block's bytes taken from the asking peer's byte
 /// bucket (sync standard §6.3) as it is read: the reply ends cleanly after
 /// the block that empties it.
@@ -8415,6 +8789,9 @@ const fn transport_event_kind(event: &TransportEvent) -> &'static str {
         TransportEvent::Rejected { .. } => "rejected",
         TransportEvent::Transactions { .. } => "transactions",
         TransportEvent::Block { .. } => "block",
+        TransportEvent::RangeRequest { .. } => "range_request",
+        TransportEvent::RangeV2Request { .. } => "range_v2_request",
+        TransportEvent::CommitQcRequest { .. } => "commit_qc_request",
         _ => "other",
     }
 }

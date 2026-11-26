@@ -581,7 +581,8 @@ votes within 60 s of reaching the head.
 ### Milestone 3 — tenure > 1 with rotate-on-timeout, epoch change, validator change
 
 Gate: rounds **M3a** kill the current tenure leader (each client in turn): every TC hands the window on per
-`view_after_tc`, ≤ 1 base timeout per dead leader; **M3b** ≥ 5 epoch boundaries with a TC landing on a boundary
+`view_after_tc`, ≤ 1 base timeout per TC handover (plus the §10.2 backoff when an epoch-boundary clamp lands the
+next view on the same dead leader: base + 2·base = 72 s at profile-1 values; AM32); **M3b** ≥ 5 epoch boundaries with a TC landing on a boundary
 (the clamp); **M3c** add a validator of each client and remove one, through the reconfiguration API, activation at the
 boundary on every client; **M3d** negative leader (a test build) proposing V4/V5-invalid blocks and a double proposal:
 every honest member refuses and records evidence.
@@ -963,4 +964,32 @@ speaks either on the wire: gov5 serves only `/rpc/bodies_by_range/1/ssz_snappy` 
 inside the 4a snapshot bundle), and the gate-3 and gate-4c mixed rounds caught members up over `/1`, with anchors
 taken from the QC each profile-1 header carries and from Decide. For v1: range sync is `bodies_by_range/1`, committed
 blocks only (the §3 rule unchanged); `bodies_by_range/2` and `commit_qc/1` move to v1.1 together with gate 4b.
+
+## Amendment AM31 (2026-11-26, owner): v1.1 scope — range sync v2; joining by full block sync
+
+Owner direction: a node that joins or rejoins syncs every block it lacks by range (a fresh node from genesis) and
+executes them to obtain its state; peer-to-peer state sync is deferred to v1.2 unless an evaluation shows it
+feasible (assessments: `docs/P1_STATESYNC_FEASIBILITY_n42rs.md`, gov5's `P1_STATESYNC_FEASIBILITY_gov5.md`, n42-26's
+HANDOFF post of 2026-11-26 03:00).
+
+v1.1 therefore consists of:
+- `bodies_by_range/2` and `commit_qc/1` (§5.1, §5.2; gov5's sync-v11 vectors), client and server, in every client,
+  with `/1` kept as fallback;
+- gate 4b redefined: in a mixed round, a wiped or fresh node of each client joins by syncing and executing the whole
+  chain from genesis over `/2` + `commit_qc/1` and votes within 60 s of reaching the head; plus a measured scale leg
+  (blocks/s, block bytes/s, total time, peak RSS, disk) on long history;
+- the v1 risks and §7 items stay open as listed in the status doc; a mixed equivocation round moves to v1.2 (no
+  client has a double-sign injector).
+
+Performance targets that are not gate criteria (worked on when the box is idle): catch-up limited by network
+bandwidth only (verification + execution + persistence well above the link rate), and lower memory footprint, in all
+three clients.
+
+## Amendment AM32 (2026-11-26, standard owner by delegation; raised by gov5's M3a/M3b rehearsal)
+
+M3a's "≤ 1 base timeout per dead leader" cannot hold when the dead leader's tenure window contains an epoch
+boundary: the TC is clamped to the boundary view, which still belongs to the same dead leader, and the second TC costs
+2·base because §10.2 resets the backoff only on a QC (gov5 rehearsal 2026-11-26: L5 killed at view 98, TC(98) -> 101,
+TC(101) -> 104 at +48 s; spec S7). M3a now reads "≤ 1 base timeout per TC handover, plus the §10.2 backoff when a
+boundary clamp lands on the same dead leader". No protocol change.
 

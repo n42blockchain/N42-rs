@@ -85,6 +85,13 @@ pub const BATCH_IMPORT_BLOCKS: usize = 256;
 /// stall watchdog: a full block (2.7 MB) goes on its own.
 pub const BATCH_IMPORT_BYTES: usize = 4 << 20;
 
+/// Transaction bytes the importer's queue holds at most, either importer
+/// (a job always goes into an empty queue). Each queued block is held twice
+/// on the validator -- its payload here and its RLP in the loop's
+/// bookkeeping -- so this bounds both: ~25 full blocks, against 512 x 2.7 MB
+/// = 1.4 GB by count alone.
+pub const IMPORT_QUEUE_BYTES: usize = 64 << 20;
+
 /// The batched importer's queue.
 pub const BATCH_IMPORT_QUEUE: usize = 2 * BATCH_IMPORT_BLOCKS;
 
@@ -691,6 +698,9 @@ pub(crate) struct ImportBatch {
 pub(crate) struct PulledImporter {
     tx: tokio::sync::mpsc::Sender<ImportJob>,
     task: tokio::task::JoinHandle<()>,
+    /// Transaction bytes of the jobs waiting in the queue
+    /// ([`IMPORT_QUEUE_BYTES`]); released as the importer takes a job.
+    queued: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PulledImporter {
@@ -703,6 +713,8 @@ impl PulledImporter {
     pub(crate) fn spawn_batched<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ImportJob>(BATCH_IMPORT_QUEUE);
         let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let taken = queued.clone();
         let task = tokio::spawn(async move {
             let mut failed_generation: Option<u64> = None;
             let mut carry: Option<ImportJob> = None;
@@ -710,7 +722,7 @@ impl PulledImporter {
                 let first = match carry.take() {
                     Some(job) => job,
                     None => match rx.recv().await {
-                        Some(job) => job,
+                        Some(job) => took(&taken, job),
                         None => return,
                     },
                 };
@@ -718,7 +730,7 @@ impl PulledImporter {
                 let mut bytes = tx_bytes(&first);
                 let mut jobs = vec![first];
                 while jobs.len() < BATCH_IMPORT_BLOCKS {
-                    match rx.try_recv() {
+                    match rx.try_recv().map(|job| took(&taken, job)) {
                         Ok(job) if job.generation == generation && bytes + tx_bytes(&job) <= BATCH_IMPORT_BYTES => {
                             bytes += tx_bytes(&job);
                             jobs.push(job);
@@ -745,18 +757,20 @@ impl PulledImporter {
                 }
             }
         });
-        (Self { tx, task }, report_rx)
+        (Self { tx, task, queued }, report_rx)
     }
 
     /// The importer that runs `newPayload` block by block.
     pub(crate) fn spawn_per_block<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ImportJob>(IMPORT_QUEUE);
         let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let taken = queued.clone();
         let task = tokio::spawn(async move {
             // Jobs of a generation whose block failed are skipped: they
             // have no parent in the execution layer.
             let mut failed_generation: Option<u64> = None;
-            while let Some(first) = rx.recv().await {
+            while let Some(first) = rx.recv().await.map(|job| took(&taken, job)) {
                 let started = Instant::now();
                 let mut batch = ImportBatch {
                     generation: first.generation,
@@ -795,32 +809,54 @@ impl PulledImporter {
                     if batch.done.len() >= REPORT_BLOCKS || started.elapsed() >= REPORT_EVERY {
                         break;
                     }
-                    job = rx.try_recv().ok();
+                    job = rx.try_recv().ok().map(|job| took(&taken, job));
                 }
                 if (!batch.done.is_empty() || batch.failed.is_some()) && report_tx.send(batch).is_err() {
                     return;
                 }
             }
         });
-        (Self { tx, task }, report_rx)
+        (Self { tx, task, queued }, report_rx)
     }
 
-    /// Queues a block; gives it back when the queue is full.
+    /// Queues a block; gives it back when the queue is full, by count or by
+    /// [`IMPORT_QUEUE_BYTES`] (a job always goes into an empty queue).
     pub(crate) fn try_send(&self, job: ImportJob) -> Result<(), ImportJob> {
+        use std::sync::atomic::Ordering;
+        let bytes = tx_bytes(&job);
+        let queued = self.queued.load(Ordering::Relaxed);
+        if queued > 0 && queued + bytes > IMPORT_QUEUE_BYTES {
+            return Err(job);
+        }
+        self.queued.fetch_add(bytes, Ordering::Relaxed);
         self.tx.try_send(job).map_err(|err| match err {
-            tokio::sync::mpsc::error::TrySendError::Full(job) | tokio::sync::mpsc::error::TrySendError::Closed(job) => job,
+            tokio::sync::mpsc::error::TrySendError::Full(job) | tokio::sync::mpsc::error::TrySendError::Closed(job) => {
+                self.queued.fetch_sub(bytes, Ordering::Relaxed);
+                job
+            }
         })
     }
 
-    /// Room left in the queue.
+    /// Room left in the queue: none once its bytes reach
+    /// [`IMPORT_QUEUE_BYTES`].
     pub(crate) fn capacity(&self) -> usize {
+        if self.queued.load(std::sync::atomic::Ordering::Relaxed) >= IMPORT_QUEUE_BYTES {
+            return 0;
+        }
         self.tx.capacity()
     }
 }
 
-/// A job's transaction bytes, for [`BATCH_IMPORT_BYTES`].
+/// A job's transaction bytes, for [`BATCH_IMPORT_BYTES`] and
+/// [`IMPORT_QUEUE_BYTES`].
 fn tx_bytes(job: &ImportJob) -> usize {
     job.payload.payload.as_v1().transactions.iter().map(|tx| tx.len()).sum()
+}
+
+/// The importer took `job` off its queue: its bytes no longer count.
+fn took(queued: &std::sync::atomic::AtomicUsize, job: ImportJob) -> ImportJob {
+    queued.fetch_sub(tx_bytes(&job), std::sync::atomic::Ordering::Relaxed);
+    job
 }
 
 /// Imports one generation's run of jobs into `batch`: in one
@@ -1085,6 +1121,27 @@ mod tests {
             failed = batch.failed;
         }
         (done, failed)
+    }
+
+    /// The importer's queue is bounded by bytes: a job always goes into an
+    /// empty queue, the next is given back while the queue holds
+    /// [`IMPORT_QUEUE_BYTES`], and taken again once the importer has drained.
+    #[tokio::test]
+    async fn the_import_queue_is_bounded_by_bytes() {
+        let big = |number: u64| {
+            let mut job = jobs(1, number).pop().expect("a job");
+            if let alloy_rpc_types_engine::ExecutionPayload::V1(v1) = &mut job.payload.payload {
+                v1.transactions = vec![alloy_primitives::Bytes::from(vec![0u8; IMPORT_QUEUE_BYTES / 2 + 1])];
+            }
+            job
+        };
+        let el = Arc::new(n42_h2_execution::MockExecutionLayer::new());
+        let (importer, mut reports) = PulledImporter::spawn_batched(el);
+        importer.try_send(big(1)).expect("an empty queue takes a job of any size");
+        let refused = importer.try_send(big(2)).expect_err("past the byte bound");
+        let report = reports.recv().await.expect("the first job imported");
+        assert_eq!(report.done.len(), 1);
+        importer.try_send(refused).expect("room again once the importer took the first");
     }
 
     #[tokio::test]

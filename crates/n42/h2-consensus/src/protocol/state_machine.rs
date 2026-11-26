@@ -284,6 +284,45 @@ pub enum SyncQcVerdict {
     Invalid(String),
 }
 
+/// A sync anchor QC's check with the engine's part done
+/// ([`ConsensusEngine::sync_anchor_qc_job`]): either its verdict, or the
+/// BLS checks still to run against the set of its view.
+#[derive(Debug)]
+pub enum SyncQcJob<'a> {
+    /// Settled without a signature check.
+    Done(SyncQcVerdict),
+    /// The commit-domain check, and the prepare-domain one if it fails.
+    Verify {
+        /// The decoded QC.
+        qc: Box<QuorumCertificate>,
+        /// The validator set of its view.
+        set: &'a ValidatorSet,
+        /// The signing domain profile.
+        profile: ConsensusSigningProfile,
+    },
+}
+
+impl SyncQcJob<'_> {
+    /// The verdict: the BLS checks, when any are left.
+    pub fn verify(self) -> SyncQcVerdict {
+        match self {
+            Self::Done(verdict) => verdict,
+            Self::Verify { qc, set, profile } => {
+                match super::quorum::verify_commit_qc_with_profile(&qc, set, &B256::ZERO, profile) {
+                    Ok(()) => SyncQcVerdict::Anchor(qc),
+                    Err(commit_err) => {
+                        if super::quorum::verify_qc_with_profile(&qc, set, profile).is_ok() {
+                            SyncQcVerdict::PrepareDomain
+                        } else {
+                            SyncQcVerdict::Invalid(commit_err.to_string())
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Actions the consensus engine requests from the outer node.
 #[derive(Debug)]
 pub enum EngineOutput {
@@ -2311,29 +2350,29 @@ impl ConsensusEngine {
     /// - no trust in the locked QC (it may be a prepare QC). The engine's own
     ///   last committed QC is trusted: it is commit-domain by construction.
     pub fn verify_sync_anchor_qc(&self, wire: &n42_h2_wire::h2_wire::H2QuorumCertificate) -> SyncQcVerdict {
+        self.sync_anchor_qc_job(wire).verify()
+    }
+
+    /// [`Self::verify_sync_anchor_qc`] split in two: the lookups that need
+    /// the engine (the set of the QC's view, the decode, the last committed
+    /// QC), here; the BLS checks, in [`SyncQcJob::verify`], which needs only
+    /// the job and can run on any thread -- so a caller can check a range's
+    /// QCs in parallel.
+    pub fn sync_anchor_qc_job(&self, wire: &n42_h2_wire::h2_wire::H2QuorumCertificate) -> SyncQcJob<'_> {
         if wire.view == 0 {
-            return SyncQcVerdict::Genesis;
+            return SyncQcJob::Done(SyncQcVerdict::Genesis);
         }
         let Some(set) = self.epoch_manager.known_validator_set_for_view(wire.view) else {
-            return SyncQcVerdict::UnknownSet;
+            return SyncQcJob::Done(SyncQcVerdict::UnknownSet);
         };
         let qc = match crate::wire_bridge::qc_to_engine(wire, set.len() as usize, "header QC") {
             Ok(qc) => qc,
-            Err(err) => return SyncQcVerdict::Invalid(err.to_string()),
+            Err(err) => return SyncQcJob::Done(SyncQcVerdict::Invalid(err.to_string())),
         };
         if &qc == self.round_state.last_committed_qc() {
-            return SyncQcVerdict::Anchor(Box::new(qc));
+            return SyncQcJob::Done(SyncQcVerdict::Anchor(Box::new(qc)));
         }
-        match super::quorum::verify_commit_qc_with_profile(&qc, set, &B256::ZERO, self.signing_profile) {
-            Ok(()) => SyncQcVerdict::Anchor(Box::new(qc)),
-            Err(commit_err) => {
-                if super::quorum::verify_qc_with_profile(&qc, set, self.signing_profile).is_ok() {
-                    SyncQcVerdict::PrepareDomain
-                } else {
-                    SyncQcVerdict::Invalid(commit_err.to_string())
-                }
-            }
-        }
+        SyncQcJob::Verify { qc: Box::new(qc), set, profile: self.signing_profile }
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {

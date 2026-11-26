@@ -38,6 +38,8 @@ hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls"] }
 url.workspace = true
+# The catch-up's parallel screening of a range reply's certificates.
+rayon.workspace = true
 
 [dev-dependencies]
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
@@ -48,7 +50,6 @@ alloy-signer-local.workspace = true
 # recover with. 0.33 (reth v2.11.0's workspace version) rerandomises its global context on every
 # signature, which would change the flood's own supply ceiling between A/B legs.
 secp256k1 = { package = "secp256k1", version = "0.30", default-features = false, features = ["global-context", "recovery", "std"] }
-rayon.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 futures.workspace = true
 hex.workspace = true

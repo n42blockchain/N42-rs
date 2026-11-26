@@ -26,6 +26,11 @@
 #   P1M_EL_BASE=22000   layer e: HTTP base+e, authrpc base+200+e, devp2p base+300+e
 #   P1M_CPUS            taskset list (default skips the faulty core 99/227)
 #   P1M_VAL_THREADS=2   tokio workers per validator (--worker-threads)
+#   P1M_SKIP="0 1 ..."  validator indices another client runs (mixed gate 5): not
+#                       started here, not dialled by index (their peer ids are foreign)
+#   P1M_EXTRA_PEERS="<multiaddr> ..."  foreign members every validator here dials
+#   P1M_GENESIS_NOW=0   init uses P1M_GENESIS byte for byte (a shared mixed-round
+#                       genesis); default 1 stamps "timestamp" = now
 #
 # Every other N42_* variable is unset (profile 1 refuses the overrides); the ports
 # stay off gov5's mixed-round ranges (307xx, 201xx, 21140+, 6210+).
@@ -55,6 +60,7 @@ devp2p_port() { echo $((P1M_EL_BASE + 300 + $1)); }
 vdir() { echo "$P1M_DIR/v$1"; }
 edir() { echo "$P1M_DIR/el$1"; }
 layer_of() { echo $(($1 % P1M_E)); }
+skipped() { case " ${P1M_SKIP:-} " in *" $1 "*) return 0;; esac; return 1; }
 maddr() { echo "/ip4/127.0.0.1/tcp/$(p2p_port "$1")/p2p/$(cat "$(vdir "$1")/peer-id")"; }
 # A process this run dir started; the bracket keeps pgrep from matching a shell.
 val_re() { echo "^[${P1M_BIN:0:1}]${P1M_BIN:1}/examples/h2_validator --datadir $P1M_DIR/v[0-9]+/"; }
@@ -103,7 +109,8 @@ cmd_init() {
   if pgrep -f "$(val_re)|$(el_re)" >/dev/null; then echo "processes of $P1M_DIR are running; down first" >&2; exit 1; fi
   mkdir -p "$P1M_DIR"
   local now; now=$(date -u +%s)
-  sed -E "s/^(\s*\"timestamp\": *\")0x[0-9a-fA-F]+(\")/\1$(printf '0x%x' "$now")\2/" "$P1M_GENESIS" > "$G"
+  if [ "${P1M_GENESIS_NOW:-1}" = 0 ]; then cp "$P1M_GENESIS" "$G"; now=$(python3 -I -c "import json,sys;print(int(json.load(open(sys.argv[1]))['timestamp'],16))" "$G"); else
+  sed -E "s/^(\s*\"timestamp\": *\")0x[0-9a-fA-F]+(\")/\1$(printf '0x%x' "$now")\2/" "$P1M_GENESIS" > "$G"; fi
   diff <(sed '/"timestamp"/d' "$P1M_GENESIS") <(sed '/"timestamp"/d' "$G") >/dev/null \
     || { echo "genesis copy differs beyond timestamp" >&2; exit 1; }
   [ -f "$P1M_DIR/jwt.hex" ] || openssl rand -hex 32 > "$P1M_DIR/jwt.hex"
@@ -137,6 +144,7 @@ cmd_up() {
     done
   done
   for i in $(seq 0 $((P1M_N - 1))); do
+    skipped "$i" && continue
     for p in $(p2p_port "$i") $((1000 + $(p2p_port "$i"))); do
       port_busy "$p" && { echo "port $p (validator $i) is in use; refusing to start" >&2; exit 1; }
     done
@@ -158,9 +166,12 @@ cmd_up() {
     [ -n "$ok" ] || { echo "layer $e did not start: $d/el.log" >&2; tail -5 "$d/el.log" >&2; exit 1; }
   done
   local addrs=(); for i in $(seq 0 $((P1M_N - 1))); do addrs+=("$(maddr "$i")"); done
+  local extra=() x; for x in ${P1M_EXTRA_PEERS:-}; do extra+=(--peer "$x"); done
   for i in $(seq 0 $((P1M_N - 1))); do
+    skipped "$i" && continue
     local peers=() j; d=$(vdir "$i"); e=$(layer_of "$i")
-    for j in $(seq 0 $((P1M_N - 1))); do [ "$j" = "$i" ] || peers+=(--peer "${addrs[$j]}"); done
+    for j in $(seq 0 $((P1M_N - 1))); do [ "$j" = "$i" ] || skipped "$j" || peers+=(--peer "${addrs[$j]}"); done
+    peers+=("${extra[@]}")
     RUST_LOG=$P1M_RUST_LOG setsid taskset -c "$P1M_CPUS" "$VAL" --datadir "$d/consensus" \
       --chain "$G" --index "$i" --bls-key "$(cat "$d/bls.key")" --node-key "$d/node.key" \
       --el "http://127.0.0.1:$(auth_port "$e")" --el-rpc "http://127.0.0.1:$(http_port "$e")" --jwt "$P1M_DIR/jwt.hex" \
@@ -184,6 +195,7 @@ cmd_status() {
   done
   local led=0 tmo=0 ref=0 voters=0 halts=0 silent=()
   for i in $(seq 0 $((P1M_N - 1))); do
+    skipped "$i" && continue
     d=$(vdir "$i")
     local l t r v
     l=$(strip "$d/v.log" 2>/dev/null | /usr/bin/grep -ac 'built a block to propose')

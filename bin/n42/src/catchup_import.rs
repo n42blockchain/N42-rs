@@ -485,14 +485,26 @@ where
                 let mut times = [0u64; 7];
                 let at = std::time::Instant::now();
                 let given = payloads.len() as u64;
-                let mut blocks = Vec::with_capacity(payloads.len());
+                // Each payload on its own (its hash and transactions root), in
+                // parallel; the first malformed one in block order ends the run.
+                let converted: Vec<Result<SealedBlock<Block>, String>> = {
+                    use rayon::prelude::*;
+                    payloads
+                        .into_par_iter()
+                        .map(|data| {
+                            let number = data.payload.block_number();
+                            <n42_engine_types::engine_validator::N42EngineValidator<n42_header::N42ChainSpec> as reth_engine_primitives::PayloadValidator<n42_engine_types::N42EngineTypes>>::convert_payload_to_block(&validator, data)
+                                .map_err(|err| format!("block {number}: payload: {err}"))
+                        })
+                        .collect()
+                };
+                let mut blocks = Vec::with_capacity(converted.len());
                 let mut malformed = None;
-                for data in payloads {
-                    let number = data.payload.block_number();
-                    match <n42_engine_types::engine_validator::N42EngineValidator<n42_header::N42ChainSpec> as reth_engine_primitives::PayloadValidator<n42_engine_types::N42EngineTypes>>::convert_payload_to_block(&validator, data) {
+                for block in converted {
+                    match block {
                         Ok(block) => blocks.push(block),
-                        Err(err) => {
-                            malformed = Some(format!("block {number}: payload: {err}"));
+                        Err(why) => {
+                            malformed = Some(why);
                             break;
                         }
                     }

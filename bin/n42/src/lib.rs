@@ -58,6 +58,40 @@ pub mod snapshot_anchor;
 pub mod snapshot_bundle;
 pub mod stacks;
 
+/// The value of `--cpu-cores N` (or `--cpu-cores=N`) in a raw command line,
+/// before clap parses it; `None` when absent or not a positive count.
+pub fn cpu_cores_arg(args: impl IntoIterator<Item = String>) -> Option<std::num::NonZeroUsize> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let value = match arg.strip_prefix("--cpu-cores") {
+            Some("") => args.next(),
+            Some(rest) => rest.strip_prefix('=').map(str::to_owned),
+            None => continue,
+        };
+        return value.and_then(|v| v.parse().ok());
+    }
+    None
+}
+
+#[cfg(test)]
+mod cpu_cores_arg_tests {
+    use super::cpu_cores_arg;
+
+    fn args(line: &str) -> Vec<String> {
+        line.split(' ').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn the_cpu_cores_flag_is_read_in_both_forms() {
+        assert_eq!(cpu_cores_arg(args("n42 node --cpu-cores 32 --http")).map(|n| n.get()), Some(32));
+        assert_eq!(cpu_cores_arg(args("n42 node --cpu-cores=8")).map(|n| n.get()), Some(8));
+        assert_eq!(cpu_cores_arg(args("n42 node --http")), None);
+        assert_eq!(cpu_cores_arg(args("n42 node --cpu-cores 0")), None, "zero is not a count");
+        assert_eq!(cpu_cores_arg(args("n42 node --cpu-cores")), None);
+        assert_eq!(cpu_cores_arg(args("n42 node --cpu-coresx 4")), None);
+    }
+}
+
 /// Re-exported utils.
 pub mod utils {
     pub use reth_db::open_db_read_only;

@@ -90,6 +90,19 @@ fn main() {
         // configuration once, at its own initialisation, before `main`).
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
+    // `--cpu-cores N` sizes reth's runtime (tokio workers and every reth
+    // pool); it sizes rayon's global pool too (QMDB roots, hashed state,
+    // the chain parser's genesis root), unless RAYON_NUM_THREADS is set. Read
+    // from the raw arguments: the parse below can already start that pool.
+    // On a many-core box a sync or profile-1 node that leaves every pool at
+    // the machine's size spends its time handing tiny tasks across all of
+    // them (`docs/P1_CATCHUP_PERF.md`, step 5).
+    if std::env::var_os("RAYON_NUM_THREADS").is_none()
+        && let Some(cores) = n42::cpu_cores_arg(std::env::args())
+    {
+        // SAFETY: as above, no thread of this program exists yet.
+        unsafe { std::env::set_var("RAYON_NUM_THREADS", cores.to_string()) };
+    }
     // The command line, chain spec included (clap runs the chain parser
     // here), before any knob of the profile is read: the knobs a profile set
     // that need a genesis feature this chain lacks (`frameBlocks`) are

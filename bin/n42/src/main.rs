@@ -96,7 +96,25 @@ fn main() {
     // withdrawn again, so the profile never forces a chain feature. A
     // command without a chain withdraws them too. An operator's own
     // `N42_FRAME_BLOCKS=1` is left for `frame_blocks::init` to refuse.
-    let cli = Cli::<N42ChainSpecParser, N42Args>::parse();
+    // Profile 1 sizes its thread pools and caches for 8-second blocks
+    // (docs/P1_MEMORY.md): rayon's global pool before clap's chain parser
+    // starts it, reth's pools and cross-block cache once the command is parsed.
+    // A flag or variable the operator set wins; `N42_P1_MEMORY=0` turns it off.
+    let process_args = n42::profile1_memory::process_args();
+    let p1_memory = n42_qmdb_reth::profile1_memory::MemoryDefaults::for_args(&process_args);
+    let mut p1_memory_set: Vec<String> = Vec::new();
+    if let Some(defaults) = &p1_memory {
+        p1_memory_set.extend(n42_qmdb_reth::profile1_memory::size_rayon_global(defaults));
+    }
+    let mut cli = Cli::<N42ChainSpecParser, N42Args>::parse();
+    if let Some(defaults) = &p1_memory
+        && let Some(node) = cli.as_node_command_mut()
+    {
+        p1_memory_set.extend(n42::profile1_memory::apply_to_node_command(defaults, &process_args, &mut node.engine));
+    }
+    if !p1_memory_set.is_empty() {
+        eprintln!("n42: profile 1 memory defaults: {} (N42_P1_MEMORY=0 turns them off)", p1_memory_set.join(", "));
+    }
     let features = n42_env::profile::ChainFeatures {
         frame_blocks: cli
             .command

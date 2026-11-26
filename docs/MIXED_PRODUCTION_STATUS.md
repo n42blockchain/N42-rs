@@ -303,3 +303,22 @@ times in a second (gov5 todo); n42-26's e3d22dd has no serve-side log for `commi
 v1.1 releases (2026-11-26): gov5 main fe5e02ed (node binary 00aa020a…, byte-identical to ecaa51f7; the serve switch
 `N42_SYNC_RANGE_SERVE` is on branch 0064ffd3); n42-rs main 004ac1167 (sync v1.1) + docs; n42-26 main 053b4f6 (PR #48,
 tree = e3d22dd, gate binary c20104ef…; follow-ups in PR #49: commit_qc/1 serve log, deferred-check timing).
+
+### v1.1 scale leg S1 — heavy history, every client rejoins from genesis (2026-11-26, PASSED)
+
+T0 06:42:00 EST, genesis `genesis-scaleS1.json` (sha256 92161d53…7f57), gate-6 set, binaries as gate 4b (gov5
+fe5e02ed, n42-rs 004ac1167 — before the catch-up/memory merges — n42-26 e3d22dd). gov5 load 150 tx/s for 6 h 50 m:
+3.67M transfers, ~1,200 tx and ~140 KB per block, 0 send errors. Headers 0..3129 equal on every dump (gov5 node0..4,
+n42-rs v2, n42-26 v3), 0 mismatches; missed slots only the wiped member's own slots during its wipe.
+
+| Rejoin from genesis | Blocks / txs / bytes | Restart->head | blocks/s | tx/s | MB/s | Peak RSS (catch-up) | Datadir | Vote after head |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| n42-rs v2, 12:42 | 2,699 / ~3.24M / 379 MB | 66.5 s pull | 40.6 | ~49k | 5.7 | EL 2.42 GB + val 0.42 GB | 1.43 GB | ~9 s |
+| gov5 v1, 13:02 | 2,840 / 3.40M / ~400 MB | 110.6 s | 25.7 | 30.7k | 3.6 | 4.0 GB | 4.1 GB | 15 s |
+| n42-26 v3, 13:22 | 2,983 / 3.58M / 419 MB | 66.9 s | 44.6 | 53.5k | 6.3 | 2.86 GB | 4.5 GB | 29 s |
+
+All three are execution-bound (fetch is pipelined and small: gov5 served 2,726 blocks / 384 MB to n42-26 in ~2 s).
+Steady RSS under load at ~3k blocks: gov5 ~0.4 GB, n42-rs 2.6 GB (EL 2.38 + val 0.22), n42-26 2.80 GB (grows with
+state, not a leak). Catch-up and memory work continues per AM31 as idle-time items (n42-rs main 535bbe121 and
+c3e028040 carry the first steps; re-measure on this history).
+

@@ -160,9 +160,15 @@ impl V11State {
 /// The `/2` request that carries a `/1` range request, or `None` when it
 /// cannot (a count outside 1..1024).
 pub(crate) fn v2_for(request: &RangeRequest) -> Option<RangeV2Request> {
+    v2_for_bounded(request, 0)
+}
+
+/// [`v2_for`] with the requester's decoded-byte budget (`0`: the server's
+/// default, 64 MiB).
+pub(crate) fn v2_for_bounded(request: &RangeRequest, max_bytes: u64) -> Option<RangeV2Request> {
     (1..=super::bodies::MAX_RANGE_V2_COUNT)
         .contains(&request.count)
-        .then(|| RangeV2Request::bodies(request.start, request.count))
+        .then(|| RangeV2Request { max_bytes, ..RangeV2Request::bodies(request.start, request.count) })
 }
 
 #[cfg(test)]

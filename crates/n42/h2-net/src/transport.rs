@@ -920,10 +920,17 @@ impl TransportCore {
     /// Asks `peer` for a range of blocks. The answer arrives as
     /// [`TransportEvent::RangeFetched`].
     pub fn request_range(&mut self, peer: PeerId, request: RangeRequest) {
+        self.request_range_bounded(peer, request, 0);
+    }
+
+    /// [`Self::request_range`] with a decoded-byte budget for the reply
+    /// (`0`: the server's default). Only `bodies_by_range/2` carries it; a
+    /// v1 server caps its replies by its own bound.
+    pub fn request_range_bounded(&mut self, peer: PeerId, request: RangeRequest, max_bytes: u64) {
         // Sync v1.1 when the peer lists `bodies_by_range/2` (§3.4.2); the
         // reply comes back as the same event, checked and converted.
         if self.v11.speaks(&peer, crate::sync_v11::bodies::BODIES_BY_RANGE_V2_PROTOCOL)
-            && let Some(v2) = crate::sync_v11::peers::v2_for(&request)
+            && let Some(v2) = crate::sync_v11::peers::v2_for_bounded(&request, max_bytes)
         {
             let id = self.swarm.behaviour_mut().ranges_v2.send_request(&peer, Ok(v2));
             self.v11.ranges.insert(id, (request, v2));
@@ -1967,9 +1974,15 @@ impl H2V4Transport {
     /// Asks `peer` for a range of blocks. The answer arrives as
     /// [`TransportEvent::RangeFetched`].
     pub fn request_range(&mut self, peer: PeerId, request: RangeRequest) {
+        self.request_range_bounded(peer, request, 0);
+    }
+
+    /// Asks `peer` for a range of blocks within a decoded-byte budget; see
+    /// [`TransportCore::request_range_bounded`].
+    pub fn request_range_bounded(&mut self, peer: PeerId, request: RangeRequest, max_bytes: u64) {
         match &mut self.inner {
-            Inner::Inline(core) => core.request_range(peer, request),
-            Inner::OffLoop(off) => off.command(crate::pump::Command::RequestRange(peer, request)),
+            Inner::Inline(core) => core.request_range_bounded(peer, request, max_bytes),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::RequestRange(peer, request, max_bytes)),
         }
     }
 

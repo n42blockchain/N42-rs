@@ -2032,6 +2032,12 @@ impl QmdbForest {
     /// that snapshot, and the next delta must be measured from it rather than
     /// carrying them a second time. Taking a delta and dropping it would do the
     /// same, at the cost of copying every changed entry to discard it.
+    pub fn forget_changes(&mut self) {
+        self.dirty_slots.clear();
+        self.dirty_slots_deduped = 0;
+        self.min_cursor = self.tree.next_slot();
+    }
+
     /// [`Self::forget_changes`] for a caller that has just persisted the chain
     /// up to `persisted` from its blocks' own deltas
     /// ([`Self::take_block_deltas`]), which never moves the tree: the tree
@@ -2055,12 +2061,6 @@ impl QmdbForest {
             self.dirty_slots.extend(undo.retired_slots());
             current = record.parent;
         }
-    }
-
-    pub fn forget_changes(&mut self) {
-        self.dirty_slots.clear();
-        self.dirty_slots_deduped = 0;
-        self.min_cursor = self.tree.next_slot();
     }
 
     /// A historical prover's one read of the live tree, under one hold of

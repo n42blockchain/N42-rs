@@ -318,7 +318,22 @@ n42-rs v2, n42-26 v3), 0 mismatches; missed slots only the wiped member's own sl
 | n42-26 v3, 13:22 | 2,983 / 3.58M / 419 MB | 66.9 s | 44.6 | 53.5k | 6.3 | 2.86 GB | 4.5 GB | 29 s |
 
 All three are execution-bound (fetch is pipelined and small: gov5 served 2,726 blocks / 384 MB to n42-26 in ~2 s).
-Steady RSS under load at ~3k blocks: gov5 ~0.4 GB, n42-rs 2.6 GB (EL 2.38 + val 0.22), n42-26 2.80 GB (grows with
-state, not a leak). Catch-up and memory work continues per AM31 as idle-time items (n42-rs main 535bbe121 and
+Steady RSS under load at ~3k blocks: n42-rs 2.6 GB (EL 2.38 + val 0.22, pre-memory-work binary), n42-26 2.80 GB
+(grows with state, not a leak); gov5 not measured in S1 (its earlier "~0.4 GB" was retracted, see P50). Catch-up and memory work continues per AM31 as idle-time items (n42-rs main 535bbe121 and
 c3e028040 carry the first steps; re-measure on this history).
+
+### P50 — 30 min under S1-shaped load, current binaries (2026-11-26 13:59-14:34)
+
+gov5 22bee6b3, n42-rs main ffe484787 (profile-1 memory defaults, catch-up step 2, explorer RPC), n42-26 6d0ea9b (PR #50,
+sender cache for the pre-import check). Headers 0..243 equal on all 7 dumps; 267.9k tx, 0 errors. RSS under the
+same load (1,200 tx/block):
+
+| Client | Start | End of load (block ~240) | Trend |
+| --- | --- | --- | --- |
+| n42-rs (EL + validator) | 369 MiB | 571 MiB (505 + 66) | slowing (+~30 MiB / 5 min at the end) |
+| gov5 | 154 MiB idle | 960-1017 MiB | +~120 MiB / 5 min, no plateau; 116-120 MB decoded block txs in heap (gov5 checking the bound) |
+| n42-26 | — | 1.01 GB at block 135 | +~16 MB / 5 min |
+
+n42-26 pre-import vote: 56 % of follower views (S1 old code 35 %); the check now ends 2.0 ms after block data (was
+~20 ms); the rest lose to Decide on localhost (2f+1 in ~3 ms without v3) — no liveness effect.
 

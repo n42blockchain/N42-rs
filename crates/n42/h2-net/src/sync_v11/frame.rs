@@ -352,6 +352,22 @@ where
     read_framed(io, max).await
 }
 
+/// Reads a request payload of at most `max` bytes as gov5's v1.1 servers
+/// read one: a declared length above `max` is `Ok(Err(message))` with
+/// gov5's message (`syncwire: declared length above the cap: N > max`), which
+/// the server answers under `0x01 INVALID_REQUEST`; a stream that breaks is
+/// the `io::Error`.
+pub async fn read_request_checked<T>(io: &mut T, max: u64) -> io::Result<Result<Vec<u8>, String>>
+where
+    T: AsyncRead + Unpin,
+{
+    let declared = read_uvarint(io).await?.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+    if declared > max {
+        return Ok(Err(format!("syncwire: declared length above the cap: {declared} > {max}")));
+    }
+    read_framed_body(io, declared, max).await.map(Ok)
+}
+
 /// Reads one response chunk (gov5's `ReadChunk`). `with_context` says
 /// SUCCESS chunks carry the 4 context bytes; `max` bounds a SUCCESS
 /// payload, an END payload is bounded by [`END_LEN`] and an error message

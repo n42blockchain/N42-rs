@@ -272,7 +272,30 @@ missed (block 222, v3's own slot during its wipe). No `/1` used. The pre-run (04
 n42-26 tail-release stall (range timer deadline slid under tx gossip; fixed in e3d22dd with tests) and the n42-rs
 `/2` busy code (0x02 -> 0x04 "1000", 004ac1167).
 
-Open for v1.1: (a) every `/2` and `commit_qc/1` in this round was served by gov5 — n42-rs and n42-26 as SERVERS to
+Open for v1.1 after 4b: (a) [closed by 4b-S below] every `/2` and `commit_qc/1` in this round was served by gov5 — n42-rs and n42-26 as SERVERS to
 another client are covered only by vectors and same-client loopback tests, a mixed leg with gov5 serving disabled is
 still due; (b) the scale leg (long history; chain-94 shared state `gov5-work/p1scale/out/`); (c) n42-26's 35 s from head
 to first vote and gov5's repeated `/2 145..146` asks are noted, not failures.
+
+### Gate 4b-S — non-gov5 clients as servers (2026-11-26, PASSED)
+
+T0 05:46:00 EST, genesis `genesis-gate4bS.json` (sha256 cebbf1ed…2e3c, hash 0x86d68d21…c15c). gov5 0064ffd3
+(68cdfe04…, = fe5e02ed + `N42_SYNC_RANGE_SERVE=off`, which leaves `/1`, `/2` and `commit_qc/1` unregistered) on
+v0/v1/v4, so only n42-rs v2 (004ac1167) and n42-26 v3 (e3d22dd) could serve. The switch reached gov5's nodes only
+after a one-by-one restart at 05:48:40-50 (gov5's harness stripped `N42_*`); nothing was served by gov5 before it.
+
+| Wipe | Refused by (no protocol) | Range pulled (/2) | Served by | Tail anchor | First vote after head |
+| --- | --- | --- | --- | --- | --- |
+| gov5 v1, 05:56:01 | gov5 v0, v4 | 1..62 | n42-26 v3 | commit_qc/1 #62, n42-26 v3 | 8 s |
+| n42-rs v2, 06:06:00 | gov5 v0, v1, v4 | 1..137, 1.38 MB, 1.5 s | n42-26 v3 | commit_qc/1 #137, n42-26 v3 | 3.4 s |
+| n42-26 v3, 06:16:01 | gov5 v1, v4 | 1..211, 180 ms | n42-rs v2 | live QCs | 3.6 s |
+
+Also n42-rs v2 served gov5 v4 `/2` 16..17 at 05:50 (v4's switch restart). Headers 0..287 equal on all seven dumps,
+0 mismatches; no slot missed during a wipe (block 17's 80 s gap is gov5's switch restart). Load 21,000 tx (5 send
+errors + 10 late receipts from that restart, all mined).
+
+Cross-client serving now exercised in mixed rounds: `/2` gov5->both, n42-26->both, n42-rs->both; `commit_qc/1`
+gov5->both, n42-26->both. n42-rs as a `commit_qc/1` server to another client is still covered only by the gov5
+vectors and same-client loopback tests. Notes (not failures): gov5's client retries a protocol-refusing peer ~10
+times in a second (gov5 todo); n42-26's e3d22dd has no serve-side log for `commit_qc/1`.
+

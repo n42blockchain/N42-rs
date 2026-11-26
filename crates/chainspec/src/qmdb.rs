@@ -516,6 +516,22 @@ mod header_field_gate_tests {
         assert!(!glamsterdam_execution_active_at(&g, 0));
     }
 
+    /// J1: `bin/n42` refuses `eth_config` (-32004, gov5's message) on a native
+    /// chain and `eth_getProof` / the execution witness on a QMDB one; a
+    /// profile-1 genesis is both, whatever else its config says.
+    #[test]
+    fn a_profile1_genesis_gets_the_native_and_qmdb_rpc_refusals() {
+        for config in [r#","n42Profile":1"#, r#","n42Profile":1,"stateScheme":"mpt","consensus":"clique""#] {
+            let g = genesis(config);
+            assert!(is_profile1(&g), "{config}");
+            assert!(is_n42_native(&g), "eth_config refused: {config}");
+            assert_eq!(state_scheme(&g), StateScheme::Qmdb, "proofs and witnesses refused: {config}");
+        }
+        let ethereum = genesis("");
+        assert!(!is_n42_native(&ethereum), "an Ethereum chain keeps reth's eth_config");
+        assert_eq!(state_scheme(&ethereum), StateScheme::Mpt);
+    }
+
     #[test]
     fn bundled_native_genesis_files() {
         let gated: Genesis =

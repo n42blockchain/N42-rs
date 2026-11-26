@@ -544,6 +544,79 @@ legs.)
   (112.7-116.3 s); without them it is 137 s. The bench chain's runs are only
   its near-empty blocks.
 
+**Step 8: a byte budget for the pull on profile 1** (2026-11-26). On the
+heavy chain the validator peaked at 0.86-0.96 GB. Most of that was the
+pull's raw blocks: four ranges of 128 blocks at up to 2.7 MB each, plus a
+256 MiB reorder buffer.
+
+Profile 1 now bounds the pull by bytes, not by slots:
+
+- The requested bytes in flight are shared equally by the four slots.
+- Each range is asked with its share as the `bodies_by_range/2` `max_bytes`.
+- No range asks for more blocks than its share holds at the block-size EWMA.
+- The reorder buffer has its own bound.
+- The importer's 64 MiB queue bound is unchanged.
+
+Other profiles keep the servers' caps. `N42_P1_PULL_IN_FLIGHT_MIB` and
+`N42_P1_PULL_READY_MIB` override the defaults. The bench now records each
+member-3 process's VmHWM.
+
+Measured against main (`9f9713306`) on a quiet box (load 2-12 before each
+leg, except one at 195), with the servers on CPUs 64-95 and 192-223. Peak
+RSS is VmHWM in MiB.
+
+| budget (in flight / ready, MiB) | chain | legs | validator peak (MiB) | wall / rate |
+| --- | --- | --- | --- | --- |
+| main (servers' caps / 256) | bench | 2 | 842-937 | 112.8 s, 112.8 s |
+| 192 / 64 | bench | 2 | 651-664 | 112.8 s, 112.7 s |
+| 96 / 32 | bench | 1 | 583 | 112.8 s |
+| 64 / 32 | bench | 2 | 550-557 | 112.7 s, 113.9 s |
+| **32 / 16 (default)** | bench | 3 | **467-492** | 112.8-113.2 s |
+| main | empty | 2 | 94-104 | 4,943, 4,125 blocks/s |
+| 192 / 64 | empty | 2 | 93-101 | 4,130, 4,127 (one leg at load 195) |
+| 64 / 32 | empty | 1 | 91 | 4,130 |
+| 32 / 16 | empty | 2 | 92-99 | 4,129, 4,127 |
+
+The execution layer's peak is unchanged (4.4 GiB on the bench chain,
+0.28 GiB on the empty chain). On the empty chain the budget never binds: a
+128-block range is ~125 KB.
+
+**Latency.** The bench runs on loopback, and no latency was injected: `tc
+netem` needs host changes, which are not allowed. The reasoning:
+
+- 32 MiB in flight is four 8 MiB ranges of ~10 heavy blocks each.
+- At the 16 MB/s execution rate, that is two seconds of work in flight.
+- A 100 Mbit/s link with a 50 ms RTT has a bandwidth-delay product of
+  ~0.6 MB, about 1/50 of the budget.
+- Each 8 MiB range takes ~0.7 s to transfer at 100 Mbit/s, so an extra
+  10-50 ms per request costs at most 7% of one slot. Four slots overlap it.
+- The chain was execution-bound at every budget, including on loopback.
+
+The empty chain's ranges are 128 blocks of ~1 KB whatever the budget, so
+latency affects it exactly as on main.
+
+**A live commit anchors the pull's tail** (mixed check 4b-R, 2026-11-26).
+A fresh member pulled 439 blocks in 4.4 s. Block 440 was then held for
+~28 s before the member's first vote.
+
+- Block 440 was the network's head. Its commit came as a Decide while the
+  pull was still running, and this node verified it.
+- The engine's `BlockCommitted` for a block not yet imported returned
+  early, before `sync_note_commit`, so the pull never learnt of the commit.
+- Every 3 s retry re-pulled 440 and left it unexecuted: the peer had no
+  commit QC to serve for its head.
+- The gossiped body had been evicted from the 16-body store by the pulled
+  ones, so the live path had nothing to import either. Block 441 came 32 s
+  later and carried 440 in.
+
+That early path now notes the commit, and an anchor for a block not yet
+buffered keeps its QC. The last 64 live commits also seed each new pull.
+Test: `a_live_commit_heard_before_the_pull_anchors_its_tail`, which fails
+without the fix.
+
+The gap is not new with the step 7 defaults. The early return and the
+anchor rule are the same under eager screening.
+
 ## 5. Throughput against link speed
 
 Best configuration measured (pin2e: branch, EL on 32 CPUs) against what each

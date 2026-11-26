@@ -25,6 +25,7 @@ pub mod observer;
 mod pump;
 pub mod rpc;
 pub mod status;
+pub mod sync_v11;
 pub mod topic;
 pub mod transport;
 

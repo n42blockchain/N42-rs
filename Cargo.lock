@@ -7420,6 +7420,7 @@ dependencies = [
  "n42-h2-wire",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "snap",
  "thiserror 2.0.21",
  "tokio",

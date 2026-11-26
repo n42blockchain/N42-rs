@@ -117,6 +117,7 @@ pub fn import_range<Provider, Evm, ChainSpec>(
     full: &(dyn FullConsensus<N42Primitives> + Send + Sync),
     chain_spec: &ChainSpec,
     times_us: &mut [u64; 7],
+    prefetch: &(dyn Fn(&[(u64, B256, B256)]) + Sync),
     hand_off: &mut dyn FnMut(Executed) -> Result<(), String>,
 ) -> RangeImport
 where
@@ -147,6 +148,15 @@ where
     let mut db = evm2::evm::CacheDB::new(evm2::evm::Db::new(StateProviderDatabase::new(
         reth_provider::StateProvider::into_evm_state_provider(&state),
     )));
+    // Every block's header check links it to its parent's committee
+    // evidence, a pure function of the parent header that takes ~0.5 ms to
+    // compute: all of the run's computed at once, on the worker pool.
+    let at = std::time::Instant::now();
+    let parents: Vec<(u64, B256, B256)> = std::iter::once((parent.number, parent.hash(), parent.receipts_root))
+        .chain(blocks[..blocks.len() - 1].iter().map(|b| (b.number, b.hash(), b.receipts_root)))
+        .collect();
+    prefetch(&parents);
+    times_us[T_CHECKS] += us(at);
     let last = blocks.len() - 1;
     let mut ready: Vec<Executed> = Vec::with_capacity(blocks.len());
     for (index, sealed) in blocks.into_iter().enumerate() {
@@ -302,6 +312,7 @@ pub fn serve<Provider, Evm>(
     qmdb: n42_qmdb_reth::QmdbNodeState,
     lean: Arc<dyn FullConsensus<N42Primitives> + Send + Sync>,
     full: Arc<dyn FullConsensus<N42Primitives> + Send + Sync>,
+    prefetch: Arc<dyn Fn(&[(u64, B256, B256)]) + Send + Sync>,
     chain_spec: Arc<n42_header::N42ChainSpec>,
     validator: Arc<n42_engine_types::engine_validator::N42EngineValidator<n42_header::N42ChainSpec>>,
 ) -> crate::engine_ext::ImportRange
@@ -319,6 +330,7 @@ where
     Arc::new(move |payloads: Vec<alloy_rpc_types_engine::ExecutionData>| {
         let (provider, evm_config, qmdb) = (provider.clone(), evm_config.clone(), qmdb.clone());
         let (lean, full, chain_spec, validator) = (lean.clone(), full.clone(), chain_spec.clone(), validator.clone());
+        let prefetch = prefetch.clone();
         let one_at_a_time = one_at_a_time.clone();
         Box::pin(async move {
             let _one = one_at_a_time.lock().await;
@@ -376,7 +388,7 @@ where
                     handed.push((hash, landed));
                     Ok(())
                 };
-                let mut out = import_range(blocks, head, &provider, &evm_config, &qmdb, &*lean, &*full, &*chain_spec, &mut times, &mut hand_off);
+                let mut out = import_range(blocks, head, &provider, &evm_config, &qmdb, &*lean, &*full, &*chain_spec, &mut times, &*prefetch, &mut hand_off);
                 // The inserts are queued in order; wait until the engine has
                 // taken every one.
                 let at = std::time::Instant::now();

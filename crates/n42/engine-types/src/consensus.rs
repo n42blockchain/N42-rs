@@ -79,6 +79,13 @@ impl<Provider: ConsensusProvider> N42Consensus<Provider> {
         matches!(self, Self::HotStuff(_))
     }
 
+    /// [`HotStuffConsensus::prefetch_committee_links`]; nothing on APoS.
+    pub fn prefetch_committee_links(&self, parents: &[(u64, alloy_primitives::B256, alloy_primitives::B256)]) {
+        if let Self::HotStuff(consensus) = self {
+            consensus.prefetch_committee_links(parents);
+        }
+    }
+
     /// These rules without the profile-1 header signature checks
     /// ([`HotStuffConsensus::without_header_signatures`]); `None` on an APoS
     /// chain.

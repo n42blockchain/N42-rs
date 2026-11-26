@@ -674,13 +674,17 @@ fn main() {
                             let evm_config = ctx.node().evm_config().clone();
                             let full: std::sync::Arc<dyn reth_consensus::FullConsensus<n42_tx_types::N42Primitives> + Send + Sync> =
                                 ctx.node().consensus().clone();
-                            let lean: std::sync::Arc<dyn reth_consensus::FullConsensus<n42_tx_types::N42Primitives> + Send + Sync> =
-                                std::sync::Arc::new(lean);
+                            let lean = std::sync::Arc::new(lean);
+                            let prefetch: std::sync::Arc<dyn Fn(&[(u64, alloy_primitives::B256, alloy_primitives::B256)]) + Send + Sync> = {
+                                let lean = lean.clone();
+                                std::sync::Arc::new(move |parents| lean.prefetch_committee_links(parents))
+                            };
+                            let lean: std::sync::Arc<dyn reth_consensus::FullConsensus<n42_tx_types::N42Primitives> + Send + Sync> = lean;
                             let profile = n42_engine_types::engine_validator::header_profile_for(&chain_spec);
                             let validator = std::sync::Arc::new(
                                 n42_engine_types::engine_validator::N42EngineValidator::new(chain_spec.clone(), profile),
                             );
-                            n42::catchup_import::serve(provider, evm_config, qmdb, lean, full, chain_spec, validator)
+                            n42::catchup_import::serve(provider, evm_config, qmdb, lean, full, prefetch, chain_spec, validator)
                         })
                     };
                     let engine_ext = N42EngineExt {

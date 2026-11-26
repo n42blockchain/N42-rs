@@ -341,6 +341,7 @@ where
                     };
                 }
             }
+            let txs: usize = payloads.iter().map(|data| data.payload.as_v1().transactions.len()).sum();
             let run = tokio::task::spawn_blocking(move || {
                 let mut times = [0u64; 7];
                 let at = std::time::Instant::now();
@@ -417,6 +418,7 @@ where
             tracing::info!(
                 target: "n42.catchup",
                 blocks = out.imported,
+                txs,
                 total_us = us(call_at),
                 decode, checks, execute, post, root, hashed, handoff,
                 forkchoice_us = us(fcu_at),

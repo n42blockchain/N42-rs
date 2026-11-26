@@ -78,6 +78,13 @@ pub const SYNC_BATCH_IMPORT_DEFAULT: bool = false;
 /// Blocks one batched import call takes at most.
 pub const BATCH_IMPORT_BLOCKS: usize = 256;
 
+/// Transaction bytes one batched import call carries at most (the first job
+/// always goes): the call is one JSON request, hex doubles the bytes, and
+/// the execution layer's server refuses a body much past 15 MB. It also
+/// bounds how long a call runs, so a report comes back well inside the
+/// stall watchdog: a full block (2.7 MB) goes on its own.
+pub const BATCH_IMPORT_BYTES: usize = 4 << 20;
+
 /// The batched importer's queue.
 pub const BATCH_IMPORT_QUEUE: usize = 2 * BATCH_IMPORT_BLOCKS;
 
@@ -708,10 +715,14 @@ impl PulledImporter {
                     },
                 };
                 let generation = first.generation;
+                let mut bytes = tx_bytes(&first);
                 let mut jobs = vec![first];
                 while jobs.len() < BATCH_IMPORT_BLOCKS {
                     match rx.try_recv() {
-                        Ok(job) if job.generation == generation => jobs.push(job),
+                        Ok(job) if job.generation == generation && bytes + tx_bytes(&job) <= BATCH_IMPORT_BYTES => {
+                            bytes += tx_bytes(&job);
+                            jobs.push(job);
+                        }
                         Ok(job) => {
                             carry = Some(job);
                             break;
@@ -805,6 +816,11 @@ impl PulledImporter {
     pub(crate) fn capacity(&self) -> usize {
         self.tx.capacity()
     }
+}
+
+/// A job's transaction bytes, for [`BATCH_IMPORT_BYTES`].
+fn tx_bytes(job: &ImportJob) -> usize {
+    job.payload.payload.as_v1().transactions.iter().map(|tx| tx.len()).sum()
 }
 
 /// Imports one generation's run of jobs into `batch`: in one

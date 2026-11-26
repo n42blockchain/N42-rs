@@ -4420,6 +4420,17 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.defer_reason = None;
             return Ok(());
         }
+        // F6: the engine signs at most one proposal per view; its own vote in
+        // the view, persisted in the vote log, is the watermark. A leader that
+        // already voted in this view (it proposed before a restart) builds
+        // nothing: a second sealed block for the view would never be proposed.
+        if self.engine.last_voted_view() >= view {
+            debug!(target: "n42.h2.node", view, "already voted in this view; no second proposal");
+            self.proposed_view = Some(view);
+            self.proposal_deferred = false;
+            self.defer_reason = None;
+            return Ok(());
+        }
         if view > 2 {
             self.check_silent_keys(view);
         }

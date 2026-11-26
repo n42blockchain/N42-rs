@@ -418,6 +418,38 @@ async fn a_failed_build_is_not_retried_inside_the_same_view() {
     assert_eq!(rig.el.calls().len(), attempts, "not tried again");
 }
 
+/// F6: once the engine signed this view's proposal (its own vote in the view
+/// is recorded), a leader whose proposal guard was cleared -- a restart, or a
+/// rebuild on the same parent -- builds and signs nothing more in that view.
+#[tokio::test]
+async fn a_leader_signs_one_proposal_per_view_even_when_its_guard_is_cleared() {
+    let (keys, set) = keys(4);
+    let mut rig = None;
+    for index in 0..4 {
+        let candidate = node_in(&keys, &set, index, None).await;
+        if candidate.svc.engine().is_current_leader() {
+            rig = Some(candidate);
+            break;
+        }
+    }
+    let rig = rig.expect("a four-member set has a leader for view 1");
+    let mut svc = rig.svc.with_payload_attributes(|context| Some(attributes_for(&context)));
+    let view = svc.engine().current_view();
+    let mut events = Vec::new();
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert_eq!(svc.engine().current_view(), view, "four members: the view waits for votes");
+    assert_eq!(svc.engine().last_voted_view(), view, "the proposal recorded the leader's vote");
+    let builds = |calls: Vec<ElCall>| calls.iter().filter(|c| matches!(c, ElCall::ResolvePayload(_))).count();
+    let before = builds(rig.el.calls());
+
+    svc.proposed_view = None;
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert_eq!(builds(rig.el.calls()), before, "no second build for a view already proposed in");
+    assert_eq!(svc.proposed_view, Some(view));
+    let proposals = svc.outbox.iter().filter(|m| matches!(m, Msg::Proposal(p) if p.view == view)).count();
+    assert_eq!(proposals, 1, "one signed proposal per (view, proposer)");
+}
+
 /// E15: an equivocation the engine reports is kept in the datadir's log,
 /// once per offence, and survives a restart.
 #[tokio::test]

@@ -3375,6 +3375,71 @@ mod tests {
         assert_eq!(engine.current_phase(), Phase::WaitingForProposal);
     }
 
+    /// The leader of view 1 in a four-member set, with its key and outputs.
+    fn view1_leader() -> (
+        ConsensusEngine,
+        Vec<n42_h2_primitives::BlsSecretKey>,
+        ValidatorSet,
+        mpsc::Receiver<EngineOutput>,
+    ) {
+        (0..4)
+            .map(|i| make_engine(4, i))
+            .find(|(engine, ..)| engine.is_current_leader())
+            .expect("a four-member set has a leader for view 1")
+    }
+
+    fn signed_proposals(rx: &mut mpsc::Receiver<EngineOutput>) -> Vec<Proposal> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|output| match output {
+                EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(p)) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// F6: a leader that builds again on the same parent in the view it has
+    /// already proposed in (a same-parent rebuild) signs no second proposal.
+    #[test]
+    fn f6_a_same_parent_rebuild_signs_no_second_proposal_in_the_view() {
+        let (mut engine, _, _, mut rx) = view1_leader();
+        engine
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xA1), None))
+            .expect("first block");
+        engine
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xA2), None))
+            .expect("the rebuilt block is ignored, not an error");
+        let proposals = signed_proposals(&mut rx);
+        assert_eq!(proposals.len(), 1, "one signed proposal per (view, proposer)");
+        assert_eq!(proposals[0].block_hash, B256::repeat_byte(0xA1));
+        assert_eq!(engine.last_voted_view(), 1);
+    }
+
+    /// F6 across a restart: the vote-log watermark the leader's own proposal
+    /// recorded keeps a restarted leader from signing another in that view.
+    #[test]
+    fn f6_a_restarted_leader_signs_no_second_proposal_in_the_view() {
+        let (engine, sks, vs, _rx) = view1_leader();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut restarted = ConsensusEngine::with_recovered_state(
+            engine.my_index,
+            sks[engine.my_index as usize].clone(),
+            crate::EpochManager::new(vs),
+            60_000,
+            120_000,
+            tx,
+            1,
+            engine.locked_qc().clone(),
+            engine.last_committed_qc().clone(),
+            0,
+            1,
+        );
+        assert!(restarted.is_current_leader());
+        restarted
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xB2), None))
+            .expect("ignored, not an error");
+        assert!(signed_proposals(&mut rx).is_empty());
+    }
+
     #[test]
     fn test_engine_block_ready_as_leader() {
         let (mut engine, _, _, mut rx) = make_engine(1, 0);

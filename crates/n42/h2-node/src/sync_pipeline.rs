@@ -318,7 +318,47 @@ struct Slot {
     /// The deadline passed and the range went back to be asked of another
     /// peer: the reply, when it comes, is dropped.
     reassigned: bool,
+    /// The decoded-byte budget the range was asked with (`0`: the server's
+    /// default); its share of [`PullBudget::in_flight_bytes`].
+    max_bytes: u64,
 }
+
+/// What a pull may hold in memory on the validator: the replies in flight
+/// and those waiting in the reorder buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PullBudget {
+    /// The decoded bytes the ranges in flight may bring at most, together;
+    /// `None` for the servers' own caps (64 MiB a `bodies_by_range/2` reply,
+    /// 128 MiB a v1 one). Each range gets an equal share of it, so the
+    /// number of ranges in flight -- what hides the link's latency -- stays.
+    /// A range is asked with its share as its byte budget, and with no more
+    /// blocks than the share holds at the blocks' size so far (a v1 server
+    /// takes no byte budget).
+    pub(crate) in_flight_bytes: Option<u64>,
+    /// The reorder buffer's bound: no new range is asked for while the
+    /// buffered replies hold this much (a gap below them still is).
+    pub(crate) ready_bytes: usize,
+}
+
+impl PullBudget {
+    /// The servers' caps and [`MAX_READY_BYTES`]: what a pull held before
+    /// profile 1 bounded it (up to ~0.5 GB in flight, 256 MiB ready).
+    pub(crate) const DEFAULT: Self = Self { in_flight_bytes: None, ready_bytes: MAX_READY_BYTES };
+
+    /// Profile 1 (8-second blocks, nodes sized for 0.5 GB): 192 MiB in
+    /// flight, 64 MiB ready (`docs/P1_CATCHUP_PERF.md`, step 8).
+    pub(crate) const PROFILE1: Self = Self { in_flight_bytes: Some(P1_IN_FLIGHT_BYTES), ready_bytes: P1_READY_BYTES };
+}
+
+/// [`PullBudget::PROFILE1`]'s bytes in flight.
+pub const P1_IN_FLIGHT_BYTES: u64 = 192 << 20;
+
+/// [`PullBudget::PROFILE1`]'s reorder buffer.
+pub const P1_READY_BYTES: usize = 64 << 20;
+
+/// The smallest byte budget a range is asked with: below it the pull waits
+/// for a reply to free its share (one block is always served).
+const MIN_RANGE_BYTES: u64 = 1 << 20;
 
 /// A reply waiting in the reorder buffer.
 #[derive(Debug)]
@@ -358,6 +398,7 @@ pub(crate) struct RangeScheduler {
     peers: HashMap<PeerId, PeerStat>,
     range_blocks: u64,
     max_slots: usize,
+    budget: PullBudget,
     /// EWMA of the bytes per block of the replies so far: with the peers'
     /// byte rates, what a range's deadline is sized by. Blocks of one chain
     /// differ by three orders of magnitude (an empty block is ~1 KB, a full
@@ -368,14 +409,23 @@ pub(crate) struct RangeScheduler {
 }
 
 impl RangeScheduler {
-    /// A scheduler whose first range starts at `next`.
-    pub(crate) fn new(next: u64) -> Self {
-        Self::with_shape(next, PIPELINE_RANGE_BLOCKS, MAX_SLOTS)
+    /// A scheduler whose first range starts at `next`, holding at most
+    /// `budget` in memory.
+    pub(crate) fn with_budget(next: u64, budget: PullBudget) -> Self {
+        Self { budget, ..Self::with_shape(next, PIPELINE_RANGE_BLOCKS, MAX_SLOTS) }
     }
 
-    /// [`Self::new`] with a range size and slot count of the caller's.
+    /// The decoded-byte budget `peer`'s range in flight was asked with
+    /// (`0`: the server's default).
+    pub(crate) fn slot_max_bytes(&self, peer: &PeerId) -> u64 {
+        self.slots.get(peer).map_or(0, |slot| slot.max_bytes)
+    }
+
+    /// [`Self::with_budget`] with the default budget, and a range size and
+    /// slot count of the caller's.
     pub(crate) fn with_shape(next: u64, range_blocks: u64, max_slots: usize) -> Self {
         Self {
+            budget: PullBudget::DEFAULT,
             next_assign: next,
             gaps: BTreeMap::new(),
             slots: HashMap::new(),
@@ -480,12 +530,28 @@ impl RangeScheduler {
             // holding it back deadlocked the pull (the importer idle, the
             // buffer full of ranges above the gap; docs/P1_CATCHUP_PERF.md).
             let below_buffer = from_gap && self.ready.keys().next().is_none_or(|first| start < *first);
-            if self.ready_bytes >= MAX_READY_BYTES && !below_buffer {
+            if self.ready_bytes >= self.budget.ready_bytes && !below_buffer {
                 break;
             }
             if start > deliver_next.saturating_add(WINDOW_BLOCKS) {
                 break;
             }
+            // The range's share of the bytes in flight (every range out,
+            // a reassigned one's late reply included), and as many blocks as
+            // the share holds at the blocks' size so far.
+            let (count, max_bytes) = match self.budget.in_flight_bytes {
+                Some(budget) => {
+                    let out: u64 = self.slots.values().map(|slot| slot.max_bytes).sum();
+                    let room = budget.saturating_sub(out).min(budget / self.max_slots as u64);
+                    if room < MIN_RANGE_BYTES && !self.slots.is_empty() {
+                        break;
+                    }
+                    let room = room.max(MIN_RANGE_BYTES);
+                    let fits = self.block_bytes.map_or(count, |per_block| ((room as f64 / per_block.max(1.0)) as u64).max(1));
+                    (count.min(fits), room)
+                }
+                None => (count, 0),
+            };
             let mut best: Option<(PeerId, u64, f64)> = None;
             for (peer, height) in peers {
                 let stat = self.peers.get(peer);
@@ -522,7 +588,7 @@ impl RangeScheduler {
                     Duration::from_secs_f64(count as f64 / bps.max(1e-3) * DEADLINE_FACTOR).max(MIN_DEADLINE)
                 }),
             };
-            self.slots.insert(peer, Slot { start, count, sent: now, deadline: now + expected, reassigned: false });
+            self.slots.insert(peer, Slot { start, count, sent: now, deadline: now + expected, reassigned: false, max_bytes });
             out.push((peer, RangeRequest { start, count, step: 1 }));
         }
         out
@@ -942,6 +1008,45 @@ mod tests {
         assert_eq!(parse_pipeline(Some("1")), Some(true));
         assert_eq!(parse_pipeline(Some("off")), Some(false));
         assert_eq!(parse_pipeline(Some("maybe")), None);
+    }
+
+    /// Profile 1's budget: four ranges stay in flight, each asked with an
+    /// equal share of the bytes in flight; once the blocks' size is known a
+    /// range asks for no more blocks than its share holds; a full reorder
+    /// buffer stops the pull running ahead.
+    #[test]
+    fn a_budget_shares_the_bytes_in_flight_and_shrinks_ranges_not_slots() {
+        let peers: Vec<(PeerId, u64)> = (1..=5).map(|i| (peer(i), 100_000)).collect();
+        let budget = PullBudget { in_flight_bytes: Some(40 << 20), ready_bytes: 16 << 20 };
+        let mut s = RangeScheduler { budget, ..RangeScheduler::with_shape(1, 128, 4) };
+        let now = Instant::now();
+        let asked = s.assign(1, &peers, now);
+        assert_eq!(asked.len(), 4, "the slots stay");
+        for (p, request) in &asked {
+            assert_eq!(s.slot_max_bytes(p), 10 << 20, "a quarter of the bytes in flight each");
+            assert_eq!(request.count, 128, "the blocks' size is not known yet");
+        }
+        // Replies of 1 MiB blocks: a range now holds 10 of them.
+        let big = |n: u64| -> Vec<BlockChunk> {
+            (0..n).map(|_| BlockChunk { fork_digest: [0; 4], rlp: alloy_primitives::Bytes::from(vec![0u8; 1 << 20]) }).collect()
+        };
+        let (p, first) = asked[0];
+        assert_eq!(s.on_reply(p, &first, big(10), now), ReplyOutcome::Buffered(10));
+        let next = s.assign(1, &peers, now);
+        assert_eq!(next.len(), 1, "one share came free");
+        assert_eq!(next[0].1.count, 10, "no more blocks than the share holds");
+        // Ready bytes at the bound: no range further ahead.
+        let (p, second) = asked[1];
+        s.on_reply(p, &second, big(10), now);
+        let (p, third) = next[0];
+        s.on_reply(p, &third, big(10), now);
+        assert!(s.ready_bytes >= 16 << 20);
+        assert!(s.assign(1, &peers, now).is_empty(), "the reorder buffer is full");
+        // The default budget asks with the servers' own caps.
+        let mut d = RangeScheduler::with_budget(1, PullBudget::DEFAULT);
+        let asked = d.assign(1, &peers, now);
+        assert_eq!(asked.len(), MAX_SLOTS);
+        assert!(asked.iter().all(|(p, r)| d.slot_max_bytes(p) == 0 && r.count == PIPELINE_RANGE_BLOCKS));
     }
 
     #[test]

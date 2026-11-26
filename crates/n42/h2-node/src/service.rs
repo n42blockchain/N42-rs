@@ -5504,8 +5504,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         info!(target: "n42.h2.node", %peer, from = latest, to = height, advertised, "behind a peer; pulling the gap by range");
         self.catch_up = Some(CatchUp::new(peer, latest, height));
         if self.sync_pipeline {
+            // Profile 1's nodes are sized for 0.5 GB: the pull's bytes in
+            // flight and in the reorder buffer are bounded for them.
+            let budget = if self.header_rules.is_profile1() {
+                crate::sync_pipeline::PullBudget::PROFILE1
+            } else {
+                crate::sync_pipeline::PullBudget::DEFAULT
+            };
             if let Some(c) = self.catch_up.as_mut() {
-                c.sched = Some(crate::sync_pipeline::RangeScheduler::new(latest + 1));
+                c.sched = Some(crate::sync_pipeline::RangeScheduler::with_budget(latest + 1, budget));
             }
             self.pull_progress_at = Some(std::time::Instant::now());
             if self.range_mode.is_none() {
@@ -6193,7 +6200,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             debug!(target: "n42.h2.node", %peer, ?request, rate = ?sched.rate(&peer), "pipelined range requested");
             c.times.requests += 1;
             c.sent.insert((peer, request.start), now);
-            self.transport.request_range(peer, request);
+            self.transport.request_range_bounded(peer, request, sched.slot_max_bytes(&peer));
         }
     }
 

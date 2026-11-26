@@ -25,5 +25,8 @@ derive_more.workspace = true
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.4"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true

@@ -7484,6 +7484,7 @@ dependencies = [
  "blst",
  "derive_more 2.1.1",
  "getrandom 0.4.3",
+ "libc",
  "n42-legacy-codec",
  "serde",
  "serde_json",

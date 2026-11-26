@@ -219,6 +219,9 @@ impl H2V4Observer {
             | TransportEvent::BlockFetchFailed { peer, .. }
             | TransportEvent::RangeRequest { peer, .. }
             | TransportEvent::RangeFetched { peer, .. }
+            | TransportEvent::RangeV2Request { peer, .. }
+            | TransportEvent::CommitQcRequest { peer, .. }
+            | TransportEvent::CommitQcFetched { peer, .. }
             | TransportEvent::BlockTxnsRequested { peer, .. }
             | TransportEvent::BlockTxnsFetched { peer, .. }
             // Direct votes and their hellos are for leaders, not observers.

@@ -406,11 +406,12 @@ impl request_response::Codec for CommitQcCodec {
 /// The request-response behaviour.
 pub type CommitQcBehaviour = request_response::Behaviour<CommitQcCodec>;
 
-/// Serving and requesting `commit_qc/1` (§6.2: 10 s).
-pub fn commit_qc_behaviour() -> CommitQcBehaviour {
+/// Requesting `commit_qc/1`, and serving it when `serve` (§6.2: 10 s).
+pub fn commit_qc_behaviour(serve: bool) -> CommitQcBehaviour {
+    let support = if serve { request_response::ProtocolSupport::Full } else { request_response::ProtocolSupport::Outbound };
     request_response::Behaviour::with_codec(
         CommitQcCodec,
-        [(commit_qc_protocol(), request_response::ProtocolSupport::Full)],
+        [(commit_qc_protocol(), support)],
         request_response::Config::default().with_request_timeout(frame::SMALL_REQUEST_TIMEOUT),
     )
 }
@@ -537,7 +538,7 @@ mod tests {
         // headers run from that QC's block down to 7.
         assert_eq!(checked.lowest(), Some((7, seven)));
         assert_eq!(checked.headers[0].0, checked.qc.block_hash);
-        assert!(checked.headers.len() >= 1);
+        assert!(!checked.headers.is_empty());
     }
 
     #[test]

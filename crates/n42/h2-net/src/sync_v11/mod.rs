@@ -8,12 +8,14 @@
 //!   codes, context bytes, chunk framing, the END trailer, error chunks).
 //! - [`bodies`]: `/rpc/bodies_by_range/2/ssz_snappy` (§5.1).
 //! - [`commit_qc`]: `/rpc/commit_qc/1/ssz_snappy` (§5.2).
+//! - [`peers`]: capability discovery, `N42_SYNC_V11`, reply channels.
 //!
 //! The golden vectors gov5 generated live in `testdata/sync-v11/`.
 
 pub mod bodies;
 pub mod commit_qc;
 pub mod frame;
+pub mod peers;
 
 #[cfg(test)]
 pub(crate) mod vectors;

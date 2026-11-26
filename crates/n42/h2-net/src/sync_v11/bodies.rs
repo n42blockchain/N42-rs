@@ -541,12 +541,14 @@ pub type RangeV2Behaviour = request_response::Behaviour<RangeV2Codec>;
 /// reading two seconds before it and keeps the prefix.
 pub const RANGE_V2_STREAM_TIMEOUT: std::time::Duration = frame::STREAM_REQUEST_TIMEOUT;
 
-/// Serving and requesting `bodies_by_range/2` on the chain whose fork digest
-/// is `context`.
-pub fn range_v2_behaviour(context: [u8; 4]) -> RangeV2Behaviour {
+/// Requesting `bodies_by_range/2` on the chain whose fork digest is
+/// `context`, and serving it when `serve` (a node that does not serve it
+/// neither lists it in identify nor accepts its streams).
+pub fn range_v2_behaviour(context: [u8; 4], serve: bool) -> RangeV2Behaviour {
+    let support = if serve { request_response::ProtocolSupport::Full } else { request_response::ProtocolSupport::Outbound };
     request_response::Behaviour::with_codec(
         RangeV2Codec::new(context, Some(RANGE_V2_STREAM_TIMEOUT - std::time::Duration::from_secs(2))),
-        [(bodies_by_range_v2_protocol(), request_response::ProtocolSupport::Full)],
+        [(bodies_by_range_v2_protocol(), support)],
         request_response::Config::default().with_request_timeout(RANGE_V2_STREAM_TIMEOUT),
     )
 }

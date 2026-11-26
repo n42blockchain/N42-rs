@@ -170,6 +170,14 @@ pub struct TransportConfig {
     /// (raw payloads despite the suffix). Off by default: a node that serves
     /// no phones neither subscribes nor relays them.
     pub mobileverify: bool,
+    /// Whether this node asks peers over the sync v1.1 protocols
+    /// (`bodies_by_range/2`, `commit_qc/1`) when they list them; `None`
+    /// reads `N42_SYNC_V11` (on unless `off`).
+    pub sync_v11_client: Option<bool>,
+    /// Whether this node serves the sync v1.1 protocols (and lists them in
+    /// identify). On by default; off makes a v1-only peer, as gov5's main
+    /// line and n42-26 are.
+    pub sync_v11_serve: bool,
 }
 
 impl TransportConfig {
@@ -182,7 +190,22 @@ impl TransportConfig {
             idle_connection_timeout: Duration::from_secs(300),
             redial_interval: Duration::from_secs(10),
             mobileverify: false,
+            sync_v11_client: None,
+            sync_v11_serve: true,
         }
+    }
+
+    /// Sets whether this node asks peers over sync v1.1 (see
+    /// [`Self::sync_v11_client`]).
+    pub const fn with_sync_v11_client(mut self, on: bool) -> Self {
+        self.sync_v11_client = Some(on);
+        self
+    }
+
+    /// Sets whether this node serves sync v1.1 (see [`Self::sync_v11_serve`]).
+    pub const fn with_sync_v11_serve(mut self, on: bool) -> Self {
+        self.sync_v11_serve = on;
+        self
     }
 
     /// Joins the mobile-verification topics (see [`Self::mobileverify`]).
@@ -313,6 +336,40 @@ pub enum TransportEvent {
         hash: B256,
         /// Why.
         reason: String,
+    },
+    /// A peer asked for a range of blocks over `bodies_by_range/2` (sync
+    /// standard §5.1). Answer with [`H2V4Transport::respond_range_v2`]. A
+    /// request that does not decode, or from a peer without a status
+    /// exchange, was answered by the transport already.
+    RangeV2Request {
+        /// Who asked.
+        peer: PeerId,
+        /// What they want.
+        request: crate::sync_v11::bodies::RangeV2Request,
+        /// Where the answer goes.
+        channel: crate::sync_v11::peers::RangeV2Channel,
+    },
+    /// A peer asked for the commit QC anchoring a block over `commit_qc/1`
+    /// (sync standard §5.2). Answer with [`H2V4Transport::respond_commit_qc`].
+    CommitQcRequest {
+        /// Who asked.
+        peer: PeerId,
+        /// What they want.
+        request: crate::sync_v11::commit_qc::CommitQcRequest,
+        /// Where the answer goes.
+        channel: crate::sync_v11::peers::CommitQcChannel,
+    },
+    /// A commit QC this node asked for ([`H2V4Transport::request_commit_qc`])
+    /// came back: the SUCCESS payload, unchecked (see
+    /// [`crate::sync_v11::commit_qc::check_commit_qc`]), or why not -- a
+    /// refusal, a failure, or a peer that does not speak the protocol.
+    CommitQcFetched {
+        /// Who was asked.
+        peer: PeerId,
+        /// What was asked.
+        request: crate::sync_v11::commit_qc::CommitQcRequest,
+        /// The payload, or the reason there is none.
+        reply: Result<Vec<u8>, String>,
     },
     /// A peer asked for a range of blocks by number (gov5's range sync,
     /// how a member that starts behind catches up). Answer with
@@ -446,6 +503,13 @@ pub enum TransportEvent {
     },
 }
 
+/// The fork digest of a chain: its genesis hash's first four bytes.
+fn fork_digest_of(genesis_hash: B256) -> [u8; 4] {
+    let mut digest = [0u8; 4];
+    digest.copy_from_slice(&genesis_hash[..4]);
+    digest
+}
+
 /// What this node says it is, in the identify exchange. gov5 does not check
 /// the string; it checks the protocol list that comes with it.
 pub const IDENTIFY_PROTOCOL_VERSION: &str = "/n42/h2/1.0.0";
@@ -468,6 +532,10 @@ pub(crate) struct H2Behaviour {
     pushes: BlockPushBehaviour,
     /// gov5's range sync, served from the execution layer's chain.
     ranges: BodiesByRangeBehaviour,
+    /// Sync v1.1 `bodies_by_range/2` (committed blocks, byte budget, END).
+    ranges_v2: crate::sync_v11::bodies::RangeV2Behaviour,
+    /// Sync v1.1 `commit_qc/1`: the anchor of a pulled tail.
+    commit_qcs: crate::sync_v11::commit_qc::CommitQcBehaviour,
     /// N42's own: the transactions of a block a peer could not assemble from
     /// its queue. See [`crate::rpc::BLOCK_TXNS_PROTOCOL`].
     block_txns: BlockTxnsBehaviour,
@@ -552,6 +620,8 @@ pub(crate) struct TransportCore {
     block_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
     /// The same for named-transactions replies (audit 2026-10 R2-I6).
     txns_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
+    /// Sync v1.1: who speaks it, requests in flight, reply guards.
+    v11: crate::sync_v11::peers::V11State,
 }
 
 impl TransportCore {
@@ -575,6 +645,11 @@ impl TransportCore {
             blocks: block_by_hash_behaviour(),
             pushes: block_push_behaviour(),
             ranges: bodies_by_range_behaviour(),
+            ranges_v2: crate::sync_v11::bodies::range_v2_behaviour(
+                fork_digest_of(config.identity.genesis_hash),
+                config.sync_v11_serve,
+            ),
+            commit_qcs: crate::sync_v11::commit_qc::commit_qc_behaviour(config.sync_v11_serve),
             block_txns: crate::rpc::block_txns_behaviour(),
             identify: libp2p::identify::Behaviour::new(
                 libp2p::identify::Config::new(IDENTIFY_PROTOCOL_VERSION.into(), keypair.public())
@@ -711,6 +786,9 @@ impl TransportCore {
             range_guards: HashMap::new(),
             block_guards: HashMap::new(),
             txns_guards: HashMap::new(),
+            v11: crate::sync_v11::peers::V11State::new(
+                config.sync_v11_client.unwrap_or_else(crate::sync_v11::peers::client_enabled),
+            ),
         })
     }
 
@@ -842,8 +920,84 @@ impl TransportCore {
     /// Asks `peer` for a range of blocks. The answer arrives as
     /// [`TransportEvent::RangeFetched`].
     pub fn request_range(&mut self, peer: PeerId, request: RangeRequest) {
+        // Sync v1.1 when the peer lists `bodies_by_range/2` (§3.4.2); the
+        // reply comes back as the same event, checked and converted.
+        if self.v11.speaks(&peer, crate::sync_v11::bodies::BODIES_BY_RANGE_V2_PROTOCOL)
+            && let Some(v2) = crate::sync_v11::peers::v2_for(&request)
+        {
+            let id = self.swarm.behaviour_mut().ranges_v2.send_request(&peer, Ok(v2));
+            self.v11.ranges.insert(id, (request, v2));
+            return;
+        }
+        self.request_range_v1(peer, request);
+    }
+
+    /// The sync v1.1 bookkeeping, for tests that stage what identify said.
+    #[cfg(test)]
+    pub(crate) const fn v11_mut(&mut self) -> &mut crate::sync_v11::peers::V11State {
+        &mut self.v11
+    }
+
+    fn request_range_v1(&mut self, peer: PeerId, request: RangeRequest) {
         let id = self.swarm.behaviour_mut().ranges.send_request(&peer, request);
         self.range_requests.insert(id, request);
+    }
+
+    /// Carries out a sync v1.1 command (inline, or from the pump).
+    pub(crate) fn apply_v11(&mut self, command: crate::sync_v11::peers::V11Command) {
+        use crate::sync_v11::peers::V11Command;
+        match command {
+            V11Command::RequestCommitQc(peer, request) => {
+                if !self.v11.speaks(&peer, crate::sync_v11::commit_qc::COMMIT_QC_PROTOCOL) {
+                    self.pending_events.push(TransportEvent::CommitQcFetched {
+                        peer,
+                        request,
+                        reply: Err("peer does not speak commit_qc/1".to_owned()),
+                    });
+                    return;
+                }
+                let id = self.swarm.behaviour_mut().commit_qcs.send_request(&peer, Ok(request));
+                self.v11.commit_qcs.insert(id, request);
+            }
+            V11Command::RespondRangeV2(channel, reply, guard) => {
+                let id = channel.1;
+                if self.swarm.behaviour_mut().ranges_v2.send_response(channel.0, reply).is_ok()
+                    && let Some(guard) = guard
+                {
+                    self.v11.range_guards.insert(id, guard);
+                }
+            }
+            V11Command::RespondCommitQc(channel, reply) => {
+                let _ = self.swarm.behaviour_mut().commit_qcs.send_response(channel.0, reply);
+            }
+        }
+    }
+
+    /// A `bodies_by_range/2` reply as the `/1` event the caller asked for:
+    /// checked against its request (§5.1 client MUSTs; a violation is the
+    /// peer's provable fault and fails the request), its blocks as chunks.
+    fn range_v2_fetched(
+        &self,
+        peer: PeerId,
+        request: RangeRequest,
+        v2: crate::sync_v11::bodies::RangeV2Request,
+        reply: crate::sync_v11::bodies::RangeV2Reply,
+    ) -> TransportEvent {
+        let fork_digest = self.our_status().fork_digest();
+        let reply = match crate::sync_v11::bodies::check_range_v2(&v2, reply) {
+            Err(fault) => {
+                tracing::warn!(target: "n42.h2.net", %peer, ?v2, %fault, "bodies_by_range/2 reply contradicts itself: a provable fault");
+                Err(format!("bodies_by_range/2 provable fault: {fault}"))
+            }
+            Ok(Err(refused)) => Err(refused.to_string()),
+            Ok(Ok(checked)) => {
+                if checked.end.is_none() {
+                    tracing::debug!(target: "n42.h2.net", %peer, ?v2, blocks = checked.payloads.len(), "bodies_by_range/2 reply without END: keeping the blocks");
+                }
+                Ok(checked.payloads.into_iter().map(|rlp| BlockChunk { fork_digest, rlp }).collect())
+            }
+        };
+        TransportEvent::RangeFetched { peer, request, reply }
     }
 
     /// Asks `peer` for named transactions of a block. The answer arrives as
@@ -1159,6 +1313,7 @@ impl TransportCore {
                         %peer_id, agent = %info.agent_version, protocols = info.protocols.len(),
                         "peer identified",
                     );
+                    self.v11.learn(peer_id, &info.protocols);
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Identify(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(
@@ -1292,6 +1447,16 @@ impl TransportCore {
                 }
                 #[allow(unreachable_patterns)] // event kinds are handled elsewhere; the arm documents them
                 SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(_)) => {}
+                SwarmEvent::Behaviour(H2BehaviourEvent::RangesV2(event)) => {
+                    if let Some(event) = self.on_range_v2(event) {
+                        return Some(event);
+                    }
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::CommitQcs(event)) => {
+                    if let Some(event) = self.on_commit_qc(event) {
+                        return Some(event);
+                    }
+                }
                 SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(
                     request_response::Event::Message { peer, message, .. },
                 )) => match message {
@@ -1375,6 +1540,7 @@ impl TransportCore {
                     ..
                 } => {
                     self.statused.remove(&peer_id);
+                    self.v11.forget(&peer_id);
                     if self.mesh_peers.remove(&peer_id) {
                         return Some(TransportEvent::PeerDisconnected(peer_id));
                     }
@@ -1402,6 +1568,108 @@ impl TransportCore {
     /// at them.
     fn our_status(&self) -> Status {
         Status::new(self.identity.genesis_hash, self.advertised_height)
+    }
+
+    /// A `bodies_by_range/2` event: an inbound request goes up (or is
+    /// refused here), a reply goes up as the `/1` event, a peer that does
+    /// not speak `/2` is marked v1-only and asked again over `/1` (§5.0).
+    fn on_range_v2(
+        &mut self,
+        event: request_response::Event<
+            crate::sync_v11::bodies::InboundRangeV2,
+            crate::sync_v11::bodies::RangeV2Reply,
+        >,
+    ) -> Option<TransportEvent> {
+        use crate::sync_v11::bodies::{RangeV2Reply, BODIES_BY_RANGE_V2_PROTOCOL};
+        use crate::sync_v11::frame::{CodeError, CODE_INVALID_REQUEST, CODE_RESOURCE_UNAVAILABLE};
+        match event {
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request { request_id, request, channel } => {
+                    let refusal = match request {
+                        Err(message) => CodeError { code: CODE_INVALID_REQUEST, message },
+                        Ok(_) if !self.statused.contains(&peer) => CodeError {
+                            code: CODE_RESOURCE_UNAVAILABLE,
+                            message: "no status exchanged for this chain".to_owned(),
+                        },
+                        Ok(request) => {
+                            return Some(TransportEvent::RangeV2Request {
+                                peer,
+                                request,
+                                channel: crate::sync_v11::peers::RangeV2Channel(channel, request_id),
+                            });
+                        }
+                    };
+                    let _ = self.swarm.behaviour_mut().ranges_v2.send_response(channel, RangeV2Reply::Refused(refusal));
+                    None
+                }
+                request_response::Message::Response { request_id, response } => {
+                    let (request, v2) = self.v11.ranges.remove(&request_id)?;
+                    Some(self.range_v2_fetched(peer, request, v2, response))
+                }
+            },
+            request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                let (request, _) = self.v11.ranges.remove(&request_id)?;
+                if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
+                    tracing::debug!(target: "n42.h2.net", %peer, "peer does not speak bodies_by_range/2: v1-only for an hour, asking over /1");
+                    self.v11.mark_refused(peer, BODIES_BY_RANGE_V2_PROTOCOL);
+                    self.request_range_v1(peer, request);
+                    return None;
+                }
+                Some(TransportEvent::RangeFetched { peer, request, reply: Err(error.to_string()) })
+            }
+            request_response::Event::ResponseSent { request_id, .. }
+            | request_response::Event::InboundFailure { request_id, .. } => {
+                self.v11.range_guards.remove(&request_id);
+                None
+            }
+        }
+    }
+
+    /// A `commit_qc/1` event: an inbound request goes up (or is refused
+    /// here), a reply goes up as [`TransportEvent::CommitQcFetched`].
+    fn on_commit_qc(
+        &mut self,
+        event: request_response::Event<
+            crate::sync_v11::commit_qc::InboundCommitQc,
+            crate::sync_v11::commit_qc::CommitQcReply,
+        >,
+    ) -> Option<TransportEvent> {
+        use crate::sync_v11::commit_qc::COMMIT_QC_PROTOCOL;
+        use crate::sync_v11::frame::{CodeError, CODE_INVALID_REQUEST, CODE_RESOURCE_UNAVAILABLE};
+        match event {
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request { request, channel, .. } => {
+                    let refusal = match request {
+                        Err(message) => CodeError { code: CODE_INVALID_REQUEST, message },
+                        Ok(_) if !self.statused.contains(&peer) => CodeError {
+                            code: CODE_RESOURCE_UNAVAILABLE,
+                            message: "no status exchanged for this chain".to_owned(),
+                        },
+                        Ok(request) => {
+                            return Some(TransportEvent::CommitQcRequest {
+                                peer,
+                                request,
+                                channel: crate::sync_v11::peers::CommitQcChannel(channel),
+                            });
+                        }
+                    };
+                    let _ = self.swarm.behaviour_mut().commit_qcs.send_response(channel, Err(refusal));
+                    None
+                }
+                request_response::Message::Response { request_id, response } => {
+                    let request = self.v11.commit_qcs.remove(&request_id)?;
+                    Some(TransportEvent::CommitQcFetched { peer, request, reply: response.map_err(|e| e.to_string()) })
+                }
+            },
+            request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                let request = self.v11.commit_qcs.remove(&request_id)?;
+                if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
+                    self.v11.mark_refused(peer, COMMIT_QC_PROTOCOL);
+                }
+                Some(TransportEvent::CommitQcFetched { peer, request, reply: Err(error.to_string()) })
+            }
+            request_response::Event::ResponseSent { .. } | request_response::Event::InboundFailure { .. } => None,
+        }
     }
 
     /// Answers an inbound status request and reports what a peer told us.
@@ -1756,6 +2024,40 @@ impl H2V4Transport {
             Inner::Inline(core) => core.respond_range_error(channel, message),
             Inner::OffLoop(off) => off.command(crate::pump::Command::RespondRangeError(channel, message)),
         }
+    }
+
+    fn v11_command(&mut self, command: crate::sync_v11::peers::V11Command) {
+        match &mut self.inner {
+            Inner::Inline(core) => core.apply_v11(command),
+            Inner::OffLoop(off) => off.command(crate::pump::Command::SyncV11(command)),
+        }
+    }
+
+    /// Asks `peer` for the commit QC anchoring `request` over `commit_qc/1`.
+    /// The answer arrives as [`TransportEvent::CommitQcFetched`] -- at once,
+    /// as an error, when the peer does not list the protocol in identify.
+    pub fn request_commit_qc(&mut self, peer: PeerId, request: crate::sync_v11::commit_qc::CommitQcRequest) {
+        self.v11_command(crate::sync_v11::peers::V11Command::RequestCommitQc(peer, request));
+    }
+
+    /// Answers a [`TransportEvent::RangeV2Request`], holding `guard` (when
+    /// given) until libp2p has sent the reply or given up on it.
+    pub fn respond_range_v2(
+        &mut self,
+        channel: crate::sync_v11::peers::RangeV2Channel,
+        reply: crate::sync_v11::bodies::RangeV2Reply,
+        guard: Option<ServeGuard>,
+    ) {
+        self.v11_command(crate::sync_v11::peers::V11Command::RespondRangeV2(channel, reply, guard));
+    }
+
+    /// Answers a [`TransportEvent::CommitQcRequest`].
+    pub fn respond_commit_qc(
+        &mut self,
+        channel: crate::sync_v11::peers::CommitQcChannel,
+        reply: crate::sync_v11::commit_qc::CommitQcReply,
+    ) {
+        self.v11_command(crate::sync_v11::peers::V11Command::RespondCommitQc(channel, reply));
     }
 
     /// Closes every connection to `peer`; see [`TransportCore::disconnect`].

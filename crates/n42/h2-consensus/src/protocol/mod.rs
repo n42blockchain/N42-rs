@@ -1,5 +1,6 @@
 mod bounded_fifo;
 mod decision;
+pub mod equivocation;
 mod pacemaker;
 mod proposal;
 pub mod quorum;

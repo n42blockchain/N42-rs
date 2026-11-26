@@ -323,6 +323,8 @@ pub enum EngineOutput {
         validator: u32,
         hash1: B256,
         hash2: B256,
+        /// The two signed messages (E15), to be persisted by the node.
+        evidence: Box<super::equivocation::EquivocationEvidence>,
     },
     /// An epoch transition has occurred. The validator set may have changed.
     EpochTransition {
@@ -459,13 +461,16 @@ pub struct ConsensusEngine {
     pub(super) unauthenticated: Option<(ViewNumber, &'static str)>,
     /// Tracks which block hash each validator voted for (equivocation detection).
     /// Tracks R1 (Vote) per validator per view for equivocation detection.
-    pub(super) equivocation_tracker: HashMap<u32, B256>,
+    /// Keyed by the voted block hash; the value keeps the first signed vote as
+    /// evidence (E15).
+    pub(super) equivocation_tracker: super::equivocation::EquivocationTracker,
     /// Tracks R2 (CommitVote) per validator per view for equivocation detection.
-    pub(super) commit_equivocation_tracker: HashMap<u32, B256>,
-    /// Tracks `(signed_message_commitment, block_hash)` per proposer in the
-    /// current view. The commitment includes validator changes, so reusing a
-    /// block hash with a different reconfiguration payload is still detected.
-    pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256)>,
+    pub(super) commit_equivocation_tracker: super::equivocation::EquivocationTracker,
+    /// Tracks the signed-message commitment per proposer in the current view,
+    /// with the first signed proposal as evidence. The commitment includes
+    /// validator changes, so reusing a block hash with a different
+    /// reconfiguration payload is still detected.
+    pub(super) proposal_equivocation_tracker: super::equivocation::EquivocationTracker,
     /// The signed-message commitment of the proposal this view has taken;
     /// a repeat of it (any peer can replay the leader's) is dropped.
     pub(super) processed_proposal: Option<B256>,
@@ -3547,7 +3552,10 @@ mod tests {
                     validator: 1,
                     hash1,
                     hash2,
+                    evidence,
                 } if *hash1 == first_hash && *hash2 == second_hash
+                    && evidence.kind == super::super::equivocation::EquivocationKind::Proposal
+                    && evidence.verify(engine.signing_profile)
             )));
             assert!(
                 !second_outputs.iter().any(|output| matches!(
@@ -3609,6 +3617,7 @@ mod tests {
                 validator: 1,
                 hash1,
                 hash2,
+                ..
             } if hash1 != hash2
         )));
         assert!(!outputs.iter().any(|output| matches!(
@@ -4752,7 +4761,10 @@ mod tests {
                     validator: 0,
                     hash1,
                     hash2,
+                    evidence,
                 } if *hash1 == first_hash && *hash2 == second_hash
+                    && evidence.kind == super::super::equivocation::EquivocationKind::Vote
+                    && evidence.verify(engine.signing_profile)
             )));
         }
     }
@@ -4812,7 +4824,10 @@ mod tests {
                     validator: 0,
                     hash1,
                     hash2,
+                    evidence,
                 } if *hash1 == first_hash && *hash2 == second_hash
+                    && evidence.kind == super::super::equivocation::EquivocationKind::CommitVote
+                    && evidence.verify(engine.signing_profile)
             )));
         }
     }

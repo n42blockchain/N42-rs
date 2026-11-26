@@ -340,34 +340,33 @@ impl ConsensusEngine {
         }
         // edition-2021: N42-26 writes this as a let-chain; filtering the
         // Option keeps the guard and the body identical.
-        if let Some((previous_commitment, previous_block_hash)) = self
+        let previous_commitment = self
             .proposal_equivocation_tracker
             .get(&proposal.proposer)
-            .copied()
-            .filter(|&(previous_commitment, _)| previous_commitment != proposal_commitment)
-        {
+            .map(|(commitment, _)| *commitment);
+        if let Some(pair) = super::equivocation::check_equivocation(
+            &mut self.proposal_equivocation_tracker,
+            proposal.proposer,
+            proposal_commitment,
+            || super::equivocation::SignedValue::new(proposal.block_hash, prop_msg.clone(), &proposal.signature),
+        ) {
             // Preserve the existing block-hash evidence shape for ordinary
             // double proposals. If only the signed changes differ, emit the
             // two distinct signed-message commitments instead.
-            let (hash1, hash2) = if previous_block_hash != proposal.block_hash {
-                (previous_block_hash, proposal.block_hash)
+            let hashes = if pair.0.block_hash != pair.1.block_hash {
+                (pair.0.block_hash, pair.1.block_hash)
             } else {
-                (previous_commitment, proposal_commitment)
+                (previous_commitment.unwrap_or_default(), proposal_commitment)
             };
-            tracing::warn!(target: "n42::cl::proposal", view,
-                proposer = proposal.proposer, %hash1, %hash2,
-                "proposal equivocation detected");
-            self.emit(EngineOutput::EquivocationDetected {
+            self.emit_equivocation(
+                super::equivocation::EquivocationKind::Proposal,
                 view,
-                validator: proposal.proposer,
-                hash1,
-                hash2,
-            })?;
+                proposal.proposer,
+                pair,
+                hashes,
+            )?;
             return Ok(());
         }
-        self.proposal_equivocation_tracker
-            .entry(proposal.proposer)
-            .or_insert((proposal_commitment, proposal.block_hash));
 
         // Verify the justify_qc's aggregate BLS signature to prevent a Byzantine leader
         // from injecting a forged QC that manipulates honest nodes' locked_qc.

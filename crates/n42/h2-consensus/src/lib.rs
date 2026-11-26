@@ -74,6 +74,7 @@ pub use protocol::quorum::{
 pub use protocol::state_machine::{
     AuthenticatedConsensusMessage, DEFAULT_VOTE_LOG_FATAL_AFTER, FUTURE_VIEW_WINDOW, SyncQcVerdict, VOTERS_SEEN_WINDOW,
 };
+pub use protocol::equivocation::{EquivocationEvidence, EquivocationKind, SignedValue};
 pub use protocol::{ConsensusEngine, ConsensusEvent, EngineOutput, Pacemaker, Phase, RoundState,
     TimeoutCollector, ViewTiming, VoteCollector};
 pub use validator::{

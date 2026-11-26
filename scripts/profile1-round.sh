@@ -146,7 +146,18 @@ PY
   echo "genesis hash (n42 init): $(strip "$(mdir "$first")/init.log" | /usr/bin/grep -aoE 'hash=0x[0-9a-f]{64}' | tail -1)"
 }
 
+# Refuses to start a round on a nearly full disk: on 2026-11-25 /data reached
+# 100% mid-round and two members died (MDBX I/O error, ENOSPC on a state save).
+need_free_disk() {
+  local dir=$1 min_gb=${P1_MIN_FREE_GB:-50} free
+  free=$(df -BG --output=avail "$dir" 2>/dev/null | awk 'NR==2{gsub("G","");print $1}')
+  if [ -n "$free" ] && [ "$free" -lt "$min_gb" ]; then
+    echo "refusing to start: ${free} GB free under $dir, need ${min_gb} (P1_MIN_FREE_GB)" >&2; exit 1
+  fi
+}
+
 cmd_up() {
+  need_free_disk "$(dirname "${P1_DIR}")"
   [ -f "$G" ] || { echo "no $G: init first" >&2; exit 1; }
   local all; all=$(members_all)
   for i in $P1_MEMBERS; do

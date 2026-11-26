@@ -232,6 +232,8 @@ impl CatchUpTimes {
 struct PeerStat {
     /// EWMA of the blocks/s its replies came at; `None` before the first.
     bps: Option<f64>,
+    /// EWMA of the bytes/s its replies came at; `None` before the first.
+    byte_rate: Option<f64>,
     /// A request to it is outstanding (also one whose range was reassigned).
     busy: bool,
     /// It answered nothing from this height: no range at or above it is
@@ -296,6 +298,13 @@ pub(crate) struct RangeScheduler {
     peers: HashMap<PeerId, PeerStat>,
     range_blocks: u64,
     max_slots: usize,
+    /// EWMA of the bytes per block of the replies so far: with the peers'
+    /// byte rates, what a range's deadline is sized by. Blocks of one chain
+    /// differ by three orders of magnitude (an empty block is ~1 KB, a full
+    /// 480M-gas one 2.7 MB), so a deadline sized by blocks/s alone, learnt
+    /// on empty blocks, expired on every range of full ones
+    /// (docs/P1_CATCHUP_PERF.md, step 2).
+    block_bytes: Option<f64>,
 }
 
 impl RangeScheduler {
@@ -315,6 +324,7 @@ impl RangeScheduler {
             peers: HashMap::new(),
             range_blocks: range_blocks.max(1),
             max_slots: max_slots.max(1),
+            block_bytes: None,
         }
     }
 
@@ -435,9 +445,15 @@ impl RangeScheduler {
             }
             let stat = self.peers.entry(peer).or_default();
             stat.busy = true;
-            let expected = stat.bps.map_or(UNKNOWN_DEADLINE, |bps| {
-                Duration::from_secs_f64(count as f64 / bps.max(1e-3) * DEADLINE_FACTOR).max(MIN_DEADLINE)
-            });
+            let expected = match (stat.byte_rate, self.block_bytes) {
+                (Some(rate), Some(per_block)) => {
+                    let bytes = (count as f64 * per_block).min(n42_h2_net::MAX_RANGE_REPLY_BYTES as f64);
+                    Duration::from_secs_f64(bytes / rate.max(1.0) * DEADLINE_FACTOR).max(MIN_DEADLINE)
+                }
+                _ => stat.bps.map_or(UNKNOWN_DEADLINE, |bps| {
+                    Duration::from_secs_f64(count as f64 / bps.max(1e-3) * DEADLINE_FACTOR).max(MIN_DEADLINE)
+                }),
+            };
             self.slots.insert(peer, Slot { start, count, sent: now, deadline: now + expected, reassigned: false });
             out.push((peer, RangeRequest { start, count, step: 1 }));
         }
@@ -452,10 +468,25 @@ impl RangeScheduler {
         self.slots.remove(&peer);
         let stat = self.peers.entry(peer).or_default();
         stat.busy = false;
-        if slot.reassigned {
-            return ReplyOutcome::Stale;
-        }
         let served = chunks.len() as u64;
+        if slot.reassigned {
+            // Late, after its range was reassigned: the blocks are taken all
+            // the same when nothing holds them yet (a late reply used to be
+            // dropped, and the range asked again, on every range a deadline
+            // learnt on smaller blocks had underestimated). What was not
+            // reassigned yet is taken back from the gaps; a copy the other
+            // peer serves later is a duplicate the delivery skips.
+            if served == 0 || self.ready.contains_key(&slot.start) {
+                return ReplyOutcome::Stale;
+            }
+            if let Some(left) = self.gaps.remove(&slot.start)
+                && left > served
+            {
+                self.gaps.insert(slot.start + served, left - served);
+            }
+            stat.timeouts = 0;
+            stat.backoff_until = None;
+        }
         if served == 0 {
             stat.exhausted_from = Some(stat.exhausted_from.map_or(slot.start, |from| from.min(slot.start)));
             self.add_gap(slot.start, slot.count);
@@ -464,7 +495,14 @@ impl RangeScheduler {
         let secs = now.duration_since(slot.sent).as_secs_f64().max(1e-3);
         let sample = served as f64 / secs;
         stat.bps = Some(stat.bps.map_or(sample, |old| (1.0 - EWMA_ALPHA).mul_add(old, EWMA_ALPHA * sample)));
+        let reply_bytes: usize = chunks.iter().map(|c| c.rlp.len()).sum();
+        let byte_sample = reply_bytes as f64 / secs;
+        stat.byte_rate =
+            Some(stat.byte_rate.map_or(byte_sample, |old| (1.0 - EWMA_ALPHA).mul_add(old, EWMA_ALPHA * byte_sample)));
         stat.timeouts = 0;
+        let per_block = reply_bytes as f64 / served as f64;
+        self.block_bytes =
+            Some(self.block_bytes.map_or(per_block, |old| (1.0 - EWMA_ALPHA).mul_add(old, EWMA_ALPHA * per_block)));
         let served = served.min(slot.count);
         if served < slot.count {
             // Short: a server caps a reply by bytes and blocks, so the rest
@@ -474,6 +512,10 @@ impl RangeScheduler {
         }
         let mut chunks = chunks;
         chunks.truncate(served as usize);
+        if self.ready.contains_key(&slot.start) {
+            // A late copy of this range from another peer got here first.
+            return ReplyOutcome::Stale;
+        }
         let bytes = chunks.iter().map(|c| c.rlp.len()).sum();
         self.ready_bytes += bytes;
         self.ready.insert(slot.start, Ready { peer, chunks, bytes });
@@ -739,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slow_peers_range_is_reassigned_and_its_late_reply_dropped() {
+    fn a_slow_peers_range_is_reassigned_and_its_late_reply_taken_once() {
         let (fast, slow) = (peer(1), peer(2));
         let mut s = RangeScheduler::with_shape(1, 10, 2);
         let t0 = Instant::now();
@@ -752,7 +794,49 @@ mod tests {
         // The fast peer takes the slow one's range; the slow one is busy and backing off.
         let again = s.assign(1, &[(slow, 100), (fast, 100)], t0 + UNKNOWN_DEADLINE);
         assert_eq!(again[0], (fast, RangeRequest { start: slow_req.start, count: 10, step: 1 }));
-        assert_eq!(s.on_reply(slow, &slow_req, chunks(10), t0 + UNKNOWN_DEADLINE * 2), ReplyOutcome::Stale);
+        // The slow peer's late reply arrives first: taken, nothing holds the
+        // range yet; the fast peer's copy after it is a duplicate.
+        assert_eq!(s.on_reply(slow, &slow_req, chunks(10), t0 + UNKNOWN_DEADLINE * 2), ReplyOutcome::Buffered(10));
+        assert_eq!(s.on_reply(fast, &again[0].1, chunks(10), t0 + UNKNOWN_DEADLINE * 2), ReplyOutcome::Stale);
+        let (_, first, _) = s.pop_ready(1).expect("the late range");
+        assert_eq!((first.start, first.count), (slow_req.start, 10));
+        assert_eq!(s.ready_bytes, 30, "the duplicate holds no bytes");
+    }
+
+    /// A late reply whose range was not asked again yet is taken, and the
+    /// range is not asked again after it; a late empty one is stale.
+    #[test]
+    fn a_late_reply_before_the_range_is_asked_again_is_taken_and_ends_the_gap() {
+        let (a, b) = (peer(1), peer(2));
+        let mut s = RangeScheduler::with_shape(1, 10, 1);
+        let t0 = Instant::now();
+        let (who, req) = s.assign(1, &[(a, 100), (b, 100)], t0).remove(0);
+        assert_eq!(s.on_deadlines(t0 + UNKNOWN_DEADLINE + Duration::from_millis(1)).len(), 1);
+        // Late and short: the first 6 are taken, the other 4 stay a gap.
+        assert_eq!(s.on_reply(who, &req, chunks(6), t0 + UNKNOWN_DEADLINE * 2), ReplyOutcome::Buffered(6));
+        let next = s.assign(1, &[(a, 100), (b, 100)], t0 + UNKNOWN_DEADLINE * 2).remove(0).1;
+        assert_eq!((next.start, next.count), (7, 4), "only the rest is asked again");
+    }
+
+    /// The deadline is sized by bytes once replies taught the scheduler a
+    /// block size and the peer's byte rate: a peer that served 128 empty
+    /// blocks in a millisecond is not given 2 s for 128 full ones when its
+    /// byte rate says they take longer.
+    #[test]
+    fn the_deadline_follows_the_bytes_a_range_is_expected_to_carry() {
+        let a = peer(1);
+        let mut s = RangeScheduler::with_shape(1, 10, 1);
+        let t0 = Instant::now();
+        let r = s.assign(1, &[(a, 1000)], t0).remove(0).1;
+        // 10 blocks of 1 MB in 1 s: 10 MB/s, 1 MB a block.
+        let big: Vec<BlockChunk> = (0..10)
+            .map(|_| BlockChunk { fork_digest: [0; 4], rlp: alloy_primitives::Bytes::from(vec![0u8; 1 << 20]) })
+            .collect();
+        assert_eq!(s.on_reply(a, &r, big, t0 + Duration::from_secs(1)), ReplyOutcome::Buffered(10));
+        let _ = s.assign(11, &[(a, 1000)], t0 + Duration::from_secs(1));
+        let slot = s.slots.get(&a).expect("in flight").clone();
+        let deadline = slot.deadline.duration_since(slot.sent);
+        assert!(deadline >= Duration::from_secs(3), "10 MB at 10 MB/s, times the factor: {deadline:?}");
     }
 
     #[test]

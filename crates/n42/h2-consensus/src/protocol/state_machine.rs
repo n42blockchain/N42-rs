@@ -537,6 +537,8 @@ pub struct ConsensusEngine {
     vote_log_failures_in_a_row: u32,
     /// Vote-log failures since start.
     vote_log_failures_total: u64,
+    /// Timeout certificates this node formed from a timeout quorum since start.
+    pub(super) tcs_formed_total: u64,
     /// Why this node no longer votes, proposes or times out, if it does not
     /// (see [`Self::halt_voting`]). It keeps following.
     voting_halted: Option<&'static str>,
@@ -651,6 +653,7 @@ impl ConsensusEngine {
             vote_log_fatal_after: DEFAULT_VOTE_LOG_FATAL_AFTER,
             vote_log_failures_in_a_row: 0,
             vote_log_failures_total: 0,
+            tcs_formed_total: 0,
             voting_halted: None,
         }
     }
@@ -785,6 +788,7 @@ impl ConsensusEngine {
             vote_log_fatal_after: DEFAULT_VOTE_LOG_FATAL_AFTER,
             vote_log_failures_in_a_row: 0,
             vote_log_failures_total: 0,
+            tcs_formed_total: 0,
             voting_halted: None,
         }
     }
@@ -1163,6 +1167,11 @@ impl ConsensusEngine {
     /// aborts its vote, as before.
     pub fn set_vote_log_fatal_after(&mut self, failures: u32) {
         self.vote_log_fatal_after = failures;
+    }
+
+    /// Timeout certificates this node formed from a timeout quorum since start (J2).
+    pub const fn tcs_formed_total(&self) -> u64 {
+        self.tcs_formed_total
     }
 
     /// Vote-log failures since start.
@@ -3341,6 +3350,7 @@ mod tests {
         engine
             .try_form_tc_and_advance(1, 2)
             .expect("TC should form and advance");
+        assert_eq!(engine.tcs_formed_total(), 1, "a TC formed here is counted (J2)");
 
         let outputs: Vec<_> = std::iter::from_fn(|| output_rx.try_recv().ok()).collect();
         let emitted_new_view = outputs.iter().find_map(|output| match output {

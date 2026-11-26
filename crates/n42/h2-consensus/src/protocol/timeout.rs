@@ -577,6 +577,7 @@ impl ConsensusEngine {
     }
 
     fn advance_with_tc(&mut self, tc: TimeoutCertificate, next_view: u64) -> ConsensusResult<()> {
+        self.tcs_formed_total += 1;
         tracing::info!(target: "n42::cl::timeout",
             view = tc.view,
             "TC formed, advancing to view {}", next_view

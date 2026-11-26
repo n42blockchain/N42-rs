@@ -3641,7 +3641,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     });
                 } else {
                     debug!(target: "n42.h2.node", %peer, ?request, "too many requests in flight; bodies_by_range/2 refused");
-                    let busy = frame::CodeError { code: frame::CODE_SERVER_ERROR, message: "server busy".to_owned() };
+                    // Spec §6.3: over quota is RATE_LIMITED with a decimal
+                    // retry_after_ms (gov5 sends "1000"), not SERVER_ERROR.
+                    let busy = frame::CodeError { code: frame::CODE_RATE_LIMITED, message: "1000".to_owned() };
                     self.transport.respond_range_v2(channel, RangeV2Reply::Refused(busy), None);
                 }
             }

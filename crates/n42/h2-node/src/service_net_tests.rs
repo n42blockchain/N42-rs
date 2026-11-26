@@ -445,6 +445,7 @@ fn block_with_extra(number: u64, parent: B256, view: u64, qc: Vec<u8>) -> (B256,
 async fn a_pulled_block_with_a_forged_parent_qc_ends_the_batch_and_its_peer_is_not_asked_again() {
     let (keys, set) = keys(4);
     let mut rig = node_in(&keys, &set, 0, None).await;
+    rig.svc.sync_lazy_verify = false;
     let peer = PeerId::random();
     let quorum = [0, 1, 2];
     let mut blocks: Vec<(B256, Header, alloy_primitives::Bytes)> = Vec::new();
@@ -806,6 +807,7 @@ async fn under_observe_an_uncertified_chain_is_imported_and_logged() {
 #[tokio::test]
 async fn a_pulled_block_that_does_not_extend_the_previous_one_is_refused() {
     let mut rig = node(1, 0, None).await;
+    rig.svc.sync_lazy_verify = false;
     let peer = PeerId::random();
     let mut blocks = anchored_chain(&rig, 2);
     blocks.push(block(3, B256::repeat_byte(0x09)));
@@ -825,6 +827,7 @@ async fn a_pulled_block_that_does_not_extend_the_previous_one_is_refused() {
 async fn a_forged_block_mid_range_never_reaches_the_execution_layer() {
     let (keys, set) = keys(4);
     let mut rig = node_in(&keys, &set, 0, None).await;
+    rig.svc.sync_lazy_verify = false;
     let peer = PeerId::random();
     let real = anchored_chain(&rig, 6);
     let qc_of = |header: &Header| n42_h2_consensus::HeaderExtra::decode(&header.extra_data).expect("extra").qc;
@@ -946,6 +949,7 @@ fn own_commit_qc(view: u64, hash: B256) -> n42_h2_primitives::consensus::QuorumC
 #[tokio::test]
 async fn an_anchored_chain_that_does_not_join_the_committed_head_halts_the_importer() {
     let mut rig = node(1, 0, None).await;
+    rig.svc.sync_lazy_verify = false;
     let peer = PeerId::random();
     let ours = B256::repeat_byte(0x42);
     let mut events = Vec::new();
@@ -985,6 +989,7 @@ async fn an_anchored_chain_that_does_not_join_the_committed_head_halts_the_impor
 #[tokio::test]
 async fn two_verified_anchors_for_different_blocks_at_one_height_halt_and_keep_the_evidence() {
     let mut rig = node(1, 0, None).await;
+    rig.svc.sync_lazy_verify = false;
     let (first, second) = (PeerId::random(), PeerId::random());
     let a = anchored_chain(&rig, 4);
     catching_up(&mut rig, first, 1, 4);
@@ -1203,6 +1208,7 @@ async fn a_restarted_node_takes_its_restored_commit_as_the_committed_height_at_o
     // Its own catch-up: from the restored commit, against it.
     let peer = PeerId::random();
     let theirs = anchored_chain(&b, 6);
+    b.svc.sync_lazy_verify = false;
     b.svc.note_peer_height(peer, 6);
     let mut events = Vec::new();
     within(b.svc.consider_catch_up(&mut events)).await;

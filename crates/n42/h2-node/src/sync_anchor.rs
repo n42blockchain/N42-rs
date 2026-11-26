@@ -92,11 +92,13 @@ pub(crate) struct AnchorBuffer<T> {
     authenticated_to: Option<u64>,
     /// Anchored hashes whose block is not in the buffer (yet).
     pending: VecDeque<B256>,
+    /// The last block [`Self::pop_ready`] released, `(number, hash)`.
+    released: Option<(u64, B256)>,
 }
 
 impl<T> Default for AnchorBuffer<T> {
     fn default() -> Self {
-        Self { blocks: VecDeque::new(), bytes: 0, authenticated_to: None, pending: VecDeque::new() }
+        Self { blocks: VecDeque::new(), bytes: 0, authenticated_to: None, pending: VecDeque::new(), released: None }
     }
 }
 
@@ -153,7 +155,33 @@ impl<T> AnchorBuffer<T> {
         }
         let block = self.blocks.pop_front()?;
         self.bytes -= block.bytes;
+        self.released = Some((block.number, block.hash));
         Some(block)
+    }
+
+    /// Drops the unanchored tail, every block above the highest anchor (a
+    /// screening fault inside it makes all of it suspect): how many there
+    /// were. What stays is authenticated.
+    pub(crate) fn drop_unanchored(&mut self) -> usize {
+        let to = self.authenticated_to;
+        let before = self.blocks.len();
+        while self.blocks.back().is_some_and(|b| to.is_none_or(|to| b.number > to)) {
+            if let Some(block) = self.blocks.pop_back() {
+                self.bytes -= block.bytes;
+            }
+        }
+        before - self.blocks.len()
+    }
+
+    /// The highest block held or released, `(number, hash)`: where a pull
+    /// that dropped its unanchored tail goes on from.
+    pub(crate) fn top(&self) -> Option<(u64, B256)> {
+        self.blocks.back().map(|b| (b.number, b.hash)).or(self.released)
+    }
+
+    /// The highest buffered block itself.
+    pub(crate) fn top_block(&self) -> Option<&T> {
+        self.blocks.back().map(|b| &b.item)
     }
 
     /// The unanchored tail: blocks and bytes above the highest anchor.
@@ -233,6 +261,33 @@ mod tests {
         // An older anchor does not move the mark back.
         buffer.anchor(B256::with_last_byte(1));
         assert_eq!(buffer.authenticated_to(), Some(2));
+    }
+
+    /// A screening fault drops the unanchored tail: what stays is
+    /// authenticated, and the pull goes on from the highest block held or,
+    /// with none held, the last one released.
+    #[test]
+    fn dropping_the_unanchored_tail_keeps_what_is_authenticated() {
+        let mut buffer = AnchorBuffer::default();
+        assert_eq!(buffer.drop_unanchored(), 0);
+        assert_eq!(buffer.top(), None);
+        for n in 1..=5 {
+            buffer.push(block(n));
+        }
+        buffer.anchor(B256::with_last_byte(3));
+        assert_eq!(buffer.pop_ready().map(|b| b.number), Some(1));
+        assert_eq!(buffer.drop_unanchored(), 2, "4 and 5");
+        assert_eq!(buffer.tail(), (0, 0));
+        assert_eq!(buffer.top(), Some((3, B256::with_last_byte(3))));
+        assert_eq!(buffer.pop_ready().map(|b| b.number), Some(2));
+        assert_eq!(buffer.pop_ready().map(|b| b.number), Some(3));
+        buffer.push(block(4));
+        assert_eq!(buffer.drop_unanchored(), 1);
+        assert_eq!(buffer.top(), Some((3, B256::with_last_byte(3))), "the last released");
+        let mut fresh = AnchorBuffer::default();
+        fresh.push(block(1));
+        assert_eq!(fresh.drop_unanchored(), 1);
+        assert_eq!(fresh.top(), None, "nothing authenticated: back to the pull's base");
     }
 
     #[test]

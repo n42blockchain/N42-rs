@@ -48,8 +48,13 @@ pub const SYNC_PIPELINE_DEFAULT: bool = true;
 /// every pulled block does (`docs/P1_CATCHUP_PERF.md`, section 4).
 pub const SYNC_LAZY_VERIFY_ENV: &str = "N42_SYNC_LAZY_VERIFY";
 
-/// Lazy screening's default when [`SYNC_LAZY_VERIFY_ENV`] is unset.
-pub const SYNC_LAZY_VERIFY_DEFAULT: bool = false;
+/// Lazy screening's default when [`SYNC_LAZY_VERIFY_ENV`] is unset: on.
+/// It applies only under `N42_SYNC_ANCHOR=enforce`, where nothing executes
+/// before a verified commit QC at or above it covers it through parent
+/// links; the per-block check only finds a forger earlier, by at most the
+/// unanchored-tail bound, and a forger is scored and disconnected when its
+/// run fails (`docs/P1_CATCHUP_PERF.md`, step 7). `0` keeps the eager path.
+pub const SYNC_LAZY_VERIFY_DEFAULT: bool = true;
 
 /// Whether lazy screening is on ([`SYNC_LAZY_VERIFY_ENV`]); a value that is
 /// not 0 or 1 keeps the default, with a warning.
@@ -72,8 +77,11 @@ pub fn lazy_verify_from_env() -> bool {
 /// execution layer without it imports block by block as before.
 pub const SYNC_BATCH_IMPORT_ENV: &str = "N42_SYNC_BATCH_IMPORT";
 
-/// The batched import's default when [`SYNC_BATCH_IMPORT_ENV`] is unset.
-pub const SYNC_BATCH_IMPORT_DEFAULT: bool = false;
+/// The batched import's default when [`SYNC_BATCH_IMPORT_ENV`] is unset: on.
+/// It is used only for anchored pulls under `N42_SYNC_ANCHOR=enforce`, and
+/// only against an execution layer that offers `n42Engine_importRange`;
+/// `0` imports block by block.
+pub const SYNC_BATCH_IMPORT_DEFAULT: bool = true;
 
 /// Blocks one batched import call takes at most.
 pub const BATCH_IMPORT_BLOCKS: usize = 256;

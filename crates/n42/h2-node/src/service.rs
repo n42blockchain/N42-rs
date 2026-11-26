@@ -557,6 +557,12 @@ pub struct H2Service<E> {
     /// execution layer is known past that height (someone else closed the
     /// gap), so a peer is not shut out of every later catch-up.
     refused_range_peers: std::collections::HashMap<PeerId, u64>,
+    /// Provable pull faults per peer (a forged certificate, a broken parent
+    /// link, a block profile 1 refuses, an unreadable or misordered one), for
+    /// the life of the node. Each one also drops the peer's connection
+    /// ([`Self::pull_fault`]), so a forger has to dial back in to be asked
+    /// again, and is not asked for the gap it failed.
+    sync_faults: std::collections::HashMap<PeerId, u32>,
     /// Blocks the execution layer has imported through this service — voted
     /// on, pulled or built. A commit for any other block is not handed to
     /// the execution layer: a forkchoice to a head reth does not have starts
@@ -2019,6 +2025,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             catch_up_retry_after: None,
             failed_peer: None,
             refused_range_peers: std::collections::HashMap::new(),
+            sync_faults: std::collections::HashMap::new(),
             imported: HashSet::new(),
             imported_order: std::collections::VecDeque::new(),
             ready_bodies: Vec::new(),
@@ -5822,6 +5829,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 return false;
             }
         };
+        let breaks_link =
+            self.catch_up.as_ref().and_then(|c| c.prev_hash).is_some_and(|prev| block.header.parent_hash != prev);
+        if breaks_link && !verify && let Err(reason) = self.sync_anchor_of(&block.header) {
+            // Lazy screening left this block's certificate unchecked: before
+            // weighing whose fault a broken link is, a forged certificate
+            // settles it.
+            warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block that does not extend the one before it and whose certificate does not verify");
+            self.pull_fault(peer, number, events);
+            return false;
+        }
         if let Some(c) = self.catch_up.as_ref()
             && let Some(prev) = c.prev_hash
             && block.header.parent_hash != prev
@@ -5916,6 +5933,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// ([`Self::requeue_after_fault`]).
     fn pull_fault(&mut self, peer: PeerId, number: u64, events: &mut Vec<ServiceEvent>) -> bool {
         self.refused_range_peers.insert(peer, number);
+        // Scored and dropped: under lazy screening a forged run is caught at
+        // its verified block or its broken link, not at every block, so the
+        // peer that served it is cut off rather than left to serve again.
+        let faults = self.sync_faults.entry(peer).or_default();
+        *faults = faults.saturating_add(1);
+        warn!(target: "n42.h2.node", %peer, number, faults = *faults, "pull fault: the peer is disconnected");
+        self.transport.disconnect(peer);
         if self.catch_up.as_ref().is_some_and(|c| c.sched.is_some()) {
             info!(target: "n42.h2.node", %peer, number, "pipelined pull: the peer is excluded for the rest of the pull, its ranges go to the others");
             return true;
@@ -5933,11 +5957,30 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some(c) = self.catch_up.as_mut() else {
             return;
         };
+        if c.sched.is_none() {
+            return;
+        }
+        let failed = c.next;
+        // The unanchored tail below the failing block is suspect too: under
+        // lazy screening most of it was never verified, and a block whose own
+        // certificate verified may still be one the next block does not
+        // extend. It is dropped unexecuted and asked again, from the last
+        // authenticated block, of the peers that remain.
+        if c.anchored.drop_unanchored() > 0 {
+            let (next, prev) = match c.anchored.top() {
+                Some((number, hash)) => (number + 1, Some(hash)),
+                None => (c.started_at + 1, None),
+            };
+            c.next = next;
+            c.prev_hash = prev;
+            c.prev_peer = None;
+            self.last_pulled_header = c.anchored.top_block().map(|(block, _)| block.header.clone());
+        }
         let next = c.next;
         let Some(sched) = c.sched.as_mut() else {
             return;
         };
-        sched.exclude(peer, Some((next, rest + 1)));
+        sched.exclude(peer, Some((next, failed.saturating_sub(next) + rest + 1)));
         for (from, request, chunks) in later {
             sched.put_back(from, request.start, chunks);
         }

@@ -410,11 +410,19 @@ impl RangeScheduler {
     /// the caller will screen (the reorder window's base).
     pub(crate) fn assign(&mut self, deliver_next: u64, peers: &[(PeerId, u64)], now: Instant) -> Vec<(PeerId, RangeRequest)> {
         let mut out = Vec::new();
-        while self.active() < self.max_slots && self.ready_bytes < MAX_READY_BYTES {
+        while self.active() < self.max_slots {
             let (start, count, from_gap) = match self.gaps.iter().next() {
                 Some((start, count)) => (*start, *count, true),
                 None => (self.next_assign, self.range_blocks, false),
             };
+            // A full buffer stops the pull running further ahead, but never a
+            // gap below everything it holds: delivery waits on that gap, and
+            // holding it back deadlocked the pull (the importer idle, the
+            // buffer full of ranges above the gap; docs/P1_CATCHUP_PERF.md).
+            let below_buffer = from_gap && self.ready.keys().next().is_none_or(|first| start < *first);
+            if self.ready_bytes >= MAX_READY_BYTES && !below_buffer {
+                break;
+            }
             if start > deliver_next.saturating_add(WINDOW_BLOCKS) {
                 break;
             }
@@ -801,6 +809,31 @@ mod tests {
         let (_, first, _) = s.pop_ready(1).expect("the late range");
         assert_eq!((first.start, first.count), (slow_req.start, 10));
         assert_eq!(s.ready_bytes, 30, "the duplicate holds no bytes");
+    }
+
+    /// A buffer over its byte bound still asks for a gap below everything it
+    /// holds (a deadlock otherwise: delivery waits on the gap), and nothing
+    /// above it.
+    #[test]
+    fn a_full_buffer_still_asks_for_the_gap_delivery_waits_on() {
+        let (a, b) = (peer(1), peer(2));
+        let mut s = RangeScheduler::with_shape(1, 10, 2);
+        let t0 = Instant::now();
+        let asked = s.assign(1, &[(a, 1000), (b, 1000)], t0);
+        let (first, second) = (asked[0], asked[1]);
+        assert_eq!(first.1.start, 1);
+        // The range above arrives, over the byte bound; the one below comes short.
+        let big: Vec<BlockChunk> = (0..10)
+            .map(|_| BlockChunk { fork_digest: [0; 4], rlp: alloy_primitives::Bytes::from(vec![0u8; MAX_READY_BYTES / 8]) })
+            .collect();
+        assert_eq!(s.on_reply(second.0, &second.1, big, t0), ReplyOutcome::Buffered(10));
+        assert_eq!(s.on_reply(first.0, &first.1, chunks(4), t0), ReplyOutcome::Buffered(4));
+        let (_, delivered, _) = s.pop_ready(1).expect("the short range");
+        assert_eq!(delivered.start, 1);
+        assert!(s.ready_bytes >= MAX_READY_BYTES);
+        let again = s.assign(5, &[(a, 1000), (b, 1000)], t0);
+        assert_eq!(again.len(), 1, "the gap and nothing above: {again:?}");
+        assert_eq!((again[0].1.start, again[0].1.count), (5, 6));
     }
 
     /// A late reply whose range was not asked again yet is taken, and the

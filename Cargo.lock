@@ -6952,6 +6952,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types",
  "alloy-rpc-types-engine",
+ "alloy-rpc-types-trace",
  "alloy-signer-local",
  "aquamarine",
  "backon",

@@ -58,6 +58,7 @@ pub mod road_runtime;
 pub mod snapshot_anchor;
 pub mod snapshot_bundle;
 pub mod stacks;
+pub mod trace_cache;
 
 /// Re-exported utils.
 pub mod utils {

@@ -85,6 +85,14 @@ pub const BATCH_IMPORT_BLOCKS: usize = 256;
 /// stall watchdog: a full block (2.7 MB) goes on its own.
 pub const BATCH_IMPORT_BYTES: usize = 4 << 20;
 
+/// A block with more transaction bytes than this is not put in a batched
+/// run: it goes on its own through `newPayload`. Measured (cc32 against
+/// cc32pb, `docs/P1_CATCHUP_PERF.md` step 6): the range import runs
+/// near-empty blocks 1.7x faster, but small to large blocks 2-17% slower
+/// than the engine's own path, which prewarms and roots in parallel.
+/// ~100 transfers.
+pub const BATCH_BLOCK_MAX_BYTES: usize = 16 << 10;
+
 /// Transaction bytes the importer's queue holds at most, either importer
 /// (a job always goes into an empty queue). Each queued block is held twice
 /// on the validator -- its payload here and its RLP in the loop's
@@ -728,10 +736,19 @@ impl PulledImporter {
                 };
                 let generation = first.generation;
                 let mut bytes = tx_bytes(&first);
+                // A block past BATCH_BLOCK_MAX_BYTES goes on its own (the
+                // engine's newPayload, whose prewarm and parallel state root
+                // run such a block faster than the range import's serial
+                // execution); a run gathers the small ones only.
+                let small = bytes <= BATCH_BLOCK_MAX_BYTES;
                 let mut jobs = vec![first];
-                while jobs.len() < BATCH_IMPORT_BLOCKS {
+                while small && jobs.len() < BATCH_IMPORT_BLOCKS {
                     match rx.try_recv().map(|job| took(&taken, job)) {
-                        Ok(job) if job.generation == generation && bytes + tx_bytes(&job) <= BATCH_IMPORT_BYTES => {
+                        Ok(job)
+                            if job.generation == generation
+                                && tx_bytes(&job) <= BATCH_BLOCK_MAX_BYTES
+                                && bytes + tx_bytes(&job) <= BATCH_IMPORT_BYTES =>
+                        {
                             bytes += tx_bytes(&job);
                             jobs.push(job);
                         }
@@ -819,15 +836,14 @@ impl PulledImporter {
         (Self { tx, task, queued }, report_rx)
     }
 
-    /// Queues a block; gives it back when the queue is full, by count or by
-    /// [`IMPORT_QUEUE_BYTES`] (a job always goes into an empty queue).
+    /// Queues a block; gives it back when the queue is full by count. The
+    /// byte bound is [`Self::capacity`]'s: the caller asks for room first and
+    /// a block it was told fits must not be refused (the service would lose
+    /// it and the run would have a gap), so the queue can pass
+    /// [`IMPORT_QUEUE_BYTES`] by at most the one block sent while under it.
     pub(crate) fn try_send(&self, job: ImportJob) -> Result<(), ImportJob> {
         use std::sync::atomic::Ordering;
         let bytes = tx_bytes(&job);
-        let queued = self.queued.load(Ordering::Relaxed);
-        if queued > 0 && queued + bytes > IMPORT_QUEUE_BYTES {
-            return Err(job);
-        }
         self.queued.fetch_add(bytes, Ordering::Relaxed);
         self.tx.try_send(job).map_err(|err| match err {
             tokio::sync::mpsc::error::TrySendError::Full(job) | tokio::sync::mpsc::error::TrySendError::Closed(job) => {
@@ -1123,9 +1139,10 @@ mod tests {
         (done, failed)
     }
 
-    /// The importer's queue is bounded by bytes: a job always goes into an
-    /// empty queue, the next is given back while the queue holds
-    /// [`IMPORT_QUEUE_BYTES`], and taken again once the importer has drained.
+    /// The importer's queue is bounded by bytes through its room: a block it
+    /// was told fits is never refused (the caller would lose it), the room is
+    /// none once the queue holds [`IMPORT_QUEUE_BYTES`], and back once the
+    /// importer has taken the jobs.
     #[tokio::test]
     async fn the_import_queue_is_bounded_by_bytes() {
         let big = |number: u64| {
@@ -1137,11 +1154,16 @@ mod tests {
         };
         let el = Arc::new(n42_h2_execution::MockExecutionLayer::new());
         let (importer, mut reports) = PulledImporter::spawn_batched(el);
-        importer.try_send(big(1)).expect("an empty queue takes a job of any size");
-        let refused = importer.try_send(big(2)).expect_err("past the byte bound");
-        let report = reports.recv().await.expect("the first job imported");
-        assert_eq!(report.done.len(), 1);
-        importer.try_send(refused).expect("room again once the importer took the first");
+        assert!(importer.capacity() > 0);
+        importer.try_send(big(1)).expect("room was reported");
+        assert!(importer.capacity() > 0, "under the bound");
+        importer.try_send(big(2)).expect("room was reported");
+        assert_eq!(importer.capacity(), 0, "no room once the bytes reach the bound");
+        let mut done = 0;
+        while done < 2 {
+            done += reports.recv().await.expect("imported").done.len();
+        }
+        assert!(importer.capacity() > 0, "room again once the importer took them");
     }
 
     #[tokio::test]

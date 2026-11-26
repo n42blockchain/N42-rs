@@ -495,7 +495,7 @@ where
                     return Err(eyre::eyre!("state root mismatch, new_beacon_state hash={:?}, new_beacon_block.state_root={:?}", new_beacon_state.hash_slow(), new_beacon_block.state_root));
                 }
 
-                self.provider.save_beacon_block_by_hash(&new_beacon_block_hash, new_beacon_block.clone())?;
+                self.provider.save_beacon_block_by_hash(&new_beacon_block_hash, new_beacon_block)?;
                 self.provider.save_beacon_block_hash_by_eth1_hash(&parent.hash(), new_beacon_block_hash)?;
             }
 

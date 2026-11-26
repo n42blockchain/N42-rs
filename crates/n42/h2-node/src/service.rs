@@ -542,6 +542,9 @@ pub struct H2Service<E> {
     /// no peers for and answers every forkchoice with SYNCING from then on.
     /// Re-examined as the pull moves the tip. Bounded.
     held_bodies: Vec<B256>,
+    /// The last [`RECENT_COMMIT_QCS`] live commits, applied as anchors to
+    /// each pull as it starts.
+    recent_commit_qcs: std::collections::VecDeque<QuorumCertificate>,
     /// `N42_CHECK_AHEAD_UNHELD` ([`check_ahead_unheld`]).
     check_ahead_unheld: bool,
     /// The highest height each peer is known to be at, from its status and
@@ -899,6 +902,31 @@ impl ByteBucket {
 
 /// Anchor QCs a pull keeps for blocks it has not buffered yet.
 const MAX_PENDING_ANCHOR_QCS: usize = 256;
+
+/// Live commits remembered for the next pull: a commit heard between two
+/// pulls anchors the next one's tail.
+const RECENT_COMMIT_QCS: usize = 64;
+
+/// A live (engine-verified) commit as an anchor for a pull's buffer: the
+/// block it names, buffered or buffered later, and those below it are
+/// authenticated (sync standard §3.3).
+fn anchor_catch_up_by_commit(catch_up: &mut CatchUp, commit_qc: &QuorumCertificate) {
+    let mark = catch_up.anchored.authenticated_to();
+    match catch_up.anchored.anchor(commit_qc.block_hash) {
+        Some(named) => {
+            if mark.is_none_or(|mark| named >= mark) {
+                catch_up.top_anchor = Some(commit_qc.clone());
+            }
+        }
+        None => {
+            if catch_up.pending_qcs.len() >= MAX_PENDING_ANCHOR_QCS {
+                catch_up.pending_qcs.clear();
+            }
+            catch_up.pending_qcs.insert(commit_qc.block_hash, commit_qc.clone());
+        }
+    }
+    catch_up.shadow.anchor(commit_qc.block_hash);
+}
 
 /// A pulled block sent to the importer, kept on the loop for the
 /// bookkeeping its report completes.
@@ -2026,6 +2054,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             gossiped_timeouts: GossipedTimeouts::default(),
             arriving_direct: false,
             held_bodies: Vec::new(),
+            recent_commit_qcs: std::collections::VecDeque::new(),
             check_ahead_unheld: check_ahead_unheld(),
             held_since: std::collections::HashMap::new(),
             held_warned: HashSet::new(),
@@ -4060,10 +4089,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         // on its check, still executing) is the driver's to commit once the
         // import lands; only a block the execution layer has not seen at all
         // is skipped.
-        if let EngineOutput::BlockCommitted { view, block_hash, .. } = &output
+        if let EngineOutput::BlockCommitted { view, block_hash, commit_qc, .. } = &output
             && !self.imported.contains(block_hash)
             && !self.driver.is_importing(block_hash)
         {
+            // Still an anchor for the pull: a block committed before the
+            // pull reached it is exactly the tail the pull holds unexecuted
+            // without one (mixed 4b-R: a joiner's tail block waited ~28 s,
+            // re-pulled every 3 s, for a commit this node had verified).
+            let number = self.block_numbers.get(block_hash).copied();
+            self.sync_note_commit(number, commit_qc, events);
             // The engine commits what the fleet certifies, imported here or
             // not; the execution layer follows only what it has. The pull
             // brings the rest, and the commits after it are for blocks it
@@ -5502,10 +5537,22 @@ impl<E: ExecutionLayer> H2Service<E> {
         let advertised = height;
         let height = capped_catch_up_target(advertised, latest, far_ahead_limit());
         info!(target: "n42.h2.node", %peer, from = latest, to = height, advertised, "behind a peer; pulling the gap by range");
-        self.catch_up = Some(CatchUp::new(peer, latest, height));
+        let mut catch_up = CatchUp::new(peer, latest, height);
+        // Commits heard before this pull: its tail may be one of them.
+        for commit_qc in &self.recent_commit_qcs {
+            anchor_catch_up_by_commit(&mut catch_up, commit_qc);
+        }
+        self.catch_up = Some(catch_up);
         if self.sync_pipeline {
+            // Profile 1's nodes are sized for 0.5 GB: the pull's bytes in
+            // flight and in the reorder buffer are bounded for them.
+            let budget = if self.header_rules.is_profile1() {
+                crate::sync_pipeline::PullBudget::profile1()
+            } else {
+                crate::sync_pipeline::PullBudget::DEFAULT
+            };
             if let Some(c) = self.catch_up.as_mut() {
-                c.sched = Some(crate::sync_pipeline::RangeScheduler::new(latest + 1));
+                c.sched = Some(crate::sync_pipeline::RangeScheduler::with_budget(latest + 1, budget));
             }
             self.pull_progress_at = Some(std::time::Instant::now());
             if self.range_mode.is_none() {
@@ -6078,14 +6125,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         if let Err(halt) = self.sync_safety.note_committed(number, commit_qc) {
             self.halt_sync(halt, events);
         }
+        if self.recent_commit_qcs.len() >= RECENT_COMMIT_QCS {
+            self.recent_commit_qcs.pop_front();
+        }
+        self.recent_commit_qcs.push_back(commit_qc.clone());
         if let Some(catch_up) = self.catch_up.as_mut() {
-            let mark = catch_up.anchored.authenticated_to();
-            if let Some(named) = catch_up.anchored.anchor(commit_qc.block_hash)
-                && mark.is_none_or(|mark| named >= mark)
-            {
-                catch_up.top_anchor = Some(commit_qc.clone());
-            }
-            catch_up.shadow.anchor(commit_qc.block_hash);
+            anchor_catch_up_by_commit(catch_up, commit_qc);
         }
     }
 
@@ -6193,7 +6238,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             debug!(target: "n42.h2.node", %peer, ?request, rate = ?sched.rate(&peer), "pipelined range requested");
             c.times.requests += 1;
             c.sent.insert((peer, request.start), now);
-            self.transport.request_range(peer, request);
+            self.transport.request_range_bounded(peer, request, sched.slot_max_bytes(&peer));
         }
     }
 

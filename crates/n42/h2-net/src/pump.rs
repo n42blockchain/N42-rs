@@ -76,7 +76,7 @@ pub(crate) enum Command {
     Dial(Multiaddr),
     SetHeight(u64),
     RequestBlock(PeerId, B256),
-    RequestRange(PeerId, RangeRequest),
+    RequestRange(PeerId, RangeRequest, u64),
     RequestTxns(PeerId, BlockTxnsRequest),
     RespondTxns(BlockTxnsChannel, BlockTxnsReply),
     RespondRange(RangeRequestChannel, Vec<Vec<u8>>),
@@ -297,7 +297,7 @@ fn apply(core: &mut TransportCore, command: Command) {
         }
         Command::SetHeight(height) => core.set_advertised_height(height),
         Command::RequestBlock(peer, hash) => core.request_block(peer, hash),
-        Command::RequestRange(peer, request) => core.request_range(peer, request),
+        Command::RequestRange(peer, request, max_bytes) => core.request_range_bounded(peer, request, max_bytes),
         Command::RequestTxns(peer, request) => core.request_block_txns(peer, request),
         Command::RespondTxns(channel, reply) => core.respond_block_txns(channel, reply),
         Command::RespondRange(channel, rlps) => core.respond_range(channel, rlps),

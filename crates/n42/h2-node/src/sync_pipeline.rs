@@ -66,6 +66,36 @@ pub fn lazy_verify_from_env() -> bool {
     }
 }
 
+/// The environment variable for the batched import of pulled blocks (`1`
+/// on, `0` off): a run of queued pulled blocks goes to the execution layer in
+/// one `n42Engine_importRange` (`docs/P1_CATCHUP_PERF.md`, step 6); an
+/// execution layer without it imports block by block as before.
+pub const SYNC_BATCH_IMPORT_ENV: &str = "N42_SYNC_BATCH_IMPORT";
+
+/// The batched import's default when [`SYNC_BATCH_IMPORT_ENV`] is unset.
+pub const SYNC_BATCH_IMPORT_DEFAULT: bool = false;
+
+/// Blocks one batched import call takes at most.
+pub const BATCH_IMPORT_BLOCKS: usize = 256;
+
+/// The batched importer's queue.
+pub const BATCH_IMPORT_QUEUE: usize = 2 * BATCH_IMPORT_BLOCKS;
+
+/// Whether the batched import is on ([`SYNC_BATCH_IMPORT_ENV`]); a value
+/// that is not 0 or 1 keeps the default, with a warning.
+pub fn batch_import_from_env() -> bool {
+    let raw = std::env::var(SYNC_BATCH_IMPORT_ENV).ok();
+    match raw.as_deref().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => SYNC_BATCH_IMPORT_DEFAULT,
+        Some("1" | "on" | "true") => true,
+        Some("0" | "off" | "false") => false,
+        Some(_) => {
+            tracing::warn!(target: "n42.h2.node", value = ?raw, "{SYNC_BATCH_IMPORT_ENV} is not 0 or 1; keeping the default");
+            SYNC_BATCH_IMPORT_DEFAULT
+        }
+    }
+}
+
 /// The environment variable for the stall watchdog, in seconds.
 pub const SYNC_STALL_ENV: &str = "N42_SYNC_STALL_SECS";
 
@@ -658,8 +688,66 @@ pub(crate) struct PulledImporter {
 
 impl PulledImporter {
     /// Spawns the importer on `el`; its reports arrive on the returned
-    /// receiver.
+    /// receiver. Batched when [`SYNC_BATCH_IMPORT_ENV`] says so.
     pub(crate) fn spawn<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
+        if batch_import_from_env() {
+            Self::spawn_batched(el)
+        } else {
+            Self::spawn_per_block(el)
+        }
+    }
+
+    /// The batched importer: the queued jobs of one generation, up to
+    /// [`BATCH_IMPORT_BLOCKS`], go to the execution layer in one
+    /// [`ExecutionLayer::import_range`]; whatever it does not take (it does
+    /// not offer the call, the run is unavailable, or it refused a block) is
+    /// imported block by block, so a refusal is the per-block path's verdict.
+    pub(crate) fn spawn_batched<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ImportJob>(BATCH_IMPORT_QUEUE);
+        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut failed_generation: Option<u64> = None;
+            let mut carry: Option<ImportJob> = None;
+            loop {
+                let first = match carry.take() {
+                    Some(job) => job,
+                    None => match rx.recv().await {
+                        Some(job) => job,
+                        None => return,
+                    },
+                };
+                let generation = first.generation;
+                let mut jobs = vec![first];
+                while jobs.len() < BATCH_IMPORT_BLOCKS {
+                    match rx.try_recv() {
+                        Ok(job) if job.generation == generation => jobs.push(job),
+                        Ok(job) => {
+                            carry = Some(job);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if failed_generation.is_some_and(|g| g >= generation) {
+                    continue;
+                }
+                let mut batch = ImportBatch { generation, done: Vec::new(), failed: None, new_payload: Duration::ZERO };
+                let at = Instant::now();
+                import_jobs(&*el, jobs, &mut batch).await;
+                batch.new_payload = at.elapsed();
+                if batch.failed.is_some() {
+                    failed_generation = Some(generation);
+                }
+                if (!batch.done.is_empty() || batch.failed.is_some()) && report_tx.send(batch).is_err() {
+                    return;
+                }
+            }
+        });
+        (Self { tx, task }, report_rx)
+    }
+
+    /// The importer that runs `newPayload` block by block.
+    pub(crate) fn spawn_per_block<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ImportJob>(IMPORT_QUEUE);
         let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
@@ -725,6 +813,39 @@ impl PulledImporter {
     /// Room left in the queue.
     pub(crate) fn capacity(&self) -> usize {
         self.tx.capacity()
+    }
+}
+
+/// Imports one generation's run of jobs into `batch`: in one
+/// [`ExecutionLayer::import_range`] when there is more than one, then block
+/// by block from the first block the range import did not take.
+async fn import_jobs<E: ExecutionLayer>(el: &E, jobs: Vec<ImportJob>, batch: &mut ImportBatch) {
+    let mut rest = std::collections::VecDeque::from(jobs);
+    if rest.len() > 1 {
+        let payloads = rest.iter().map(|job| job.payload.clone()).collect();
+        match el.import_range(payloads).await {
+            Ok(Some(out)) => {
+                let taken = usize::try_from(out.imported).unwrap_or(usize::MAX).min(rest.len());
+                batch.done.extend(rest.drain(..taken).map(|job| (job.number, job.hash)));
+                if let Some(why) = out.refused.as_ref().or(out.unavailable.as_ref()) {
+                    // The block-by-block path gives the verdict on the rest.
+                    tracing::debug!(target: "n42.h2.node", taken, rest = rest.len(), why = %why, "range import stopped; block by block");
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(target: "n42.h2.node", %err, "range import failed; block by block");
+            }
+        }
+    }
+    for job in rest {
+        match ExecutionDriver::<E>::pulled_new_payload(el, job.payload).await {
+            Ok(()) => batch.done.push((job.number, job.hash)),
+            Err(err) => {
+                batch.failed = Some((job.number, job.hash, err.to_string()));
+                return;
+            }
+        }
     }
 }
 
@@ -930,5 +1051,68 @@ mod tests {
         let mut s = RangeScheduler::with_shape(1, WINDOW_BLOCKS, 4);
         let asked = s.assign(1, &peers, Instant::now());
         assert_eq!(asked.len(), 2, "a range starting past the window waits");
+    }
+
+    fn jobs(generation: u64, n: u64) -> Vec<ImportJob> {
+        (1..=n)
+            .map(|number| {
+                let hash = B256::with_last_byte(number as u8);
+                ImportJob { generation, number, hash, payload: n42_h2_execution::MockExecutionLayer::payload_for(hash, number) }
+            })
+            .collect()
+    }
+
+    async fn import_all(
+        el: Arc<n42_h2_execution::MockExecutionLayer>,
+        jobs: Vec<ImportJob>,
+    ) -> (Vec<(u64, B256)>, Option<(u64, B256, String)>) {
+        let want = jobs.len();
+        let (importer, mut reports) = PulledImporter::spawn_batched(el);
+        for job in jobs {
+            importer.try_send(job).expect("room");
+        }
+        let (mut done, mut failed) = (Vec::new(), None);
+        while done.len() < want && failed.is_none() {
+            let batch = reports.recv().await.expect("report");
+            done.extend(batch.done);
+            failed = batch.failed;
+        }
+        (done, failed)
+    }
+
+    #[tokio::test]
+    async fn batched_importer_takes_a_queued_run_in_one_call() {
+        let el = Arc::new(n42_h2_execution::MockExecutionLayer::new());
+        el.set_behaviour(n42_h2_execution::MockBehaviour { range_imports: true, ..Default::default() });
+        let (done, failed) = import_all(el.clone(), jobs(1, 10)).await;
+        assert!(failed.is_none());
+        assert_eq!(done.iter().map(|(n, _)| *n).collect::<Vec<_>>(), (1..=10).collect::<Vec<_>>());
+        assert_eq!(el.range_imports(), vec![10], "one call for the queued run");
+    }
+
+    #[tokio::test]
+    async fn batched_importer_goes_block_by_block_without_the_call() {
+        let el = Arc::new(n42_h2_execution::MockExecutionLayer::new());
+        let (done, failed) = import_all(el.clone(), jobs(1, 10)).await;
+        assert!(failed.is_none());
+        assert_eq!(done.len(), 10);
+        assert!(el.range_imports().is_empty());
+        let new_payloads = el.calls().iter().filter(|c| matches!(c, n42_h2_execution::ElCall::NewPayload(_))).count();
+        assert_eq!(new_payloads, 10);
+    }
+
+    #[tokio::test]
+    async fn batched_importer_reports_a_refused_block_with_the_per_block_verdict() {
+        let el = Arc::new(n42_h2_execution::MockExecutionLayer::new());
+        el.set_behaviour(n42_h2_execution::MockBehaviour {
+            range_imports: true,
+            new_payload_status: alloy_rpc_types_engine::PayloadStatusEnum::Invalid { validation_error: "bad".into() },
+            ..Default::default()
+        });
+        let (done, failed) = import_all(el.clone(), jobs(1, 10)).await;
+        assert!(done.is_empty());
+        let (number, _, why) = failed.expect("refused");
+        assert_eq!(number, 1);
+        assert!(why.contains("bad"), "{why}");
     }
 }

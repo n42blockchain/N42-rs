@@ -146,6 +146,7 @@ where
     )));
     let last = blocks.len() - 1;
     for (index, sealed) in blocks.into_iter().enumerate() {
+        let block_at = std::time::Instant::now();
         let number = sealed.number;
         let hash = sealed.hash();
         let refuse = |out: &mut RangeImport, why: String| {
@@ -228,6 +229,7 @@ where
         };
         times_us[T_HASHED] += us(at);
         let next_parent = recovered.clone_sealed_header();
+        let txs = recovered.body().transactions.len();
         let at = std::time::Instant::now();
         let executed = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(recovered),
@@ -241,6 +243,7 @@ where
             return out;
         }
         times_us[T_HANDOFF] += us(at);
+        tracing::debug!(target: "n42.catchup", number, txs, us = us(block_at), "range block imported");
         out.imported += 1;
         out.head = Some(hash);
         parent = next_parent;
@@ -356,7 +359,9 @@ where
                 }
                 out
             });
+            let call_at = std::time::Instant::now();
             let out = run.await.unwrap_or_else(|err| RangeImport { unavailable: Some(format!("import task: {err}")), ..Default::default() });
+            let fcu_at = std::time::Instant::now();
             if let Some(head) = out.head
                 && let Err(err) = forkchoice(head).await
             {
@@ -364,6 +369,17 @@ where
                 // caller's own newPayload finds them held and answers VALID.
                 return RangeImport { unavailable: Some(format!("forkchoice to {head}: {err}")), times_us: out.times_us, ..Default::default() };
             }
+            let [decode, checks, execute, post, root, hashed, handoff] = out.times_us;
+            tracing::info!(
+                target: "n42.catchup",
+                blocks = out.imported,
+                total_us = us(call_at),
+                decode, checks, execute, post, root, hashed, handoff,
+                forkchoice_us = us(fcu_at),
+                refused = out.refused.as_deref(),
+                unavailable = out.unavailable.as_deref(),
+                "range import"
+            );
             out
         })
     })

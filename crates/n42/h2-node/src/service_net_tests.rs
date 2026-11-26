@@ -1755,6 +1755,33 @@ async fn from_a_v1_only_server_the_pull_falls_back_to_bodies_by_range_1() {
     assert!(!b.seen.contains(&"commit_qc_request"), "{:?}", b.seen);
 }
 
+/// Mixed 4b-R: the pull's top block has no header after it to anchor it
+/// and the server cannot answer `commit_qc/1`, but this node's engine
+/// committed that block live before the pull reached it -- heard while the
+/// block was not imported, the path that used to return before telling the
+/// pull, so the joiner re-pulled the block every retry and left it
+/// unexecuted until the next block came (~28 s). That commit anchors the
+/// tail, and the whole gap is executed.
+#[tokio::test]
+async fn a_live_commit_heard_before_the_pull_anchors_its_tail() {
+    let (mut a, mut b, blocks) = behind_a_server(5, 4, false).await;
+    let mut a_events = Vec::new();
+    let tail = blocks[3].0;
+    let committed = EngineOutput::BlockCommitted { view: 50, block_hash: tail, commit_qc: own_commit_qc(50, tail), validator_changes: None };
+    a.svc.handle_output(committed, &mut a_events).await.expect("handled");
+    assert!(!a.svc.imported.contains(&tail), "not imported yet: the early path");
+    pump(&mut a, &mut b, (true, true), &mut a_events, |_, _, events| {
+        events.iter().any(|e| matches!(e, ServiceEvent::Synced { .. }))
+    })
+    .await;
+    assert!(a_events.contains(&ServiceEvent::Synced { height: 4, complete: true }), "{a_events:?}");
+    for (hash, _, _) in &blocks[..4] {
+        assert!(a.svc.imported.contains(hash), "block {hash} was pulled and executed");
+    }
+    assert!(!a.svc.imported.contains(&blocks[4].0), "nothing above the committed head is served");
+    assert_eq!(a.svc.sync_v11_anchors, 0, "anchored by the live commit, not commit_qc/1");
+}
+
 // ---------------------------------------------------------------------------
 // Layout claims of compact frame descriptions (audit 2026-10 R2-X4)
 // ---------------------------------------------------------------------------

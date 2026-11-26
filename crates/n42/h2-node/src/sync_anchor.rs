@@ -172,6 +172,13 @@ impl<T> AnchorBuffer<T> {
         blocks > MAX_TAIL_BLOCKS || bytes > MAX_TAIL_BYTES
     }
 
+    /// The highest buffered block no anchor covers, `(number, hash)`: what a
+    /// `commit_qc/1` request asks to have certified.
+    pub(crate) fn unanchored_top(&self) -> Option<(u64, B256)> {
+        let top = self.blocks.back()?;
+        self.authenticated_to.is_none_or(|to| top.number > to).then_some((top.number, top.hash))
+    }
+
     /// The highest number an anchor covers, buffered or released.
     pub(crate) const fn authenticated_to(&self) -> Option<u64> {
         self.authenticated_to

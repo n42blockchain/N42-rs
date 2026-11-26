@@ -60,6 +60,7 @@ impl ConsensusEngine {
             &decide.validator_changes_hash,
             self.signing_profile,
         )?;
+        self.note_certificate_signers(decide.commit_qc.view, &decide.commit_qc.signers);
 
         // Cache the committed block's changes hash so a late Proposal for the same
         // block can still recover validator_changes after this Decide advances the view.

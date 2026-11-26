@@ -484,6 +484,12 @@ pub struct ConsensusEngine {
     /// quorum are keeping up (see `voters_seen`); nothing in the protocol's
     /// safety depends on it.
     pub(super) voters_seen: HashMap<ViewNumber, HashSet<u32>>,
+    /// The highest certificate view in which each validator index (of the
+    /// current set) signed a QC or TC this node verified. A gov5 member sends
+    /// its votes only to the leader, so a node that is not that leader sees
+    /// them only as certificate signers; the silent-key diagnostic reads this
+    /// beside `voters_seen`. Diagnostic only; nothing in safety reads it.
+    pub(super) cert_signers_seen: HashMap<u32, ViewNumber>,
     /// Proposals this node received but had not imported when their view
     /// passed, so never voted for. When the import completes a *progress
     /// vote* goes to that view's leader (see `progress_vote_message`), if
@@ -632,6 +638,7 @@ impl ConsensusEngine {
             vote_log_retrying: false,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
+            cert_signers_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
             progress_votes: false,
             vote_aggregate: false,
@@ -766,6 +773,7 @@ impl ConsensusEngine {
             vote_log_retrying: false,
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
+            cert_signers_seen: HashMap::new(),
             withheld_votes: VecDeque::new(),
             progress_votes: false,
             vote_aggregate: false,
@@ -1140,6 +1148,29 @@ impl ConsensusEngine {
     /// The vote rules in force; see [`Self::set_vote_rules`].
     pub const fn vote_rules(&self) -> crate::VoteRules {
         self.vote_rules
+    }
+
+    /// Records the signers of a verified QC or TC of `view` in
+    /// `cert_signers_seen`. A bitmap whose length is not the current set's is
+    /// read against another set and ignored: its indices name other keys.
+    pub(super) fn note_certificate_signers(
+        &mut self,
+        view: ViewNumber,
+        signers: &bitvec::slice::BitSlice<u8, bitvec::order::Msb0>,
+    ) {
+        if view == 0 || signers.len() != self.validator_set().len() as usize {
+            return;
+        }
+        for index in signers.iter_ones() {
+            let seen = self.cert_signers_seen.entry(index as u32).or_insert(view);
+            *seen = (*seen).max(view);
+        }
+    }
+
+    /// The highest view of a verified QC or TC that `voter` (an index in the
+    /// current set) signed; `None` if it is in none this node verified.
+    pub fn certificate_signer_last_seen(&self, voter: u32) -> Option<ViewNumber> {
+        self.cert_signers_seen.get(&voter).copied()
     }
 
     /// Records a verified Round 1 vote in `voters_seen`, keeping the last
@@ -1930,6 +1961,7 @@ impl ConsensusEngine {
             "QC-based view jump: recovering node catching up to network"
         );
 
+        self.note_certificate_signers(qc.view, &qc.signers);
         self.round_state.update_locked_qc(qc);
         self.round_state.reset_consecutive_timeouts();
 
@@ -3813,6 +3845,35 @@ mod tests {
         assert_eq!(engine.current_phase(), Phase::TimedOut, "and the view stays timed out");
         engine.on_timeout().expect("still timed out");
         assert_eq!(engine.consecutive_timeouts(), timeouts, "the repeat timeout is not a new one");
+    }
+
+    /// A gov5 member votes to the leader only, so a follower sees its key
+    /// only as a certificate signer: the signers of a verified Decide's
+    /// CommitQC are recorded, a key outside it is not, and a bitmap read
+    /// against another set's size names nobody.
+    #[test]
+    fn signers_of_a_verified_certificate_are_recorded() {
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        let view = engine.current_view();
+        let block_hash = B256::repeat_byte(0xC5);
+        assert_eq!(engine.certificate_signer_last_seen(1), None);
+        let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[1, 2, 3]);
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+            view,
+            block_hash,
+            commit_qc,
+            validator_changes_hash: B256::ZERO,
+        })));
+        for signer in 1..4 {
+            assert_eq!(engine.certificate_signer_last_seen(signer), Some(view), "signer {signer}");
+        }
+        assert_eq!(engine.certificate_signer_last_seen(0), None, "not a signer");
+        assert_eq!(engine.voter_last_seen(1), None, "no vote was seen, only the certificate");
+
+        let mut other_set = bitvec::bitvec![u8, bitvec::order::Msb0; 0; 7];
+        other_set.set(0, true);
+        engine.note_certificate_signers(view + 5, &other_set);
+        assert_eq!(engine.certificate_signer_last_seen(0), None, "another set's bitmap is ignored");
     }
 
     /// Audit 2026-10 R2-C6: gov5's commit signatures do not cover the

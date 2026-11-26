@@ -411,6 +411,33 @@ async fn a_repeated_timeout_reaches_a_late_peer_over_the_direct_protocol() {
 }
 
 #[tokio::test]
+async fn a_peers_timeout_that_came_by_gossip_is_not_published_again() {
+    // Mixed rounds: every node relayed each gossiped timeout to the next
+    // leader by publishing it again, and gossipsub refused it as a duplicate
+    // with a WARN at every node. One that came by gossip is left to gossip;
+    // one that did not (a direct copy) is still relayed.
+    let (keys, set) = keys(4);
+    let mut a = node_in(&keys, &set, 0, None).await;
+    a.svc = a.svc.with_gov5_h2_profile(keys[0].clone());
+    a.svc.engine.on_timeout().unwrap();
+    let mut events = Vec::new();
+    within(a.svc.drain_outputs(&mut events)).await.unwrap();
+    let timeout = a.svc.outbox.last().unwrap().clone();
+    assert!(matches!(timeout, n42_h2_primitives::consensus::ConsensusMessage::Timeout(_)));
+
+    let mut b = node_in(&keys, &set, 1, None).await;
+    b.svc = b.svc.with_gov5_h2_profile(keys[1].clone());
+    let queued = b.svc.outbox.len();
+    b.svc.send_to_validator(2, timeout.clone(), &mut events);
+    assert_eq!(b.svc.outbox.len(), queued + 1, "a timeout not seen on gossip is relayed");
+
+    let wire = wire_bridge::to_wire(&timeout, b.svc.identity, B256::ZERO).unwrap();
+    b.svc.gossiped_timeouts.note(&wire.message);
+    b.svc.send_to_validator(2, timeout, &mut events);
+    assert_eq!(b.svc.outbox.len(), queued + 1, "a gossiped timeout is not published again");
+}
+
+#[tokio::test]
 async fn a_relayed_timeout_already_on_the_topic_is_not_fanned_out_to_every_peer() {
     // Gate 5: a relay of a timeout this node already holds in its gossip
     // cache must not go to every connected peer directly, or one view change

@@ -9,12 +9,23 @@
 use alloy_primitives::B256;
 use n42_h2_primitives::BlsSignature;
 
+/// The mixed-production standard's `MAX_CONSENSUS_MSG` (G5, gov5
+/// `783b8a29`): the largest decoded consensus message a node accepts from a
+/// gossip topic. Both consensus decoders here are tighter -- the native one
+/// at [`MAX_ENVELOPE_PAYLOAD`] + 5, the v4 one at its 8 KiB wire plus header,
+/// each checked from the Snappy length header before decompressing -- so a
+/// message over this cap is refused without allocating its output. Block and
+/// transaction topics have their own limits.
+pub const MAX_CONSENSUS_MSG: usize = 64 * 1024;
+
 const MAX_ENVELOPE_PAYLOAD: usize = 8 * 1024;
 const MAX_SIGNATURE: usize = 256;
 const MAX_BITMAP: usize = 1024;
 const MAX_QC: usize = 2 * 1024;
 const MAX_HIGH_TC: usize = 4 * 1024;
 const MAX_VALIDATORS: usize = 4096;
+
+const _: () = assert!(MAX_ENVELOPE_PAYLOAD + 5 <= MAX_CONSENSUS_MSG, "the native decoder's bound is within G5");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -841,6 +852,26 @@ mod tests {
                 max: MAX_SIGNATURE,
             })
         );
+    }
+
+    /// Standard G5: a native consensus gossip message whose Snappy header
+    /// declares more than `MAX_CONSENSUS_MSG` decoded bytes (or anything
+    /// past this decoder's own tighter bound) is refused from the header.
+    #[test]
+    fn native_gossip_over_the_consensus_cap_is_refused() {
+        for size in [MAX_ENVELOPE_PAYLOAD + 6, MAX_CONSENSUS_MSG + 1] {
+            let bomb = snap::raw::Encoder::new().compress_vec(&vec![0u8; size]).unwrap();
+            assert_eq!(
+                decode_gov5_gossip_message(&bomb),
+                Err(H2WireError::EnvelopeTooLarge { actual: size, max: MAX_ENVELOPE_PAYLOAD + 5 }),
+                "{size} decoded bytes"
+            );
+        }
+        // A real message within the bound still decodes.
+        let fixture = fixture();
+        let wire = hex::decode(&fixture.messages[0].wire_hex).unwrap();
+        let gossip = snap::raw::Encoder::new().compress_vec(&wire).unwrap();
+        assert!(decode_gov5_gossip_message(&gossip).is_ok());
     }
 
     #[test]

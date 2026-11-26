@@ -1038,21 +1038,33 @@ mod tests {
         assert_eq!(spec.genesis_hash(), want);
     }
 
-    /// Each of gov5's 14 refused geneses (V8 `refused/`) is refused here.
+    /// Each of gov5's 33 refused geneses (V8 `refused/`, gov5's
+    /// `internal/testdata/profile1/refused` byte for byte: one bare genesis
+    /// per file, named with gov5's error in `expected_errors.json`) is
+    /// refused here. gov5's message is informative; this node names the
+    /// field its own way.
     #[test]
     fn gov5_refused_cases_are_refused() {
         let dir = gov5_dir().join("V8/refused");
-        let mut cases = 0;
+        let expected: std::collections::BTreeMap<String, String> = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("expected_errors.json")).expect("V8 expected errors"),
+        )
+        .expect("a name -> error map");
+        let mut files = 0;
         for entry in std::fs::read_dir(&dir).expect("V8 refused") {
-            let path = entry.expect("an entry").path();
-            let case: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
-            let name = case["case"].as_str().expect("a case name");
-            let genesis: Genesis = serde_json::from_value(case["genesis"].clone()).expect("a genesis");
-            let err = crate::check_genesis(&genesis).expect_err(name);
-            println!("{name}: {err:#}");
-            cases += 1;
+            let name = entry.expect("an entry").file_name().into_string().expect("a utf-8 name");
+            if name != "expected_errors.json" {
+                assert!(expected.contains_key(&name), "{name} has no expected error");
+                files += 1;
+            }
         }
-        assert_eq!(cases, 14);
+        assert_eq!(files, expected.len(), "every listed case has its file");
+        for (name, gov5_error) in &expected {
+            // The parser `n42 node`, `n42 init` and `h2_validator --chain` use.
+            let err = parse(&dir.join(name)).expect_err(name);
+            println!("{name}: {err:#} (gov5: {gov5_error})");
+        }
+        assert_eq!(expected.len(), 33);
     }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

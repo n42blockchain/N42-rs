@@ -385,6 +385,7 @@ impl ConsensusEngine {
                     );
                     e
                 })?;
+            self.note_certificate_signers(proposal.justify_qc.view, &proposal.justify_qc.signers);
         } else if !crate::wire_bridge::is_engine_genesis_qc(&proposal.justify_qc) {
             return Err(ConsensusError::InvalidQC {
                 view: 0,
@@ -415,6 +416,7 @@ impl ConsensusEngine {
                         qc_view = piggybacked_qc.view,
                         "accepted piggybacked PrepareQC from proposal"
                     );
+                    self.note_certificate_signers(piggybacked_qc.view, &piggybacked_qc.signers);
                     self.round_state.update_locked_qc(piggybacked_qc);
                 }
                 Err(e) => {
@@ -576,6 +578,7 @@ impl ConsensusEngine {
 
         let qc_set = self.resolve_qc_validator_set(&pqc.qc)?;
         super::quorum::verify_qc_with_profile(&pqc.qc, qc_set, self.signing_profile)?;
+        self.note_certificate_signers(pqc.qc.view, &pqc.qc.signers);
         self.round_state.update_locked_qc(&pqc.qc);
         self.round_state.enter_pre_commit();
 
@@ -592,7 +595,9 @@ impl ConsensusEngine {
         tracing::debug!(target: "n42::cl::proposal", view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
 
         if !self.round_state.may_commit_vote_in(view) {
-            tracing::warn!(target: "n42::cl::proposal", view,
+            // Expected: a PrepareQC can arrive more than once (topic and
+            // direct), and only the first copy yields a commit vote.
+            tracing::debug!(target: "n42::cl::proposal", view,
                 last_commit_voted = self.round_state.last_commit_voted_view(),
                 "suppressed duplicate commit vote (already commit-voted in this view)");
             return Ok(());

@@ -332,7 +332,7 @@ same load (1,200 tx/block):
 | --- | --- | --- | --- |
 | n42-rs (EL + validator) | 369 MiB | 571 MiB (505 + 66) | slowing (+~30 MiB / 5 min at the end) |
 | gov5 | 154 MiB idle | 960-1017 MiB | +~120 MiB / 5 min, no plateau; 116-120 MB decoded block txs in heap (gov5 checking the bound) |
-| n42-26 | — | 1.01 GB at block 135 | +~16 MB / 5 min |
+| n42-26 | 663 MB (block 31) | ~1.0 GB (block ~130) | +~75 MB / 5 min (~3.2 MB/block, steeper than S1; n42-26 checking PR #50) |
 
 n42-26 pre-import vote: 56 % of follower views (S1 old code 35 %); the check now ends 2.0 ms after block data (was
 ~20 ms); the rest lose to Decide on localhost (2f+1 in ~3 ms without v3) — no liveness effect.

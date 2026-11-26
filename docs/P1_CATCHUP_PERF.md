@@ -245,6 +245,109 @@ QMDB's pools size themselves to the machine and then spend their time handing
 tiny tasks across 254 threads. 64 CPUs is no better than 32 on empty blocks
 and slightly better on full ones; 16 CPUs is too few for full blocks.
 
+**Step 6: batch import of a committed range** (`n42Engine_importRange`,
+`bin/n42/src/catchup_import.rs`; validator side `N42_SYNC_BATCH_IMPORT=1`,
+off by default). The validator's pulled-block importer hands every queued
+block of one pull generation (up to 256) to the EL in one call instead of one
+`newPayload` each. The EL converts the payloads as `newPayload` does, then for
+each block, in order:
+
+1. checks it against the parent: the same header, pre-execution and body
+   rules the engine uses (`validate_header`, `validate_header_against_parent`,
+   `validate_block_pre_execution_with_tx_root`), with one difference given
+   below;
+2. executes it on one EVM cache carried across the run (no per-block
+   prewarm, no state-cache rebuild, no per-block engine task fan-out);
+3. checks its receipts, gas and requests (`validate_block_post_execution`);
+4. computes its QMDB root and compares it with the header's state root
+   (`validate_block_operations`, the follower import's check);
+5. once every block of the run has passed, hands the executed blocks to the
+   engine's tree in order (`executed_inserts`, the fleet7 follower's road),
+   so persistence and history are what they are for any block.
+
+One forkchoice at the end moves the head to the last block. The call is all
+or nothing: the head moves only when every block of the run passed, the last
+one with the full rules. The run stops at the first block that fails any check
+and reports it as `refused`, with nothing imported and nothing handed to the
+tree. The validator then imports the whole run by `newPayload`, so the
+verdict on a bad block is always the per-block path's. A run whose first
+parent is not the EL's head, a chain under deferred execution, or an engine
+that is not running answers `unavailable`, and the validator goes block by
+block.
+
+Two deviations from the first sketch (section 7, item 1):
+
+- *The root is still per block, not one per batch.* The QMDB forest records a
+  version per block, and history, persistence and the engine tree are keyed
+  by it. Pinned, an empty block's root costs 0.35 ms. A mismatch is localised
+  to its block when it happens, with no re-execution pass.
+- *Persistence is the engine's.* The executed blocks enter the tree like any
+  other block and are persisted at the engine's threshold, not once per call.
+
+**The condition for ever turning it on by default.** A batch is imported
+only after the BLS check of a commit QC at or above its last block has
+passed, and only when the batch is parent-linked to that QC's block and to the
+EL's head. Execution may start speculatively, but nothing becomes canonical,
+is persisted or is served, and no forkchoice moves, before that. A failed
+check or a root mismatch leaves no trace in the EL. Where the code holds it:
+
+- *QC first.* The validator spawns the batched importer only under
+  `N42_SYNC_ANCHOR=enforce` (`sync_batch_import && sync_anchor_mode ==
+  Enforce` in `service.rs`; under `observe` or `off` it imports block by
+  block). Under enforce, a pulled block is queued for the importer only when
+  a commit-domain QC, verified under the set of its exact view, names a block
+  at or above it. The anchor buffer is parent-linked from that block down to
+  the executed head (`buffer_pulled`, `sync_anchor.rs`). Every block of a batch
+  is therefore covered by a verified commit QC before the EL sees it.
+- *Linked to our head.* The EL refuses a run whose first parent is not its
+  canonical head (`unavailable`), and checks each block's parent link.
+- *No trace on failure.* The EL executes the whole run on a private cache.
+  It hands the executed blocks to the engine's tree only after every block
+  has passed, the last one also with its QC and seal. Only then does one
+  forkchoice move the head. A refused run hands over nothing, moves no head
+  and persists nothing. A block whose QMDB root does not match is not filed
+  in the forest. Blocks of a failed run whose roots did match stay as
+  in-memory, non-canonical forest entries, as a fork block's do under
+  `newPayload`, and are never persisted.
+- *Test.* `a_batch_whose_top_qc_is_forged_leaves_the_el_head_and_state_unchanged`
+  (a chain whose QCs are forged from block 2, no honest peer, batch import
+  and lazy screening on): no run, no block and no forkchoice reaches the EL.
+  `batch_import_runs_the_honest_chain_and_nothing_a_forger_served` (a forger
+  beside an honest peer, eager and lazy): the honest chain goes in runs, in
+  order, and no forged block is ever in one.
+
+**Safety.** The live path does not change: `newPayload`, forkchoice, the
+builder and the follower import are not touched. The method is on the
+JWT-authenticated Engine API, and only the validator's catch-up importer calls
+it. That importer only ever holds blocks under a verified commit-QC anchor
+(step 3), and it stops calling it once the pull is done and the loop is at the
+head. The one check the EL drops is on every block *but the last of a run*:
+the profile-1 header's two BLS checks, the embedded QC and the proposer's
+seal. The last block gets the full rule set (`HotStuffConsensus::
+without_header_signatures` is the same rules with the proposer schedule taken
+out). The EL's own guarantee is therefore at least what `newPayload` gives
+block by block, without trusting the caller:
+
+- The last block's embedded QC is 2f+1 signatures over its parent's hash. That
+  hash commits to the grandparent's, and so on down to the run's first block.
+  So every block below the last is quorum-certified through the hash chain,
+  the same way a block's own embedded QC certifies only its parent under
+  `newPayload`.
+- The last block's seal is checked as `newPayload` checks it.
+- A forged block inside the run therefore cannot match the hash chain the
+  last block's verified QC fixes. A run with a forged tail fails at its last
+  block, and nothing of it reaches the engine's tree.
+- Everything else -- execution, receipts, gas, requests, the state root
+  against the QMDB root, the parent link, timestamps, the committee link --
+  is checked for every block, as before.
+
+`N42_CATCHUP_IMPORT=0` withdraws the method on the EL (it answers `null`, and
+the validator stops asking). Tests: `batched_importer_*` (one call for a
+queued run; block by block without the method; a refused block gets the
+per-block verdict), `import_range_is_null_when_not_offered_*`,
+`an_import_range_answer_is_read`; end to end, the catch-up legs below, which
+check the joiner's head hash against the servers'.
+
 ## 5. Throughput against link speed
 
 Best configuration measured (pin2e: branch, EL on 32 CPUs) against what each

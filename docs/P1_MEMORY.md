@@ -8,19 +8,22 @@ untouched: every change applies only on a genesis that declares `"n42Profile": 1
 
 ## Result
 
-RSS per process, MiB, median of the phase (8 s blocks, four members, 150 tx/s total; catch-up: the
-peak, two legs each):
+RSS per process, MiB, median of the phase (8 s blocks, four members, 150 tx/s total; round v4)
+and the catch-up peak (VmHWM):
 
 | phase | EL before | EL after | validator before | validator after | member before | member after |
 |---|---|---|---|---|---|---|
-| idle (5 min) | 485 | 206 | 186 | 53 | 671 | 259 (-61%) |
-| steady load (10 min, 150 tx/s) | 681 | 323 | 196 | 65 | 877 | 388 (-56%) |
-| after load (3 min) | 739 | 346 | 196 | 62 | 935 | 408 (-56%) |
-| catch-up of 3,020 blocks (VmHWM) | 1,031-1,042 | 449-456 | 219-222 | 87-92 | 1,253-1,261 | 541-543 (-57%) |
+| idle (4 min) | 483 | 193 | 185 | 43 | 668 | 236 (-65%) |
+| steady load (7 min, 150 tx/s) | 656 | 291-294 | 195 | 51 | 851 | 343 (-60%) |
+| after load (2 min) | 701 | 302-305 | 194 | 47 | 895 | 351 (-61%) |
+| catch-up, 3,020 light blocks (peak) | 1,031-1,042 | 449-456 | 219-222 | 87-92 | 1,253-1,261 | 541-543 (-57%) |
+| catch-up, heavy chain of 2,277 blocks (peak) | 5,580-5,621 | 2,857 | 1,018-1,103 | 958 | 6,598-6,724 | 3,815 (-43%) |
 
-"before" = the same binary with `N42_P1_MEMORY=0` (identical to `main` at 027c47322), in the
-same round as "after" (round v3, below); thread count EL 1,569 -> 343, validator
-515 -> 273.
+"before" = the same binary with `N42_P1_MEMORY=0` (`main`'s behaviour), in the same round as
+"after". Threads: EL 1,569-1,825 -> 96-107, validator 515 -> 27. The light catch-up was
+4.7x faster with the defaults and the heavy one 17-24% faster (20.3 against 16.9-17.1
+blocks/s; base members drive this 254-CPU box's load to 180-250). The light catch-up row
+predates blst's pool and the heavy row is h5-ef (every default, the entry file included).
 
 ## How it is measured
 
@@ -153,14 +156,30 @@ Every member applies the in-process defaults and re-execs itself with
   "retained" (address space held, not resident) drops from 2.4 GB to 0.2 GB.
 - 4, 8 or 16 cores differ by under 15 MiB: the remaining threads no longer scale with the
   host, so 8 is kept (the build and the catch-up get more parallelism than 4).
-- Threads left: the EL's 255 `payload-convert` workers (a reth/engine-types pool sized by
-  the host, not by rayon's default; ~1 MiB stacks barely touched) and the validator's
-  `blst` pool (254 threads named `h2_validator`, `ThreadPool::default()` in `blst::mt`).
-  Each costs little resident memory now that its arena is shared.
+- Threads left: 255 named `payload-convert` in the EL and 263 named `h2_validator` in the
+  validator. Both are blst's verification pool (`ThreadPool::default()` in `blst::mt`, one
+  thread per CPU, made at the first aggregate-signature check; its unnamed threads take the
+  name of the thread that made it). Round v4 sizes it.
 - Heap that remains in the EL (v2 m3 after the load, 416 MiB sampled live, mostly
   untouched): the cross-block cache 128 MiB (256 MiB cap), RocksDB 48 + 16 + 8 MiB, the
   static-file writers 48 + 5 MiB (`get_writer`), execution outputs 28 MiB, the twig pool
   8 + 3 MiB, receipt ZSTD dictionary 6 MiB.
+
+### Round v4 (blst's pool sized, 209899a49; 14:55-15:08 UTC, load idle 1.6, load 1.0, post 17.7)
+
+blst has no setting for its pool, so `n42_h2_primitives::bls::pool::size_verification_pool`
+makes it first (one Miller loop through the pooled entry point) from a helper thread whose CPU
+mask holds `N42_P1_CORES` CPUs (`num_cpus` counts the calling thread's mask), then gives the
+workers (`n42-bls-pool`) the process's full mask back. Same verification code, 8 workers.
+Phases 4 / 7 / 2 min; m0 `N42_P1_MEMORY=0`, m1-m3 the defaults (identical, three samples).
+
+| member | idle EL / val | load EL / val | post EL / val | EL / val threads |
+|---|---|---|---|---|
+| m0 (off) | 483 / 185 | 656 / 195 | 701 / 194 | 1,568-1,825 / 515 |
+| m1-m3 | 192-193 / 43 | 291-294 / 51 | 302-305 / 47 | 96-107 / 27 |
+
+Against v3's defaults: EL threads 343 -> 97, validator 273 -> 27; EL -13 MiB idle and
+~-30 MiB under load, validator -10 to -15 MiB.
 
 ### Catch-up (rounds cu-base/cu-new and cu-new2/cu-base2, 14:24-14:35 UTC)
 
@@ -184,9 +203,92 @@ before the first sample -- VmHWM covers them.
   blocks), while the defaults left it at 5-25. A member on a small host would not see
   this ratio; it does say 8 cores are not the bound of a range catch-up of 8-second-class
   blocks. The defaults' EL RSS falls back to ~410 MiB once at the head.
-- Not compared here: the catch-up lane's heavy chain (2,000-40,000 tx/s phases), where
-  the peak is the engine's in-memory blocks and the range-sync buffers (baseline section),
-  not the pools.
+### Catch-up on the heavy chain (rounds hv-*, 18:44-19:44 UTC, binary 209899a49)
+
+The catch-up lane's chain (`scripts/catchup-bench.sh`, a copy of its serving members): 2,277
+blocks at 500 ms, 14.9M transactions, 1.78 GB, phases of 2,000-40,000 tx/s (blocks up to
+22,857 transactions). Member 3 pulls it from members 0 and 1 (defaults on); `leg`'s own
+report gives the speed, `p1-memory-sample.py` the memory each second; `hv-prof` adds
+`MALLOC_CONF=prof:true` and an EL heap profile every 8 s.
+
+| leg | member 3 | box load before / after | blocks/s | EL VmHWM | EL RSS median | validator VmHWM | validator median |
+|---|---|---|---|---|---|---|---|
+| hv-base | `N42_P1_MEMORY=0` | 0.6 / 180 | 15.9 | 5,592 | 4,238 | 1,135 | 958 |
+| hv-baseb | `N42_P1_MEMORY=0` | 7.5 / 192 | 16.9 | 5,594 | 4,299 | 1,150 | 927 |
+| hv-p1 | defaults (8) | 125 (a build) / 28 | 19.6 | 4,788 | 3,299 | 1,061 | 728 |
+| hv-p1b | defaults (8) | 5.0 / 7.7 | 19.8 | 4,761 | 3,360 | 877 | 696 |
+| hv-prof | defaults + heap profiles | 0.5 / 6.8 | 19.7 | 4,706 | 3,412 | 912 | 693 |
+| hv-p1c32 | `N42_P1_CORES=32` | 20.5 / 26 | 26.8 | 5,241 | 3,505 | 803 | 595 |
+
+- The defaults lower the heavy catch-up's EL peak by 15% (5.59 -> 4.71-4.79 GB) and its
+  median by 21%, the validator's peak by 8-24%, and catch up 17-24% *faster* than the base
+  (the base member alone takes the box's load to 180-192).
+- `N42_P1_CORES=32` is 36% faster again (26.8 blocks/s, the speed of the catch-up lane's
+  `--cpu-cores 32` legs) for +0.45-0.5 GB of EL peak; in steady state 16 cores cost
+  ~10 MiB over 8 (v3). Execution is the bound (`new_payload` 45 ms a block at 8 cores,
+  31 ms at 32; the pull itself is not).
+- What remains is not threads. The EL's heap at hv-prof's peak (3.43 GB sampled live,
+  `go tool pprof -traces` plus `addr2line` for the inlined frames):
+
+  | what | MiB | where |
+  |---|---|---|
+  | QMDB entries in the heap | 1,024 | one `Vec` in `n42_twig_core::entry_store::Entries` (heap mode, ~160 B per entry, grown by doubling), `apply_ops_recorded_phased` |
+  | receipts copied into reth's RPC state cache | 756 | `reth_rpc_eth_types::cache::ChainChange::new` clones every canonical block's receipts; the receipt cache is bounded at 1 GiB |
+  | `RocksDB` memtables (transaction hash index, history) | 479 | 128 MiB per column family, a 4 GiB budget (`N42_ROCKSDB_WRITE_BUFFER_MB`) |
+  | reth cross-block cache | 128 | its 256 MiB profile-1 bound |
+  | execution outputs, receipts, logs of the blocks in flight | ~400 | `validate_payload`, `eip7708_transfer_log` |
+
+### Heavy chain, the EL heap levers (rounds h5-*, h6-*, 20:35-22:40 UTC)
+
+Binary 99fa092f3 (`bin-new5`: main's catch-up step 3 merged, the RPC caches bounded at
+64 MiB each, 4c64a1f3f). Same chain and method; box load 3-11 at every start.
+
+| leg | member 3 | blocks/s | EL VmHWM | EL RSS median | validator VmHWM |
+|---|---|---|---|---|---|
+| h5-base, h5-baseb | `N42_P1_MEMORY=0` | 16.9, 17.1 | 5,580, 5,621 | 4,301, 4,336 | 1,018, 1,103 |
+| h5-p1, h5-p1b, h5-prof | defaults | 20.3, 20.3, 20.1 | 3,482, 3,591, 3,630 | 2,293, 2,294, 2,322 | 1,004, 1,008, 1,000 |
+| h5-ef | defaults + `N42_QMDB_ENTRY_FILE=1` | 20.4 | 2,857 | 2,227 | 958 |
+| h5-wb | defaults + `N42_ROCKSDB_WRITE_BUFFER_MB=128` | stopped at block 817 | -- | -- | -- |
+
+- The RPC cache bound takes the EL peak from 4.71-4.79 GB (hv-p1) to 3.48-3.63 GB at the
+  same speed: -36% against the base peak, -47% on the median.
+- The entry file takes another 0.63-0.77 GB off the peak (2.86 GB, -49% against the base)
+  at the same speed; its file pages (`RssFile` 336 MiB median) are reclaimable.
+  Adopted as a profile-1 default (5533af98a): a heap-mode datadir migrates once at the
+  next start and then stays in file mode. SIGKILL test (`kill-ef`, four members at 500 ms,
+  150 tx/s): member 2 started in heap mode, was SIGKILLed under load, restarted in file
+  mode (migration), SIGKILLed again 2 s after that restart, then three more times at
+  40-70 s; every restart restored from the entry file and the four heads matched (417)
+  with no halt.
+- `N42_ROCKSDB_WRITE_BUFFER_MB=128` **stops a catch-up for good**, twice (hv-wb on a busy
+  box, h5-wb on a quiet one), right after `RocksDB`'s first budget-triggered flush: the
+  flush finishes (`AccountsHistory`, 82 ms), then neither `RocksDB` nor the engine logs
+  anything again; the engine never receives the next payload and the validator's request
+  times out. The budget's write stall (`WriteBufferManager` with `allow_stall`) waits
+  until memtable memory falls below the budget, and a flushed memtable is freed only once
+  nothing references it -- a provider's history snapshot keeps its cached iterators, and
+  with them the memtables they were created on, until it is dropped
+  (`DatabaseProvider::history_rocksdb_snapshot`). Not adopted. 5b8fb0177 adds
+  `N42_ROCKSDB_WRITE_BUFFER_STALL=0` (default unchanged): the budget then only triggers
+  flushes. With it the catch-up completes every time (h6-wbns, h6-wbns2 at 128 MiB,
+  h6-wb256ns at 256 MiB: 20.3-20.4 blocks/s), which confirms the stall as the cause, but the
+  EL peak moves only 3.42-3.55 GB against the defaults' 3.48-3.63 GB -- inside the spread.
+  The budget is therefore left at upstream's 4 GiB with the stall on; nothing is adopted.
+
+### The explorer workload with the 64 MiB RPC caches (explorer-rc, 22:25-22:31 UTC)
+
+`scripts/explorer-load.py` (Blockscout's receipts fetchers) against member 3's EL alone on
+the heavy chain (blocks 1-2,277), 60 s per fetcher, the profile-1 bound (`cap64`) and
+reth's (`reth`: 2 GiB / 1 GiB / 500 MiB) alternated twice:
+
+| fetcher | cap64 | reth | EL VmHWM cap64 / reth |
+|---|---|---|---|
+| receipts (`eth_getTransactionReceipt`, 250 x 10) | 86,620 / 87,767 calls/s | 88,004 / 88,083 calls/s | 3.5 / 4.3 GB |
+| block-receipts (`eth_getBlockReceipts`, 10 x 10) | 216.0 / 225.4 blocks/s | 225.4 / 227.8 blocks/s | 6.8-7.1 / 10.6-11.6 GB |
+
+Within the runs' spread (-0.3 to -1.6% on receipts); p50/p99 latency the same. Both
+variants hit the same 320 "batch response was too large" errors on block-receipts (10
+heavy blocks' receipts exceed the 160 MiB response limit), a property of the chain.
 
 ## What changed (all on a profile-1 genesis only)
 
@@ -205,6 +307,9 @@ pool and opens a QMDB tree), so everything is in place before the first thread.
 | QMDB twig pool floor | 512 trees (64 MiB) | 16 (2 MiB) | `N42_TWIG_POOL_FLOOR` | n42, h2_validator |
 | QMDB append populate-ahead | 64 MiB | 8 MiB | `N42_QMDB_APPEND_AHEAD_MB` | n42, h2_validator |
 | QMDB offsets segments ahead | 2 (16 MiB) | 1 | `N42_QMDB_OFFSET_SEGMENTS_AHEAD` | n42, h2_validator |
+| blst verification pool | CPUs | `N42_P1_CORES` (`n42-bls-pool-*`, full CPU mask) | `N42_P1_CORES` | n42, h2_validator |
+| RPC state cache (blocks, receipts, block access lists) | 2 GiB, 1 GiB, 500 MiB | 64 MiB each | `--rpc-cache.max-{blocks,receipts,bals}-bytes`, `N42_P1_RPC_CACHE_MB` | n42 |
+| QMDB entries | in the heap | in `qmdb/entries.log` (one-way: a migrated datadir stays in file mode) | `N42_QMDB_ENTRY_FILE` | n42 |
 
 `N42_P1_CORES` defaults to 8 (never more than the host has; `0` keeps the host's count and
 also leaves the allocator alone); `N42_P1_MEMORY=0` turns every row off. Both binaries print
@@ -213,8 +318,8 @@ counts, cache sizes and when a page is faulted; the blocks, roots, votes and wir
 are the same.
 
 Recommended profile-1 settings: the defaults above (nothing to pass). On a host where a
-member must catch up thousands of blocks quickly, `N42_P1_CORES=16` trades memory for
-parallel execution (see v3).
+member must catch up thousands of blocks quickly, `N42_P1_CORES=32` catches up 36% faster
+for ~0.5 GB more EL peak (hv-p1c32); in steady state 16 cores cost ~10 MiB over 8 (v3).
 
 ## Why the host matters
 
@@ -225,23 +330,24 @@ the cross-block cache, the RocksDB cache and the QMDB pools do not depend on the
 
 ## Biggest remaining consumers / next steps
 
-1. **Catch-up** is the peak by an order of magnitude (the catch-up lane's heavy chain:
-   EL 10 GB, validator 5 GB). The EL's share is the engine tree's in-memory blocks and
-   their execution outputs between persistences, plus the reth payload path that fills
-   the cross-block cache (now capped at 256 MiB); the validator's is the range-sync
-   buffers (`sync_pipeline.rs`, byte-capped at 256 MiB ready, 4 x 128-block slots, a
-   64-block import queue) and the decoded blocks behind them. Those buffers belong to the
-   catch-up lane (perf/p1-catchup) and were left alone here; a profile-1 cap on the slots
-   and the ready bytes is the next lever there. reth's persistence threshold was not
-   lowered: it is the SIGKILL-recovery setting of the QMDB node (see the reth-bump notes).
+1. **Catch-up** is still the peak: EL 2.9 GB, validator ~0.95 GB on the heavy chain. The
+   EL's remainder is `RocksDB`'s memtables (~480 MiB), the blocks in flight and their
+   execution outputs (~400 MiB), the cross-block cache (256 MiB bound); reth's canonical
+   in-memory state holds only 6-15 blocks throughout (its metrics), so the engine's
+   in-memory block limit is not a lever, and the persistence threshold stays (SIGKILL
+   recovery). The validator's is the range-sync pipeline (`sync_pipeline.rs`: 4 x
+   128-block slots in flight, 256 MiB ready, a 64-block import queue). That belongs to the
+   catch-up lane; byte budgets (~192 MiB requested in flight, 64 MiB ready, a byte-bounded
+   import queue) were handed to it.
 2. **The EL's steady heap** after the pools: RocksDB (~72 MiB with a 32 MiB block cache:
    write buffers and statistics), the static-file writers (~53 MiB, one per segment, open
    for the node's life), the cross-block cache as it fills (up to 256 MiB), and execution
    outputs held by the engine tree until persistence (~30 MiB at 150 tx/s).
-3. **Threads that still follow the host:** 255 `payload-convert` workers in the EL and
-   `blst`'s 254-thread pool in the validator. Sizing `payload-convert` by `--cpu-cores`
-   and giving blst a profile-1 pool (it has no knob: `blst::mt::da_pool` is a
-   `ThreadPool::default()`; the verification would have to go through the single-threaded
-   entry points) would save their stacks and thread caches, a few MiB each now.
+3. **Threads:** none follow the host any more (EL 97-107, validator 27; v4).
 4. **File pages** (~65-69 MiB `RssFile`, the binary and MDBX/QMDB mappings) are shared and
-   reclaimable; they were not targeted.
+   reclaimable; they were not targeted. With the entry file the EL's `RssFile` grows to
+   ~340-600 MiB during a heavy catch-up (the entry file's pages), also reclaimable.
+5. **Not done:** the `RocksDB` memtable budget (see h5-wb / h6-*: a stall hazard below
+   ~256 MiB with upstream's write stall, no gain without it); the steady-state rounds
+   (v1-v4) predate the RPC-cache bound and the entry file, which matter for catch-up and
+   for a long-lived node's growth (heap entries grow with every state entry ever written).

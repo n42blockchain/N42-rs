@@ -144,7 +144,16 @@ fn main() {
             &process_args,
             &mut node.engine,
             &mut node.db,
+            &mut node.rpc.rpc_state_cache,
         ));
+    }
+    if let Some(cores) = p1_memory.as_ref().and_then(|defaults| defaults.cores) {
+        // blst's verification pool (committee evidence in every header) is
+        // one thread per CPU and has no setting: make it first, at this size.
+        match n42_h2_primitives::bls::pool::size_verification_pool(cores) {
+            Ok(threads) => p1_memory_set.push(format!("blst pool {threads}")),
+            Err(err) => eprintln!("n42: profile 1: blst's pool keeps its size ({err})"),
+        }
     }
     if !p1_memory_set.is_empty() {
         eprintln!("n42: profile 1 memory defaults: {} (N42_P1_MEMORY=0 turns them off)", p1_memory_set.join(", "));

@@ -337,3 +337,22 @@ same load (1,200 tx/block):
 n42-26 pre-import vote: 56 % of follower views (S1 old code 35 %); the check now ends 2.0 ms after block data (was
 ~20 ms); the rest lose to Decide on localhost (2f+1 in ~3 ms without v3) — no liveness effect.
 
+
+### 4b-R — n42-rs catch-up defaults in a mixed round (2026-11-26 15:25-16:57)
+
+n42-rs main 9f9713306 (lazy QC screening + batch import on by default, parallel QC screening; n42 7f22a41a…,
+h2_validator d3ea377b…), gov5 22bee6b3, n42-26 6d0ea9b. Genesis gate6/genesis-g4bR.json (sha256 0a271bd9…,
+hash 0x3fe4571d…). **Headers 0..623 equal on all 7 dumps, mismatch 0**; 733k tx, 0 send errors.
+
+- n42-rs v2 could not start at T0: gov5's separate memory A/B held 31700-31703, and v2's body channel is its
+  libp2p port + 1000 (31702). The chain ran on three members until 15:36; gov5 keeps 31700-31799 free from now on.
+- 15:36:17 v2 fresh: 1..35 pulled (commit_qc/1 anchor from gov5 v1), first vote 15:36:20.
+- 16:30:09 v2 wiped again, fresh pull of 1..439 heavy blocks (~1.2k tx, 148 KB each; 65 MB): **4.43 s = 99 blk/s**
+  (S1, old build: 40.6), 5 requests, checked=18 of 439 (lazy), 0 faults, 0 disconnects. Served by gov5 v0/v1/v4
+  (16 requests) and n42-26 v3 (385..439). EL 782 MiB + validator 87 MiB right after.
+- gov5 and n42-26 logged no refusal, score change, rate limit or INVALID caused by v2's requests.
+- Open (catch-up step 4): batch import did not engage on these heavy blocks (437 forkchoices), and after the
+  pull v2 refetched the unanchored tail block 440 three times; first vote 16:30:44, 28 s after the pull
+  (S1 old build ~9 s; within M3's 60 s).
+- n42-26: pre-import votes 272 of 475 follower views (57 %); RSS 1.69 GB at 92 min (same trend as S1).
+  gov5: RSS 1.6-1.8 GB on main (512-block cache full); fix/p1-steady-rss plateaus ~650 MB RssAnon (owner merge pending).

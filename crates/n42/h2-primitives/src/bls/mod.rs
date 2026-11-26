@@ -1,5 +1,6 @@
 mod aggregate;
 mod keys;
+pub mod pool;
 mod verify;
 
 /// BLS12-381 Domain Separation Tag for signatures.

@@ -87,10 +87,23 @@ fn reconcile_profile(frame_blocks: bool) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Profile 1's allocator options (docs/P1_MEMORY.md): jemalloc reads them
+    // before `main`, so a validator started without them restarts itself once
+    // with them in MALLOC_CONF (same pid and arguments). First, before any
+    // thread exists.
+    let process_args: Vec<String> = std::env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()).collect();
+    let p1_memory = n42_qmdb_reth::profile1_memory::MemoryDefaults::for_args(&process_args);
+    if let Some(defaults) = &p1_memory
+        && let Some(err) = n42_qmdb_reth::profile1_memory::reexec_with_malloc_conf(defaults)
+    {
+        eprintln!("h2_validator: profile 1: could not restart with the allocator's options ({err}); keeping its defaults");
+    }
     // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
     // left unset, before any knob is read or any thread exists.
-    // SAFETY: the first statement of `main`: no thread this program starts
-    // exists yet, so nothing reads or writes the environment concurrently.
+    // SAFETY: no thread this program starts exists yet (the profile-1 check
+    // above reads a file and the environment only; the allocator's background
+    // threads, on profile 1, only return pages), so nothing reads or writes
+    // the environment concurrently.
     unsafe { n42_env::profile::apply_or_exit("h2_validator") };
     // The vote knobs that give up a safety property start only when the
     // operator says this is a benchmark (audit 2026-10 round 2, R2-C3).
@@ -230,11 +243,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 8-second blocks instead of the host's cores and the fleet's blocks
     // (docs/P1_MEMORY.md), before anything uses them; an operator's
     // RAYON_NUM_THREADS / N42_* value wins and N42_P1_MEMORY=0 turns it off.
-    let process_args: Vec<String> = std::env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()).collect();
-    if let Some(defaults) = n42_qmdb_reth::profile1_memory::MemoryDefaults::for_args(&process_args) {
+    if let Some(defaults) = &p1_memory {
         // SAFETY: no thread of this program exists yet (the tracing
         // subscriber spawns none) and no QMDB knob has been read.
-        let done = unsafe { n42_qmdb_reth::profile1_memory::set_env_defaults(&defaults) };
+        let mut done = unsafe { n42_qmdb_reth::profile1_memory::set_env_defaults(defaults) };
+        done.extend(std::env::var("MALLOC_CONF").ok().map(|conf| format!("MALLOC_CONF={conf}")));
         if !done.is_empty() {
             eprintln!("h2_validator: profile 1 memory defaults: {} (N42_P1_MEMORY=0 turns them off)", done.join(", "));
         }

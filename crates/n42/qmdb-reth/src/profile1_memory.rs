@@ -89,6 +89,60 @@ impl MemoryDefaults {
     }
 }
 
+/// The jemalloc options a profile-1 member runs with: one arena per core of
+/// [`MemoryDefaults::cores`] instead of jemalloc's four per host core (1,016
+/// on a 254-core host, each keeping its own dirty pages and metadata), and
+/// the background threads that return decayed pages without waiting for the
+/// arena's next allocation. `None` when the pools follow the host's cores.
+pub fn malloc_conf(defaults: &MemoryDefaults) -> Option<String> {
+    defaults.cores.map(|cores| format!("narenas:{cores},background_thread:true"))
+}
+
+/// The `MALLOC_CONF` a profile-1 member restarts with, given the one it was
+/// started with: [`malloc_conf`] when none was set, the operator's options
+/// after it when they do not choose the arena count (jemalloc reads them in
+/// order, so the operator's later options win), and `None` -- nothing to do
+/// -- when they do choose it, which is also how the restarted process
+/// recognises itself.
+pub fn malloc_conf_to_apply(defaults: &MemoryDefaults, current: Option<&str>) -> Option<String> {
+    let ours = malloc_conf(defaults)?;
+    match current.map(str::trim) {
+        None | Some("") => Some(ours),
+        Some(current) if current.contains("narenas") => None,
+        Some(current) => Some(format!("{ours},{current}")),
+    }
+}
+
+/// Restarts this program (same pid, same arguments, same `argv[0]`) with
+/// [`malloc_conf_to_apply`] in `MALLOC_CONF`: jemalloc reads its options once,
+/// before `main`, so a profile-1 member started without them can only take
+/// them by `exec`ing itself. Returns without restarting when there is nothing
+/// to apply, and with the error when the `exec` fails (the caller goes on
+/// with the allocator as it is).
+///
+/// Call it first thing in `main`, before any thread exists.
+#[cfg(unix)]
+pub fn reexec_with_malloc_conf(defaults: &MemoryDefaults) -> Option<std::io::Error> {
+    use std::os::unix::process::CommandExt;
+
+    let current = std::env::var("MALLOC_CONF").ok();
+    let conf = malloc_conf_to_apply(defaults, current.as_deref())?;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => return Some(err),
+    };
+    let mut args = std::env::args_os();
+    let arg0 = args.next().unwrap_or_else(|| exe.clone().into_os_string());
+    // `exec` returns only on failure.
+    Some(std::process::Command::new(exe).arg0(arg0).args(args).env("MALLOC_CONF", conf).exec())
+}
+
+/// Not on unix: the allocator stays as it is.
+#[cfg(not(unix))]
+pub fn reexec_with_malloc_conf(_defaults: &MemoryDefaults) -> Option<std::io::Error> {
+    None
+}
+
 /// The QMDB prefault knobs a profile-1 member sets when the environment
 /// leaves them unset (`crates/n42/twig-core/src/prefault.rs`). Their
 /// defaults keep memory faulted in ahead for the fleet's 163,000-operation
@@ -206,6 +260,25 @@ mod tests {
         assert!(peek_args(&args(&["node", "--chain", p1.to_str().expect("utf8")])));
         assert!(!peek_args(&args(&["node", "--chain", "dev"])));
         assert!(!peek_args(&args(&["node"])));
+    }
+
+    #[test]
+    fn malloc_conf_leaves_an_operator_arena_count_alone() {
+        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32 };
+        let ours = "narenas:8,background_thread:true";
+        assert_eq!(malloc_conf_to_apply(&defaults, None).as_deref(), Some(ours));
+        assert_eq!(malloc_conf_to_apply(&defaults, Some(" ")).as_deref(), Some(ours));
+        // The operator's options come after ours, so theirs win.
+        assert_eq!(
+            malloc_conf_to_apply(&defaults, Some("prof:true,background_thread:false")).as_deref(),
+            Some("narenas:8,background_thread:true,prof:true,background_thread:false")
+        );
+        // An arena count already chosen (the operator's, or ours after the
+        // restart) means nothing to apply: no restart loop.
+        assert_eq!(malloc_conf_to_apply(&defaults, Some("narenas:32")), None);
+        assert_eq!(malloc_conf_to_apply(&defaults, Some(ours)), None);
+        let host = MemoryDefaults { cores: None, ..defaults };
+        assert_eq!(malloc_conf_to_apply(&host, None), None);
     }
 
     #[test]

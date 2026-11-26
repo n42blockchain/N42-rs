@@ -73,12 +73,27 @@ fn parse_history_mode(raw: &str) -> Result<n42_qmdb_reth::history::HistoryMode, 
 
 #[allow(clippy::iter_with_drain)] // the batch buffer is reused, so it is drained rather than consumed
 fn main() {
+    // Profile 1 sizes the allocator, its thread pools and caches for
+    // 8-second blocks (docs/P1_MEMORY.md). jemalloc reads its options before
+    // `main`, so a member started without them restarts itself once with
+    // them in MALLOC_CONF (same pid and arguments), before anything else
+    // runs. A flag or variable the operator set wins; `N42_P1_MEMORY=0`
+    // turns all of it off; a chain without `n42Profile` is untouched.
+    let process_args = n42::profile1_memory::process_args();
+    let p1_memory = n42_qmdb_reth::profile1_memory::MemoryDefaults::for_args(&process_args);
+    if let Some(defaults) = &p1_memory
+        && let Some(err) = n42_qmdb_reth::profile1_memory::reexec_with_malloc_conf(defaults)
+    {
+        eprintln!("n42: profile 1: could not restart with the allocator's options ({err}); keeping its defaults");
+    }
     // `N42_PROFILE=x22`: the adopted knob set, for every knob the operator
     // left unset. First, before any knob is read (they are cached in
     // `OnceLock`s at first use) and before any thread exists.
-    // SAFETY: the first statement of `main`: no thread this program starts
-    // exists yet, and nothing else reads or writes the environment
-    // concurrently (the allocator read its configuration before `main`).
+    // SAFETY: no thread this program starts exists yet (the profile-1 check
+    // above reads a file and the environment only), and nothing else reads
+    // or writes the environment concurrently (the allocator read its
+    // configuration before `main`; its background threads, on profile 1,
+    // only return pages).
     unsafe { n42_env::profile::apply_or_exit("n42") };
     // Enable backtraces unless a RUST_BACKTRACE value has already been
     // explicitly provided. First, before this process spawns any thread or
@@ -96,17 +111,16 @@ fn main() {
     // withdrawn again, so the profile never forces a chain feature. A
     // command without a chain withdraws them too. An operator's own
     // `N42_FRAME_BLOCKS=1` is left for `frame_blocks::init` to refuse.
-    // Profile 1 sizes its thread pools and caches for 8-second blocks
-    // (docs/P1_MEMORY.md): rayon's global pool before clap's chain parser
-    // starts it, reth's pools and cross-block cache once the command is parsed.
-    // A flag or variable the operator set wins; `N42_P1_MEMORY=0` turns it off.
-    let process_args = n42::profile1_memory::process_args();
-    let p1_memory = n42_qmdb_reth::profile1_memory::MemoryDefaults::for_args(&process_args);
+    // Before it, profile 1's pool sizes and QMDB prefault knobs go into the
+    // environment (rayon's pools follow RAYON_NUM_THREADS, and the chain
+    // parser starts the global one); reth's pools and caches are set on the
+    // parsed command.
     let mut p1_memory_set: Vec<String> = Vec::new();
     if let Some(defaults) = &p1_memory {
         // SAFETY: before any thread this program starts and before any of
         // the variables is read (the chain parser below is the first reader).
         p1_memory_set.extend(unsafe { n42_qmdb_reth::profile1_memory::set_env_defaults(defaults) });
+        p1_memory_set.extend(std::env::var("MALLOC_CONF").ok().map(|conf| format!("MALLOC_CONF={conf}")));
     }
     let mut cli = Cli::<N42ChainSpecParser, N42Args>::parse();
     if let Some(defaults) = &p1_memory

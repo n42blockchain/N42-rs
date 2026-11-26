@@ -1,0 +1,41 @@
+{
+  "protocol": "/rpc/qmdb_status/1/ssz_snappy",
+  "spec": "N42-SYNC-SPEC.md §5.3 (and §3 framing)",
+  "framing": "request_wire = uvarint(len(request_payload)) || snappy framed(request_payload). Each response chunk = result code (1 byte) || [4 context bytes = genesis_hash[:4], only on SUCCESS chunks of bodies_by_range/2] || uvarint(len(payload)) || snappy framed(payload). Error chunks carry a UTF-8 message as payload. Snappy framing is golang/snappy's buffered writer; an encoder that chunks differently produces other bytes for the same payload, so implementations should compare payloads (and code/context bytes), and may compare whole wires only with the same framer.",
+  "chain_id": 1144,
+  "genesis_hash": "0x1feee5ac916e77a1d2d1ed7cf03f8b84516c459fcc0607b1d34605e8eef2c776",
+  "chain": "gov5 internal/snapshot_join_test.go buildSnapshotJoinFixture: profile-1 v1 genesis, 11 blocks; server joined at pivot 6, applied 7..11, committed head 10, state-sync pivot 8 (root = header(9).Root)",
+  "cases": [
+    {
+      "name": "status",
+      "note": "empty request; earliest_body, pivot_lo = pivot_hi = 8, pivot_hi_hash, flags 3 (twigs | code)",
+      "request_fields": {},
+      "request_payload": "0x",
+      "request_wire": "0x00",
+      "response_wire": "0x0039ff060000734e61507059003000002b0c87b53900000d0100083a0800807da1680eed7d2b8bd41a3145608c161128c70e5f0f30d9a4f59358131b5a8b3c03",
+      "response_chunks": [
+        {
+          "code": "0x00",
+          "payload": "0x0000000000000000080000000000000008000000000000007da1680eed7d2b8bd41a3145608c161128c70e5f0f30d9a4f59358131b5a8b3c03"
+        }
+      ]
+    },
+    {
+      "name": "non_empty_request",
+      "note": "any request bytes are refused with 0x01",
+      "request_fields": {
+        "payload": "0x01"
+      },
+      "request_payload": "0x01",
+      "request_wire": "0x01ff060000734e6150705901050000052b284301",
+      "response_wire": "0x0122ff060000734e61507059012600003b354d93716d64625f7374617475732074616b657320616e20656d7074792072657175657374",
+      "response_chunks": [
+        {
+          "code": "0x01",
+          "payload": "0x716d64625f7374617475732074616b657320616e20656d7074792072657175657374",
+          "error_message": "qmdb_status takes an empty request"
+        }
+      ]
+    }
+  ]
+}

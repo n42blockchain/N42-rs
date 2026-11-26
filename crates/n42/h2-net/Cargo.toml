@@ -22,6 +22,7 @@ n42-h2-consensus.workspace = true
 libp2p = { workspace = true, features = ["gossipsub", "tokio", "tcp", "noise", "yamux", "macros", "secp256k1", "request-response", "identify"] }
 futures = "0.3"
 snap.workspace = true
+blake3.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 
 alloy-primitives = { workspace = true, features = ["serde"] }
@@ -37,6 +38,7 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+sha2 = { workspace = true, features = ["std"] }
 serde_json.workspace = true
 hex.workspace = true
 snap.workspace = true

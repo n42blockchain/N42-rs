@@ -581,7 +581,8 @@ votes within 60 s of reaching the head.
 ### Milestone 3 — tenure > 1 with rotate-on-timeout, epoch change, validator change
 
 Gate: rounds **M3a** kill the current tenure leader (each client in turn): every TC hands the window on per
-`view_after_tc`, ≤ 1 base timeout per dead leader; **M3b** ≥ 5 epoch boundaries with a TC landing on a boundary
+`view_after_tc`, ≤ 1 base timeout per TC handover (plus the §10.2 backoff when an epoch-boundary clamp lands the
+next view on the same dead leader: base + 2·base = 72 s at profile-1 values; AM32); **M3b** ≥ 5 epoch boundaries with a TC landing on a boundary
 (the clamp); **M3c** add a validator of each client and remove one, through the reconfiguration API, activation at the
 boundary on every client; **M3d** negative leader (a test build) proposing V4/V5-invalid blocks and a double proposal:
 every honest member refuses and records evidence.
@@ -983,4 +984,12 @@ v1.1 therefore consists of:
 Performance targets that are not gate criteria (worked on when the box is idle): catch-up limited by network
 bandwidth only (verification + execution + persistence well above the link rate), and lower memory footprint, in all
 three clients.
+
+## Amendment AM32 (2026-11-26, standard owner by delegation; raised by gov5's M3a/M3b rehearsal)
+
+M3a's "≤ 1 base timeout per dead leader" cannot hold when the dead leader's tenure window contains an epoch
+boundary: the TC is clamped to the boundary view, which still belongs to the same dead leader, and the second TC costs
+2·base because §10.2 resets the backoff only on a QC (gov5 rehearsal 2026-11-26: L5 killed at view 98, TC(98) -> 101,
+TC(101) -> 104 at +48 s; spec S7). M3a now reads "≤ 1 base timeout per TC handover, plus the §10.2 backoff when a
+boundary clamp lands on the same dead leader". No protocol change.
 

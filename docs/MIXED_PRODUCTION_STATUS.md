@@ -195,3 +195,12 @@ pool (its blocks are empty); a gov5 member that follows another gov5 member buil
 that has not yet dropped the previous block's transactions (near-empty blocks); n42-rs's pool gossip ran once per
 block (fixed on main cbdb5ba5d). A mixed re-check with all three fixes must show an even per-leader transaction split.
 
+## Gate 5 PASSED (2026-11-25, round gate5b, T0 20:55 EST) — gates 1-6 all passed
+
+100 validators in one mixed round: 30 gov5 processes (indices 0..29), 69 n42-rs keys over four shared execution
+layers (30..98) and one n42-26 validator (99). Heights 0..183 equal on every dump of all three clients; all 100
+validators proposed (gov5 58 blocks, n42-rs 124, n42-26 1); AM27 deltas 8 s except one 40 s at startup; every
+gov5 leader counted 100/100 votes; 0 refusals, no halt. The first attempt (gate5a) stalled because gov5's
+consensus-topic subscription used a 32-message queue that dropped most of a 99-vote burst; gov5 raised it to
+16384 and now warns on drops. Absent-leader behaviour at n=100 is covered by the all-Rust r100x round (33 absent).
+

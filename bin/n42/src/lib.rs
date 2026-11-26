@@ -49,6 +49,8 @@ pub mod follower_import;
 pub mod import_once;
 pub mod native_rpc;
 pub mod own_new_payload;
+/// Profile-1 memory defaults (thread pools, cross-block cache).
+pub mod profile1_memory;
 pub mod payload_serve;
 pub mod qmdb_proof_ext;
 pub mod queue_prune;

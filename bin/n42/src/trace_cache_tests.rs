@@ -30,7 +30,8 @@ fn block_hash(b: usize) -> B256 {
 fn frame(b: usize, i: usize) -> GethTrace {
     GethTrace::CallTracer(CallFrame {
         from: Address::ZERO,
-        value: Some(U256::from(b * 1000 + i)),
+        // Wrapping: the fallback decodes an unknown hash into huge b and i.
+        value: Some(U256::from(b.wrapping_mul(1000).wrapping_add(i))),
         typ: "CALL".into(),
         ..Default::default()
     })

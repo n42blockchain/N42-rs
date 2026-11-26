@@ -59,6 +59,7 @@ pub mod road_runtime;
 pub mod snapshot_anchor;
 pub mod snapshot_bundle;
 pub mod stacks;
+pub mod trace_cache;
 
 /// The value of `--cpu-cores N` (or `--cpu-cores=N`) in a raw command line,
 /// before clap parses it; `None` when absent or not a positive count.

@@ -795,6 +795,56 @@ fn main() {
                         }
                     }
 
+                    // An explorer traces every transaction of a block with
+                    // `debug_traceTransaction`; reth replays the block's prefix for
+                    // each one (O(n^2) a block). Answer from one block trace
+                    // instead (`n42::trace_cache`, docs/EXPLORER_RPC_PERF.md).
+                    if ctx.modules.module_config().contains_any(&reth_rpc_server_types::RethRpcModule::Debug) {
+                        use n42::trace_cache::{BlockTraceCache, LocateFn, TraceBlockFn, TraceCacheConfig, TraceTxFn, TxLocation};
+                        let config = TraceCacheConfig::from_env();
+                        if config.max_txs > 0 {
+                            let debug = ctx.registry.debug_api();
+                            let locate_provider = ctx.provider().clone();
+                            let locate: LocateFn = std::sync::Arc::new(move |hash| {
+                                let provider = locate_provider.clone();
+                                Box::pin(async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        use reth_provider::{BlockBodyIndicesProvider, TransactionsProvider};
+                                        let (_, meta) = provider.transaction_by_hash_with_meta(hash).ok()??;
+                                        let indices = provider.block_body_indices(meta.block_number).ok()??;
+                                        Some(TxLocation {
+                                            block_hash: meta.block_hash,
+                                            index: meta.index as usize,
+                                            block_txs: indices.tx_count as usize,
+                                        })
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                })
+                            });
+                            let block_debug = debug.clone();
+                            let trace_block: TraceBlockFn = std::sync::Arc::new(move |hash, opts| {
+                                let debug = block_debug.clone();
+                                // The server trait's handlers: boxed `Send` futures, and
+                                // the same tracing permit reth's own methods take.
+                                Box::pin(async move {
+                                    reth_rpc_api::DebugApiServer::debug_trace_block_by_hash(&debug, hash, Some(opts)).await
+                                })
+                            });
+                            let trace_tx: TraceTxFn = std::sync::Arc::new(move |hash, opts| {
+                                let debug = debug.clone();
+                                Box::pin(async move {
+                                    reth_rpc_api::DebugApiServer::debug_trace_transaction(&debug, hash, Some(opts)).await
+                                })
+                            });
+                            let cache = std::sync::Arc::new(BlockTraceCache::new(config, locate, trace_block, trace_tx));
+                            ctx.modules.replace_configured(cache.into_rpc())?;
+                            info!(target: "reth::cli", max_txs = config.max_txs, min_block_txs = config.min_block_txs,
+                                "debug_traceTransaction answered from block traces (N42_TRACE_BLOCK_CACHE_TXS=0 turns it off)");
+                        }
+                    }
+
                     // now we merge our extension namespace into all configured transports
                     ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
                     ctx.auth_module.merge_auth_methods(engine_ext.into_rpc())?;

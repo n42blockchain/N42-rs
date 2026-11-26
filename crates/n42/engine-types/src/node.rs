@@ -169,13 +169,17 @@ pub struct EthereumAddOns<
     PVB,
     ValB = BasicEngineValidatorBuilder<PVB>,
 > {
-    inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, ValB>,
+    inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, ValB, crate::rpc_batch::ConcurrentBatchLayer>,
 }
 
 impl<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB, ValB> EthereumAddOns<N, EthB, PVB, ValB> {
-    /// Create new add-ons with given RPC add-ons.
-    pub fn new(inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, ValB>) -> Self {
-        Self { inner }
+    /// Create new add-ons with given RPC add-ons; batches of the RPC server
+    /// run as [`crate::rpc_batch::ConcurrentBatchLayer`] says.
+    pub fn new(
+        inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, ValB>,
+        batches: crate::rpc_batch::ConcurrentBatchLayer,
+    ) -> Self {
+        Self { inner: inner.with_rpc_middleware(batches) }
     }
 }
 
@@ -279,7 +283,7 @@ where
             QmdbEngineValidatorBuilder::new(self.qmdb.clone()),
             Default::default(),
             Default::default(),
-        ))
+        ), crate::rpc_batch::ConcurrentBatchLayer::from_process())
     }
 }
 

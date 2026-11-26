@@ -43,6 +43,11 @@ pub const CROSS_BLOCK_CACHE_KNOB: &str = "N42_P1_CROSS_BLOCK_CACHE_MB";
 /// member (default [`DEFAULT_ROCKSDB_CACHE_MB`]).
 pub const ROCKSDB_CACHE_KNOB: &str = "N42_P1_ROCKSDB_CACHE_MB";
 
+/// `N42_P1_RPC_CACHE_MB=<n>`: the byte bound of each of the RPC state
+/// cache's block, receipt and block-access-list caches on a profile-1 member
+/// (default [`DEFAULT_RPC_CACHE_MB`]).
+pub const RPC_CACHE_KNOB: &str = "N42_P1_RPC_CACHE_MB";
+
 /// The cores a profile-1 member sizes its pools by.
 pub const DEFAULT_CORES: usize = 8;
 
@@ -54,6 +59,12 @@ pub const DEFAULT_CROSS_BLOCK_CACHE_MB: usize = 256;
 /// in MiB (reth's default is 128).
 pub const DEFAULT_ROCKSDB_CACHE_MB: usize = 32;
 
+/// Each RPC state cache's byte bound on a profile-1 member, in MiB (reth's
+/// are 2 GiB of blocks, 1 GiB of receipts, 500 MiB of block access lists).
+/// Every canonical block's receipts are copied into it, so a catch-up of
+/// heavy blocks filled the receipt cache to ~750 MiB (`docs/P1_MEMORY.md`).
+pub const DEFAULT_RPC_CACHE_MB: usize = 64;
+
 /// What a profile-1 member sizes by, after the knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryDefaults {
@@ -63,6 +74,8 @@ pub struct MemoryDefaults {
     pub cross_block_cache_mb: usize,
     /// The `RocksDB` block cache, MiB.
     pub rocksdb_cache_mb: usize,
+    /// Each RPC state cache's byte bound, MiB.
+    pub rpc_cache_mb: usize,
 }
 
 impl MemoryDefaults {
@@ -78,7 +91,8 @@ impl MemoryDefaults {
         };
         let cross_block_cache_mb = n42_env::parse(CROSS_BLOCK_CACHE_KNOB, DEFAULT_CROSS_BLOCK_CACHE_MB);
         let rocksdb_cache_mb = n42_env::parse(ROCKSDB_CACHE_KNOB, DEFAULT_ROCKSDB_CACHE_MB);
-        Some(Self { cores, cross_block_cache_mb, rocksdb_cache_mb })
+        let rpc_cache_mb = n42_env::parse(RPC_CACHE_KNOB, DEFAULT_RPC_CACHE_MB);
+        Some(Self { cores, cross_block_cache_mb, rocksdb_cache_mb, rpc_cache_mb })
     }
 
     /// The defaults for a process started with `args` (the program name
@@ -264,7 +278,7 @@ mod tests {
 
     #[test]
     fn malloc_conf_leaves_an_operator_arena_count_alone() {
-        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32 };
+        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32, rpc_cache_mb: 64 };
         let ours = "narenas:8,background_thread:true";
         assert_eq!(malloc_conf_to_apply(&defaults, None).as_deref(), Some(ours));
         assert_eq!(malloc_conf_to_apply(&defaults, Some(" ")).as_deref(), Some(ours));

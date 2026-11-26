@@ -131,6 +131,7 @@ fn main() {
             &process_args,
             &mut node.engine,
             &mut node.db,
+            &mut node.rpc.rpc_state_cache,
         ));
     }
     if let Some(cores) = p1_memory.as_ref().and_then(|defaults| defaults.cores) {

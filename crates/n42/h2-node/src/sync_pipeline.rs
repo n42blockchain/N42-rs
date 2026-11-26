@@ -687,21 +687,12 @@ pub(crate) struct PulledImporter {
 }
 
 impl PulledImporter {
-    /// Spawns the importer on `el`; its reports arrive on the returned
-    /// receiver. Batched when [`SYNC_BATCH_IMPORT_ENV`] says so.
-    pub(crate) fn spawn<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
-        if batch_import_from_env() {
-            Self::spawn_batched(el)
-        } else {
-            Self::spawn_per_block(el)
-        }
-    }
-
-    /// The batched importer: the queued jobs of one generation, up to
+    /// The batched importer (its reports arrive on the returned receiver): the queued jobs of one generation, up to
     /// [`BATCH_IMPORT_BLOCKS`], go to the execution layer in one
     /// [`ExecutionLayer::import_range`]; whatever it does not take (it does
     /// not offer the call, the run is unavailable, or it refused a block) is
     /// imported block by block, so a refusal is the per-block path's verdict.
+    /// The service spawns it only under the enforced anchor rule.
     pub(crate) fn spawn_batched<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ImportJob>(BATCH_IMPORT_QUEUE);
         let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();

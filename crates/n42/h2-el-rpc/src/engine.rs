@@ -870,6 +870,9 @@ pub struct EngineApiClient<T> {
     /// until it says "method not found" once; a stock execution layer is asked
     /// exactly one extra question in its life.
     raw_payloads: std::sync::atomic::AtomicBool,
+    /// Whether the execution layer answers `n42Engine_blocksByRange`, assumed
+    /// until it says "method not found" once (as [`Self::raw_payloads`]).
+    raw_ranges: std::sync::atomic::AtomicBool,
     /// The loopback channel this repo's execution layer serves built blocks
     /// on as bytes (`payload_serve`), once its address has been asked for.
     raw_channel: tokio::sync::Mutex<RawChannel>,
@@ -913,6 +916,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             builds: Mutex::new((HashMap::new(), Vec::new())),
             fcu_rung: std::sync::atomic::AtomicUsize::new(0),
             raw_payloads: std::sync::atomic::AtomicBool::new(true),
+            raw_ranges: std::sync::atomic::AtomicBool::new(true),
             raw_channel: tokio::sync::Mutex::new(RawChannel::default()),
             raw_import: tokio::sync::Mutex::new(RawChannel::default()),
             raw_build: tokio::sync::Mutex::new(RawChannel::default()),
@@ -1474,6 +1478,36 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
             .await
             .map_err(|e| ElError::new(e.to_string()))?;
         Ok(block.map(block_parts))
+    }
+
+    async fn blocks_by_range(&self, start: u64, count: u64, max_bytes: usize) -> Result<Option<Vec<ChainBlock>>, ElError> {
+        // This repo's execution layer reads the range in one call and answers
+        // with each block's RLP: no transaction is turned into a JSON object
+        // and back, which per block was the range server's whole cost.
+        if !self.raw_ranges.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let params = vec![json!(start), json!(count), json!(max_bytes as u64)];
+        match self.transport.call("n42Engine_blocksByRange", params).await {
+            Ok(Value::Null) => Ok(None),
+            Ok(value) => {
+                let rlps: Vec<alloy_primitives::Bytes> = serde_json::from_value(value)
+                    .map_err(|e| ElError::new(format!("unusable blocksByRange answer: {e}")))?;
+                rlps.iter()
+                    .map(|rlp| {
+                        let (header, transactions, withdrawals) = split_block_rlp(rlp)?;
+                        Ok(ChainBlock { header, transactions, withdrawals: Some(withdrawals) })
+                    })
+                    .collect::<Result<Vec<_>, ElError>>()
+                    .map(Some)
+            }
+            Err(TransportError::Rpc(err)) if err.code == METHOD_NOT_FOUND => {
+                debug!(target: "n42.h2.el", "execution layer has no n42Engine_blocksByRange; block by block");
+                self.raw_ranges.store(false, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            }
+            Err(err) => Err(ElError::new(err)),
+        }
     }
 
     async fn send_raw_transaction(&self, raw: alloy_primitives::Bytes) -> Result<B256, ElError> {

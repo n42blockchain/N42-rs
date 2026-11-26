@@ -102,6 +102,9 @@ pub struct MockBehaviour {
     /// the real channel sends no `CHECKED` frame, and the import's verdict is
     /// [`Self::new_payload_status`].
     pub check_refused: bool,
+    /// Whether this execution layer reads a range in one call
+    /// (`blocks_by_range`); `false` answers `None`, as a stock one does.
+    pub bulk_ranges: bool,
 }
 
 impl Default for MockBehaviour {
@@ -123,6 +126,7 @@ impl Default for MockBehaviour {
             new_payload_gate: None,
             forkchoice_delay: None,
             check_refused: false,
+            bulk_ranges: false,
         }
     }
 }
@@ -479,6 +483,26 @@ impl ExecutionLayer for MockExecutionLayer {
 
     async fn block_by_number(&self, number: u64) -> Result<Option<ChainBlock>, ElError> {
         Ok(self.state.lock().expect("mock state lock").blocks.get(&number).cloned())
+    }
+
+    async fn blocks_by_range(&self, start: u64, count: u64, max_bytes: usize) -> Result<Option<Vec<ChainBlock>>, ElError> {
+        if !self.behaviour.lock().expect("mock behaviour lock").bulk_ranges {
+            return Ok(None);
+        }
+        let state = self.state.lock().expect("mock state lock");
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for number in start..start.saturating_add(count) {
+            let Some(block) = state.blocks.get(&number) else {
+                break;
+            };
+            bytes += block.transactions.iter().map(|tx| tx.len()).sum::<usize>() + 512;
+            out.push(block.clone());
+            if bytes >= max_bytes {
+                break;
+            }
+        }
+        Ok(Some(out))
     }
 
     async fn resolve_payload(

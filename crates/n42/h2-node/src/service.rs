@@ -8099,8 +8099,26 @@ async fn serve_range_metered<E: ExecutionLayer>(
     let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let mut short_of_budget = false;
     let mut bytes = 0usize;
+    // The whole range in one read when the execution layer offers it
+    // (`n42Engine_blocksByRange`); block by block otherwise. Either way each
+    // block goes through the same caps below, in order.
+    // One read is held to BULK_RANGE_READ_BYTES (its answer is hex inside
+    // JSON); a reply it leaves short is asked on from where it ended.
+    let bulk_bytes = n42_h2_net::MAX_RANGE_REPLY_BYTES.min(BULK_RANGE_READ_BYTES);
+    let mut bulk = match el.blocks_by_range(request.start, count, bulk_bytes).await {
+        Ok(Some(blocks)) => Some(blocks.into_iter()),
+        Ok(None) => None,
+        Err(err) => {
+            debug!(target: "n42.h2.node", %err, "execution layer could not read the range in one call; block by block");
+            None
+        }
+    };
     for number in request.start..request.start.saturating_add(count) {
-        match el.block_by_number(number).await {
+        let read = match bulk.as_mut() {
+            Some(blocks) => Ok(blocks.next().filter(|block| block.header.number == number)),
+            None => el.block_by_number(number).await,
+        };
+        match read {
             Ok(Some(block)) => {
                 let rlp = n42_h2_net::encode_block_rlp_raw(
                     &block.header,
@@ -8264,6 +8282,11 @@ impl VerifiedHeaderQcs {
         }
     }
 }
+
+/// The block RLP one bulk range read asks the execution layer for at most:
+/// the answer travels hex-encoded in JSON, so 32 MiB of blocks is a 64 MB
+/// response, well inside the auth server's limit.
+const BULK_RANGE_READ_BYTES: usize = 32 << 20;
 
 /// Whether a range reply holding `blocks` blocks of `bytes` takes one more
 /// of `next` bytes: always the first, then while the total stays within

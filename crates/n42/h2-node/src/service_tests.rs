@@ -275,6 +275,33 @@ async fn a_range_is_served_up_to_the_committed_height_only() {
     assert!(unknown.rlps.is_empty() && unknown.restored.is_none());
 }
 
+/// docs/P1_CATCHUP_PERF.md: an execution layer that reads a range in one
+/// call serves byte for byte what the block-by-block road serves, under the
+/// same committed ceiling and up to the same first missing block.
+#[tokio::test]
+async fn a_bulk_range_read_serves_what_the_block_by_block_read_does() {
+    use n42_h2_execution::ExecutionLayer;
+    let el = MockExecutionLayer::new();
+    let mut parent = B256::ZERO;
+    for number in 1..=6 {
+        let built = MockExecutionLayer::built_block_on(number, parent);
+        parent = built.hash;
+        within(el.new_payload(built.execution_data)).await.expect("accepted");
+    }
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1 << 20));
+    let cases = [(1, 10, 6), (2, 3, 6), (3, 10, 4), (7, 5, 6), (1, 10, 0)];
+    let mut by_block = Vec::new();
+    for (start, count, ceiling) in cases {
+        let served = within(serve_range(&el, n42_h2_net::RangeRequest { start, count, step: 1 }, &budget, ServeCeiling::Height(ceiling))).await;
+        by_block.push(served.rlps.clone());
+    }
+    el.set_behaviour(n42_h2_execution::MockBehaviour { bulk_ranges: true, ..Default::default() });
+    for ((start, count, ceiling), want) in cases.into_iter().zip(by_block) {
+        let served = within(serve_range(&el, n42_h2_net::RangeRequest { start, count, step: 1 }, &budget, ServeCeiling::Height(ceiling))).await;
+        assert_eq!(served.rlps, want, "start {start} count {count} ceiling {ceiling}");
+    }
+}
+
 #[test]
 fn transport_event_kinds_name_what_the_loop_logs() {
     assert_eq!(transport_event_kind(&TransportEvent::Rejected { from: None, reason: "x".into() }), "rejected");

@@ -208,3 +208,8 @@ Gate 5c (2026-11-25, T0 21:37 EST, same 100-validator mix, gov5 main f7bf6b09): 
 n42-rs leader (index 40) were each absent for their view; both views ended in a TC (gov5 now publishes its own
 timeouts at n=100) and cost exactly one 32 s interval each. Heights 0..176 equal on every dump, 0 refusals.
 
+Gate 5d (2026-11-25, T0 23:00 EST): 33 members absent at once (gov5 10..19, n42-rs 40..62) for ten minutes, leaving
+exactly q = 67. Heights 0..147 equal on every dump, 0 refusals, every absent member voted again after its restart.
+Six consecutive absent leaders (views 57..62) cost one 464 s gap (TC backoff 24/48/96/96/96/96 s): a liveness cost,
+not a safety one, recorded as a v1.1 risk. With 5c (killed leaders) and 5d, gate 5 is complete as written.
+

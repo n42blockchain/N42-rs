@@ -943,8 +943,8 @@ Owner: "on the performance branches the block interval is about 30 ms, so be len
 
 E15's RPC answer, which the standard left open, is fixed for all three clients:
 `n42_equivocations` returns `{total, evidence: [{view, validatorIndex, hash1, hash2, detectedAt, kind, publicKey,
-first, second}]}`, where `kind` is `vote`, `commit_vote` or `proposal`, and `first` / `second` each carry the exact
-signed bytes and the BLS signature, so a record verifies on its own. Evidence is persisted one record per
+first, second}]}`, where `kind` is `vote`, `commit_vote` or `proposal`, and `first` / `second` are each exactly
+`{signed, signature}` (the signed bytes and the BLS signature, hex), so a record verifies on its own. Evidence is persisted one record per
 (kind, view, validator) in `<datadir>/equivocations.jsonl` and survives a restart; `n42_equivocations_total`
 starts from that file. The shape is n42-26's existing one plus the last four fields (n42-rs 47f1792b9).
 

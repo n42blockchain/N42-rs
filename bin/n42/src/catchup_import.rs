@@ -28,11 +28,16 @@
 //! hands only blocks a verified commit QC authenticates -- is argued in
 //! `docs/P1_CATCHUP_PERF.md` (step 6).
 //!
+//! Under deferred execution (profile 1 from block 1) a header carries an
+//! ancestor's execution: each block's header is checked against the results
+//! this node filed for its parent (the previous block of the run, or the
+//! engine's last import), and its own results are filed for its child, as
+//! the engine's import does. The run's last block's own results are checked
+//! by the header that follows it, in the next run or on the live path.
+//!
 //! The run is refused as a whole -- `unavailable`, and the caller imports it
-//! block by block as before -- where this road does not apply: a chain under
-//! deferred execution (a header carries its parent's execution, which the
-//! follower import handles), or a first block whose parent is not the
-//! engine's canonical head.
+//! block by block as before -- when its first block's parent cannot be made
+//! the engine's canonical head.
 
 use std::sync::Arc;
 
@@ -128,9 +133,6 @@ where
         return unavailable(format!("the run starts on {}, not on the head {head}", first.parent_hash));
     }
     let genesis = chain_spec.genesis();
-    if blocks.iter().any(|b| reth_chainspec::qmdb::deferred_execution_active_at(genesis, b.timestamp)) {
-        return unavailable("deferred execution: the follower import's road".to_string());
-    }
     let mut parent = match provider.sealed_header_by_hash(first.parent_hash) {
         Ok(Some(parent)) => parent,
         Ok(None) => return unavailable(format!("parent {} unknown", first.parent_hash)),
@@ -205,15 +207,29 @@ where
         let at = std::time::Instant::now();
         let prague = n42_qmdb_reth::system_caller_leaf_at(chain_spec, recovered.timestamp);
         let ops = n42_qmdb_reth::sorted_operations_from_execution(&output.state, prague);
-        match qmdb.validate_block_operations(parent.hash(), hash, number, ops, recovered.state_root) {
-            Ok(root) if root == recovered.state_root => {}
-            Ok(root) => {
-                refuse(&mut out, format!("state root {root} is not the header's {}", recovered.state_root));
-                return out;
+        if reth_chainspec::qmdb::deferred_execution_active_at(genesis, recovered.timestamp) {
+            // Deferred execution: the header carries an ancestor's root, which
+            // the header check above compared with this node's result. This
+            // block's own root is filed for its child's header to be checked
+            // against, as the engine's and the follower's imports file it.
+            match qmdb.insert_block_operations(parent.hash(), hash, number, ops) {
+                Ok(root) => n42_engine_types::executed_fields::remember_state_root(hash, root),
+                Err(err) => {
+                    refuse(&mut out, format!("state root: {err}"));
+                    return out;
+                }
             }
-            Err(err) => {
-                refuse(&mut out, format!("state root: {err}"));
-                return out;
+        } else {
+            match qmdb.validate_block_operations(parent.hash(), hash, number, ops, recovered.state_root) {
+                Ok(root) if root == recovered.state_root => {}
+                Ok(root) => {
+                    refuse(&mut out, format!("state root {root} is not the header's {}", recovered.state_root));
+                    return out;
+                }
+                Err(err) => {
+                    refuse(&mut out, format!("state root: {err}"));
+                    return out;
+                }
             }
         }
         times_us[T_ROOT] += us(at);
@@ -309,6 +325,22 @@ where
             let Some(forkchoice) = FORKCHOICE.get().cloned() else {
                 return RangeImport { unavailable: Some("the engine is not running yet".to_string()), ..Default::default() };
             };
+            // The run's first parent is the caller's last imported block, which
+            // its own forkchoice may not have made the head yet (it moves the
+            // head once per report). Made the head here, as that forkchoice
+            // would: the engine takes it only for a block it holds as valid.
+            if let Some(first) = payloads.first() {
+                let first_parent = first.payload.parent_hash();
+                let head = provider.chain_info().map(|info| info.best_hash);
+                if head.as_ref().is_ok_and(|head| *head != first_parent)
+                    && let Err(err) = forkchoice(first_parent).await
+                {
+                    return RangeImport {
+                        unavailable: Some(format!("the run's parent {first_parent} could not be made the head: {err}")),
+                        ..Default::default()
+                    };
+                }
+            }
             let run = tokio::task::spawn_blocking(move || {
                 let mut times = [0u64; 7];
                 let at = std::time::Instant::now();

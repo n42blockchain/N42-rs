@@ -270,10 +270,18 @@ or nothing: the head moves only when every block of the run passed, the last
 one with the full rules. The run stops at the first block that fails any check
 and reports it as `refused`, with nothing imported and nothing handed to the
 tree. The validator then imports the whole run by `newPayload`, so the
-verdict on a bad block is always the per-block path's. A run whose first
-parent is not the EL's head, a chain under deferred execution, or an engine
-that is not running answers `unavailable`, and the validator goes block by
-block.
+verdict on a bad block is always the per-block path's.
+
+Under deferred execution (profile 1, from block 1) step 4 is the engine's
+deferred form. A header carries its parent's results, which step 1 compares
+with what this node filed for the parent: the previous block of the run, or
+the engine's last import. The block's own receipts and QMDB root are filed
+for its child (`insert_block_operations`, `remember_state_root`). The last
+block's own results are checked by the header after it, in the next run or on
+the live path. When the run's first parent is executed but not yet the head
+(the validator moves the head once per report), the EL first makes it the
+head. A parent it cannot make the head, or an engine that is not running,
+answers `unavailable`, and the validator goes block by block.
 
 Two deviations from the first sketch (section 7, item 1):
 
@@ -299,8 +307,11 @@ check or a root mismatch leaves no trace in the EL. Where the code holds it:
   at or above it. The anchor buffer is parent-linked from that block down to
   the executed head (`buffer_pulled`, `sync_anchor.rs`). Every block of a batch
   is therefore covered by a verified commit QC before the EL sees it.
-- *Linked to our head.* The EL refuses a run whose first parent is not its
-  canonical head (`unavailable`), and checks each block's parent link.
+- *Linked to our head.* The run's first parent must be the EL's head. The
+  only forkchoice the EL makes before a run passes is to that parent: a block
+  the validator already imported, which the engine accepts only if it holds
+  it as valid. Otherwise the run is `unavailable`. Each block's parent link
+  is checked.
 - *No trace on failure.* The EL executes the whole run on a private cache.
   It hands the executed blocks to the engine's tree only after every block
   has passed, the last one also with its QC and seal. Only then does one
@@ -308,7 +319,8 @@ check or a root mismatch leaves no trace in the EL. Where the code holds it:
   and persists nothing. A block whose QMDB root does not match is not filed
   in the forest. Blocks of a failed run whose roots did match stay as
   in-memory, non-canonical forest entries, as a fork block's do under
-  `newPayload`, and are never persisted.
+  `newPayload`, and are never persisted. The same holds for their deferred
+  execution fields: in memory, keyed by block hash.
 - *Test.* `a_batch_whose_top_qc_is_forged_leaves_the_el_head_and_state_unchanged`
   (a chain whose QCs are forged from block 2, no honest peer, batch import
   and lazy screening on): no run, no block and no forkchoice reaches the EL.

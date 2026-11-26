@@ -8,14 +8,15 @@ untouched: every change applies only on a genesis that declares `"n42Profile": 1
 
 ## Result
 
-RSS per process, MiB, median of the phase (8 s blocks, four members, 150 tx/s total):
+RSS per process, MiB, median of the phase (8 s blocks, four members, 150 tx/s total; catch-up: the
+peak, two legs each):
 
 | phase | EL before | EL after | validator before | validator after | member before | member after |
 |---|---|---|---|---|---|---|
 | idle (5 min) | 485 | 206 | 186 | 53 | 671 | 259 (-61%) |
 | steady load (10 min, 150 tx/s) | 681 | 323 | 196 | 65 | 877 | 388 (-56%) |
 | after load (3 min) | 739 | 346 | 196 | 62 | 935 | 408 (-56%) |
-| catch-up (max) | (pending) | (pending) | (pending) | (pending) | | |
+| catch-up of 3,020 blocks (VmHWM) | 1,031-1,042 | 449-456 | 219-222 | 87-92 | 1,253-1,261 | 541-543 (-57%) |
 
 "before" = the same binary with `N42_P1_MEMORY=0` (identical to `main` at 027c47322), in the
 same round as "after" (round v3, below); thread count EL 1,569 -> 343, validator
@@ -161,7 +162,31 @@ Every member applies the in-process defaults and re-execs itself with
   static-file writers 48 + 5 MiB (`get_writer`), execution outputs 28 MiB, the twig pool
   8 + 3 MiB, receipt ZSTD dictionary 6 MiB.
 
-### Catch-up (pending)
+### Catch-up (rounds cu-base/cu-new and cu-new2/cu-base2, 14:24-14:35 UTC)
+
+Chain: the V1 genesis at 500 ms, 150 tx/s for 25 min, 3,019-3,034 blocks. Member 3 is
+wiped, re-initialised and pulls the chain by range from members 0 and 1 (which run the
+defaults in every leg); its own variant is `N42_P1_MEMORY=0` (base) or the defaults.
+Two pairs, the second in the reverse order. Sampled every second; the sampler starts
+once the members are up, so the first blocks (269 base, 1,280 defaults) were pulled
+before the first sample -- VmHWM covers them.
+
+| leg | box load at start / end | EL VmHWM | EL RSS median | EL threads | validator VmHWM | blocks/s (sampled window) |
+|---|---|---|---|---|---|---|
+| cu-base | 60 / 284 | 1,031 | 1,022 | 1,823 | 222 | 83 (269 -> 3,019 in 34 s) |
+| cu-new | 27 / 25 | 456 | 412 | 351 | 87 | 405 (1,280 -> 3,022 in 4.4 s) |
+| cu-new2 | 5 / 5 | 449 | 414 | 351 | 92 | 400 |
+| cu-base2 | 2 / 217 | 1,042 | 1,029 | 1,824 | 219 | 87 (272 -> 3,034 in 35 s) |
+
+- The catch-up peak falls by 57% (EL -56%, validator -60%).
+- And it is ~4.7x faster on this host, in both orders: with 1,823 threads the base member
+  alone drove the box's load from 2 to 217-284 (its 254-thread pools spinning on small
+  blocks), while the defaults left it at 5-25. A member on a small host would not see
+  this ratio; it does say 8 cores are not the bound of a range catch-up of 8-second-class
+  blocks. The defaults' EL RSS falls back to ~410 MiB once at the head.
+- Not compared here: the catch-up lane's heavy chain (2,000-40,000 tx/s phases), where
+  the peak is the engine's in-memory blocks and the range-sync buffers (baseline section),
+  not the pools.
 
 ## What changed (all on a profile-1 genesis only)
 

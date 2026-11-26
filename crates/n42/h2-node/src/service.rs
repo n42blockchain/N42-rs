@@ -1731,6 +1731,12 @@ const fn tip_of(head: Option<u64>, in_flight: Option<u64>, layer: Option<u64>) -
     higher(higher(head, in_flight), layer)
 }
 
+/// The later of a key's last verified vote and its last verified certificate
+/// signature: either means the key took part in that view.
+fn last_participation(vote: Option<u64>, certificate: Option<u64>) -> Option<u64> {
+    vote.max(certificate)
+}
+
 /// How many consecutive views a key may go without a verified vote before the
 /// leader names it.
 const SILENT_KEY_VIEWS: u64 = 16;
@@ -6686,7 +6692,12 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
         }
         let engine = &self.engine;
-        let silent = self.silent_keys.observe(observed, validators, me, |voter| engine.voter_last_seen(voter));
+        // A gov5 member sends its votes to the leader only, so this node sees
+        // them as signers of the certificates it verifies, not as votes: a key
+        // in a verified QC or TC has voted.
+        let silent = self.silent_keys.observe(observed, validators, me, |voter| {
+            last_participation(engine.voter_last_seen(voter), engine.certificate_signer_last_seen(voter))
+        });
         for (key, silent_views) in silent {
             warn!(
                 target: "n42.h2.node",
@@ -8332,6 +8343,26 @@ mod tests {
         assert!(keys.warned.is_empty());
         let gone = |voter: u32| if voter == 4 { Some(40) } else { Some(100) };
         assert_eq!(keys.observe(40 + SILENT_KEY_VIEWS, 7, 0, gone), vec![(4, SILENT_KEY_VIEWS)]);
+    }
+
+    /// A key whose votes go to the leader only (gov5) but that signs the
+    /// certificates this node verifies is not silent; a key in no vote and
+    /// no certificate still is.
+    #[test]
+    fn a_certificate_signer_is_not_named_silent() {
+        let mut keys = SilentKeys::default();
+        let votes = |voter: u32| if voter < 4 { Some(100) } else { None };
+        let certificates = |voter: u32| if voter == 4 { Some(100) } else { None };
+        let seen = |voter: u32| last_participation(votes(voter), certificates(voter));
+        assert!(keys.observe(90, 7, 0, seen).is_empty());
+        assert_eq!(
+            keys.observe(90 + SILENT_KEY_VIEWS, 7, 0, seen),
+            vec![(5, SILENT_KEY_VIEWS), (6, SILENT_KEY_VIEWS)],
+            "only the keys absent from every vote and certificate"
+        );
+        assert_eq!(last_participation(Some(3), Some(9)), Some(9));
+        assert_eq!(last_participation(Some(3), None), Some(3));
+        assert_eq!(last_participation(None, None), None);
     }
 
     /// The tip is the higher of the head and the imports in flight, and

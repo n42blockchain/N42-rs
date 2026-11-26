@@ -205,6 +205,7 @@ impl ConsensusEngine {
         self.prepare_qc = Some(qc.clone());
         self.round_state.enter_pre_commit();
         self.round_state.update_locked_qc(&qc);
+        self.note_certificate_signers(qc.view, &qc.signers);
 
         let block_hash = qc.block_hash;
         let prepare_qc_msg = PrepareQC {

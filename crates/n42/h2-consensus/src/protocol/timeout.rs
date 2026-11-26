@@ -505,6 +505,8 @@ impl ConsensusEngine {
 
         // Verify TC's high_qc signature to prevent injection of forged QCs.
         self.verify_embedded_qc(&nv.timeout_cert.high_qc)?;
+        self.note_certificate_signers(nv.timeout_cert.view, &nv.timeout_cert.signers);
+        self.note_certificate_signers(nv.timeout_cert.high_qc.view, &nv.timeout_cert.high_qc.signers);
 
         self.round_state.update_locked_qc(&nv.timeout_cert.high_qc);
 
@@ -545,6 +547,7 @@ impl ConsensusEngine {
             return Ok(false);
         }
         tracing::info!(target: "n42::cl::timeout", current_view, target_view, "piggybacked TC: catching up to the fleet");
+        self.note_certificate_signers(tc.view, &tc.signers);
         self.round_state.update_locked_qc(&tc.high_qc);
         self.round_state.reset_consecutive_timeouts();
         self.advance_to_view(target_view)?;
@@ -581,6 +584,7 @@ impl ConsensusEngine {
             view = tc.view,
             "TC formed, advancing to view {}", next_view
         );
+        self.note_certificate_signers(tc.view, &tc.signers);
 
         self.round_state.update_locked_qc(&tc.high_qc);
 

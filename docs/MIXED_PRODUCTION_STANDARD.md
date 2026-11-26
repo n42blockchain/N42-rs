@@ -964,3 +964,23 @@ inside the 4a snapshot bundle), and the gate-3 and gate-4c mixed rounds caught m
 taken from the QC each profile-1 header carries and from Decide. For v1: range sync is `bodies_by_range/1`, committed
 blocks only (the §3 rule unchanged); `bodies_by_range/2` and `commit_qc/1` move to v1.1 together with gate 4b.
 
+## Amendment AM31 (2026-11-26, owner): v1.1 scope — range sync v2; joining by full block sync
+
+Owner direction: a node that joins or rejoins syncs every block it lacks by range (a fresh node from genesis) and
+executes them to obtain its state; peer-to-peer state sync is deferred to v1.2 unless an evaluation shows it
+feasible (assessments: `docs/P1_STATESYNC_FEASIBILITY_n42rs.md`, gov5's `P1_STATESYNC_FEASIBILITY_gov5.md`, n42-26's
+HANDOFF post of 2026-11-26 03:00).
+
+v1.1 therefore consists of:
+- `bodies_by_range/2` and `commit_qc/1` (§5.1, §5.2; gov5's sync-v11 vectors), client and server, in every client,
+  with `/1` kept as fallback;
+- gate 4b redefined: in a mixed round, a wiped or fresh node of each client joins by syncing and executing the whole
+  chain from genesis over `/2` + `commit_qc/1` and votes within 60 s of reaching the head; plus a measured scale leg
+  (blocks/s, block bytes/s, total time, peak RSS, disk) on long history;
+- the v1 risks and §7 items stay open as listed in the status doc; a mixed equivocation round moves to v1.2 (no
+  client has a double-sign injector).
+
+Performance targets that are not gate criteria (worked on when the box is idle): catch-up limited by network
+bandwidth only (verification + execution + persistence well above the link rate), and lower memory footprint, in all
+three clients.
+

@@ -204,3 +204,7 @@ gov5 leader counted 100/100 votes; 0 refusals, no halt. The first attempt (gate5
 consensus-topic subscription used a 32-message queue that dropped most of a 99-vote burst; gov5 raised it to
 16384 and now warns on drops. Absent-leader behaviour at n=100 is covered by the all-Rust r100x round (33 absent).
 
+Gate 5c (2026-11-25, T0 21:37 EST, same 100-validator mix, gov5 main f7bf6b09): a gov5 leader (index 10) and an
+n42-rs leader (index 40) were each absent for their view; both views ended in a TC (gov5 now publishes its own
+timeouts at n=100) and cost exactly one 32 s interval each. Heights 0..176 equal on every dump, 0 refusals.
+

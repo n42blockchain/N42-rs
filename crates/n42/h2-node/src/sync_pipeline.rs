@@ -345,8 +345,8 @@ impl PullBudget {
     /// profile 1 bounded it (up to ~0.5 GB in flight, 256 MiB ready).
     pub(crate) const DEFAULT: Self = Self { in_flight_bytes: None, ready_bytes: MAX_READY_BYTES };
 
-    /// Profile 1 (8-second blocks, nodes sized for 0.5 GB): 192 MiB in
-    /// flight, 64 MiB ready (`docs/P1_CATCHUP_PERF.md`, step 8).
+    /// Profile 1 (8-second blocks, nodes sized for 0.5 GB): 32 MiB in
+    /// flight, 16 MiB ready (`docs/P1_CATCHUP_PERF.md`, step 8).
     pub(crate) const PROFILE1: Self = Self { in_flight_bytes: Some(P1_IN_FLIGHT_BYTES), ready_bytes: P1_READY_BYTES };
 
     /// [`Self::PROFILE1`] with [`P1_IN_FLIGHT_MIB_ENV`] and
@@ -368,11 +368,16 @@ pub const P1_IN_FLIGHT_MIB_ENV: &str = "N42_P1_PULL_IN_FLIGHT_MIB";
 /// Overrides [`P1_READY_BYTES`], in MiB.
 pub const P1_READY_MIB_ENV: &str = "N42_P1_PULL_READY_MIB";
 
-/// [`PullBudget::PROFILE1`]'s bytes in flight.
-pub const P1_IN_FLIGHT_BYTES: u64 = 192 << 20;
+/// [`PullBudget::PROFILE1`]'s bytes in flight: 8 MiB a range over four
+/// slots. Measured on the heavy bench chain (0.78 MB blocks, execution at
+/// ~16 MB/s): 192, 96, 64 and 32 MiB pull at the same speed, the
+/// validator's peak 0.67, 0.60, 0.57 and 0.49 GB. 32 MiB is two seconds of
+/// execution in flight and ~50 times a 100 Mbit/s, 50 ms link's
+/// bandwidth-delay product, so the four slots still hide the latency.
+pub const P1_IN_FLIGHT_BYTES: u64 = 32 << 20;
 
-/// [`PullBudget::PROFILE1`]'s reorder buffer.
-pub const P1_READY_BYTES: usize = 64 << 20;
+/// [`PullBudget::PROFILE1`]'s reorder buffer: one second of execution.
+pub const P1_READY_BYTES: usize = 16 << 20;
 
 /// The smallest byte budget a range is asked with: below it the pull waits
 /// for a reply to free its share (one block is always served).

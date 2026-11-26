@@ -2038,6 +2038,31 @@ impl QmdbForest {
         self.min_cursor = self.tree.next_slot();
     }
 
+    /// [`Self::forget_changes`] for a caller that has just persisted the chain
+    /// up to `persisted` from its blocks' own deltas
+    /// ([`Self::take_block_deltas`]), which never moves the tree: the tree
+    /// may stand several blocks above `persisted`, and those blocks are
+    /// applied already -- nothing notes them again. What they retired stays
+    /// in the bookkeeping, so a later [`Self::delta_since`] (their chain of
+    /// deltas no longer held whole) still carries it. Forgetting everything
+    /// lost those flags: the log then left two active slots for one key and
+    /// a restart refused it. A slot kept here that a taken delta already
+    /// described costs one flag read at the next measurement, no more.
+    pub fn forget_persisted_changes(&mut self, persisted: B256) {
+        self.forget_changes();
+        let floor = self.records.get(&persisted).map_or(0, |record| record.number);
+        if let Some((_, undo)) = &self.pending {
+            self.dirty_slots.extend(undo.retired_slots());
+        }
+        let mut current = self.tip;
+        while current != persisted {
+            let Some(record) = self.records.get(&current) else { break };
+            let Some(undo) = record.undo.as_ref().filter(|_| record.number > floor) else { break };
+            self.dirty_slots.extend(undo.retired_slots());
+            current = record.parent;
+        }
+    }
+
     /// A historical prover's one read of the live tree, under one hold of
     /// the forest's lock: each key's live slot, the entry log's offsets and,
     /// with `retired_since = (ancestor, below, limit)`, the slots below
@@ -2790,6 +2815,43 @@ mod tests {
         forest.apply(h(0x0B), h(0xB2), 2, &changes(3)).unwrap();
         forest.set_canonical(h(0xB2)).unwrap();
         assert!(forest.take_block_deltas(h(0x0A), first[0].next_slot, h(0xB2)).is_none(), "B2's chain does not pass through A");
+        let measured = forest.delta_since(first[0].next_slot).unwrap();
+        replayed.apply_delta(&measured).unwrap();
+        assert_eq!(replayed.tree, forest.snapshot().unwrap().tree);
+    }
+
+    /// A block persisted by its own delta while the tree already stands
+    /// further up the chain: the blocks above it are applied, and nothing
+    /// applies them again. When they are later persisted by the measured
+    /// path (the chain of deltas no longer held whole), the measured delta
+    /// has to carry the slots they retired. Forgetting the whole bookkeeping
+    /// at the first persistence lost them: the replayed state kept two
+    /// active slots for one key, and a restart refused the entry file
+    /// ("duplicate active key").
+    #[test]
+    fn a_measured_delta_after_a_per_block_one_carries_the_blocks_already_applied() {
+        let touch = |nonce: u64| {
+            let mut changes = BlockChanges::new();
+            changes.set_account(
+                Address::with_last_byte(7),
+                AccountState { nonce, balance: U256::from(nonce), code_hash: B256::ZERO },
+            );
+            changes
+        };
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(0xF0)).unwrap();
+        let mut replayed = forest.snapshot().unwrap();
+        let start = forest.next_slot();
+        // Three blocks rewrite one account, all applied before the first is persisted.
+        forest.apply(GENESIS, h(1), 1, &touch(1)).unwrap();
+        forest.apply(h(1), h(2), 2, &touch(2)).unwrap();
+        forest.apply(h(2), h(3), 3, &touch(3)).unwrap();
+        forest.set_canonical(h(1)).unwrap();
+        let first = forest.take_block_deltas(GENESIS, start, h(1)).expect("a chain of one");
+        replayed.apply_delta(&first[0]).unwrap();
+        forest.forget_persisted_changes(h(1));
+        assert_eq!(forest.tip(), h(3), "the persistence did not move the tree");
+        // The head moves on and is persisted by measuring.
+        forest.set_canonical(h(3)).unwrap();
         let measured = forest.delta_since(first[0].next_slot).unwrap();
         replayed.apply_delta(&measured).unwrap();
         assert_eq!(replayed.tree, forest.snapshot().unwrap().tree);

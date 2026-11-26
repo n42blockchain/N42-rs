@@ -3654,7 +3654,7 @@ impl QmdbNodeState {
                 (deltas, roots)
             });
             if ready.is_some() {
-                forest.forget_changes();
+                forest.forget_persisted_changes(block_hash);
             }
             Ok((block_hash, forest.head().0, ready, released))
         })?;

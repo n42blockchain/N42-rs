@@ -35,6 +35,9 @@ CB_GASPRICE=${CB_GASPRICE:-1000000000000000}
 CB_SCHEDULE=${CB_SCHEDULE:-0:60 2000:240 10000:240 40000:90 0:60 20000:240 40000:90 0:30}
 CB_SAMPLE_S=${CB_SAMPLE_S:-0.5}
 CB_METRICS_PORT=${CB_METRICS_PORT:-20290}
+# CPUs: every member on the whole box less the faulty core 99/227 unless
+# CB_CPUS (member 3) / CB_SERVER_CPUS (members 0 and 1) pin them.
+DEF_CPUS=0-98,100-226,228-255
 export P1_DIR=$CB_DIR/members P1_BIN=$CB_BIN P1_PORT_OFFSET=${P1_PORT_OFFSET:-60}
 export P1_GENESIS=$CB_DIR/genesis.json P1_GENESIS_NOW=0 P1_MIN_FREE_GB=${P1_MIN_FREE_GB:-50}
 # Pool sizing for the flood (reth's defaults hold 10k pending, 16 per sender)
@@ -146,7 +149,7 @@ cmd_leg() {
   # Member 3 from nothing: a fresh EL (n42 init) and no consensus store.
   rm -rf "$P1_DIR/m3/el" "$P1_DIR/m3/consensus"
   taskset -c 0-98,100-226,228-255 "$CB_BIN/n42" init --datadir "$P1_DIR/m3/el" --chain "$P1_DIR/genesis.json" > "$out/init.log" 2>&1 || exit 1
-  P1_MEMBERS="0 1" P1_MEMBERS_ALL="0 1 3" P1_EL_ARGS="$EL_POOL ${CB_SERVER_EL_ARGS:-}" P1_MEMBER_ENV="${CB_SERVER_ENV:-}" \
+  P1_CPUS="${CB_SERVER_CPUS:-$DEF_CPUS}" P1_MEMBERS="0 1" P1_MEMBERS_ALL="0 1 3" P1_EL_ARGS="$EL_POOL ${CB_SERVER_EL_ARGS:-}" P1_MEMBER_ENV="${CB_SERVER_ENV:-}" \
     P1_RUST_LOG=info "$P1" up > "$out/up-servers.log" 2>&1 || exit 1
   sleep 5
   echo "load before: $(cut -d' ' -f1-3 /proc/loadavg); top: $(ps -eo pcpu,comm --sort=-pcpu | sed -n 2,6p | tr -s ' ' | tr '\n' ';')" | tee "$out/box.txt"
@@ -155,7 +158,7 @@ cmd_leg() {
   python3 -I "$REPO/scripts/catchup-sampler.py" "$(http_port 3)" "$target" "$CB_SAMPLE_S" "${CB_STALL_S:-60}" \
     "$CB_BIN" "$P1_DIR" "$out" &
   local sampler=$!
-  P1_MEMBERS=3 P1_MEMBERS_ALL="0 1 3" P1_EL_ARGS="$EL_POOL --metrics 127.0.0.1:$CB_METRICS_PORT ${CB_EL_ARGS:-}" \
+  P1_CPUS="${CB_CPUS:-$DEF_CPUS}" P1_MEMBERS=3 P1_MEMBERS_ALL="0 1 3" P1_EL_ARGS="$EL_POOL --metrics 127.0.0.1:$CB_METRICS_PORT ${CB_EL_ARGS:-}" \
     P1_MEMBER_ENV="${CB_ENV:-}" P1_RUST_LOG=info,n42=debug "$P1" up > "$out/up-m3.log" 2>&1 || { kill $sampler; exit 1; }
   wait $sampler
   sleep 2

@@ -528,6 +528,15 @@ pub struct H2Service<E> {
     silent_keys: SilentKeys,
     /// The view whose votes `silent_keys` last looked at.
     silent_checked_view: Option<u64>,
+    /// Peers' timeouts, as `(view, sender)`, that reached this node on a
+    /// gossip topic: the engine's relay of one to the next leader is not
+    /// published again, since gossip already carries it there (gov5 relays
+    /// none and leaves timeouts to gossip; re-publishing made gossipsub refuse
+    /// a duplicate, with a WARN, at every node for every timeout).
+    gossiped_timeouts: GossipedTimeouts,
+    /// Set while a message that came over the direct vote protocol is
+    /// handled, so it is not taken for a gossiped one.
+    arriving_direct: bool,
     /// Bodies held back because they run far ahead of the execution layer:
     /// on a block more than 32 past its tip reth starts a backfill it has
     /// no peers for and answers every forkchoice with SYNCING from then on.
@@ -1731,6 +1740,34 @@ const fn tip_of(head: Option<u64>, in_flight: Option<u64>, layer: Option<u64>) -
     higher(higher(head, in_flight), layer)
 }
 
+/// How many views back [`GossipedTimeouts`] remembers a timeout.
+const GOSSIPED_TIMEOUT_VIEWS: u64 = 64;
+
+/// Peers' timeouts that arrived on a gossip topic, as `(view, sender)`,
+/// bounded to the last [`GOSSIPED_TIMEOUT_VIEWS`] views seen.
+#[derive(Debug, Default)]
+struct GossipedTimeouts {
+    seen: HashSet<(u64, u32)>,
+    highest: u64,
+}
+
+impl GossipedTimeouts {
+    /// Records `message` if it is a timeout.
+    fn note(&mut self, message: &H2Message) {
+        let H2Message::Timeout(timeout) = message else { return };
+        self.seen.insert((timeout.view, timeout.sender));
+        if timeout.view > self.highest {
+            self.highest = timeout.view;
+            let oldest = self.highest.saturating_sub(GOSSIPED_TIMEOUT_VIEWS);
+            self.seen.retain(|(view, _)| *view >= oldest);
+        }
+    }
+
+    fn contains(&self, view: u64, sender: u32) -> bool {
+        self.seen.contains(&(view, sender))
+    }
+}
+
 /// The later of a key's last verified vote and its last verified certificate
 /// signature: either means the key took part in that view.
 fn last_participation(vote: Option<u64>, certificate: Option<u64>) -> Option<u64> {
@@ -1905,6 +1942,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             last_forced_layer_read: None,
             silent_keys: SilentKeys::default(),
             silent_checked_view: None,
+            gossiped_timeouts: GossipedTimeouts::default(),
+            arriving_direct: false,
             held_bodies: Vec::new(),
             check_ahead_unheld: check_ahead_unheld(),
             held_since: std::collections::HashMap::new(),
@@ -3029,8 +3068,16 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     fn handle_transport_event_inner(&mut self, event: TransportEvent) -> Result<(), ServiceError> {
         match event {
-            TransportEvent::Envelope { envelope, .. } => self.accept_envelope(&envelope),
+            TransportEvent::Envelope { envelope, .. } => {
+                if !self.arriving_direct {
+                    self.gossiped_timeouts.note(&envelope.message);
+                }
+                self.accept_envelope(&envelope);
+            }
             TransportEvent::Native { message, .. } => {
+                if !self.arriving_direct {
+                    self.gossiped_timeouts.note(&message);
+                }
                 // The native topic is chain-scoped by its fork digest and
                 // carries no envelope; give the message the envelope the
                 // bridge expects, under this node's own identity. The
@@ -3526,7 +3573,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             TransportEvent::DirectVote { inner, .. } => {
                 self.direct_votes.note_direct();
-                return self.handle_transport_event_inner(*inner);
+                self.arriving_direct = true;
+                let handled = self.handle_transport_event_inner(*inner);
+                self.arriving_direct = false;
+                return handled;
             }
             TransportEvent::MobilePacket { data, .. } => self.forward_mobile(n42_h2_net::MobileTopic::Packet, data),
             TransportEvent::MobileRegistration { data, .. } => {
@@ -4992,6 +5042,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
             }
+        }
+        // A peer's timeout that arrived by gossip is on its way to the target
+        // by gossip already: publishing it again is refused as a duplicate.
+        if let M::Timeout(timeout) = &message
+            && timeout.sender != self.engine.my_index()
+            && self.gossiped_timeouts.contains(timeout.view, timeout.sender)
+        {
+            debug!(target: "n42.h2.node", view = timeout.view, sender = timeout.sender, target,
+                   "timeout relay left to gossip");
+            return;
         }
         // Not fanned out again when the gossip layer already holds it: a
         // relayed timeout is one this node received from the topic, which

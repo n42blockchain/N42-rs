@@ -22,6 +22,11 @@
 //! enabled by default, because a QUIC dial to a node that only advertises TCP
 //! fails in a way that is easy to misread as a consensus problem.
 
+// rustc 1.100 reports `unreachable_code` inside libp2p's `NetworkBehaviour`
+// derive and on the `with_behaviour` error arm: both handle an error type that
+// has no values. The code is libp2p's shape, not something to rewrite here.
+#![allow(unreachable_code)]
+
 use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::B256;

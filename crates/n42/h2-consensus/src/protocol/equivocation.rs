@@ -17,11 +17,13 @@ use super::quorum::ConsensusSigningProfile;
 
 /// The consensus value a validator signed twice in one view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum EquivocationKind {
     /// Two Round-1 votes.
     Vote,
-    /// Two Round-2 commit votes.
+    /// Two Round-2 commit votes (`commit_vote` in AM28; records written as
+    /// `commitVote` before AM28 was pinned still load).
+    #[serde(alias = "commitVote")]
     CommitVote,
     /// Two proposals.
     Proposal,
@@ -121,3 +123,23 @@ pub(super) fn check_equivocation(
         }
     }
 }
+
+#[cfg(test)]
+mod am28_kind_tests {
+    use super::EquivocationKind;
+
+    #[test]
+    fn kinds_serialise_as_am28_names() {
+        for (kind, name) in [
+            (EquivocationKind::Vote, "vote"),
+            (EquivocationKind::CommitVote, "commit_vote"),
+            (EquivocationKind::Proposal, "proposal"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).expect("serialise"), name);
+            assert_eq!(serde_json::from_value::<EquivocationKind>(name.into()).expect("parse"), kind);
+        }
+        let old: EquivocationKind = serde_json::from_value("commitVote".into()).expect("pre-AM28 record");
+        assert_eq!(old, EquivocationKind::CommitVote);
+    }
+}
+

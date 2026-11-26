@@ -565,9 +565,7 @@ impl TwigTree {
                         twig.recompute(&mut fold_scratch);
                     } else {
                         fold_locals.clear();
-                        for k in i..j {
-                            fold_locals.push((self.touched[k] % TWIG_SIZE as u64) as usize);
-                        }
+                        fold_locals.extend(self.touched[i..j].iter().map(|slot| (slot % TWIG_SIZE as u64) as usize));
                         twig.fold_batch(&fold_locals, &mut fold_scratch);
                     }
                     twig.dirty = false;

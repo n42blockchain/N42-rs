@@ -1,5 +1,34 @@
 # Mixed production standard, profile 1: status per client
 
+> ## v1 CLOSED (2026-11-26 01:50 EST)
+>
+> Every gate of the standard (as amended by AM28-AM30) passed in mixed rounds of gov5, n42-rs and n42-26:
+>
+> | Gate | Round(s) | Result |
+> | --- | --- | --- |
+> | 1 vectors | V1, V3, V4, V6, V8 (all 33 gov5 refused cases) | pass on each client |
+> | 2 idle mixed | mixed-3 (11-24) | 0..227 equal |
+> | 3 catch-up | gate3d | 0..378 equal, all four pull directions |
+> | 4 long absence | 4a snapshot files; 4c 70 min absent (gov5 15, n42-rs EL + 17 keys, n42-26 v99) | 0..410 equal; catch-up 13-30 s, voting <= 27 s after |
+> | 5 scale | 5b n=100, 5c killed leaders, 5d 33 absent | 0..183 / 0..176 / 0..147 equal, no halt |
+> | 6 n42-26 producer | gate6c | 0..182 equal, led every slot |
+> | block quality | txcheck2 | per-leader spread 1.8%, p90 inclusion 7.2-7.4 s |
+>
+> Releases: gov5 main 5eb5aba9 (binary 854a1982…), n42-rs main 6a793112e, n42-26 main 9feef34 (binary 9bba532a…;
+> AM28 fields in PR #47, approved by the owner, merge pending in n42-26's session).
+>
+> **v1.1 (open):** gate 4b p2p state sync, `bodies_by_range/2`, `commit_qc/1` (AM29, AM30); a mixed equivocation
+> round (no client has a double-sign injector); gov5 proposal-equivocation detection (M3d); the §7 open items
+> (E2 set changes, B11 follower rule, kept-tail bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a
+> negative leader).
+>
+> **Risks carried:** (1) liveness — k consecutive absent leaders stall about 24 + 48 + 96·(k−2) s (5d: 464 s for six);
+> mitigation candidates for v1.1: cap backoff across consecutive TCs, or a leader order that interleaves operators.
+> (2) Host — a full `/data` killed two members mid-round (round scripts now refuse under 50 GB free).
+> (3) gov5's consensus topic once used a 32-message queue (fixed, now warns on drops) — any client's subscriber
+> queue must hold a full vote burst at n = 100.
+
+
 **2026-11-24 21:15 EST — gate 2 PASSED.** Mixed round 3 (gov5 v0/v1 + n42-rs v2/v3, genesis-mixed-3 0xe6b358e8…): heights 0..227 byte-equal on all four, each validator led 57-58 blocks, 0 refusals, timeouts only at startup. Round 2 (12:00) was void and found the n42-rs justify-extension defect (fixed, main d8185220d) and a gov5 rebuild-on-genesis defect (fixed, gov5 1d72bf1b). Open from round 3: A17 timestamp stamping point (gov5 stamps at build start, n42-rs at publication), proposal AM26.
 
 As of 2026-11-24 (after the 05:05 EST post). Rules: `docs/MIXED_PRODUCTION_STANDARD_V1_RC.md` (v1.0-rc2).
@@ -113,25 +142,25 @@ Alias rows (`A3 / E1` …) are one row: the second id is defined by the first.
 | E12 | impl | vec | ? | V6 `decide_valid`; conflict halt: gov5 g0409 (commit_conflict.go, safety_halt.go); n42-rs 5c7bc9562 (`h2-node/src/safety_halt.rs`, tests 8f3438971) |
 | E13 | impl | vec | ? | gov5 g0346b anchors enforced; n42-rs V6 + V1 QC refusals + strict anchor verifier (d1efe75da); n42-26 strict-anchor range client (AM13), not reported for profile 1 |
 | E14 | — | impl | ? | gov5 g0255 "finality tags aliased to latest (E14 fixed in M2)"; n42-rs split tags only on profile 1 (f31f32bc6, `h2-execution/src/settlement.rs`) |
-| E15 | — | — | ? | gov5 g0255 "equivocation evidence stores hashes only"; n42-rs detects in `h2-consensus/src/protocol/voting.rs`, no persisted pair, no `n42_equivocations` RPC, no metric |
+| E15 | impl | impl | ? | AM28 shape: n42-rs main 6413d13b2 (persisted pair, `n42_equivocations`, `n42_equivocations_total`); gov5 feat/p1-j2-e15 5eb5aba9 (vote/commit_vote kinds; merge pending) |
 | E16 | ? | impl | ? | n42-rs 4c818ee56 (every vote on the consensus topic), `N42_VOTE_TRANSPORT=direct` refused |
 | E17 | ? | vec | ? | V6 Decide wire / snappy gossip bytes |
 | F1 | impl | impl | — | gov5 g0346b; n42-rs cc71c34e2; n42-26 does not produce profile-1 blocks yet (n0505) |
 | F2 | ? | impl | ? | n42-rs proposes empty blocks |
 | F3 | impl | impl | — | gov5 g0346b "maxBlockBytes*0.9 - 32 KiB - header"; n42-rs `engine-types/src/payload.rs` 9/10 of the block bound (the −32 KiB term not checked here); n42-26 not producing |
 | F5 | ? | vec | ? | V6 `tc_leader_proposes_on_high_qc` |
-| F6 | ? | ? | ? | n42-rs: same-parent rebuild path not verified against F6 |
+| F6 | ? | impl | ? | n42-rs 2460fa4e6: one signed proposal per (view, proposer), tested incl. a restart inside the view |
 | F7 | ? | impl | — | n42-rs deferred execution + sealed own block; n42-26 not producing |
 | G1 | ? | impl | ? | n42-rs `h2-net` |
 | G2 | ? | impl | ? | n42-rs `h2-net` topics incl. mobileverify |
 | G3 | ? | impl | ? | n42-rs `h2-net` message id |
 | G4 | ? | impl | ? | V9 not published; n42-rs `gov5_gossipsub_config` |
-| G5 | impl | ? | ? | gov5 g0346b "consensus gossip messages capped at 64 KiB decoded"; n42-rs: 64 KiB on direct vote bodies (`h2-net/src/rpc.rs` MAX_VOTE_BODY), gossip-side cap not found |
+| G5 | impl | impl | ? | n42-rs: consensus gossip decoders refuse > ~8 KiB declared length before decompressing (stricter than 64 KiB; = gov5 v4 cap), pinned by 0c1f934b2 |
 | G6 | ? | impl | ? | n42-rs: no single-client protocol needed by another |
 | I1 | ? | impl | ? | n42-rs `crates/n42/mobileverify`, `h2-node/src/mobile.rs` (`docs/MOBILEVERIFY_V3_PARITY.md`) |
 | I2 | ? | impl | ? | gov5 g0316 "gov5 adds the repeat-parent fallback" (plan); n42-rs 9501762b0 |
-| J1 | ? | ? | ? | no evidence found for `eth_config` −32004 on profile 1 |
-| J2 | ? | — | ? | n42-rs: none of the seven metric names exists in `crates/` |
+| J1 | ? | impl | ? | n42-rs: `eth_config` −32004 and proof/witness refusals on a profile-1 genesis, pinned by 1486f03f4 |
+| J2 | impl | impl | ? | all seven `n42_*` metrics: n42-rs 02d187fd7 (`h2_validator --metrics`); gov5 feat/p1-j2-e15 5eb5aba9 (merge pending) |
 | J3 | vec | vec | vec | V8 `legacy_*` cases |
 | J4 | impl | impl | impl | gov5 g0331 (AM10, incl. `--miner.gasceil`, `--block-interval-ms`); n42-rs `profile1.rs` refuse_overrides / FORBIDDEN_ENV / FORBIDDEN_FLAGS (f31f32bc6); n42-26 n0505 (AM10) |
 
@@ -141,10 +170,10 @@ Sync (§3 of the standard; not item ids, not counted above):
 | --- | --- | --- | --- | --- |
 | anchors enforced | impl | impl | ? | gov5 g0346b "sync anchors pinned to enforce"; n42-rs e6f4efe59, `N42_SYNC_ANCHOR` refused unless enforce; n42-26 strict-anchor client (AM13), default not reported |
 | ranges committed-only | impl | impl | ? | gov5 g0346b; n42-rs 92b81a20e |
-| by-hash serves proposals, miss `0x03` | impl | — | ? | gov5 g0346b; n42-rs serves proposals but defines only codes 1 and 2 (`h2-net/src/rpc.rs`) |
-| `bodies_by_range/2` | — | — | — | gov5 g0252 "follow M1"; n42-rs none in `crates/`; n42-26 AM13 |
-| `commit_qc/1` | — | — | — | same |
-| state-sync servers (`qmdb_*`, `code_by_hash`) | — | — | — | same |
+| by-hash serves proposals, miss `0x03` | impl | impl | ? | gov5 g0346b; n42-rs `RESPONSE_CODE_RESOURCE_UNAVAILABLE` (`h2-net/src/rpc.rs`) |
+| range sync (`bodies_by_range/1`, AM30) | mix | mix | mix | gates 3 and 4c: members of all three clients caught up by range in mixed rounds; `/2` -> v1.1 |
+| `commit_qc/1` | — | — | — | v1.1 (AM30); v1 anchors from header QCs and Decide; gov5 uses the layout only inside the 4a bundle |
+| state-sync servers (`qmdb_*`, `code_by_hash`) | — | — | — | v1.1 gate 4b (AM29); v1 long absence = range pull (4c) or snapshot file (4a) |
 | conflict halt on the sync path | impl | impl | ? | gov5 g0409; n42-rs 643a83949, 50202ac13 |
 
 ## n42-rs items still at `—`, `impl` or `?`, and what is missing
@@ -157,15 +186,11 @@ Sync (§3 of the standard; not item ids, not counted above):
 - **B15** (impl): no vector; gate 2/3 exercise it.
 - **B16, C7, E5, E8, E9/F8, E16, G1-G4, G6, I1, I2** (impl): implemented; no profile-1 vector (G4 waits for V9).
 - **E14** (impl): split tags only on profile 1; no vector and no round yet.
-- **E15** (—): persist the signed pair, add the `n42_equivocations` RPC and `n42_equivocations_total`.
-- **J2** (—): none of the seven common metrics.
-- **J1** (?): check `eth_config` (−32004) and the witness/proof refusals on a profile-1 node.
-- **F6** (?): verify one signed proposal per (view, proposer) on the same-parent rebuild path.
-- **G5** (?): find or add the 64 KiB decoded cap on gossiped consensus messages.
-- **V8**: the test reads gov5's first 14 refused files (`qmdb-reth/testdata/profile1/gov5/V8/refused`); gov5's
-  19 later cases are the equivalents of n42-rs's own 33 `refused_*.json`. Re-copy gov5's 33 to close it.
-- **Sync** (—): `block_by_hash` miss as `0x03`; `bodies_by_range/2`; `commit_qc/1`; the state-sync servers
-  (gates 3 and 4).
+- **E15, J2, J1, F6, G5, V8, by-hash `0x03`: closed 2026-11-26** (main 47f1792b9, 70c39164d, 6413d13b2; rows above).
+- **Sync:** range sync on `/1` proven mixed (gates 3, 4c; AM30); `bodies_by_range/2`, `commit_qc/1` and the
+  state-sync servers are v1.1 (AM29, AM30).
+- **A17, F1-F3, F7, A22, B15, E14:** production behaviour now exercised by the mixed gates 2-6 and the transaction
+  re-check (txcheck2); still no dedicated vector.
 
 ## Gate 3 PASSED (2026-11-25, round gate3d, T0 08:45 EST)
 
@@ -219,4 +244,12 @@ With all three fixes in (gov5's speculative-fill rebuild, n42-rs's pool relay, n
 four leaders (gov5 v0/v1, n42-rs v2, n42-26 v3) sealed 158.5-161.5 transactions per block in steady state (spread
 1.8%), and transactions submitted to any client's RPC were included with p90 7.2-7.4 s (within one slot); 17,602
 sent, all included. Heights 0..146 equal, 0 refusals. The block-quality items opened after gates 3-6 are closed.
+
+## Gate 4c PASSED (2026-11-26, T0 00:20 EST) — long absence by range (AM29)
+
+Same 100-member mix. Absent 70 min under load: gov5 member 15 (with its execution layer), n42-rs layer 3 (one
+execution layer + 17 validator keys) and n42-26 v99. The chain advanced 32 -> 335 meanwhile. On restart: n42-rs
+caught up ~300 blocks in 18 s and voted 0.3 s later; n42-26 304 blocks in 13 s, voted at once and led block 424;
+gov5 member 15 at the head 30 s after restart, voting after 27 s. Heights 0..410 equal on all eight dumps, deltas
+8 x335 / 32 x74 (absent leaders) / 48 x1 (startup), 0 refusals, 45,000 transactions with 0 errors.
 

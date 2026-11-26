@@ -1883,10 +1883,8 @@ fn sealed_header_from_fields(
         }
         (root, _) => vec![root],
     };
-    let requests_hashes: Vec<Option<B256>> = match built.requests_hash {
-        // EIP-7685's hash on both sides: the builder's own.
-        hash => vec![hash],
-    };
+    // EIP-7685's hash on both sides: the builder's own.
+    let requests_hashes: Vec<Option<B256>> = vec![built.requests_hash];
     for ommers_hash in [built.ommers_hash, B256::ZERO, alloy_consensus::EMPTY_OMMER_ROOT_HASH] {
         for difficulty in [built.difficulty, alloy_primitives::U256::ZERO, alloy_primitives::U256::from(1)] {
             for withdrawals_root in &withdrawals_roots {

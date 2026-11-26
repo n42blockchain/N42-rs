@@ -120,13 +120,13 @@ fn main() {
             eprintln!("error: {err}");
             std::process::exit(2);
         }
-        if let Some(bytes) = n42_qmdb_reth::profile1::max_block_bytes(&spec.genesis) {
-            if let Err(cap) = n42_engine_types::byte_budget::set_wire_cap(bytes) {
-                eprintln!(
-                    "error: the block size cap was fixed at {cap} bytes before the genesis's maxBlockBytes {bytes} was read"
-                );
-                std::process::exit(2);
-            }
+        if let Some(bytes) = n42_qmdb_reth::profile1::max_block_bytes(&spec.genesis)
+            && let Err(cap) = n42_engine_types::byte_budget::set_wire_cap(bytes)
+        {
+            eprintln!(
+                "error: the block size cap was fixed at {cap} bytes before the genesis's maxBlockBytes {bytes} was read"
+            );
+            std::process::exit(2);
         }
     }
     // `init` on a profile-1 chain writes the genesis as the node stores it:

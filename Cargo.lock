@@ -7687,6 +7687,7 @@ dependencies = [
  "reth-trie",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tikv-jemallocator",
  "tracing",

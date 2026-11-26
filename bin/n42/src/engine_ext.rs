@@ -80,7 +80,7 @@ pub trait N42EngineApi {
     /// `null` when the node does not offer the read. What the validator
     /// serves range requests from: one call for a range instead of one
     /// `eth_getBlockByNumber` with every transaction as a JSON object per
-    /// block (docs/P1_CATCHUP_PERF.md).
+    /// block (`docs/P1_CATCHUP_PERF.md`).
     #[method(name = "blocksByRange")]
     async fn blocks_by_range(&self, start: u64, count: u64, max_bytes: u64) -> RpcResult<Option<Vec<Bytes>>>;
 }

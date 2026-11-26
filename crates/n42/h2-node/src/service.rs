@@ -5611,7 +5611,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     let executing_before = self.catch_up.as_ref().map(|c| c.times.new_payload + c.times.forkchoice);
                     // Lazy screening verifies the certificates of a reply's
                     // last block, and of every LAZY_VERIFY_TAIL-th unanchored
-                    // one, only (docs/P1_CATCHUP_PERF.md, section 4).
+                    // one, only (`docs/P1_CATCHUP_PERF.md`, section 4).
                     let verify = !self.sync_lazy_verify
                         || chunks.is_empty()
                         || self.catch_up.as_ref().is_none_or(|c| c.anchored.tail().0 + 1 >= LAZY_VERIFY_TAIL);
@@ -6685,7 +6685,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// `check_seal` false leaves out the seal (B2/B3), the one BLS
     /// verification of the rules: the lazy screening (`N42_SYNC_LAZY_VERIFY`)
     /// does so for a block that executes only once a verified commit QC of a
-    /// descendant authenticates it (docs/P1_CATCHUP_PERF.md, section 4).
+    /// descendant authenticates it (`docs/P1_CATCHUP_PERF.md`, section 4).
     fn profile1_pulled_refusal(&self, header: &Header, block_bytes: Option<usize>, check_seal: bool) -> Option<String> {
         if let Some(reason) = self.profile1_header_refusal(header, block_bytes, check_seal) {
             return Some(reason);

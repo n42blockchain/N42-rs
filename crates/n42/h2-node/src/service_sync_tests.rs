@@ -269,7 +269,7 @@ async fn a_forging_peer_among_honest_ones_gets_nothing_forged_executed() {
     assert_eq!(unique, hashes, "the honest chain, in order");
 }
 
-/// Lazy screening (`N42_SYNC_LAZY_VERIFY`, docs/P1_CATCHUP_PERF.md): the
+/// Lazy screening (`N42_SYNC_LAZY_VERIFY`, `docs/P1_CATCHUP_PERF.md`): the
 /// same pull executes the same blocks, in order, while verifying the
 /// certificates of a small fraction of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -289,7 +289,7 @@ async fn lazy_screening_executes_the_same_chain_verifying_a_fraction() {
         let hashes: Vec<B256> = blocks[..count as usize - 1].iter().map(|b| b.0).collect();
         assert_eq!(executed(&a), hashes, "every anchored block once, in order (pipeline {pipeline})");
         let times = a.svc.last_catch_up_times.clone().expect("the pull's timing");
-        assert!(times.checked > 0 && times.checked * 8 <= u64::from(count), "verified {} of {count}", times.checked);
+        assert!(times.checked > 0 && times.checked * 8 <= count, "verified {} of {count}", times.checked);
     }
 }
 

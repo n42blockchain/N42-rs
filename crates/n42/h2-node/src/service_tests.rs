@@ -290,7 +290,7 @@ async fn a_range_is_served_up_to_the_committed_height_only() {
     assert!(unknown.rlps.is_empty() && unknown.restored.is_none());
 }
 
-/// docs/P1_CATCHUP_PERF.md: an execution layer that reads a range in one
+/// `docs/P1_CATCHUP_PERF.md`: an execution layer that reads a range in one
 /// call serves byte for byte what the block-by-block road serves, under the
 /// same committed ceiling and up to the same first missing block.
 #[tokio::test]

@@ -45,7 +45,7 @@ pub const SYNC_PIPELINE_DEFAULT: bool = true;
 /// `0` off): only a reply's last block, and every 32nd unanchored block,
 /// has its header QC and seal verified; the blocks between are parent-linked
 /// to it and execute only under a verified anchor at or above them, as
-/// every pulled block does (docs/P1_CATCHUP_PERF.md, section 4).
+/// every pulled block does (`docs/P1_CATCHUP_PERF.md`, section 4).
 pub const SYNC_LAZY_VERIFY_ENV: &str = "N42_SYNC_LAZY_VERIFY";
 
 /// Lazy screening's default when [`SYNC_LAZY_VERIFY_ENV`] is unset.
@@ -303,7 +303,7 @@ pub(crate) struct RangeScheduler {
     /// differ by three orders of magnitude (an empty block is ~1 KB, a full
     /// 480M-gas one 2.7 MB), so a deadline sized by blocks/s alone, learnt
     /// on empty blocks, expired on every range of full ones
-    /// (docs/P1_CATCHUP_PERF.md, step 2).
+    /// (`docs/P1_CATCHUP_PERF.md`, step 2).
     block_bytes: Option<f64>,
 }
 

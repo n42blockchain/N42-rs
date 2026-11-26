@@ -37,6 +37,11 @@
 #   P1_DIR=<run dir>      everything lives here (default /data/n42-build/p1-round)
 #   P1_BIN=<dir>          release dir holding n42 and examples/h2_validator, h2_keygen
 #   P1_CPUS=<list>        taskset CPU list (default skips the faulty core 99/227)
+#   P1_EL_ARGS="<args>"   extra `n42 node` arguments for `up` (pool sizing, --rpc.txfeecap,
+#                         --metrics; scripts/catchup-bench.sh uses it). Unset: none
+#   P1_MEMBER_ENV="K=V .." environment for the members `up` starts (EL and validator),
+#                         set after the N42_* clean-out below: only knobs profile 1 allows
+#                         (refused ones stop the member at start-up, which is loud)
 #   P1_LOAD=<tx/s>        `up` also starts `load` at that rate for P1_LOAD_SECONDS (3600)
 #                         (P1_LOAD_MEMBERS, default the running ones of P1_MEMBERS)
 #   P1_LOAD_TOOL=gov5     gov5's gate-3 load_core.py (P1_LOAD_PY; funds its senders from the
@@ -181,12 +186,13 @@ cmd_up() {
   done
   for i in $P1_MEMBERS; do
     local d; d=$(mdir "$i")
-    setsid taskset -c "$P1_CPUS" "$EL" node --datadir "$d/el" --chain "$G" \
+    # shellcheck disable=SC2086 # P1_MEMBER_ENV / P1_EL_ARGS split on purpose
+    env ${P1_MEMBER_ENV:-} setsid taskset -c "$P1_CPUS" "$EL" node --datadir "$d/el" --chain "$G" \
       --authrpc.addr 127.0.0.1 --authrpc.port "$(auth_port "$i")" --authrpc.jwtsecret "$P1_DIR/jwt.hex" \
       --http --http.addr 127.0.0.1 --http.port "$(http_port "$i")" --http.api eth,net,web3,txpool,debug \
       --ipcdisable --port "$(devp2p_port "$i")" --discovery.port "$(devp2p_port "$i")" \
       --disable-discovery --no-persist-peers --max-inbound-peers 0 --max-outbound-peers 0 --disable-tx-gossip \
-      --log.file.max-files 0 --color never \
+      --log.file.max-files 0 --color never ${P1_EL_ARGS:-} \
       > "$d/el.log" 2>&1 < /dev/null &
   done
   for i in $P1_MEMBERS; do
@@ -198,7 +204,8 @@ cmd_up() {
     local d peers=() j; d=$(mdir "$i")
     for j in $all; do [ "$j" = "$i" ] || peers+=(--peer "$(maddr "$j")"); done
     for j in $P1_EXTRA_PEERS; do peers+=(--peer "$j"); done
-    RUST_LOG=${P1_RUST_LOG:-info,n42=debug} setsid taskset -c "$P1_CPUS" "$VAL" --datadir "$d/consensus" \
+    # shellcheck disable=SC2086
+    env ${P1_MEMBER_ENV:-} RUST_LOG=${P1_RUST_LOG:-info,n42=debug} setsid taskset -c "$P1_CPUS" "$VAL" --datadir "$d/consensus" \
       --chain "$G" --index "$i" --bls-key "$(cat "$d/bls.key")" --node-key "$d/node.key" \
       --el "http://127.0.0.1:$(auth_port "$i")" --el-rpc "http://127.0.0.1:$(http_port "$i")" --jwt "$P1_DIR/jwt.hex" \
       --listen "/ip4/127.0.0.1/tcp/$(p2p_port "$i")" --propose "${peers[@]}" \

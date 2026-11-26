@@ -269,6 +269,69 @@ async fn a_forging_peer_among_honest_ones_gets_nothing_forged_executed() {
     assert_eq!(unique, hashes, "the honest chain, in order");
 }
 
+/// Lazy screening (`N42_SYNC_LAZY_VERIFY`, `docs/P1_CATCHUP_PERF.md`): the
+/// same pull executes the same blocks, in order, while verifying the
+/// certificates of a small fraction of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lazy_screening_executes_the_same_chain_verifying_a_fraction() {
+    for pipeline in [false, true] {
+        let (keys, set) = keys(1);
+        let builder = node_in(&keys, &set, 0, None).await;
+        let count = 400;
+        let blocks = anchored_chain(&builder, count);
+        drop(builder);
+        let mut servers = vec![server_with(&keys, &set, &blocks).await];
+        let mut a = puller(&keys, &set, &mut servers, 0, 0, pipeline).await;
+        a.svc.sync_lazy_verify = true;
+        let mut events = Vec::new();
+        pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| synced(events).is_some()).await;
+        assert_eq!(synced(&events), Some((count - 1, true)), "{events:?}");
+        let hashes: Vec<B256> = blocks[..count as usize - 1].iter().map(|b| b.0).collect();
+        assert_eq!(executed(&a), hashes, "every anchored block once, in order (pipeline {pipeline})");
+        let times = a.svc.last_catch_up_times.clone().expect("the pull's timing");
+        assert!(times.checked > 0 && times.checked * 8 <= count, "verified {} of {count}", times.checked);
+    }
+}
+
+/// Lazy screening against forgers: a chain whose certificates stop
+/// verifying at block 150, and one forged from block 2, each beside an
+/// honest peer. Nothing forged reaches `newPayload` (the unverified blocks
+/// wait for an anchor a forged chain cannot carry), and the honest chain is
+/// executed in full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lazy_screening_executes_nothing_a_forger_served() {
+    for first_forged in [150u64, 2] {
+        let (keys, set) = keys(1);
+        let builder = node_in(&keys, &set, 0, None).await;
+        let count = 300;
+        let honest = anchored_chain(&builder, count);
+        let mut forged = honest[..first_forged as usize - 1].to_vec();
+        let mut parent = forged[first_forged as usize - 2].0;
+        for number in first_forged..=count {
+            let qc = header_qc(&builder.svc, &builder.keys, &[0], number - 1, parent, B256::repeat_byte(7));
+            let block = block_with_extra(number, parent, number, qc);
+            parent = block.0;
+            forged.push(block);
+        }
+        drop(builder);
+        let mut servers = vec![server_with(&keys, &set, &forged).await, server_with(&keys, &set, &honest).await];
+        let mut a = puller(&keys, &set, &mut servers, 0, 0, true).await;
+        a.svc.sync_lazy_verify = true;
+        let mut events = Vec::new();
+        pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| {
+            synced(events).is_some_and(|(height, complete)| complete && height == count - 1)
+        })
+        .await;
+        let forged_hashes: HashSet<B256> = forged[first_forged as usize - 1..].iter().map(|b| b.0).collect();
+        let ran = executed(&a);
+        assert!(ran.iter().all(|h| !forged_hashes.contains(h)), "a forged block reached newPayload");
+        let hashes: Vec<B256> = honest[..count as usize - 1].iter().map(|b| b.0).collect();
+        let mut seen = HashSet::new();
+        let unique: Vec<B256> = ran.into_iter().filter(|h| seen.insert(*h)).collect();
+        assert_eq!(unique, hashes, "the honest chain, in order (forged from {first_forged})");
+    }
+}
+
 /// The stall watchdog: an execution layer that stops answering mid-pull
 /// leaves the executed head where it is while pulled blocks wait; the
 /// pipeline gives up, says so, and the next pull runs serially and

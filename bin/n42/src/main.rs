@@ -627,11 +627,34 @@ fn main() {
                                 .saturating_sub(persisted_state.canonical_chain().count() as u64),
                         }
                     });
+                    // Canonical blocks by range, as RLP, for the validator's
+                    // range serving (in-memory and persisted alike: the
+                    // provider answers both). Stops at the first block not
+                    // held and once the byte bound is reached.
+                    let range_provider = ctx.provider().clone();
+                    let blocks_by_range: n42::engine_ext::BlocksByRange =
+                        std::sync::Arc::new(move |start, count, max_bytes| {
+                            let mut out = Vec::new();
+                            let mut bytes = 0usize;
+                            for number in start..start.saturating_add(count) {
+                                let Ok(Some(block)) = reth_provider::BlockReader::block_by_number(&range_provider, number) else {
+                                    break;
+                                };
+                                let rlp = alloy_rlp::encode(&block);
+                                bytes = bytes.saturating_add(rlp.len());
+                                out.push(rlp.into());
+                                if bytes >= max_bytes {
+                                    break;
+                                }
+                            }
+                            out
+                        });
                     let engine_ext = N42EngineExt {
                         payloads: ctx.node().payload_builder_handle().clone(),
                         raw_endpoint,
                         in_memory_blocks: Some(in_memory_blocks),
                         persisted_block: Some(persisted_block),
+                        blocks_by_range: Some(blocks_by_range),
                     };
 
                     // A QMDB chain proves state from the forest: `n42_getProof`

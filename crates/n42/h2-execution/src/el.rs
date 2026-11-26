@@ -373,6 +373,16 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Canonical blocks `start..start+count` in one read, in order, ending at
+    /// the first block not held or once `max_bytes` of block RLP is reached
+    /// (the block that reaches it included). `Ok(None)` when the execution
+    /// layer does not offer the read: the caller asks block by block with
+    /// [`Self::block_by_number`]. The default does not offer it.
+    async fn blocks_by_range(&self, start: u64, count: u64, max_bytes: usize) -> Result<Option<Vec<ChainBlock>>, ElError> {
+        let _ = (start, count, max_bytes);
+        Ok(None)
+    }
+
     /// Hands a transaction to the execution layer's pool
     /// (`eth_sendRawTransaction`), returning its hash. The default declines:
     /// an execution layer that does not offer the method.

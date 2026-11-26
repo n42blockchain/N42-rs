@@ -71,7 +71,26 @@ pub trait N42EngineApi {
     /// `n42_h2_execution::settlement`), polled with `inMemoryBlocks`.
     #[method(name = "persistedBlock")]
     async fn persisted_block(&self) -> RpcResult<Option<u64>>;
+
+    /// Canonical blocks `start..start+count` as their RLP
+    /// (`[header, transactions, ommers, withdrawals]`, what
+    /// [`RawBuiltPayload::block`] carries), in order, stopping at the first
+    /// block not held and once `max_bytes` is reached (the block that reaches
+    /// it is included, so an answer always carries a block when one exists).
+    /// `null` when the node does not offer the read. What the validator
+    /// serves range requests from: one call for a range instead of one
+    /// `eth_getBlockByNumber` with every transaction as a JSON object per
+    /// block (`docs/P1_CATCHUP_PERF.md`).
+    #[method(name = "blocksByRange")]
+    async fn blocks_by_range(&self, start: u64, count: u64, max_bytes: u64) -> RpcResult<Option<Vec<Bytes>>>;
 }
+
+/// The most blocks one [`N42EngineApi::blocks_by_range`] call answers with.
+pub const MAX_BLOCKS_BY_RANGE: u64 = 1024;
+
+/// Reads canonical blocks by range; see [`N42EngineApi::blocks_by_range`].
+/// Arguments: start, count, byte bound. Runs on a blocking thread.
+pub type BlocksByRange = std::sync::Arc<dyn Fn(u64, u64, usize) -> Vec<Bytes> + Send + Sync>;
 
 /// Reads the unpersisted-block count; see [`N42EngineApi::in_memory_blocks`].
 pub type InMemoryBlocks = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -89,6 +108,8 @@ pub struct N42EngineExt<T: PayloadTypes> {
     pub in_memory_blocks: Option<InMemoryBlocks>,
     /// The last persisted block number, when the node can read it.
     pub persisted_block: Option<PersistedBlock>,
+    /// The canonical block reader by range, when the node offers it.
+    pub blocks_by_range: Option<BlocksByRange>,
 }
 
 impl<T: PayloadTypes> std::fmt::Debug for N42EngineExt<T> {
@@ -130,6 +151,19 @@ where
 
     async fn persisted_block(&self) -> RpcResult<Option<u64>> {
         Ok(self.persisted_block.as_ref().map(|number| number()))
+    }
+
+    async fn blocks_by_range(&self, start: u64, count: u64, max_bytes: u64) -> RpcResult<Option<Vec<Bytes>>> {
+        let Some(read) = self.blocks_by_range.clone() else {
+            return Ok(None);
+        };
+        let count = count.min(MAX_BLOCKS_BY_RANGE);
+        let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        // Database reads: off the RPC's async workers.
+        tokio::task::spawn_blocking(move || read(start, count, max_bytes))
+            .await
+            .map(Some)
+            .map_err(|err| ErrorObject::owned(INTERNAL_ERROR_CODE, err.to_string(), Option::<()>::None))
     }
 }
 

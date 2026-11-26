@@ -1,5 +1,34 @@
 # Mixed production standard, profile 1: status per client
 
+> ## v1 CLOSED (2026-11-26 01:50 EST)
+>
+> Every gate of the standard (as amended by AM28-AM30) passed in mixed rounds of gov5, n42-rs and n42-26:
+>
+> | Gate | Round(s) | Result |
+> | --- | --- | --- |
+> | 1 vectors | V1, V3, V4, V6, V8 (all 33 gov5 refused cases) | pass on each client |
+> | 2 idle mixed | mixed-3 (11-24) | 0..227 equal |
+> | 3 catch-up | gate3d | 0..378 equal, all four pull directions |
+> | 4 long absence | 4a snapshot files; 4c 70 min absent (gov5 15, n42-rs EL + 17 keys, n42-26 v99) | 0..410 equal; catch-up 13-30 s, voting <= 27 s after |
+> | 5 scale | 5b n=100, 5c killed leaders, 5d 33 absent | 0..183 / 0..176 / 0..147 equal, no halt |
+> | 6 n42-26 producer | gate6c | 0..182 equal, led every slot |
+> | block quality | txcheck2 | per-leader spread 1.8%, p90 inclusion 7.2-7.4 s |
+>
+> Releases: gov5 main 5eb5aba9 (binary 854a1982…), n42-rs main 6a793112e, n42-26 main 9feef34 (binary 9bba532a…;
+> AM28 fields in PR #47, approved by the owner, merge pending in n42-26's session).
+>
+> **v1.1 (open):** gate 4b p2p state sync, `bodies_by_range/2`, `commit_qc/1` (AM29, AM30); a mixed equivocation
+> round (no client has a double-sign injector); gov5 proposal-equivocation detection (M3d); the §7 open items
+> (E2 set changes, B11 follower rule, kept-tail bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a
+> negative leader).
+>
+> **Risks carried:** (1) liveness — k consecutive absent leaders stall about 24 + 48 + 96·(k−2) s (5d: 464 s for six);
+> mitigation candidates for v1.1: cap backoff across consecutive TCs, or a leader order that interleaves operators.
+> (2) Host — a full `/data` killed two members mid-round (round scripts now refuse under 50 GB free).
+> (3) gov5's consensus topic once used a 32-message queue (fixed, now warns on drops) — any client's subscriber
+> queue must hold a full vote burst at n = 100.
+
+
 **2026-11-24 21:15 EST — gate 2 PASSED.** Mixed round 3 (gov5 v0/v1 + n42-rs v2/v3, genesis-mixed-3 0xe6b358e8…): heights 0..227 byte-equal on all four, each validator led 57-58 blocks, 0 refusals, timeouts only at startup. Round 2 (12:00) was void and found the n42-rs justify-extension defect (fixed, main d8185220d) and a gov5 rebuild-on-genesis defect (fixed, gov5 1d72bf1b). Open from round 3: A17 timestamp stamping point (gov5 stamps at build start, n42-rs at publication), proposal AM26.
 
 As of 2026-11-24 (after the 05:05 EST post). Rules: `docs/MIXED_PRODUCTION_STANDARD_V1_RC.md` (v1.0-rc2).
@@ -215,4 +244,12 @@ With all three fixes in (gov5's speculative-fill rebuild, n42-rs's pool relay, n
 four leaders (gov5 v0/v1, n42-rs v2, n42-26 v3) sealed 158.5-161.5 transactions per block in steady state (spread
 1.8%), and transactions submitted to any client's RPC were included with p90 7.2-7.4 s (within one slot); 17,602
 sent, all included. Heights 0..146 equal, 0 refusals. The block-quality items opened after gates 3-6 are closed.
+
+## Gate 4c PASSED (2026-11-26, T0 00:20 EST) — long absence by range (AM29)
+
+Same 100-member mix. Absent 70 min under load: gov5 member 15 (with its execution layer), n42-rs layer 3 (one
+execution layer + 17 validator keys) and n42-26 v99. The chain advanced 32 -> 335 meanwhile. On restart: n42-rs
+caught up ~300 blocks in 18 s and voted 0.3 s later; n42-26 304 blocks in 13 s, voted at once and led block 424;
+gov5 member 15 at the head 30 s after restart, voting after 27 s. Heights 0..410 equal on all eight dumps, deltas
+8 x335 / 32 x74 (absent leaders) / 48 x1 (startup), 0 refusals, 45,000 transactions with 0 errors.
 

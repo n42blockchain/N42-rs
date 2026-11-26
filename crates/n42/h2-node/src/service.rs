@@ -8405,12 +8405,28 @@ async fn serve_range_v2_metered<E: ExecutionLayer>(
     let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let mut short_of_budget = false;
     let mut served = 0u64;
+    // The range in one read when the execution layer offers it, as the /1
+    // path does; a block the read did not carry is read on its own.
+    let count = request.count.min(MAX_SERVED_RANGE_BLOCKS).min(ceiling.saturating_add(1).saturating_sub(request.start));
+    let mut bulk = match el.blocks_by_range(request.start, count, BULK_RANGE_READ_BYTES).await {
+        Ok(Some(blocks)) => Some(blocks.into_iter().peekable()),
+        Ok(None) => None,
+        Err(err) => {
+            debug!(target: "n42.h2.node", %err, "execution layer could not read the range in one call; block by block");
+            None
+        }
+    };
     while let Some(number) = builder.wanted() {
         if served >= MAX_SERVED_RANGE_BLOCKS {
             builder.stop(EndReason::CountCap);
             break;
         }
-        let block = match el.block_by_number(number).await {
+        let pre = bulk.as_mut().and_then(|blocks| blocks.next_if(|block| block.header.number == number));
+        let read = match pre {
+            Some(block) => Ok(Some(block)),
+            None => el.block_by_number(number).await,
+        };
+        let block = match read {
             Ok(block) => block,
             Err(err) => {
                 debug!(target: "n42.h2.node", number, %err, "execution layer could not serve a block");

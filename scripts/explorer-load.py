@@ -14,6 +14,7 @@ CPU (utime+stime from /proc) is sampled around the run when --pid is given.
   explorer-load.py --rpc URL prepare --from A --to B           # index the range once
   explorer-load.py --rpc URL run --from A --to B --fetchers blocks,receipts [--duration S]
   explorer-load.py --rpc URL dump --from A --to B --out FILE   # responses for a diff
+  explorer-load.py --rpc URL ws --ws ws://HOST:PORT [--seconds S] # the realtime newHeads subscription
 
 Fetchers and their defaults (Blockscout's documented env defaults; see the
 doc for the assumptions behind them):
@@ -390,6 +391,64 @@ def cmd_dump(o):
     print(f"wrote {o.out}")
 
 
+def cmd_ws(o):
+    """Blockscout's realtime fetcher subscribes to newHeads over WebSocket:
+    check the subscription is accepted and count the heads that arrive."""
+    import base64
+    import socket
+    import struct
+    u = urllib.parse.urlparse(o.ws)
+    sock = socket.create_connection((u.hostname, u.port or 80), timeout=o.seconds + 5)
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall((f"GET {u.path or '/'} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\n"
+                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        buf += sock.recv(4096)
+    head, buf = buf.split(b"\r\n\r\n", 1)
+    if b" 101 " not in head.split(b"\r\n")[0]:
+        raise SystemExit(f"no upgrade: {head[:200]!r}")
+
+    def send(text):
+        data, mask = text.encode(), os.urandom(4)
+        n = len(data)
+        hdr = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
+        sock.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv():
+        nonlocal buf
+        def need(k):
+            nonlocal buf
+            while len(buf) < k:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise EOFError
+                buf += chunk
+        need(2)
+        n = buf[1] & 0x7F
+        off = 2
+        if n == 126:
+            need(4); n = struct.unpack(">H", buf[2:4])[0]; off = 4
+        elif n == 127:
+            need(10); n = struct.unpack(">Q", buf[2:10])[0]; off = 10
+        need(off + n)
+        payload, buf = buf[off:off + n], buf[off + n:]
+        return payload.decode()
+
+    send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["newHeads"]}))
+    print("subscribe:", recv())
+    heads, end = 0, time.time() + o.seconds
+    while time.time() < end:
+        sock.settimeout(max(0.1, end - time.time()))
+        try:
+            msg = json.loads(recv())
+        except (socket.timeout, TimeoutError, EOFError):
+            break
+        if msg.get("method") == "eth_subscription":
+            heads += 1
+    print(f"newHeads received in {o.seconds:.0f} s: {heads}")
+
+
 def main():
     # fork: the workers inherit the work list instead of unpickling it each
     # (Python 3.14 defaults to forkserver, which made the client the bound).
@@ -420,8 +479,11 @@ def main():
             p.add_argument("--out", required=True)
             p.add_argument("--sample-blocks", type=int, default=3)
             p.add_argument("--sample-calls", type=int, default=5)
+    p = sub.add_parser("ws", help="check the newHeads subscription")
+    p.add_argument("--ws", required=True, help="ws://host:port")
+    p.add_argument("--seconds", type=float, default=10.0)
     o = ap.parse_args()
-    {"prepare": cmd_prepare, "run": cmd_run, "dump": cmd_dump}[o.cmd](o)
+    {"prepare": cmd_prepare, "run": cmd_run, "dump": cmd_dump, "ws": cmd_ws}[o.cmd](o)
 
 
 if __name__ == "__main__":

@@ -94,12 +94,13 @@ fn us(at: std::time::Instant) -> u64 {
 }
 
 /// Executes `blocks` (consecutive, the first on `blocks[0].parent_hash`) on
-/// the parent's state and hands each executed block to `hand_off` in order.
+/// the parent's state and, once every block has passed, hands the executed
+/// blocks to `hand_off` in order; a refused run hands over nothing.
 ///
 /// `lean` checks every block but the last without the profile-1 signatures;
 /// `full` checks the last with them (both are the node's consensus rules
-/// otherwise). Stops at the first block refused or not handed off; `head` is
-/// the canonical head the run must start on. See the module docs.
+/// otherwise). Stops at the first block refused; `head` is the canonical
+/// head the run must start on. See the module docs.
 #[allow(clippy::too_many_arguments)]
 pub fn import_range<Provider, Evm, ChainSpec>(
     blocks: Vec<SealedBlock<Block>>,
@@ -145,6 +146,7 @@ where
         reth_provider::StateProvider::into_evm_state_provider(&state),
     )));
     let last = blocks.len() - 1;
+    let mut ready: Vec<Executed> = Vec::with_capacity(blocks.len());
     for (index, sealed) in blocks.into_iter().enumerate() {
         let block_at = std::time::Instant::now();
         let number = sealed.number;
@@ -237,17 +239,27 @@ where
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(TrieUpdates::default()),
         };
-        if let Err(why) = hand_off(executed) {
-            // Not the block's fault: the caller imports the rest itself.
-            out.unavailable = (out.imported == 0).then(|| format!("hand-off: {why}"));
-            return out;
-        }
+        ready.push(executed);
         times_us[T_HANDOFF] += us(at);
         tracing::debug!(target: "n42.catchup", number, txs, us = us(block_at), "range block imported");
         out.imported += 1;
         out.head = Some(hash);
         parent = next_parent;
     }
+    // Every block passed, the last with the profile-1 signatures: only now
+    // does anything reach the engine. A run refused above leaves nothing in
+    // the tree (its matching QMDB roots are non-canonical forest entries,
+    // as a fork block's are, never persisted).
+    let at = std::time::Instant::now();
+    for executed in ready {
+        if let Err(why) = hand_off(executed) {
+            out.unavailable = Some(format!("hand-off: {why}"));
+            out.imported = 0;
+            out.head = None;
+            break;
+        }
+    }
+    times_us[T_HANDOFF] += us(at);
     out
 }
 

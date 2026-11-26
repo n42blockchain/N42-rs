@@ -1806,6 +1806,7 @@ pub struct H2V4Transport {
     inner: Inner,
     identity: H2V4ChainIdentity,
     local_peer_id: PeerId,
+    commit_qc_peers: crate::sync_v11::peers::CommitQcPeers,
 }
 
 enum Inner {
@@ -1827,6 +1828,7 @@ impl H2V4Transport {
         Ok(Self {
             identity: core.identity(),
             local_peer_id: *core.local_peer_id(),
+            commit_qc_peers: core.v11.commit_qc_peers(),
             inner: Inner::Inline(Box::new(core)),
         })
     }
@@ -1844,6 +1846,7 @@ impl H2V4Transport {
         Ok(Self {
             identity: core.identity(),
             local_peer_id: *core.local_peer_id(),
+            commit_qc_peers: core.v11.commit_qc_peers(),
             inner: Inner::OffLoop(crate::pump::OffLoop::spawn(core)),
         })
     }
@@ -2031,6 +2034,12 @@ impl H2V4Transport {
             Inner::Inline(core) => core.apply_v11(command),
             Inner::OffLoop(off) => off.command(crate::pump::Command::SyncV11(command)),
         }
+    }
+
+    /// Whether this node asks `peer` over `commit_qc/1`: the client is on,
+    /// the peer listed it in identify and has not refused it.
+    pub fn speaks_commit_qc(&self, peer: &PeerId) -> bool {
+        self.commit_qc_peers.read().is_ok_and(|peers| peers.contains(peer))
     }
 
     /// Asks `peer` for the commit QC anchoring `request` over `commit_qc/1`.

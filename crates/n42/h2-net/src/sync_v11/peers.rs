@@ -6,7 +6,8 @@
 //! marking a peer v1-only for an hour), the requests in flight, and the
 //! reply channels a server answers on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use libp2p::request_response::{InboundRequestId, OutboundRequestId, ResponseChannel};
@@ -56,6 +57,10 @@ pub(crate) enum V11Command {
     RespondCommitQc(CommitQcChannel, CommitQcReply),
 }
 
+/// The peers this node asks `commit_qc/1`, shared with the transport's
+/// owner (the swarm may run on its own task).
+pub(crate) type CommitQcPeers = Arc<RwLock<HashSet<PeerId>>>;
+
 /// The transport's v1.1 bookkeeping.
 #[derive(Debug)]
 pub(crate) struct V11State {
@@ -72,6 +77,8 @@ pub(crate) struct V11State {
     pub(crate) commit_qcs: HashMap<OutboundRequestId, CommitQcRequest>,
     /// What each `/2` reply holds until it is sent.
     pub(crate) range_guards: HashMap<InboundRequestId, ServeGuard>,
+    /// [`Self::speaks`] `commit_qc/1`, as a set the owner can read.
+    commit_qc_peers: CommitQcPeers,
 }
 
 impl Default for V11State {
@@ -90,6 +97,23 @@ impl V11State {
             ranges: HashMap::new(),
             commit_qcs: HashMap::new(),
             range_guards: HashMap::new(),
+            commit_qc_peers: CommitQcPeers::default(),
+        }
+    }
+
+    /// The peers this node asks `commit_qc/1`, kept current.
+    pub(crate) fn commit_qc_peers(&self) -> CommitQcPeers {
+        Arc::clone(&self.commit_qc_peers)
+    }
+
+    fn publish_commit_qc(&self, peer: PeerId) {
+        let speaks = self.speaks(&peer, COMMIT_QC_PROTOCOL);
+        if let Ok(mut peers) = self.commit_qc_peers.write() {
+            if speaks {
+                peers.insert(peer);
+            } else {
+                peers.remove(&peer);
+            }
         }
     }
 
@@ -97,11 +121,13 @@ impl V11State {
     pub(crate) fn learn(&mut self, peer: PeerId, protocols: &[StreamProtocol]) {
         let lists = |id: &str| protocols.iter().any(|p| p.as_ref() == id);
         self.caps.insert(peer, (lists(BODIES_BY_RANGE_V2_PROTOCOL), lists(COMMIT_QC_PROTOCOL)));
+        self.publish_commit_qc(peer);
     }
 
     /// Forgets a peer that went away.
     pub(crate) fn forget(&mut self, peer: &PeerId) {
         self.caps.remove(peer);
+        self.publish_commit_qc(*peer);
     }
 
     /// Marks `peer` v1-only for `protocol` ([`V1_ONLY_FOR`]).
@@ -111,6 +137,7 @@ impl V11State {
             self.refused.retain(|_, until| *until > now);
         }
         self.refused.insert((peer, protocol), Instant::now() + V1_ONLY_FOR);
+        self.publish_commit_qc(peer);
     }
 
     /// Whether this node asks `peer` over `protocol`: the client is on, the

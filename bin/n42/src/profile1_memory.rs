@@ -10,18 +10,23 @@
 //!   chain parser starts it; an operator's `RAYON_NUM_THREADS` wins);
 //! - `--cpu-cores` (tokio's workers and reth's CPU, RPC, blocking, proof and
 //!   prewarming pools) and `--engine.cross-block-cache-size` take the
-//!   profile's values ([`apply_to_node_command`]; a flag on the command line
-//!   wins).
+//!   profile's values, and so does `--db.rocksdb-block-cache-size`
+//!   ([`apply_to_node_command`]; a flag on the command line wins);
+//! - the QMDB prefault knobs the environment leaves unset are set for the
+//!   profile's block size
+//!   ([`n42_qmdb_reth::profile1_memory::set_prefault_knobs`]).
 
 use std::num::NonZeroUsize;
 
 use n42_qmdb_reth::profile1_memory::{flag_given, MemoryDefaults};
-use reth_node_core::args::EngineArgs;
+use reth_node_core::args::{DatabaseArgs, EngineArgs};
 
 /// The flag that sizes reth's pools by a core count.
 pub const CPU_CORES_FLAG: &str = "--cpu-cores";
 /// The flag that sizes reth's cross-block execution cache.
 pub const CROSS_BLOCK_CACHE_FLAG: &str = "--engine.cross-block-cache-size";
+/// The flag that sizes the `RocksDB` block cache.
+pub const ROCKSDB_CACHE_FLAG: &str = "--db.rocksdb-block-cache-size";
 
 /// The process's arguments (program name excluded), lossy UTF-8.
 pub fn process_args() -> Vec<String> {
@@ -30,7 +35,12 @@ pub fn process_args() -> Vec<String> {
 
 /// After the command line is parsed: the node command's engine arguments
 /// the operator left unset take the profile's values. Returns what it set.
-pub fn apply_to_node_command(defaults: &MemoryDefaults, args: &[String], engine: &mut EngineArgs) -> Vec<String> {
+pub fn apply_to_node_command(
+    defaults: &MemoryDefaults,
+    args: &[String],
+    engine: &mut EngineArgs,
+    db: &mut DatabaseArgs,
+) -> Vec<String> {
     let mut set = Vec::new();
     if let Some(cores) = defaults.cores.and_then(NonZeroUsize::new)
         && !flag_given(args, CPU_CORES_FLAG)
@@ -41,6 +51,10 @@ pub fn apply_to_node_command(defaults: &MemoryDefaults, args: &[String], engine:
     if !flag_given(args, CROSS_BLOCK_CACHE_FLAG) {
         engine.cross_block_cache_size = defaults.cross_block_cache_mb;
         set.push(format!("{CROSS_BLOCK_CACHE_FLAG} {}", defaults.cross_block_cache_mb));
+    }
+    if !flag_given(args, ROCKSDB_CACHE_FLAG) {
+        db.rocksdb_block_cache_size = Some(defaults.rocksdb_cache_mb << 20);
+        set.push(format!("{ROCKSDB_CACHE_FLAG} {}MB", defaults.rocksdb_cache_mb));
     }
     set
 }
@@ -55,33 +69,46 @@ mod tests {
 
     #[test]
     fn unset_flags_take_the_profile_values() {
-        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256 };
+        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32 };
         let mut engine = EngineArgs::default();
-        let set = apply_to_node_command(&defaults, &args(&["node", "--chain", "g.json"]), &mut engine);
+        let mut db = DatabaseArgs::default();
+        let set = apply_to_node_command(&defaults, &args(&["node", "--chain", "g.json"]), &mut engine, &mut db);
         assert_eq!(engine.cpu_cores, NonZeroUsize::new(8));
         assert_eq!(engine.cross_block_cache_size, 256);
-        assert_eq!(set.len(), 2);
+        assert_eq!(db.rocksdb_block_cache_size, Some(32 << 20));
+        assert_eq!(set.len(), 3);
     }
 
     #[test]
     fn an_operator_flag_wins() {
-        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256 };
+        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32 };
         let mut engine = EngineArgs { cpu_cores: NonZeroUsize::new(32), cross_block_cache_size: 1024, ..Default::default() };
+        let mut db = DatabaseArgs { rocksdb_block_cache_size: Some(1 << 30), ..Default::default() };
         let set = apply_to_node_command(
             &defaults,
-            &args(&["node", "--cpu-cores", "32", "--engine.cross-block-cache-size=1024"]),
+            &args(&[
+                "node",
+                "--cpu-cores",
+                "32",
+                "--engine.cross-block-cache-size=1024",
+                "--db.rocksdb-block-cache-size",
+                "1GB",
+            ]),
             &mut engine,
+            &mut db,
         );
         assert_eq!(engine.cpu_cores, NonZeroUsize::new(32));
         assert_eq!(engine.cross_block_cache_size, 1024);
+        assert_eq!(db.rocksdb_block_cache_size, Some(1 << 30));
         assert!(set.is_empty());
     }
 
     #[test]
     fn host_cores_leave_cpu_cores_unset() {
-        let defaults = MemoryDefaults { cores: None, cross_block_cache_mb: 256 };
+        let defaults = MemoryDefaults { cores: None, cross_block_cache_mb: 256, rocksdb_cache_mb: 32 };
         let mut engine = EngineArgs::default();
-        apply_to_node_command(&defaults, &args(&["node"]), &mut engine);
+        let mut db = DatabaseArgs::default();
+        apply_to_node_command(&defaults, &args(&["node"]), &mut engine, &mut db);
         assert_eq!(engine.cpu_cores, None);
         assert_eq!(engine.cross_block_cache_size, 256);
     }

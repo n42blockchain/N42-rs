@@ -104,13 +104,21 @@ fn main() {
     let p1_memory = n42_qmdb_reth::profile1_memory::MemoryDefaults::for_args(&process_args);
     let mut p1_memory_set: Vec<String> = Vec::new();
     if let Some(defaults) = &p1_memory {
+        // SAFETY: before any thread this program starts (the rayon pool is
+        // built just below) and before any QMDB knob is read.
+        p1_memory_set.extend(unsafe { n42_qmdb_reth::profile1_memory::set_prefault_knobs() });
         p1_memory_set.extend(n42_qmdb_reth::profile1_memory::size_rayon_global(defaults));
     }
     let mut cli = Cli::<N42ChainSpecParser, N42Args>::parse();
     if let Some(defaults) = &p1_memory
         && let Some(node) = cli.as_node_command_mut()
     {
-        p1_memory_set.extend(n42::profile1_memory::apply_to_node_command(defaults, &process_args, &mut node.engine));
+        p1_memory_set.extend(n42::profile1_memory::apply_to_node_command(
+            defaults,
+            &process_args,
+            &mut node.engine,
+            &mut node.db,
+        ));
     }
     if !p1_memory_set.is_empty() {
         eprintln!("n42: profile 1 memory defaults: {} (N42_P1_MEMORY=0 turns them off)", p1_memory_set.join(", "));

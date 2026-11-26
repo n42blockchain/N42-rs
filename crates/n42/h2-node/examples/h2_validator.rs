@@ -226,14 +226,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown argument {other}\n\n{USAGE}").into()),
         }
     }
-    // Profile 1 sizes rayon's global pool for 8-second blocks instead of the
-    // host's cores (docs/P1_MEMORY.md), before anything uses it; an
-    // operator's RAYON_NUM_THREADS wins and N42_P1_MEMORY=0 turns it off.
+    // Profile 1 sizes rayon's global pool and the QMDB prefault pools for
+    // 8-second blocks instead of the host's cores and the fleet's blocks
+    // (docs/P1_MEMORY.md), before anything uses them; an operator's
+    // RAYON_NUM_THREADS / N42_* value wins and N42_P1_MEMORY=0 turns it off.
     let process_args: Vec<String> = std::env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()).collect();
-    if let Some(defaults) = n42_qmdb_reth::profile1_memory::MemoryDefaults::for_args(&process_args)
-        && let Some(done) = n42_qmdb_reth::profile1_memory::size_rayon_global(&defaults)
-    {
-        eprintln!("h2_validator: profile 1 memory defaults: {done} (N42_P1_MEMORY=0 turns them off)");
+    if let Some(defaults) = n42_qmdb_reth::profile1_memory::MemoryDefaults::for_args(&process_args) {
+        // SAFETY: no thread of this program exists yet (the tracing
+        // subscriber spawns none) and no QMDB knob has been read.
+        let mut done = unsafe { n42_qmdb_reth::profile1_memory::set_prefault_knobs() };
+        done.extend(n42_qmdb_reth::profile1_memory::size_rayon_global(&defaults));
+        if !done.is_empty() {
+            eprintln!("h2_validator: profile 1 memory defaults: {} (N42_P1_MEMORY=0 turns them off)", done.join(", "));
+        }
     }
 
     // Everything about the fleet from one file, when there is one.

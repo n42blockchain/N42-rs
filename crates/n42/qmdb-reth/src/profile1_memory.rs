@@ -38,12 +38,20 @@ pub const CORES_KNOB: &str = "N42_P1_CORES";
 /// a profile-1 member (default [`DEFAULT_CROSS_BLOCK_CACHE_MB`]).
 pub const CROSS_BLOCK_CACHE_KNOB: &str = "N42_P1_CROSS_BLOCK_CACHE_MB";
 
+/// `N42_P1_ROCKSDB_CACHE_MB=<n>`: the `RocksDB` block cache on a profile-1
+/// member (default [`DEFAULT_ROCKSDB_CACHE_MB`]).
+pub const ROCKSDB_CACHE_KNOB: &str = "N42_P1_ROCKSDB_CACHE_MB";
+
 /// The cores a profile-1 member sizes its pools by.
 pub const DEFAULT_CORES: usize = 8;
 
 /// reth's cross-block execution cache on a profile-1 member, in MiB (reth's
 /// default is 4096).
 pub const DEFAULT_CROSS_BLOCK_CACHE_MB: usize = 256;
+
+/// The `RocksDB` block cache (transaction hash index) on a profile-1 member,
+/// in MiB (reth's default is 128).
+pub const DEFAULT_ROCKSDB_CACHE_MB: usize = 32;
 
 /// What a profile-1 member sizes by, after the knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +60,8 @@ pub struct MemoryDefaults {
     pub cores: Option<usize>,
     /// reth's cross-block execution cache, MiB.
     pub cross_block_cache_mb: usize,
+    /// The `RocksDB` block cache, MiB.
+    pub rocksdb_cache_mb: usize,
 }
 
 impl MemoryDefaults {
@@ -66,7 +76,8 @@ impl MemoryDefaults {
             n => Some(n.min(host)),
         };
         let cross_block_cache_mb = n42_env::parse(CROSS_BLOCK_CACHE_KNOB, DEFAULT_CROSS_BLOCK_CACHE_MB);
-        Some(Self { cores, cross_block_cache_mb })
+        let rocksdb_cache_mb = n42_env::parse(ROCKSDB_CACHE_KNOB, DEFAULT_ROCKSDB_CACHE_MB);
+        Some(Self { cores, cross_block_cache_mb, rocksdb_cache_mb })
     }
 
     /// The defaults for a process started with `args` (the program name
@@ -92,6 +103,40 @@ pub fn size_rayon_global(defaults: &MemoryDefaults) -> Option<String> {
         .build_global()
         .ok()
         .map(|()| format!("rayon global pool {cores} threads"))
+}
+
+/// The QMDB prefault knobs a profile-1 member sets when the environment
+/// leaves them unset (`crates/n42/twig-core/src/prefault.rs`). Their
+/// defaults keep memory faulted in ahead for the fleet's 163,000-operation
+/// blocks -- 512 clean twig trees (64 MiB), a 64 MiB populated append window,
+/// two 8 MiB offsets segments -- in every process that opens a QMDB tree,
+/// the validator's genesis-root computation included. A profile-1 block is a
+/// few hundred operations: one twig (2,048 entries) lasts several blocks.
+/// The values change when a page is faulted, never a byte of the tree.
+pub const PREFAULT_KNOBS: &[(&str, &str)] = &[
+    ("N42_TWIG_POOL_FLOOR", "16"),
+    ("N42_QMDB_APPEND_AHEAD_MB", "8"),
+    ("N42_QMDB_OFFSET_SEGMENTS_AHEAD", "1"),
+];
+
+/// Sets every [`PREFAULT_KNOBS`] entry the environment leaves unset; returns
+/// the ones it set, as `NAME=value`.
+///
+/// # Safety
+///
+/// Writes the process environment: call it from `main` before any thread
+/// that could read or write the environment exists, and before any of the
+/// knobs is read (they are read once, at first use).
+pub unsafe fn set_prefault_knobs() -> Vec<String> {
+    let mut set = Vec::new();
+    for (name, value) in PREFAULT_KNOBS {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: the caller guarantees no concurrent environment access.
+            unsafe { std::env::set_var(name, value) };
+            set.push(format!("{name}={value}"));
+        }
+    }
+    set
 }
 
 /// The value of `--chain` in `args` (`--chain <v>` or `--chain=<v>`), the last

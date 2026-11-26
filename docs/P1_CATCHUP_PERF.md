@@ -245,6 +245,188 @@ QMDB's pools size themselves to the machine and then spend their time handing
 tiny tasks across 254 threads. 64 CPUs is no better than 32 on empty blocks
 and slightly better on full ones; 16 CPUs is too few for full blocks.
 
+**Step 6: batch import of a committed range** (`n42Engine_importRange`,
+`bin/n42/src/catchup_import.rs`; validator side `N42_SYNC_BATCH_IMPORT=1`,
+off by default). The validator's pulled-block importer hands every queued
+block of one pull generation (up to 256) to the EL in one call instead of one
+`newPayload` each. The EL converts the payloads as `newPayload` does, then for
+each block, in order:
+
+1. checks it against the parent: the same header, pre-execution and body
+   rules the engine uses (`validate_header`, `validate_header_against_parent`,
+   `validate_block_pre_execution_with_tx_root`), with one difference given
+   below;
+2. executes it on one EVM cache carried across the run (no per-block
+   prewarm, no state-cache rebuild, no per-block engine task fan-out);
+3. checks its receipts, gas and requests (`validate_block_post_execution`);
+4. computes its QMDB root and compares it with the header's state root
+   (`validate_block_operations`, the follower import's check);
+5. once every block of the run has passed, hands the executed blocks to the
+   engine's tree in order (`executed_inserts`, the fleet7 follower's road),
+   so persistence and history are what they are for any block.
+
+One forkchoice at the end moves the head to the last block. The call is all
+or nothing: the head moves only when every block of the run passed, the last
+one with the full rules. The run stops at the first block that fails any check
+and reports it as `refused`, with nothing imported and nothing handed to the
+tree. The validator then imports the whole run by `newPayload`, so the
+verdict on a bad block is always the per-block path's.
+
+Under deferred execution (profile 1, from block 1) step 4 is the engine's
+deferred form. A header carries its parent's results, which step 1 compares
+with what this node filed for the parent: the previous block of the run, or
+the engine's last import. The block's own receipts and QMDB root are filed
+for its child (`insert_block_operations`, `remember_state_root`). The last
+block's own results are checked by the header after it, in the next run or on
+the live path. When the run's first parent is executed but not yet the head
+(the validator moves the head once per report), the EL first makes it the
+head. A parent it cannot make the head, or an engine that is not running,
+answers `unavailable`, and the validator goes block by block.
+
+Two deviations from the first sketch (section 7, item 1):
+
+- *The root is still per block, not one per batch.* The QMDB forest records a
+  version per block, and history, persistence and the engine tree are keyed
+  by it. Pinned, an empty block's root costs 0.35 ms. A mismatch is localised
+  to its block when it happens, with no re-execution pass.
+- *Persistence is the engine's.* The executed blocks enter the tree like any
+  other block and are persisted at the engine's threshold, not once per call.
+
+**The condition for ever turning it on by default.** A batch is imported
+only after the BLS check of a commit QC at or above its last block has
+passed, and only when the batch is parent-linked to that QC's block and to the
+EL's head. Execution may start speculatively, but nothing becomes canonical,
+is persisted or is served, and no forkchoice moves, before that. A failed
+check or a root mismatch leaves no trace in the EL. Where the code holds it:
+
+- *QC first.* The validator spawns the batched importer only under
+  `N42_SYNC_ANCHOR=enforce` (`sync_batch_import && sync_anchor_mode ==
+  Enforce` in `service.rs`; under `observe` or `off` it imports block by
+  block). Under enforce, a pulled block is queued for the importer only when
+  a commit-domain QC, verified under the set of its exact view, names a block
+  at or above it. The anchor buffer is parent-linked from that block down to
+  the executed head (`buffer_pulled`, `sync_anchor.rs`). Every block of a batch
+  is therefore covered by a verified commit QC before the EL sees it.
+- *Linked to our head.* The run's first parent must be the EL's head. The
+  only forkchoice the EL makes before a run passes is to that parent: a block
+  the validator already imported, which the engine accepts only if it holds
+  it as valid. Otherwise the run is `unavailable`. Each block's parent link
+  is checked.
+- *No trace on failure.* The EL executes the whole run on a private cache.
+  It hands the executed blocks to the engine's tree only after every block
+  has passed, the last one also with its QC and seal. Only then does one
+  forkchoice move the head. A refused run hands over nothing, moves no head
+  and persists nothing. A block whose QMDB root does not match is not filed
+  in the forest. Blocks of a failed run whose roots did match stay as
+  in-memory, non-canonical forest entries, as a fork block's do under
+  `newPayload`, and are never persisted. The same holds for their deferred
+  execution fields: in memory, keyed by block hash.
+- *Test.* `a_batch_whose_top_qc_is_forged_leaves_the_el_head_and_state_unchanged`
+  (a chain whose QCs are forged from block 2, no honest peer, batch import
+  and lazy screening on): no run, no block and no forkchoice reaches the EL.
+  `batch_import_runs_the_honest_chain_and_nothing_a_forger_served` (a forger
+  beside an honest peer, eager and lazy): the honest chain goes in runs, in
+  order, and no forged block is ever in one.
+
+**Safety.** The live path does not change: `newPayload`, forkchoice, the
+builder and the follower import are not touched. The method is on the
+JWT-authenticated Engine API, and only the validator's catch-up importer calls
+it. That importer only ever holds blocks under a verified commit-QC anchor
+(step 3), and it stops calling it once the pull is done and the loop is at the
+head. The one check the EL drops is on every block *but the last of a run*:
+the profile-1 header's two BLS checks, the embedded QC and the proposer's
+seal. The last block gets the full rule set (`HotStuffConsensus::
+without_header_signatures` is the same rules with the proposer schedule taken
+out). The EL's own guarantee is therefore at least what `newPayload` gives
+block by block, without trusting the caller:
+
+- The last block's embedded QC is 2f+1 signatures over its parent's hash. That
+  hash commits to the grandparent's, and so on down to the run's first block.
+  So every block below the last is quorum-certified through the hash chain,
+  the same way a block's own embedded QC certifies only its parent under
+  `newPayload`.
+- The last block's seal is checked as `newPayload` checks it.
+- A forged block inside the run therefore cannot match the hash chain the
+  last block's verified QC fixes. A run with a forged tail fails at its last
+  block, and nothing of it reaches the engine's tree.
+- Everything else -- execution, receipts, gas, requests, the state root
+  against the QMDB root, the parent link, timestamps, the committee link --
+  is checked for every block, as before.
+
+`N42_CATCHUP_IMPORT=0` withdraws the method on the EL (it answers `null`, and
+the validator stops asking). Tests: `batched_importer_*` (one call for a
+queued run; block by block without the method; a refused block gets the
+per-block verdict), `import_range_is_null_when_not_offered_*`,
+`an_import_range_answer_is_read`; end to end, the catch-up legs below, which
+check the joiner's head hash against the servers'.
+
+**Only small blocks go in runs** (`BATCH_BLOCK_MAX_BYTES`, 16 KiB of
+transactions). Per block, `newPayload` was as fast as or faster than the run
+on small, medium and large blocks: the engine overlaps execution with its
+root and receipt tasks, and the run executes serially. The run wins only on
+near-empty blocks, so a bigger block goes alone through `newPayload`.
+
+**Memory bounds** (validator side). The importer's queue is bounded by
+transaction bytes (`IMPORT_QUEUE_BYTES`, 64 MiB) as well as by count. A call
+carries at most 4 MiB (`BATCH_IMPORT_BYTES`) and 256 blocks. The byte bound
+is checked once, when the service asks for room. An earlier version also
+refused in `try_send`. The service dropped the refused block, the next run
+had a gap, and the EL refused the run ("not the child of"). Leg p1ba on ba5
+showed this: 362 s. With the fix, the same leg takes 114 s and no run is
+refused.
+
+**Measured** (ba6 = this branch at the fix; joiner EL unpinned; servers on
+CPUs 64-95,192-223; 2026-11-26 15:19-15:59 UTC, S1 hold running; foreign
+tests by the memory agent drove the load to 180-460 from 15:25 to 15:47, and
+every leg that overlapped them was rerun. Load is noted per leg.)
+
+| leg | chain | profile-1 memory defaults | import | wall | rate | EL cores | load before / after |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| p1pb6r | bench, 2,277 blocks | on | per block | 116.8 s | 127k tx/s, 15.2 MB/s | 7.4 | 33 / 19 |
+| p1ba6 / p1ba6r | bench | on | runs (small blocks) | 114.3 / 115.3 s | 130k / 129k tx/s | 7.8 | 10 / 12; 12 / 13 |
+| p1nopw6r | bench | on, `--engine.disable-prewarming` | per block | 116.8 s | 127k tx/s | 6.7 | 30 / 15 |
+| p0pb6r | bench | off (`N42_P1_MEMORY=0`) | per block | 142.5 s | 104k tx/s | 121 | 42 / 168 (own EL) |
+| p0ba6r | bench | off | runs | 137.1 s | 109k tx/s | 128 | 15 / 217 (own EL) |
+| ep1pb6 | empty, 12,584 blocks | on | per block | 26.6 s | 473 blocks/s | | 12 / 11 |
+| ep1ba6 | empty | on | runs | 17.6 s | 716 blocks/s | 2.1 | 18 / 15 |
+| ep0ba6r | empty | off | runs | 25.6 s | 489 blocks/s | 199 | 13 / 76 |
+| ep1pblazy6r | empty, lazy screening | on | per block | 26.1 s | 482 blocks/s | 1.6 | 22 / 15 |
+| ep1balazy6r | empty, lazy screening | on | runs | 3.6 s | **3,541 blocks/s**, 3.4 MB/s | 4.3 | 25 / 25 |
+
+What one near-empty block costs inside a run (EL log, ms):
+
+| leg | checks | execute | root | rest | whole call | blocks a call |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ep1ba6 | 0.90 | 0.07 | 0.12 | 0.07 | 1.18 | 2 |
+| ep1balazy6r | 0.05 | 0.02 | 0.12 | 0.03 | **0.23** | 247 |
+| ep0ba6r (defaults off) | 0.31 | 0.07 | 1.45 | 0.13 | 1.96 | 9 |
+| per block, `newPayload` (ep1pb6) | | | 0.13 | | 2.0 (cycle) | 1 |
+
+- *The run reaches 0.23 ms a block, but only when it is fed.* With eager
+  screening, the validator verifies every pulled block's QC before queuing
+  it, about 1.15 ms a block. The importer then finds two blocks waiting per
+  call (5,407 of 5,438 calls). The last block's full checks (embedded QC and
+  seal, about 1.2 ms) are paid per call, i.e. per two blocks. With lazy
+  screening (step 3, off by default) the runs are 247 blocks long, and the
+  EL's per-block cost is the QMDB root (0.12 ms) plus 0.1 ms. The eager
+  screening is now the bound on empty blocks.
+- *Against the link.* 3,541 blocks/s of ~970-byte blocks is 3.4 MB/s, about
+  28 Mbit/s: still short of 100 Mbit/s (12.9k blocks/s at this size, 17.6k
+  at chain 94's 710 bytes). The EL could do about 4.4k blocks/s at 0.23 ms;
+  past that the per-block QMDB root is the floor. Eager screening caps it at
+  ~720 blocks/s.
+- *The thread pools* (task 2b). `--cpu-cores` sizes reth's pools and, since
+  this branch, rayon's global pool (`RAYON_NUM_THREADS`, when unset), the one
+  QMDB's root and the committee-link prefetch run on. Main's profile-1
+  defaults pass `--cpu-cores 8`. With them, the bench chain runs 18-20%
+  faster on 7-8 EL cores instead of 120-130. An empty block's root is 0.12 ms
+  instead of 1.45 ms. A run of empty blocks is 1.7x faster.
+- *Prewarm and receipt-root tasks* (task 2c). A run executes on one cache
+  carried across its blocks, with no prewarm and no per-block receipt-root
+  task. On the per-block path, `--engine.disable-prewarming` changes nothing
+  measurable on this chain with the profile-1 pools (116.8 s either way),
+  so it is not made a default.
+
 ## 5. Throughput against link speed
 
 Best configuration measured (pin2e: branch, EL on 32 CPUs) against what each
@@ -299,7 +481,16 @@ batch, next newPayload). On full blocks the engine's per-block tasks dominate
 payload-convert 12 ms, post-execution validation 9 ms, persistence 194 ms
 per cycle of ~5.5 blocks.
 
-Next steps, largest first:
+Status after step 6 (2026-11-26): item 1 is built (`n42Engine_importRange`,
+off by default) and reaches 0.23 ms per empty block when the runs are long.
+Item 2 is main's profile-1 defaults plus rayon following `--cpu-cores`. Item
+3's prewarm is irrelevant at those pool sizes, and a run skips it anyway. On
+empty blocks the bound is now the validator's eager QC screening, about
+1.15 ms a block. Next: screen a pulled range's QCs in parallel, or rely on
+the anchor's QC when the run is anchored. Then the per-block QMDB root at
+0.12 ms.
+
+Next steps, largest first (as written before step 6):
 
 1. **Batch import for committed ranges** (an Engine extension such as
    `n42Engine_importRange(blocks)`). It would execute a run of

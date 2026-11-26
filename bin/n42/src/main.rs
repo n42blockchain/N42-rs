@@ -104,10 +104,9 @@ fn main() {
     let p1_memory = n42_qmdb_reth::profile1_memory::MemoryDefaults::for_args(&process_args);
     let mut p1_memory_set: Vec<String> = Vec::new();
     if let Some(defaults) = &p1_memory {
-        // SAFETY: before any thread this program starts (the rayon pool is
-        // built just below) and before any QMDB knob is read.
-        p1_memory_set.extend(unsafe { n42_qmdb_reth::profile1_memory::set_prefault_knobs() });
-        p1_memory_set.extend(n42_qmdb_reth::profile1_memory::size_rayon_global(defaults));
+        // SAFETY: before any thread this program starts and before any of
+        // the variables is read (the chain parser below is the first reader).
+        p1_memory_set.extend(unsafe { n42_qmdb_reth::profile1_memory::set_env_defaults(defaults) });
     }
     let mut cli = Cli::<N42ChainSpecParser, N42Args>::parse();
     if let Some(defaults) = &p1_memory

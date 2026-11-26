@@ -18,8 +18,9 @@
 //!
 //! The chain is known only after the command line is parsed, but the thread
 //! pools that matter are sized before that (clap runs the chain parser, which
-//! computes the genesis root on rayon's global pool), so [`peek_args`] reads
-//! the genesis file named by `--chain` first, the way the parser will.
+//! computes the genesis root on rayon's global pool and opens a QMDB tree),
+//! so [`peek_args`] reads the genesis file named by `--chain` first, the way
+//! the parser will, and [`set_env_defaults`] runs before it.
 
 use std::path::Path;
 
@@ -88,23 +89,6 @@ impl MemoryDefaults {
     }
 }
 
-/// rayon's global pool sized for the profile: [`MemoryDefaults::cores`]
-/// threads, unless the operator set `RAYON_NUM_THREADS` or the pool already
-/// exists. Called before anything uses the pool (`n42`: before clap's chain
-/// parser computes the genesis root on it). Returns what it did.
-pub fn size_rayon_global(defaults: &MemoryDefaults) -> Option<String> {
-    let cores = defaults.cores?;
-    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
-        return None;
-    }
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(cores)
-        .thread_name(|i| format!("rayon-{i:02}"))
-        .build_global()
-        .ok()
-        .map(|()| format!("rayon global pool {cores} threads"))
-}
-
 /// The QMDB prefault knobs a profile-1 member sets when the environment
 /// leaves them unset (`crates/n42/twig-core/src/prefault.rs`). Their
 /// defaults keep memory faulted in ahead for the fleet's 163,000-operation
@@ -119,17 +103,23 @@ pub const PREFAULT_KNOBS: &[(&str, &str)] = &[
     ("N42_QMDB_OFFSET_SEGMENTS_AHEAD", "1"),
 ];
 
-/// Sets every [`PREFAULT_KNOBS`] entry the environment leaves unset; returns
-/// the ones it set, as `NAME=value`.
+/// Sets, where the environment leaves them unset, `RAYON_NUM_THREADS` to
+/// [`MemoryDefaults::cores`] -- every rayon pool built with the default size
+/// follows it: the global pool (which clap's chain parser starts for the
+/// genesis root), reth's RPC blocking pool -- and every [`PREFAULT_KNOBS`]
+/// entry. Returns what it set, as `NAME=value`.
 ///
 /// # Safety
 ///
 /// Writes the process environment: call it from `main` before any thread
 /// that could read or write the environment exists, and before any of the
-/// knobs is read (they are read once, at first use).
-pub unsafe fn set_prefault_knobs() -> Vec<String> {
+/// variables is read (the knobs are read once, at first use; rayon reads
+/// `RAYON_NUM_THREADS` when a pool is built).
+pub unsafe fn set_env_defaults(defaults: &MemoryDefaults) -> Vec<String> {
     let mut set = Vec::new();
-    for (name, value) in PREFAULT_KNOBS {
+    let cores = defaults.cores.map(|cores| cores.to_string());
+    let rayon = cores.as_deref().map(|cores| ("RAYON_NUM_THREADS", cores));
+    for (name, value) in rayon.into_iter().chain(PREFAULT_KNOBS.iter().copied()) {
         if std::env::var_os(name).is_none() {
             // SAFETY: the caller guarantees no concurrent environment access.
             unsafe { std::env::set_var(name, value) };

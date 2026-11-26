@@ -5,16 +5,14 @@
 //! [`n42_qmdb_reth::profile1_memory`]): on a profile-1 genesis, unless the
 //! operator chose otherwise,
 //!
-//! - rayon's global pool gets [`MemoryDefaults::cores`] threads
-//!   ([`n42_qmdb_reth::profile1_memory::size_rayon_global`], before clap's
-//!   chain parser starts it; an operator's `RAYON_NUM_THREADS` wins);
+//! - rayon's pools get [`MemoryDefaults::cores`] threads and the QMDB
+//!   prefault knobs the profile's block size
+//!   ([`n42_qmdb_reth::profile1_memory::set_env_defaults`], before clap's
+//!   chain parser starts the global pool; an operator's value wins);
 //! - `--cpu-cores` (tokio's workers and reth's CPU, RPC, blocking, proof and
 //!   prewarming pools) and `--engine.cross-block-cache-size` take the
 //!   profile's values, and so does `--db.rocksdb-block-cache-size`
-//!   ([`apply_to_node_command`]; a flag on the command line wins);
-//! - the QMDB prefault knobs the environment leaves unset are set for the
-//!   profile's block size
-//!   ([`n42_qmdb_reth::profile1_memory::set_prefault_knobs`]).
+//!   ([`apply_to_node_command`]; a flag on the command line wins).
 
 use std::num::NonZeroUsize;
 

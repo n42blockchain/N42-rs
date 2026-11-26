@@ -185,6 +185,15 @@ fn write_buffer_manager_size() -> usize {
         .map_or(DEFAULT_WRITE_BUFFER_MANAGER_SIZE, |mb| mb << 20)
 }
 
+/// Whether a write waits once the memtables exceed the budget
+/// (`N42_ROCKSDB_WRITE_BUFFER_STALL`, on by default as upstream). Off, the
+/// budget only triggers flushes. With a 128 MiB budget a catch-up stopped
+/// for good right after a budget-triggered flush (`docs/P1_MEMORY.md`): the
+/// flushed memtable's memory stayed counted, so the stall never ended.
+fn write_buffer_manager_stall() -> bool {
+    std::env::var("N42_ROCKSDB_WRITE_BUFFER_STALL").map_or(true, |v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
+}
+
 /// Default cap on the total size of `RocksDB`'s write-ahead log (256 MiB).
 ///
 /// Unset, `RocksDB` derives the cap as four times the column families' combined
@@ -290,7 +299,7 @@ impl RocksDBBuilder {
         options.set_max_background_jobs(DEFAULT_MAX_BACKGROUND_JOBS);
         options.set_bytes_per_sync(DEFAULT_BYTES_PER_SYNC);
         let write_buffer_manager =
-            WriteBufferManager::new_write_buffer_manager(write_buffer_manager_size(), true);
+            WriteBufferManager::new_write_buffer_manager(write_buffer_manager_size(), write_buffer_manager_stall());
         options.set_write_buffer_manager(&write_buffer_manager);
 
         options.set_bottommost_compression_type(DBCompressionType::Zstd);

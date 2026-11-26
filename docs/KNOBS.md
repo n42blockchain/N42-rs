@@ -386,7 +386,7 @@ never reads them. Each sets a default the operator can still override with the f
 
 | Knob | Default | Values | Meaning | Where read | Status |
 |---|---|---|---|---|---|
-| `N42_P1_MEMORY` | on (profile 1 only) | `0` turns it off | Every profile-1 memory default: jemalloc `narenas`/`background_thread` (one `exec` of the process with `MALLOC_CONF`), `RAYON_NUM_THREADS`, `--cpu-cores`, the cross-block and RocksDB caches, and the QMDB prefault knobs `N42_TWIG_POOL_FLOOR=16`, `N42_QMDB_APPEND_AHEAD_MB=8`, `N42_QMDB_OFFSET_SEGMENTS_AHEAD=1`. A value the operator set always wins. | `qmdb-reth:profile1_memory.rs` | default |
+| `N42_P1_MEMORY` | on (profile 1 only) | `0` turns it off | Every profile-1 memory default: jemalloc `narenas`/`background_thread` (one `exec` of the process with `MALLOC_CONF`), `RAYON_NUM_THREADS`, `--cpu-cores`, blst's verification pool (`N42_P1_CORES` workers), the cross-block and RocksDB caches, and the QMDB prefault knobs `N42_TWIG_POOL_FLOOR=16`, `N42_QMDB_APPEND_AHEAD_MB=8`, `N42_QMDB_OFFSET_SEGMENTS_AHEAD=1`. A value the operator set always wins. | `qmdb-reth:profile1_memory.rs` | default |
 | `N42_P1_CORES` | 8 | integer (`0` = the host's count) | Cores a profile-1 member sizes its pools and jemalloc arenas by (capped at the host's). `0` also leaves the allocator alone. | `qmdb-reth:profile1_memory.rs` | default |
 | `N42_P1_CROSS_BLOCK_CACHE_MB` | 256 | integer (MiB) | `--engine.cross-block-cache-size` of a profile-1 member when the flag is not given (reth: 4096). | `qmdb-reth:profile1_memory.rs` | default |
 | `N42_P1_ROCKSDB_CACHE_MB` | 32 | integer (MiB) | `--db.rocksdb-block-cache-size` of a profile-1 member when the flag is not given (reth: 128 MiB). | `qmdb-reth:profile1_memory.rs` | default |

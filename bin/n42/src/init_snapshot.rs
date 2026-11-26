@@ -974,7 +974,7 @@ fn anchor(args: AnchorArgs) -> eyre::Result<()> {
 /// An account's dump row, or `None` for an EIP-161 empty account (no nonce,
 /// balance, code or storage): the plain state gov5 dumps from drops those,
 /// and QMDB holds none for a zero-balance genesis entry, which reth's hashed
-/// state keeps (devnet-fleet LATE_SNAPSHOT on `n42_devnet.json`). `init`
+/// state keeps (devnet-fleet `LATE_SNAPSHOT` on `n42_devnet.json`). `init`
 /// accepts a dump without the empty leaves QMDB does retain.
 fn dump_account(
     nonce: u64,

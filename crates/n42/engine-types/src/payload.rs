@@ -4744,10 +4744,10 @@ where
     header.excess_blob_gas = block.header().excess_blob_gas;
     header.requests_hash = block.header().requests_hash;
     // AM25: on a profile-1 chain the header carries the parent's requests hash.
-    if let (Some(carried), true) = (carried_requests_hash, crate::hotstuff_consensus::requests_hash_deferred(chain_spec.genesis())) {
-        if header.requests_hash.is_some() {
-            header.requests_hash = Some(carried);
-        }
+    if let (Some(carried), true) = (carried_requests_hash, crate::hotstuff_consensus::requests_hash_deferred(chain_spec.genesis()))
+        && header.requests_hash.is_some()
+    {
+        header.requests_hash = Some(carried);
     }
     let own_requests_hash = requests.as_ref().map_or(crate::executed_fields::NO_REQUESTS_HASH, |requests| {
         crate::hotstuff_consensus::executed_requests_hash(chain_spec.genesis(), requests)

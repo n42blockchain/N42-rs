@@ -427,6 +427,92 @@ What one near-empty block costs inside a run (EL log, ms):
   measurable on this chain with the profile-1 pools (116.8 s either way),
   so it is not made a default.
 
+**Step 7: lazy screening and runs by default; the BLS checks in parallel;
+the root off the critical path** (2026-11-26, `d53d0c181`..`ccc2bb91b`).
+
+*Defaults.* `N42_SYNC_LAZY_VERIFY` and `N42_SYNC_BATCH_IMPORT` are on when
+unset; `0` keeps the eager, block-by-block path. Both act only on anchored
+pulls under `N42_SYNC_ANCHOR=enforce`. The argument for lazy screening is
+step 3's. A verified commit QC at or above a hash-linked run authenticates
+every block in it, and nothing executes, persists or moves a forkchoice
+before such a QC covers it. The per-block check only finds a forger
+earlier, by at most the unanchored-tail bound (64 blocks). Three changes
+make that a default:
+
+- *A faulting peer is scored and dropped.* Every provable pull fault (a
+  forged certificate, a broken parent link that is the peer's, a block
+  profile 1 refuses, an unreadable or misordered block) counts against the
+  peer (`sync_faults`) and disconnects it, as well as refusing it for the
+  gap.
+- *A broken link is checked before it is judged.* Lazy screening leaves most
+  certificates unchecked. When a block does not extend the one before it and
+  its certificate was not checked, it is checked first. A forger whose block
+  follows an honest peer's reply is then blamed, instead of the pull ending
+  with no one blamed.
+- *A fault inside a pipelined pull drops the unanchored tail.* The blocks
+  above the last anchor are dropped unexecuted and asked again, from the last
+  authenticated block, of the peers that remain. The pull goes on instead of
+  ending at the next link it cannot make.
+
+Tests (`service_sync_tests.rs`): the defaults; an honest chain in runs; a
+forged anchor and a forged middle block (a block replaced by another one on
+the same parent, with a genuine certificate) both score, disconnect and
+refuse the peer, with nothing forged executed; a peer switch with no one
+blamed; and the anchor buffer's tail drop. Six hand-driven tests of eager
+screening's exact outcomes pin the eager path.
+
+*Parallel BLS checks* (eager path and anchor checks). The engine's sync
+anchor check is split into its lookups (the set of the QC's view, the
+decode) and a pure BLS step (`SyncQcJob::verify`). For each range reply,
+the validator verifies ahead, on rayon's global pool, the header QCs and
+profile-1 seals of the blocks it will screen: every block when eager, the
+last and every 32nd when lazy. Profile 1 sizes that pool to its cores
+(`RAYON_NUM_THREADS`, main's profile-1 memory defaults). Results that
+verified are memoised for the per-block screening, which applies every
+rule in order as before. Anything that failed is not recorded, so the
+per-block check refuses it in its place. Aggregate multi-verify (one
+pairing product for many QCs) is not used: the parallel check already takes
+eager screening off the critical path (below).
+
+*The root chain* (EL, `importRange`). Each block's QMDB root now runs on a
+worker in block order, beside the next block's execution. The header check
+against the parent, which under deferred execution reads the parent's filed
+root, moves after execution and waits for that root. The run's committee
+links are computed beside the run, 32 at a time, on a pool of four threads
+of their own. On rayon's global pool they took the root's threads and slowed
+the root chain by a third (ep1ba7c). The run's payloads are converted in
+parallel.
+
+*One root per run* is not done. The QMDB forest files a version per block,
+and persistence (the view advance), history reads and the engine tree read
+it per block. One root for a run would need a merged version and
+persistence changes in the vendored provider. It would also leave the
+intermediate headers' carried roots unchecked under deferred execution.
+The per-block root, ~0.13 ms on an empty block with the profile-1 pools, is
+the floor of the run.
+
+Smoke legs during the S1 hold (ba7*, defaults, empty chain, 12,584 blocks;
+load 10-21, foreign builds noted in the reports):
+
+| leg | change | pull | EL per block (call) | root work | committee links |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ep1ba6r (step 6, lazy) | | 3,541 blocks/s | 0.23 ms | 0.12 ms (serial) | 13 ms a call, before the run |
+| ep1eager7 | eager, prescreen in parallel | 3,542 blocks/s (was 716) | 0.22 ms | | |
+| ep1ba7b | root worker | 3,545 blocks/s | 0.21 ms | 0.13 ms | 13 ms a call, before the run |
+| ep1ba7c | + links beside the run, global pool | 3,542 blocks/s | 0.21 ms | 0.17 ms | 2.5 ms a call |
+| ep1ba7d | + links on their own pool | 4,120 blocks/s | 0.18 ms | 0.13 ms | 5 ms a call |
+| ep1ba7e | + parallel payload conversion | 4,122 blocks/s; the pull itself 5,462 blocks/s | **0.15 ms** | 0.12 ms | 5 ms a call |
+
+The bench's wall includes the pull's start. The validator's own pull timing
+for ep1ba7e (`catch-up timing`) is 12,584 blocks in 2.30 s: 5,462 blocks/s,
+5.3 MB/s, about 42 Mbit/s, with `newPayload`/importRange time at 2,286 ms of
+it. The pull is importer-bound, and the importer is bound by the root chain.
+The bench chain is unchanged (p1ba7: 113.8 s, 131k tx/s): its runs are only
+the near-empty blocks.
+
+Quiet-box measurements after S1: see the table below (filled in at the end
+of the step).
+
 ## 5. Throughput against link speed
 
 Best configuration measured (pin2e: branch, EL on 32 CPUs) against what each

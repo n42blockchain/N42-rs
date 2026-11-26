@@ -529,7 +529,8 @@ client that passes every vector but has not passed the round is not "done" for t
    directions (gov5 from gov5, gov5 from n42-rs, n42-rs from gov5, n42-rs from n42-rs), first idle, then under
    load; needs `bodies_by_range/2` and `commit_qc/1` (§3) on both clients. Pass: the member rejoins at the
    head with equal hashes and votes within 60 s of reaching it.
-4. **Long absence.** A member absent ≥ 1 h rejoins by state sync (`qmdb_*`, `code_by_hash`, §3). Pass as gate 3.
+4. **Long absence.** A member absent ≥ 1 h rejoins: v1 by range pull in a mixed round (4c) and by a snapshot file
+   (4a); by peer-to-peer state sync (`qmdb_*`, `code_by_hash`, §3) in v1.1 (4b, AM29). Pass as gate 3.
 5. **Scale.** A mixed round with ≥ 100 validators (several per execution layer, every producing client
    present), including a killed leader and 33 absent members. Prerequisites: batched vote verification and a
    timeout-certificate path that is not quadratic in n, in every participating client.
@@ -625,6 +626,8 @@ that settled them).
 | AM25 | owner decision: requests produced as on Ethereum and ignored; requestsHash carried as a deferred field (rc3) | A10, B8, A13, §5 (V5) |
 | AM27 | owner decision 2026-11-25: slots counted from the genesis timestamp (beacon-chain style, no cumulative drift); timestamp = slot start; B4 grid + later-slot checks; supersedes AM26 | A17, B4 |
 | AM27a | owner 2026-11-25: be lenient — any positive blockIntervalMs (sub-second allowed, e.g. 30 ms performance branches); grid in ms; exact on-grid check only for whole-second intervals; no start refusal | A17, B4 |
+| AM28 | E15 RPC shape: n42_equivocations {total, evidence:[{view, validatorIndex, hash1, hash2, detectedAt, kind, publicKey, first, second}]}, persisted equivocations.jsonl | §7 E15 |
+| AM29 | owner 2026-11-25: v1 gate 4 = >=1 h absence rejoined by range pull (4c) + snapshot files (4a); p2p state sync -> v1.1 gate 4b | §6 gate 4 |
 | gov5 02:55 readings (accepted in v0.2.1) | D3 caller only if changed; D5 gap; C6 no exemption; ommers zero in genesis; B15 gossip; J4 extra entries | D3, D5, C6, B3, B15, J4 |
 | gov5 02:55 | type `0x05` refused | C4 |
 | PN gov5 03:46 (V1 readings, unobjected; V1 equal both ways 04:09/04:28) | QC ancestry checked when known; "QC absent only while none" not enforced; stamp cache local | B1, B4 |

@@ -939,3 +939,20 @@ The owner ruled that block timing is an offset from genesis and must not accumul
 
 Owner: "on the performance branches the block interval is about 30 ms, so be lenient". AM27's whole-second requirement (start refusal) is withdrawn: blockIntervalMs may be any positive number of milliseconds; the grid is kept in milliseconds from G; the header's seconds are floor(slot start / 1000); the exact on-grid and later-slot checks apply only to whole-second intervals, otherwise B4 checks non-decreasing seconds. Profile 1 (8000 ms) behaves exactly as under AM27, so no client change is needed before gate 3; the start refusal is removed in each client afterwards.
 
+## Amendment AM28 (2026-11-25, standard owner by delegation; gov5 and n42-26 agreed): equivocation evidence
+
+E15's RPC answer, which the standard left open, is fixed for all three clients:
+`n42_equivocations` returns `{total, evidence: [{view, validatorIndex, hash1, hash2, detectedAt, kind, publicKey,
+first, second}]}`, where `kind` is `vote`, `commit_vote` or `proposal`, and `first` / `second` each carry the exact
+signed bytes and the BLS signature, so a record verifies on its own. Evidence is persisted one record per
+(kind, view, validator) in `<datadir>/equivocations.jsonl` and survives a restart; `n42_equivocations_total`
+starts from that file. The shape is n42-26's existing one plus the last four fields (n42-rs 47f1792b9).
+
+## Amendment AM29 (2026-11-25, owner): gate 4 split
+
+Owner decision: for v1, gate 4 ("long absence") is passed by a member absent at least one hour that rejoins by
+range pull (`bodies_by_range`, `commit_qc`, as gate 3) in a mixed round (gate 4c), together with the snapshot-file
+join of gate 4a. v1 does not require any member to prune history, so a long-absent member always finds its range
+on its peers. Peer-to-peer state sync (`qmdb_*`, `code_by_hash`, SYNC section 3) becomes gate 4b of v1.1; until a
+client serves it, a member that cannot pull by range joins from a snapshot file (4a).
+

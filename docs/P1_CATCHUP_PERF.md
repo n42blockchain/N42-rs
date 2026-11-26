@@ -510,8 +510,39 @@ it. The pull is importer-bound, and the importer is bound by the root chain.
 The bench chain is unchanged (p1ba7: 113.8 s, 131k tx/s): its runs are only
 the near-empty blocks.
 
-Quiet-box measurements after S1: see the table below (filled in at the end
-of the step).
+Measurements after S1 (binary ba7e = `ccc2bb91b`; 2026-11-26 19:34-20:05
+UTC; each leg started under the coordinator's round lock and at a 1-minute
+load under 10. "Pull" is the validator's own `catch-up timing`, which leaves
+out the pull's start-up that the bench's wall includes. Foreign CPU users
+are noted per leg; the EL's own pools account for the load of the `P1=0`
+legs.)
+
+| leg | chain | settings | wall | pull | EL cores | load before / after, foreign |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| s3e1 | empty, 12,584 blocks | defaults | 2.5 s, 4,937 blocks/s, 4.8 MB/s | **6,043 blocks/s** (~47 Mbit/s) | 5.3 | 5.8 / 6.1, none |
+| s3e2 | empty | defaults | 3.0 s, 4,126 blocks/s | 5,492 blocks/s | 5.1 | 7.3 / 7.0, pprof 117% |
+| s3eEager | empty | `N42_SYNC_LAZY_VERIFY=0` | 3.5 s, 3,546 blocks/s | 4,285 blocks/s | 4.7 (validator 6.9) | 163 / 138, a foreign burst |
+| s3ePb | empty | `N42_SYNC_BATCH_IMPORT=0` | 26.1 s, 483 blocks/s | 489 blocks/s | 1.6 | 6.6 / 5.9, pprof 120% |
+| s3eP0 | empty | `N42_P1_MEMORY=0` | 17.6 s, 714 blocks/s | 732 blocks/s | 229 | 4.9 / 53 (own EL), pprof 120% |
+| s3b1 / s3b2 | bench, 2,277 blocks | defaults | 112.7 / 113.3 s, 132k / 131k tx/s, 15.8 MB/s | | 8.0 | 6.3 / 9.2; 5.9 / 12.7, pprof 117% |
+| s3bEager | bench | `N42_SYNC_LAZY_VERIFY=0` | 112.8 s, 132k tx/s | | 7.9 | 6.4 / 11.2, pprof 119% |
+| s3bPb | bench | `N42_SYNC_BATCH_IMPORT=0` | 116.3 s, 128k tx/s | | 7.6 | 7.5 / 13.6, n42 builds ~200% |
+| s3bP0 | bench | `N42_P1_MEMORY=0` | 137.0 s, 109k tx/s | | 132 | 6.7 / 190 (own EL), pprof 119% |
+
+- The empty chain on the defaults pulls at 5,500-6,000 blocks/s:
+  - 12x the block-by-block path (489 blocks/s);
+  - 8x the defaults without profile 1's pools (732 blocks/s);
+  - 1.7x step 6's lazy runs (3,541).
+- Eager screening is no longer the bound. Its prescreen keeps it at
+  4,285 blocks/s against 716 before step 7, and that leg ran under a
+  foreign load of 163.
+- 100 Mbit/s is ~12,900 blocks/s of these ~970-byte blocks and ~17,600 of
+  chain 94's 710 bytes. The pull reaches 47 Mbit/s, about half of it. It is
+  importer-bound, and the importer is bound by the per-block QMDB root
+  (~0.12 ms of the 0.15 ms an empty block costs).
+- On the bench chain every setting with profile 1's pools is within 3%
+  (112.7-116.3 s); without them it is 137 s. The bench chain's runs are only
+  its near-empty blocks.
 
 ## 5. Throughput against link speed
 
@@ -566,6 +597,14 @@ batch, next newPayload). On full blocks the engine's per-block tasks dominate
 (engine metrics, means over a pull): prewarm 52 ms, receipt-root task 35 ms,
 payload-convert 12 ms, post-execution validation 9 ms, persistence 194 ms
 per cycle of ~5.5 blocks.
+
+Status after step 7 (2026-11-26): lazy screening and runs are the
+defaults. Eager screening runs its BLS checks in parallel. An empty block
+costs the EL 0.15 ms in a run, and the pull reaches 5,500-6,000 blocks/s
+(~47 Mbit/s). The bound is the per-block QMDB root (~0.12 ms). Lifting it
+needs QMDB to file one version per run (a merged version, persistence
+changes in the vendored provider), or a cheaper root for a block that
+touches a handful of leaves.
 
 Status after step 6 (2026-11-26): item 1 is built (`n42Engine_importRange`,
 off by default) and reaches 0.23 ms per empty block when the runs are long.

@@ -78,6 +78,8 @@ reth-provider.workspace = true
 
 eyre.workspace = true
 tokio.workspace = true
+jsonrpsee = { workspace = true, features = ["server"] }
+tower.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -104,6 +106,7 @@ metrics.workspace = true
 default = []
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 # `claimed_build`'s tests sign the transactions they check the claim of.
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }

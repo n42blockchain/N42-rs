@@ -7243,6 +7243,7 @@ dependencies = [
  "eyre",
  "futures-core",
  "futures-util",
+ "jsonrpsee",
  "libc",
  "metrics",
  "n42-clique",
@@ -7311,6 +7312,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

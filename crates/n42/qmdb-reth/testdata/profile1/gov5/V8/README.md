@@ -8,11 +8,14 @@ Contents now:
   generated from params.Profile1AllowedKeys (gov5 test TestProfile1AllowedKeysFile
   keeps internal/testdata/profile1/allowed_keys.json equal to the code). Any other
   key refuses the genesis. blobSchedule is the only optional config key.
-- refused/*.json: one case per file: {"case", "expectedError", "genesis"}.
-  A client MUST refuse to start on "genesis"; "expectedError" is gov5's error
-  substring (informative; other clients name the field their own way).
-  Same files (bare genesis + refused/expected_errors.json) in gov5
-  internal/testdata/profile1/refused, checked by TestProfile1RefusedGenesisVectors.
+- refused/: gov5 internal/testdata/profile1/refused at gov5 main f7bf6b09, copied
+  byte for byte (git blob ids and SHA-256 of raw bytes match): 33 bare geneses, one
+  case per file, plus refused/expected_errors.json mapping each file name to gov5's
+  error substring (informative; other clients name the field their own way). A
+  client MUST refuse to start on every one; gov5 checks them in
+  TestProfile1RefusedGenesisVectors. (Until 2026-11-25 this directory held the
+  first 14 cases in a wrapped {"case", "expectedError", "genesis"} form from
+  feat/profile1 015bd9f6.)
 
 NOT here yet (owner decision AM17): genesis.json and hash.txt. The refused cases
 are built from gov5's provisional standard-genesis fixture

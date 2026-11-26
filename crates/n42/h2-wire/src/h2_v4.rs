@@ -14,6 +14,11 @@ const PREFIX: &[u8; 7] = b"N42H2V4";
 const MAX_WIRE_SIZE: usize = 8192;
 const HEADER_SIZE: usize = 7 + 8 + 32 + 32 + 4;
 
+const _: () = assert!(
+    HEADER_SIZE + MAX_WIRE_SIZE <= crate::h2_wire::MAX_CONSENSUS_MSG,
+    "the v4 decoder's bound is within G5"
+);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct H2V4Envelope {
     pub identity: H2V4ChainIdentity,
@@ -347,6 +352,13 @@ mod tests {
         // 4. A Snappy frame that expands past the ceiling: rejected from the
         //    declared length alone, without allocating the output.
         let bomb = vec![0u8; HEADER_SIZE + MAX_WIRE_SIZE + 1];
+        let compressed = snap::raw::Encoder::new().compress_vec(&bomb).unwrap();
+        assert!(matches!(
+            decode_gossip(&compressed, identity),
+            Err(H2V4Error::InvalidLength)
+        ));
+        //    And past the standard's 64 KiB consensus cap (G5).
+        let bomb = vec![0u8; crate::h2_wire::MAX_CONSENSUS_MSG + 1];
         let compressed = snap::raw::Encoder::new().compress_vec(&bomb).unwrap();
         assert!(matches!(
             decode_gossip(&compressed, identity),

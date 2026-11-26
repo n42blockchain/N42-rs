@@ -299,3 +299,7 @@ gov5->both, n42-26->both. n42-rs as a `commit_qc/1` server to another client is 
 vectors and same-client loopback tests. Notes (not failures): gov5's client retries a protocol-refusing peer ~10
 times in a second (gov5 todo); n42-26's e3d22dd has no serve-side log for `commit_qc/1`.
 
+
+v1.1 releases (2026-11-26): gov5 main fe5e02ed (node binary 00aa020a…, byte-identical to ecaa51f7; the serve switch
+`N42_SYNC_RANGE_SERVE` is on branch 0064ffd3); n42-rs main 004ac1167 (sync v1.1) + docs; n42-26 main 053b4f6 (PR #48,
+tree = e3d22dd, gate binary c20104ef…; follow-ups in PR #49: commit_qc/1 serve log, deferred-check timing).

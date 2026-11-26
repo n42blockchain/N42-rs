@@ -5547,7 +5547,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             // Profile 1's nodes are sized for 0.5 GB: the pull's bytes in
             // flight and in the reorder buffer are bounded for them.
             let budget = if self.header_rules.is_profile1() {
-                crate::sync_pipeline::PullBudget::PROFILE1
+                crate::sync_pipeline::PullBudget::profile1()
             } else {
                 crate::sync_pipeline::PullBudget::DEFAULT
             };

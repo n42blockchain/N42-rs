@@ -348,7 +348,25 @@ impl PullBudget {
     /// Profile 1 (8-second blocks, nodes sized for 0.5 GB): 192 MiB in
     /// flight, 64 MiB ready (`docs/P1_CATCHUP_PERF.md`, step 8).
     pub(crate) const PROFILE1: Self = Self { in_flight_bytes: Some(P1_IN_FLIGHT_BYTES), ready_bytes: P1_READY_BYTES };
+
+    /// [`Self::PROFILE1`] with [`P1_IN_FLIGHT_MIB_ENV`] and
+    /// [`P1_READY_MIB_ENV`] applied (a measurement knob; an unset or
+    /// unparsable value keeps the default).
+    pub(crate) fn profile1() -> Self {
+        let mib = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+        let base = Self::PROFILE1;
+        Self {
+            in_flight_bytes: mib(P1_IN_FLIGHT_MIB_ENV).map(|n| n << 20).or(base.in_flight_bytes),
+            ready_bytes: mib(P1_READY_MIB_ENV).map_or(base.ready_bytes, |n| (n << 20) as usize),
+        }
+    }
 }
+
+/// Overrides [`P1_IN_FLIGHT_BYTES`], in MiB.
+pub const P1_IN_FLIGHT_MIB_ENV: &str = "N42_P1_PULL_IN_FLIGHT_MIB";
+
+/// Overrides [`P1_READY_BYTES`], in MiB.
+pub const P1_READY_MIB_ENV: &str = "N42_P1_PULL_READY_MIB";
 
 /// [`PullBudget::PROFILE1`]'s bytes in flight.
 pub const P1_IN_FLIGHT_BYTES: u64 = 192 << 20;

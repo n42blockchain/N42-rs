@@ -379,6 +379,18 @@ Status caveat: `adopted` follows the stage sets named above plus the X22 base se
 | `N42_CORE_LAYOUT_CRITICAL_CORES` | 4 | integer | Cores in the critical set. | `core-layout:lib.rs:119` | adopted |
 | `N42_CORE_LAYOUT_SIBLINGS` | off (background enables) | see Default | Put SMT siblings of the build cores in the background set. | `core-layout:lib.rs:121` | adopted |
 
+## Profile-1 memory (qmdb-reth profile1_memory, bin/n42, h2_validator)
+
+Read only on a genesis that declares `"n42Profile": 1` (`docs/P1_MEMORY.md`); a chain without it
+never reads them. Each sets a default the operator can still override with the flag or variable named.
+
+| Knob | Default | Values | Meaning | Where read | Status |
+|---|---|---|---|---|---|
+| `N42_P1_MEMORY` | on (profile 1 only) | `0` turns it off | Every profile-1 memory default: jemalloc `narenas`/`background_thread` (one `exec` of the process with `MALLOC_CONF`), `RAYON_NUM_THREADS`, `--cpu-cores`, the cross-block and RocksDB caches, and the QMDB prefault knobs `N42_TWIG_POOL_FLOOR=16`, `N42_QMDB_APPEND_AHEAD_MB=8`, `N42_QMDB_OFFSET_SEGMENTS_AHEAD=1`. A value the operator set always wins. | `qmdb-reth:profile1_memory.rs` | default |
+| `N42_P1_CORES` | 8 | integer (`0` = the host's count) | Cores a profile-1 member sizes its pools and jemalloc arenas by (capped at the host's). `0` also leaves the allocator alone. | `qmdb-reth:profile1_memory.rs` | default |
+| `N42_P1_CROSS_BLOCK_CACHE_MB` | 256 | integer (MiB) | `--engine.cross-block-cache-size` of a profile-1 member when the flag is not given (reth: 4096). | `qmdb-reth:profile1_memory.rs` | default |
+| `N42_P1_ROCKSDB_CACHE_MB` | 32 | integer (MiB) | `--db.rocksdb-block-cache-size` of a profile-1 member when the flag is not given (reth: 128 MiB). | `qmdb-reth:profile1_memory.rs` | default |
+
 ## Test and bench helpers
 
 | Knob | Default | Values | Meaning | Where read | Status |

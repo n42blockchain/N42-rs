@@ -42,9 +42,13 @@ impl EquivocationKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedValue {
-    /// The block the message names.
+    /// The block the message names. Not part of the AM28 JSON shape: the
+    /// record's `hash1` / `hash2` carry it.
+    #[serde(skip)]
     pub block_hash: B256,
-    /// The exact bytes the validator signed (the signing profile's message).
+    /// The exact bytes the validator signed (the signing profile's message),
+    /// named `signed` in the AM28 JSON shape.
+    #[serde(rename = "signed")]
     pub message: Bytes,
     /// The validator's BLS signature over `message` (96 bytes).
     pub signature: Bytes,

@@ -114,7 +114,13 @@ impl EquivocationLog {
             Ok(text) => {
                 for (number, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
                     match serde_json::from_str::<EquivocationRecord>(line) {
-                        Ok(record) => records.push(record),
+                        Ok(mut record) => {
+                            // AM28's JSON names each side's block only in
+                            // `hash1` / `hash2`; put it back on the sides.
+                            record.first.block_hash = record.hash1;
+                            record.second.block_hash = record.hash2;
+                            records.push(record);
+                        }
                         Err(err) => tracing::warn!(target: "n42.h2.node", path = %path.display(), line = number + 1, %err, "unreadable equivocation record skipped"),
                     }
                 }
@@ -233,5 +239,10 @@ mod tests {
         }
         assert_eq!(entry["kind"], "vote");
         assert!(entry["first"]["signature"].as_str().is_some_and(|s| s.len() == 2 + 192));
+        // AM28: each side is exactly `{signed, signature}`, as gov5 answers.
+        let side = entry["first"].as_object().expect("first is an object");
+        let mut keys: Vec<&str> = side.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["signature", "signed"]);
     }
 }

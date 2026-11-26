@@ -557,6 +557,12 @@ pub struct H2Service<E> {
     /// execution layer is known past that height (someone else closed the
     /// gap), so a peer is not shut out of every later catch-up.
     refused_range_peers: std::collections::HashMap<PeerId, u64>,
+    /// Provable pull faults per peer (a forged certificate, a broken parent
+    /// link, a block profile 1 refuses, an unreadable or misordered one), for
+    /// the life of the node. Each one also drops the peer's connection
+    /// ([`Self::pull_fault`]), so a forger has to dial back in to be asked
+    /// again, and is not asked for the gap it failed.
+    sync_faults: std::collections::HashMap<PeerId, u32>,
     /// Blocks the execution layer has imported through this service — voted
     /// on, pulled or built. A commit for any other block is not handed to
     /// the execution layer: a forkchoice to a head reth does not have starts
@@ -608,6 +614,12 @@ pub struct H2Service<E> {
     /// Header QCs that verified as sync anchors (commit domain, the set of
     /// their exact view), so the catch-up checks each once.
     sync_anchor_qcs: std::cell::RefCell<VerifiedHeaderQcs>,
+    /// Eager screening's BLS checks done ahead for one range reply, in
+    /// parallel ([`Self::prescreen_reply`]): the header QCs that verified as
+    /// anchors, by the hash of their bytes, and the blocks whose profile-1
+    /// seal verified. Taken by the per-block screening; cleared per reply.
+    prescreened_qcs: std::cell::RefCell<std::collections::HashMap<B256, QuorumCertificate>>,
+    prescreened_seals: std::cell::RefCell<std::collections::HashSet<B256>>,
     /// How the catch-up treats blocks no verified anchor covers
     /// (`N42_SYNC_ANCHOR`, see [`crate::sync_anchor`]).
     sync_anchor_mode: SyncAnchorMode,
@@ -619,6 +631,12 @@ pub struct H2Service<E> {
     /// a reply's last block (and every [`LAZY_VERIFY_TAIL`]-th unanchored
     /// one) only; see [`crate::sync_pipeline::lazy_verify_from_env`].
     sync_lazy_verify: bool,
+    /// `N42_SYNC_BATCH_IMPORT`: pulled blocks go to the execution layer in
+    /// runs (`n42Engine_importRange`). Only ever under
+    /// `N42_SYNC_ANCHOR=enforce`, where every block the importer gets is
+    /// covered by a verified commit QC at or above it and parent-linked to
+    /// it and to the executed head (`docs/P1_CATCHUP_PERF.md` step 6).
+    sync_batch_import: bool,
     /// `N42_SYNC_STALL_SECS`: how long the executed head may stand still
     /// while pulled blocks wait for execution before the pipeline is given up.
     sync_stall: Duration,
@@ -1302,6 +1320,10 @@ const PULLED_BLOCKS_PER_STEP: usize = 32;
 /// ([`crate::sync_anchor::MAX_TAIL_BLOCKS`]), which a pull therefore never
 /// reaches for want of a verification.
 const LAZY_VERIFY_TAIL: usize = crate::sync_anchor::MAX_TAIL_BLOCKS / 2;
+
+/// Entries [`H2Service::prescreen_reply`]'s memos hold before they are
+/// cleared: a few replies' worth.
+const PRESCREEN_MEMO: usize = 2048;
 
 /// How far past the committed height a pull may import blocks nothing proves
 /// (no header QC this node can verify): past it the pull ends at the first
@@ -2013,6 +2035,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             catch_up_retry_after: None,
             failed_peer: None,
             refused_range_peers: std::collections::HashMap::new(),
+            sync_faults: std::collections::HashMap::new(),
             imported: HashSet::new(),
             imported_order: std::collections::VecDeque::new(),
             ready_bodies: Vec::new(),
@@ -2029,9 +2052,12 @@ impl<E: ExecutionLayer> H2Service<E> {
             fill_bytes: FillBudget::new(MAX_FILL_SERVE_BYTES >> 10),
             verified_header_qcs: std::cell::RefCell::default(),
             sync_anchor_qcs: std::cell::RefCell::default(),
+            prescreened_qcs: std::cell::RefCell::default(),
+            prescreened_seals: std::cell::RefCell::default(),
             sync_anchor_mode: SyncAnchorMode::from_env(),
             sync_pipeline: crate::sync_pipeline::pipeline_from_env(),
             sync_lazy_verify: crate::sync_pipeline::lazy_verify_from_env(),
+            sync_batch_import: crate::sync_pipeline::batch_import_from_env(),
             sync_stall: crate::sync_pipeline::stall_from_env(),
             pulled_importer: None,
             pulled_reports: None,
@@ -5576,6 +5602,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                 continue;
             }
             let mut chunks = std::collections::VecDeque::from(chunks);
+            if enforce {
+                let prescreen_at = std::time::Instant::now();
+                self.prescreen_reply(&chunks);
+                if let Some(c) = self.catch_up.as_mut() {
+                    c.times.verify += prescreen_at.elapsed();
+                }
+            }
             // Pipelined, the importer's queue bounds the screening too:
             // what does not fit waits here, in order.
             while budget > 0 && (!pipelined || self.import_room()) {
@@ -5815,6 +5848,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 return false;
             }
         };
+        let breaks_link =
+            self.catch_up.as_ref().and_then(|c| c.prev_hash).is_some_and(|prev| block.header.parent_hash != prev);
+        if breaks_link && !verify && let Err(reason) = self.sync_anchor_of(&block.header) {
+            // Lazy screening left this block's certificate unchecked: before
+            // weighing whose fault a broken link is, a forged certificate
+            // settles it.
+            warn!(target: "n42.h2.node", %peer, number, %reason, "peer served a block that does not extend the one before it and whose certificate does not verify");
+            self.pull_fault(peer, number, events);
+            return false;
+        }
         if let Some(c) = self.catch_up.as_ref()
             && let Some(prev) = c.prev_hash
             && block.header.parent_hash != prev
@@ -5909,6 +5952,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// ([`Self::requeue_after_fault`]).
     fn pull_fault(&mut self, peer: PeerId, number: u64, events: &mut Vec<ServiceEvent>) -> bool {
         self.refused_range_peers.insert(peer, number);
+        // Scored and dropped: under lazy screening a forged run is caught at
+        // its verified block or its broken link, not at every block, so the
+        // peer that served it is cut off rather than left to serve again.
+        let faults = self.sync_faults.entry(peer).or_default();
+        *faults = faults.saturating_add(1);
+        warn!(target: "n42.h2.node", %peer, number, faults = *faults, "pull fault: the peer is disconnected");
+        self.transport.disconnect(peer);
         if self.catch_up.as_ref().is_some_and(|c| c.sched.is_some()) {
             info!(target: "n42.h2.node", %peer, number, "pipelined pull: the peer is excluded for the rest of the pull, its ranges go to the others");
             return true;
@@ -5926,11 +5976,30 @@ impl<E: ExecutionLayer> H2Service<E> {
         let Some(c) = self.catch_up.as_mut() else {
             return;
         };
+        if c.sched.is_none() {
+            return;
+        }
+        let failed = c.next;
+        // The unanchored tail below the failing block is suspect too: under
+        // lazy screening most of it was never verified, and a block whose own
+        // certificate verified may still be one the next block does not
+        // extend. It is dropped unexecuted and asked again, from the last
+        // authenticated block, of the peers that remain.
+        if c.anchored.drop_unanchored() > 0 {
+            let (next, prev) = match c.anchored.top() {
+                Some((number, hash)) => (number + 1, Some(hash)),
+                None => (c.started_at + 1, None),
+            };
+            c.next = next;
+            c.prev_hash = prev;
+            c.prev_peer = None;
+            self.last_pulled_header = c.anchored.top_block().map(|(block, _)| block.header.clone());
+        }
         let next = c.next;
         let Some(sched) = c.sched.as_mut() else {
             return;
         };
-        sched.exclude(peer, Some((next, rest + 1)));
+        sched.exclude(peer, Some((next, failed.saturating_sub(next) + rest + 1)));
         for (from, request, chunks) in later {
             sched.put_back(from, request.start, chunks);
         }
@@ -6241,7 +6310,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         proven: Option<Option<u64>>,
     ) {
         if self.pulled_importer.is_none() {
-            let (importer, reports) = crate::sync_pipeline::PulledImporter::spawn(self.driver.execution_layer_arc());
+            // Runs only under the enforced anchor rule: there every block
+            // queued here is authenticated by a verified commit QC.
+            let batched = self.sync_batch_import && self.sync_anchor_mode == SyncAnchorMode::Enforce;
+            let el = self.driver.execution_layer_arc();
+            let (importer, reports) = if batched {
+                crate::sync_pipeline::PulledImporter::spawn_batched(el)
+            } else {
+                crate::sync_pipeline::PulledImporter::spawn_per_block(el)
+            };
             self.pulled_importer = Some(importer);
             self.pulled_reports = Some(reports);
         }
@@ -6484,6 +6561,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         if let Some(qc) = self.sync_anchor_qcs.borrow().get(&key) {
             return Ok(Some(qc));
         }
+        if let Some(qc) = self.prescreened_qcs.borrow_mut().remove(&key) {
+            return Ok(Some(qc));
+        }
         match self.engine.verify_sync_anchor_qc(&wire) {
             n42_h2_consensus::SyncQcVerdict::Anchor(qc) => {
                 self.sync_anchor_qcs.borrow_mut().insert(key, (*qc).clone());
@@ -6505,6 +6585,103 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             n42_h2_consensus::SyncQcVerdict::Invalid(reason) => Err(format!("header QC does not verify: {reason}")),
         }
+    }
+
+    /// The screening's BLS checks for the blocks of one range reply that
+    /// will be verified, done ahead and in parallel on rayon's global pool
+    /// (`RAYON_NUM_THREADS`; profile 1 sizes it to its cores): each header
+    /// QC against the set of its view, and on profile 1 the proposer's seal.
+    /// Eager screening checks every block; lazy screening the reply's last
+    /// block and every [`LAZY_VERIFY_TAIL`]-th. What verified is left in
+    /// [`Self::prescreened_qcs`] / [`Self::prescreened_seals`] for the
+    /// per-block screening, which runs every other rule in order as before;
+    /// what did not is not recorded, so the per-block check finds it again
+    /// and refuses it in its place. Nothing is decided here.
+    fn prescreen_reply(&self, chunks: &std::collections::VecDeque<BlockChunk>) {
+        use rayon::prelude::*;
+        // Bounded: what a reply left unused (a block refused before its turn)
+        // does not pile up. A reply cut by the screening budget comes back in
+        // pieces, so the memos are not cleared per call.
+        if self.prescreened_qcs.borrow().len() > PRESCREEN_MEMO {
+            self.prescreened_qcs.borrow_mut().clear();
+        }
+        if self.prescreened_seals.borrow().len() > PRESCREEN_MEMO {
+            self.prescreened_seals.borrow_mut().clear();
+        }
+        let last = chunks.len().saturating_sub(1);
+        let picked: Vec<&BlockChunk> = chunks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.sync_lazy_verify || *i == last || (i + 1) % LAZY_VERIFY_TAIL == 0)
+            .map(|(_, chunk)| chunk)
+            .collect();
+        if picked.len() < 2 {
+            return;
+        }
+        let profile = self.header_profile;
+        let headers: Vec<(B256, Header)> = picked
+            .par_iter()
+            .filter_map(|chunk| n42_h2_consensus::decode_block_body_header(&chunk.rlp, profile).ok())
+            .collect();
+        // The engine's part, in order: the set of each QC's view, the
+        // proposer of each view.
+        enum Seal<'a> {
+            Info(&'a n42_h2_consensus::ValidatorInfo),
+            Key(n42_h2_primitives::BlsPublicKey),
+        }
+        let rules = &self.header_rules;
+        let mut qc_jobs = Vec::with_capacity(headers.len());
+        let mut seal_jobs = Vec::new();
+        for (_, header) in &headers {
+            if let Ok(Some((key, wire))) = self.header_qc_wire(header)
+                && self.sync_anchor_qcs.borrow().get(&key).is_none()
+                && !self.prescreened_qcs.borrow().contains_key(&key)
+            {
+                qc_jobs.push((key, self.engine.sync_anchor_qc_job(&wire)));
+            }
+            if rules.is_profile1()
+                && header.number > 0
+                && let Ok(extra) = n42_h2_consensus::validate_profile1_header(header, rules)
+            {
+                // Keyed as the per-block check reads it.
+                let hash = header.hash_slow();
+                if self.prescreened_seals.borrow().contains(&hash) {
+                    continue;
+                }
+                let seal = match &rules.proposers {
+                    Some(schedule) => schedule.proposer(extra.view).map(Seal::Info),
+                    None => self.engine.leader_public_key_for_view(extra.view).map(Seal::Key),
+                };
+                if let Some(seal) = seal {
+                    seal_jobs.push((hash, header, seal));
+                }
+            }
+        }
+        let (anchors, seals) = rayon::join(
+            || {
+                qc_jobs
+                    .into_par_iter()
+                    .filter_map(|(key, job)| match job.verify() {
+                        n42_h2_consensus::SyncQcVerdict::Anchor(qc) => Some((key, *qc)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            },
+            || {
+                seal_jobs
+                    .into_par_iter()
+                    .filter_map(|(hash, header, seal)| {
+                        let ok = match seal {
+                            Seal::Info(proposer) => n42_h2_consensus::verify_profile1_seal(header, proposer).is_ok(),
+                            Seal::Key(key) => n42_h2_consensus::verify_seal(header, &key).is_ok(),
+                        };
+                        ok.then_some(hash)
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        self.prescreened_qcs.borrow_mut().extend(anchors);
+        self.prescreened_seals.borrow_mut().extend(seals);
     }
 
     /// What a range-pulled block has to show before it is imported.
@@ -6732,8 +6909,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         // The seal (B2) and the coinbase (B3) against the proposer the
         // rules name; without a schedule, the seal against the leader key
         // the engine knows for the view.
+        let prescreened = check_seal && {
+            let mut seals = self.prescreened_seals.borrow_mut();
+            !seals.is_empty() && seals.remove(&header.hash_slow())
+        };
         let sealed = match &rules.proposers {
-            _ if !check_seal => Ok(()),
+            _ if !check_seal || prescreened => Ok(()),
             Some(schedule) => match schedule.proposer(extra.view) {
                 Some(proposer) => n42_h2_consensus::verify_profile1_seal(header, proposer).map_err(|err| err.to_string()),
                 None => Err(format!("B2: no proposer for view {}", extra.view)),

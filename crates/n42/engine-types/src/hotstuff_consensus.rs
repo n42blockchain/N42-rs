@@ -94,6 +94,31 @@ pub fn chain_header_rules<C: EthChainSpec>(chain_spec: &C) -> HeaderRules {
     rules
 }
 
+/// The committee links [`HotStuffConsensus::prefetch_committee_links`]
+/// computed ahead, by the parent's (number, hash, receipts root): the link is
+/// a pure function of the three, so a kept one is the one the check would
+/// compute. One chain per process; bounded (cleared when full).
+static COMMITTEE_LINKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u64, B256, B256), B256>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// [`COMMITTEE_LINKS`]' bound.
+const COMMITTEE_LINKS_MAX: usize = 4096;
+
+/// The parent beacon root a child of the parent `(number, hash,
+/// receipts_root)` must carry: kept by a prefetch, or computed now.
+fn committee_link(
+    pool: &SimulatedCommitteePool,
+    number: u64,
+    hash: B256,
+    receipts_root: B256,
+) -> Result<B256, n42_h2_consensus::committee_pool::CommitteePoolError> {
+    let key = (number, hash, receipts_root);
+    if let Some(root) = COMMITTEE_LINKS.lock().unwrap_or_else(|p| p.into_inner()).remove(&key) {
+        return Ok(root);
+    }
+    pool.parent_beacon_root(number, &hash, &receipts_root)
+}
+
 /// A header whose parent beacon root is not the parent's committee evidence.
 #[derive(Debug, thiserror::Error)]
 #[error("parent beacon root {got} is not the parent's committee evidence {expected}")]
@@ -137,6 +162,43 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> HotStuffConsensus<ChainSpec> {
     /// not profile 1).
     pub const fn header_rules(&self) -> &HeaderRules {
         &self.header_rules
+    }
+
+    /// Computes the committee links ([`committee_link`]) of the given parents
+    /// on rayon's pool and keeps them for the header checks that follow. A
+    /// run of committed blocks is checked one after the other, and each check
+    /// otherwise spends ~0.5 ms signing its parent's simulated evidence.
+    /// Nothing on a chain without a committee pool.
+    pub fn prefetch_committee_links(&self, parents: &[(u64, B256, B256)]) {
+        use rayon::prelude::*;
+        let Some(pool) = &self.committee else {
+            return;
+        };
+        let links: Vec<_> = parents
+            .par_iter()
+            .filter_map(|&(number, hash, receipts_root)| {
+                pool.parent_beacon_root(number, &hash, &receipts_root)
+                    .ok()
+                    .map(|root| ((number, hash, receipts_root), root))
+            })
+            .collect();
+        let mut memo = COMMITTEE_LINKS.lock().unwrap_or_else(|p| p.into_inner());
+        if memo.len() + links.len() > COMMITTEE_LINKS_MAX {
+            memo.clear();
+        }
+        memo.extend(links);
+    }
+
+    /// The same rules without the profile-1 header's two signature checks
+    /// (the embedded QC and the proposer's seal, which the header rules make
+    /// only when they carry the proposer schedule). For a committed range the
+    /// caller has already authenticated by a verified commit QC
+    /// (`n42Engine_importRange`, `docs/P1_CATCHUP_PERF.md` step 6); every
+    /// other rule is the same.
+    pub fn without_header_signatures(&self) -> Self {
+        let mut rules = (*self.header_rules).clone();
+        rules.proposers = None;
+        Self::new(self.chain_spec.clone()).with_header_rules(rules)
     }
 
     /// The committee pool the chain runs, if any.
@@ -489,8 +551,7 @@ where
         // checks it: the parent beacon root is the Blake3 of the parent's
         // evidence, zero when the parent is genesis.
         if let Some(pool) = &self.committee {
-            let expected = pool
-                .parent_beacon_root(parent.number, &parent.hash(), &parent.receipts_root)
+            let expected = committee_link(pool, parent.number, parent.hash(), parent.receipts_root)
                 .map_err(|err| ConsensusError::Other(Arc::new(err)))?;
             let got = header.parent_beacon_block_root.unwrap_or_default();
             if got != expected {
@@ -1570,8 +1631,20 @@ mod tests {
 
         // A missing root reads as zero, which is not the evidence either.
         child.parent_beacon_block_root = None;
-        let err = c.validate_header_against_parent(&sealed(child), &parent).unwrap_err();
+        let err = c.validate_header_against_parent(&sealed(child.clone()), &parent).unwrap_err();
         assert_eq!(other_err::<CommitteeLinkError>(&err).unwrap().got, B256::ZERO);
+
+        // A link computed ahead (a committed run's prefetch) gives the same
+        // verdicts: the right root passes, a wrong one is still refused with
+        // the same expected root.
+        let parents = [(parent.number, parent.hash(), parent.receipts_root)];
+        c.prefetch_committee_links(&parents);
+        child.parent_beacon_block_root = Some(expected);
+        c.validate_header_against_parent(&sealed(child.clone()), &parent).unwrap();
+        c.prefetch_committee_links(&parents);
+        child.parent_beacon_block_root = Some(B256::repeat_byte(0x66));
+        let err = c.validate_header_against_parent(&sealed(child), &parent).unwrap_err();
+        assert_eq!(other_err::<CommitteeLinkError>(&err).unwrap().expected, expected);
     }
 
     fn block_of(header: Header, body: EthBlockBody) -> SealedBlock<EthBlock> {

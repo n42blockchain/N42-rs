@@ -48,8 +48,13 @@ pub const SYNC_PIPELINE_DEFAULT: bool = true;
 /// every pulled block does (`docs/P1_CATCHUP_PERF.md`, section 4).
 pub const SYNC_LAZY_VERIFY_ENV: &str = "N42_SYNC_LAZY_VERIFY";
 
-/// Lazy screening's default when [`SYNC_LAZY_VERIFY_ENV`] is unset.
-pub const SYNC_LAZY_VERIFY_DEFAULT: bool = false;
+/// Lazy screening's default when [`SYNC_LAZY_VERIFY_ENV`] is unset: on.
+/// It applies only under `N42_SYNC_ANCHOR=enforce`, where nothing executes
+/// before a verified commit QC at or above it covers it through parent
+/// links; the per-block check only finds a forger earlier, by at most the
+/// unanchored-tail bound, and a forger is scored and disconnected when its
+/// run fails (`docs/P1_CATCHUP_PERF.md`, step 7). `0` keeps the eager path.
+pub const SYNC_LAZY_VERIFY_DEFAULT: bool = true;
 
 /// Whether lazy screening is on ([`SYNC_LAZY_VERIFY_ENV`]); a value that is
 /// not 0 or 1 keeps the default, with a warning.
@@ -62,6 +67,61 @@ pub fn lazy_verify_from_env() -> bool {
         Some(_) => {
             tracing::warn!(target: "n42.h2.node", value = ?raw, "{SYNC_LAZY_VERIFY_ENV} is not 0 or 1; keeping the default");
             SYNC_LAZY_VERIFY_DEFAULT
+        }
+    }
+}
+
+/// The environment variable for the batched import of pulled blocks (`1`
+/// on, `0` off): a run of queued pulled blocks goes to the execution layer in
+/// one `n42Engine_importRange` (`docs/P1_CATCHUP_PERF.md`, step 6); an
+/// execution layer without it imports block by block as before.
+pub const SYNC_BATCH_IMPORT_ENV: &str = "N42_SYNC_BATCH_IMPORT";
+
+/// The batched import's default when [`SYNC_BATCH_IMPORT_ENV`] is unset: on.
+/// It is used only for anchored pulls under `N42_SYNC_ANCHOR=enforce`, and
+/// only against an execution layer that offers `n42Engine_importRange`;
+/// `0` imports block by block.
+pub const SYNC_BATCH_IMPORT_DEFAULT: bool = true;
+
+/// Blocks one batched import call takes at most.
+pub const BATCH_IMPORT_BLOCKS: usize = 256;
+
+/// Transaction bytes one batched import call carries at most (the first job
+/// always goes): the call is one JSON request, hex doubles the bytes, and
+/// the execution layer's server refuses a body much past 15 MB. It also
+/// bounds how long a call runs, so a report comes back well inside the
+/// stall watchdog: a full block (2.7 MB) goes on its own.
+pub const BATCH_IMPORT_BYTES: usize = 4 << 20;
+
+/// A block with more transaction bytes than this is not put in a batched
+/// run: it goes on its own through `newPayload`. Measured (cc32 against
+/// cc32pb, `docs/P1_CATCHUP_PERF.md` step 6): the range import runs
+/// near-empty blocks 1.7x faster, but small to large blocks 2-17% slower
+/// than the engine's own path, which prewarms and roots in parallel.
+/// ~100 transfers.
+pub const BATCH_BLOCK_MAX_BYTES: usize = 16 << 10;
+
+/// Transaction bytes the importer's queue holds at most, either importer
+/// (a job always goes into an empty queue). Each queued block is held twice
+/// on the validator -- its payload here and its RLP in the loop's
+/// bookkeeping -- so this bounds both: ~25 full blocks, against 512 x 2.7 MB
+/// = 1.4 GB by count alone.
+pub const IMPORT_QUEUE_BYTES: usize = 64 << 20;
+
+/// The batched importer's queue.
+pub const BATCH_IMPORT_QUEUE: usize = 2 * BATCH_IMPORT_BLOCKS;
+
+/// Whether the batched import is on ([`SYNC_BATCH_IMPORT_ENV`]); a value
+/// that is not 0 or 1 keeps the default, with a warning.
+pub fn batch_import_from_env() -> bool {
+    let raw = std::env::var(SYNC_BATCH_IMPORT_ENV).ok();
+    match raw.as_deref().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => SYNC_BATCH_IMPORT_DEFAULT,
+        Some("1" | "on" | "true") => true,
+        Some("0" | "off" | "false") => false,
+        Some(_) => {
+            tracing::warn!(target: "n42.h2.node", value = ?raw, "{SYNC_BATCH_IMPORT_ENV} is not 0 or 1; keeping the default");
+            SYNC_BATCH_IMPORT_DEFAULT
         }
     }
 }
@@ -654,19 +714,88 @@ pub(crate) struct ImportBatch {
 pub(crate) struct PulledImporter {
     tx: tokio::sync::mpsc::Sender<ImportJob>,
     task: tokio::task::JoinHandle<()>,
+    /// Transaction bytes of the jobs waiting in the queue
+    /// ([`IMPORT_QUEUE_BYTES`]); released as the importer takes a job.
+    queued: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PulledImporter {
-    /// Spawns the importer on `el`; its reports arrive on the returned
-    /// receiver.
-    pub(crate) fn spawn<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
+    /// The batched importer (its reports arrive on the returned receiver): the queued jobs of one generation, up to
+    /// [`BATCH_IMPORT_BLOCKS`], go to the execution layer in one
+    /// [`ExecutionLayer::import_range`]; whatever it does not take (it does
+    /// not offer the call, the run is unavailable, or it refused a block) is
+    /// imported block by block, so a refusal is the per-block path's verdict.
+    /// The service spawns it only under the enforced anchor rule.
+    pub(crate) fn spawn_batched<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ImportJob>(BATCH_IMPORT_QUEUE);
+        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let taken = queued.clone();
+        let task = tokio::spawn(async move {
+            let mut failed_generation: Option<u64> = None;
+            let mut carry: Option<ImportJob> = None;
+            loop {
+                let first = match carry.take() {
+                    Some(job) => job,
+                    None => match rx.recv().await {
+                        Some(job) => took(&taken, job),
+                        None => return,
+                    },
+                };
+                let generation = first.generation;
+                let mut bytes = tx_bytes(&first);
+                // A block past BATCH_BLOCK_MAX_BYTES goes on its own (the
+                // engine's newPayload, whose prewarm and parallel state root
+                // run such a block faster than the range import's serial
+                // execution); a run gathers the small ones only.
+                let small = bytes <= BATCH_BLOCK_MAX_BYTES;
+                let mut jobs = vec![first];
+                while small && jobs.len() < BATCH_IMPORT_BLOCKS {
+                    match rx.try_recv().map(|job| took(&taken, job)) {
+                        Ok(job)
+                            if job.generation == generation
+                                && tx_bytes(&job) <= BATCH_BLOCK_MAX_BYTES
+                                && bytes + tx_bytes(&job) <= BATCH_IMPORT_BYTES =>
+                        {
+                            bytes += tx_bytes(&job);
+                            jobs.push(job);
+                        }
+                        Ok(job) => {
+                            carry = Some(job);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if failed_generation.is_some_and(|g| g >= generation) {
+                    continue;
+                }
+                let mut batch = ImportBatch { generation, done: Vec::new(), failed: None, new_payload: Duration::ZERO };
+                let at = Instant::now();
+                import_jobs(&*el, jobs, &mut batch).await;
+                batch.new_payload = at.elapsed();
+                if batch.failed.is_some() {
+                    failed_generation = Some(generation);
+                }
+                if (!batch.done.is_empty() || batch.failed.is_some()) && report_tx.send(batch).is_err() {
+                    return;
+                }
+            }
+        });
+        (Self { tx, task, queued }, report_rx)
+    }
+
+    /// The importer that runs `newPayload` block by block.
+    pub(crate) fn spawn_per_block<E: ExecutionLayer>(el: Arc<E>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ImportBatch>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ImportJob>(IMPORT_QUEUE);
         let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let taken = queued.clone();
         let task = tokio::spawn(async move {
             // Jobs of a generation whose block failed are skipped: they
             // have no parent in the execution layer.
             let mut failed_generation: Option<u64> = None;
-            while let Some(first) = rx.recv().await {
+            while let Some(first) = rx.recv().await.map(|job| took(&taken, job)) {
                 let started = Instant::now();
                 let mut batch = ImportBatch {
                     generation: first.generation,
@@ -705,26 +834,85 @@ impl PulledImporter {
                     if batch.done.len() >= REPORT_BLOCKS || started.elapsed() >= REPORT_EVERY {
                         break;
                     }
-                    job = rx.try_recv().ok();
+                    job = rx.try_recv().ok().map(|job| took(&taken, job));
                 }
                 if (!batch.done.is_empty() || batch.failed.is_some()) && report_tx.send(batch).is_err() {
                     return;
                 }
             }
         });
-        (Self { tx, task }, report_rx)
+        (Self { tx, task, queued }, report_rx)
     }
 
-    /// Queues a block; gives it back when the queue is full.
+    /// Queues a block; gives it back when the queue is full by count. The
+    /// byte bound is [`Self::capacity`]'s: the caller asks for room first and
+    /// a block it was told fits must not be refused (the service would lose
+    /// it and the run would have a gap), so the queue can pass
+    /// [`IMPORT_QUEUE_BYTES`] by at most the one block sent while under it.
     pub(crate) fn try_send(&self, job: ImportJob) -> Result<(), ImportJob> {
+        use std::sync::atomic::Ordering;
+        let bytes = tx_bytes(&job);
+        self.queued.fetch_add(bytes, Ordering::Relaxed);
         self.tx.try_send(job).map_err(|err| match err {
-            tokio::sync::mpsc::error::TrySendError::Full(job) | tokio::sync::mpsc::error::TrySendError::Closed(job) => job,
+            tokio::sync::mpsc::error::TrySendError::Full(job) | tokio::sync::mpsc::error::TrySendError::Closed(job) => {
+                self.queued.fetch_sub(bytes, Ordering::Relaxed);
+                job
+            }
         })
     }
 
-    /// Room left in the queue.
+    /// Room left in the queue: none once its bytes reach
+    /// [`IMPORT_QUEUE_BYTES`].
     pub(crate) fn capacity(&self) -> usize {
+        if self.queued.load(std::sync::atomic::Ordering::Relaxed) >= IMPORT_QUEUE_BYTES {
+            return 0;
+        }
         self.tx.capacity()
+    }
+}
+
+/// A job's transaction bytes, for [`BATCH_IMPORT_BYTES`] and
+/// [`IMPORT_QUEUE_BYTES`].
+fn tx_bytes(job: &ImportJob) -> usize {
+    job.payload.payload.as_v1().transactions.iter().map(|tx| tx.len()).sum()
+}
+
+/// The importer took `job` off its queue: its bytes no longer count.
+fn took(queued: &std::sync::atomic::AtomicUsize, job: ImportJob) -> ImportJob {
+    queued.fetch_sub(tx_bytes(&job), std::sync::atomic::Ordering::Relaxed);
+    job
+}
+
+/// Imports one generation's run of jobs into `batch`: in one
+/// [`ExecutionLayer::import_range`] when there is more than one, then block
+/// by block from the first block the range import did not take.
+async fn import_jobs<E: ExecutionLayer>(el: &E, jobs: Vec<ImportJob>, batch: &mut ImportBatch) {
+    let mut rest = std::collections::VecDeque::from(jobs);
+    if rest.len() > 1 {
+        let payloads = rest.iter().map(|job| job.payload.clone()).collect();
+        match el.import_range(payloads).await {
+            Ok(Some(out)) => {
+                let taken = usize::try_from(out.imported).unwrap_or(usize::MAX).min(rest.len());
+                batch.done.extend(rest.drain(..taken).map(|job| (job.number, job.hash)));
+                if let Some(why) = out.refused.as_ref().or(out.unavailable.as_ref()) {
+                    // The block-by-block path gives the verdict on the rest.
+                    tracing::debug!(target: "n42.h2.node", taken, rest = rest.len(), why = %why, "range import stopped; block by block");
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(target: "n42.h2.node", %err, "range import failed; block by block");
+            }
+        }
+    }
+    for job in rest {
+        match ExecutionDriver::<E>::pulled_new_payload(el, job.payload).await {
+            Ok(()) => batch.done.push((job.number, job.hash)),
+            Err(err) => {
+                batch.failed = Some((job.number, job.hash, err.to_string()));
+                return;
+            }
+        }
     }
 }
 
@@ -930,5 +1118,95 @@ mod tests {
         let mut s = RangeScheduler::with_shape(1, WINDOW_BLOCKS, 4);
         let asked = s.assign(1, &peers, Instant::now());
         assert_eq!(asked.len(), 2, "a range starting past the window waits");
+    }
+
+    fn jobs(generation: u64, n: u64) -> Vec<ImportJob> {
+        (1..=n)
+            .map(|number| {
+                let hash = B256::with_last_byte(number as u8);
+                ImportJob { generation, number, hash, payload: n42_h2_execution::MockExecutionLayer::payload_for(hash, number) }
+            })
+            .collect()
+    }
+
+    async fn import_all(
+        el: Arc<n42_h2_execution::MockExecutionLayer>,
+        jobs: Vec<ImportJob>,
+    ) -> (Vec<(u64, B256)>, Option<(u64, B256, String)>) {
+        let want = jobs.len();
+        let (importer, mut reports) = PulledImporter::spawn_batched(el);
+        for job in jobs {
+            importer.try_send(job).expect("room");
+        }
+        let (mut done, mut failed) = (Vec::new(), None);
+        while done.len() < want && failed.is_none() {
+            let batch = reports.recv().await.expect("report");
+            done.extend(batch.done);
+            failed = batch.failed;
+        }
+        (done, failed)
+    }
+
+    /// The importer's queue is bounded by bytes through its room: a block it
+    /// was told fits is never refused (the caller would lose it), the room is
+    /// none once the queue holds [`IMPORT_QUEUE_BYTES`], and back once the
+    /// importer has taken the jobs.
+    #[tokio::test]
+    async fn the_import_queue_is_bounded_by_bytes() {
+        let big = |number: u64| {
+            let mut job = jobs(1, number).pop().expect("a job");
+            if let alloy_rpc_types_engine::ExecutionPayload::V1(v1) = &mut job.payload.payload {
+                v1.transactions = vec![alloy_primitives::Bytes::from(vec![0u8; IMPORT_QUEUE_BYTES / 2 + 1])];
+            }
+            job
+        };
+        let el = Arc::new(n42_h2_execution::MockExecutionLayer::new());
+        let (importer, mut reports) = PulledImporter::spawn_batched(el);
+        assert!(importer.capacity() > 0);
+        importer.try_send(big(1)).expect("room was reported");
+        assert!(importer.capacity() > 0, "under the bound");
+        importer.try_send(big(2)).expect("room was reported");
+        assert_eq!(importer.capacity(), 0, "no room once the bytes reach the bound");
+        let mut done = 0;
+        while done < 2 {
+            done += reports.recv().await.expect("imported").done.len();
+        }
+        assert!(importer.capacity() > 0, "room again once the importer took them");
+    }
+
+    #[tokio::test]
+    async fn batched_importer_takes_a_queued_run_in_one_call() {
+        let el = Arc::new(n42_h2_execution::MockExecutionLayer::new());
+        el.set_behaviour(n42_h2_execution::MockBehaviour { range_imports: true, ..Default::default() });
+        let (done, failed) = import_all(el.clone(), jobs(1, 10)).await;
+        assert!(failed.is_none());
+        assert_eq!(done.iter().map(|(n, _)| *n).collect::<Vec<_>>(), (1..=10).collect::<Vec<_>>());
+        assert_eq!(el.range_imports(), vec![10], "one call for the queued run");
+    }
+
+    #[tokio::test]
+    async fn batched_importer_goes_block_by_block_without_the_call() {
+        let el = Arc::new(n42_h2_execution::MockExecutionLayer::new());
+        let (done, failed) = import_all(el.clone(), jobs(1, 10)).await;
+        assert!(failed.is_none());
+        assert_eq!(done.len(), 10);
+        assert!(el.range_imports().is_empty());
+        let new_payloads = el.calls().iter().filter(|c| matches!(c, n42_h2_execution::ElCall::NewPayload(_))).count();
+        assert_eq!(new_payloads, 10);
+    }
+
+    #[tokio::test]
+    async fn batched_importer_reports_a_refused_block_with_the_per_block_verdict() {
+        let el = Arc::new(n42_h2_execution::MockExecutionLayer::new());
+        el.set_behaviour(n42_h2_execution::MockBehaviour {
+            range_imports: true,
+            new_payload_status: alloy_rpc_types_engine::PayloadStatusEnum::Invalid { validation_error: "bad".into() },
+            ..Default::default()
+        });
+        let (done, failed) = import_all(el.clone(), jobs(1, 10)).await;
+        assert!(done.is_empty());
+        let (number, _, why) = failed.expect("refused");
+        assert_eq!(number, 1);
+        assert!(why.contains("bad"), "{why}");
     }
 }

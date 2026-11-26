@@ -235,6 +235,21 @@ pub type ChainSealer = std::sync::Arc<
         + Sync,
 >;
 
+/// What one [`ExecutionLayer::import_range`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RangeImport {
+    /// How many of the given blocks, from the first, are executed and the
+    /// execution layer's chain now (the head is the last of them).
+    pub imported: u64,
+    /// The block after the imported ones was refused, and why: invalid, as a
+    /// `newPayload` answered INVALID.
+    pub refused: Option<String>,
+    /// The run was not taken at all, and why: the caller imports it block by
+    /// block. Blocks past `imported` that were neither refused nor taken are
+    /// the caller's to import block by block too.
+    pub unavailable: Option<String>,
+}
+
 /// A block as the execution layer holds it: header, transactions and, on a
 /// post-Shanghai chain, its withdrawals — which on a gov5 chain are its
 /// rewards.
@@ -380,6 +395,16 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// [`Self::block_by_number`]. The default does not offer it.
     async fn blocks_by_range(&self, start: u64, count: u64, max_bytes: usize) -> Result<Option<Vec<ChainBlock>>, ElError> {
         let _ = (start, count, max_bytes);
+        Ok(None)
+    }
+
+    /// Executes a run of consecutive committed blocks in one call, the first
+    /// on the execution layer's head, and makes the last one imported the
+    /// head (`n42Engine_importRange`). For a catch-up over blocks a verified
+    /// commit QC authenticates only. `Ok(None)` when the execution layer does
+    /// not offer it: the caller imports block by block. The default does not.
+    async fn import_range(&self, payloads: Vec<ExecutionData>) -> Result<Option<RangeImport>, ElError> {
+        let _ = payloads;
         Ok(None)
     }
 

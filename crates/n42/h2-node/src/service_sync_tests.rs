@@ -332,6 +332,83 @@ async fn lazy_screening_executes_nothing_a_forger_served() {
     }
 }
 
+/// The batched import (`N42_SYNC_BATCH_IMPORT`, `docs/P1_CATCHUP_PERF.md`
+/// step 6) beside a forger: the honest chain goes to the execution layer in
+/// runs, in order, and no forged block is ever in a run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_import_runs_the_honest_chain_and_nothing_a_forger_served() {
+    for lazy in [false, true] {
+        let (keys, set) = keys(1);
+        let builder = node_in(&keys, &set, 0, None).await;
+        let count = 300;
+        let honest = anchored_chain(&builder, count);
+        let mut forged = honest[..149].to_vec();
+        let mut parent = forged[148].0;
+        for number in 150..=count {
+            let qc = header_qc(&builder.svc, &builder.keys, &[0], number - 1, parent, B256::repeat_byte(7));
+            let block = block_with_extra(number, parent, number, qc);
+            parent = block.0;
+            forged.push(block);
+        }
+        drop(builder);
+        let mut servers = vec![server_with(&keys, &set, &forged).await, server_with(&keys, &set, &honest).await];
+        let mut a = puller(&keys, &set, &mut servers, 0, 0, true).await;
+        a.svc.sync_lazy_verify = lazy;
+        a.svc.sync_batch_import = true;
+        a.el.set_behaviour(MockBehaviour { range_imports: true, new_payload_delay: Some(Duration::from_millis(2)), ..Default::default() });
+        let mut events = Vec::new();
+        pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| {
+            synced(events).is_some_and(|(height, complete)| complete && height == count - 1)
+        })
+        .await;
+        assert!(!a.el.range_imports().is_empty(), "the pull went in runs (lazy {lazy})");
+        let forged_hashes: HashSet<B256> = forged[149..].iter().map(|b| b.0).collect();
+        let ran = executed(&a);
+        assert!(ran.iter().all(|h| !forged_hashes.contains(h)), "a forged block reached the execution layer");
+        let hashes: Vec<B256> = honest[..count as usize - 1].iter().map(|b| b.0).collect();
+        let mut seen = HashSet::new();
+        let unique: Vec<B256> = ran.into_iter().filter(|h| seen.insert(*h)).collect();
+        assert_eq!(unique, hashes, "the honest chain, in order (lazy {lazy})");
+    }
+}
+
+/// A run whose top commit QC is forged (every block past the first carries a
+/// QC that does not verify) and no honest peer: under the batched import the
+/// execution layer is handed nothing -- no run, no block, no forkchoice to a
+/// forged block -- so its head and state are what they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_whose_top_qc_is_forged_leaves_the_el_head_and_state_unchanged() {
+    let (keys, set) = keys(1);
+    let builder = node_in(&keys, &set, 0, None).await;
+    let count = 200;
+    let honest = anchored_chain(&builder, count);
+    let mut forged = honest[..1].to_vec();
+    let mut parent = forged[0].0;
+    for number in 2..=count {
+        let qc = header_qc(&builder.svc, &builder.keys, &[0], number - 1, parent, B256::repeat_byte(7));
+        let block = block_with_extra(number, parent, number, qc);
+        parent = block.0;
+        forged.push(block);
+    }
+    drop(builder);
+    let mut servers = vec![server_with(&keys, &set, &forged).await];
+    let mut a = puller(&keys, &set, &mut servers, 0, 0, true).await;
+    a.svc.sync_lazy_verify = true;
+    a.svc.sync_batch_import = true;
+    a.el.set_behaviour(MockBehaviour { range_imports: true, ..Default::default() });
+    let before = a.el.calls().len();
+    let mut events = Vec::new();
+    pump_many(&mut a, &mut servers, &mut events, 30, |_, _| false, |_, events| synced(events).is_some()).await;
+    let forged_hashes: HashSet<B256> = forged.iter().map(|b| b.0).collect();
+    assert!(a.el.range_imports().is_empty(), "no run reached the execution layer");
+    assert!(executed(&a).is_empty(), "no block reached the execution layer: {:?}", executed(&a));
+    let heads: Vec<B256> = a.el.calls()[before..]
+        .iter()
+        .filter_map(|c| if let ElCall::ForkchoiceUpdated(s) = c { Some(s.head_block_hash) } else { None })
+        .collect();
+    assert!(heads.iter().all(|h| !forged_hashes.contains(h)), "a forkchoice moved to a pulled block: {heads:?}");
+}
+
 /// The stall watchdog: an execution layer that stops answering mid-pull
 /// leaves the executed head where it is while pulled blocks wait; the
 /// pipeline gives up, says so, and the next pull runs serially and
@@ -445,4 +522,195 @@ async fn a_greedy_peer_is_throttled_by_its_byte_rate_and_an_ordinary_catch_up_is
     pump(&mut c, &mut b, (false, true), &mut c_events, |c, _, _| !c.svc.pending_imports.is_empty()).await;
     assert_eq!(c.svc.pending_imports[0].2.len(), 4, "served in full");
     assert_eq!(b.svc.range_rate_limited, 3);
+}
+
+/// Step 7 of `docs/P1_CATCHUP_PERF.md`: with the environment unset, lazy
+/// screening and the batched import are on; `0` keeps the eager,
+/// block-by-block path selectable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lazy_screening_and_batch_import_are_on_by_default() {
+    const _: () = assert!(crate::sync_pipeline::SYNC_LAZY_VERIFY_DEFAULT && crate::sync_pipeline::SYNC_BATCH_IMPORT_DEFAULT);
+    let (keys, set) = keys(1);
+    let rig = node_in(&keys, &set, 0, None).await;
+    if std::env::var_os(crate::sync_pipeline::SYNC_LAZY_VERIFY_ENV).is_none() {
+        assert!(rig.svc.sync_lazy_verify);
+    }
+    if std::env::var_os(crate::sync_pipeline::SYNC_BATCH_IMPORT_ENV).is_none() {
+        assert!(rig.svc.sync_batch_import);
+    }
+}
+
+/// The parallel prescreen of a reply records the header QCs that verify and
+/// nothing of a forged chain, so a forged block still meets the per-block
+/// check; eager screening of a reply needs no further BLS work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_prescreen_records_verified_qcs_and_nothing_forged() {
+    let (keys, set) = keys(1);
+    let mut rig = node_in(&keys, &set, 0, None).await;
+    rig.svc.sync_lazy_verify = false;
+    let count = 40;
+    let honest = anchored_chain(&rig, count);
+    let forged = forged_from(&rig, &honest, 2, count);
+    let reply = |blocks: &[(B256, Header, alloy_primitives::Bytes)]| -> std::collections::VecDeque<BlockChunk> {
+        chunks(blocks).into()
+    };
+    rig.svc.prescreen_reply(&reply(&forged[1..]));
+    assert!(rig.svc.prescreened_qcs.borrow().is_empty(), "a forged QC is not recorded");
+    rig.svc.prescreen_reply(&reply(&honest[1..]));
+    assert_eq!(rig.svc.prescreened_qcs.borrow().len(), count as usize - 1, "every honest QC, checked ahead");
+    for (_, header, _) in &forged[1..] {
+        assert!(rig.svc.sync_anchor_of(header).is_err(), "the per-block check still refuses a forged block");
+    }
+    for (_, header, _) in &honest[1..] {
+        assert!(rig.svc.sync_anchor_of(header).expect("verifies").is_some());
+    }
+    assert!(rig.svc.prescreened_qcs.borrow().is_empty(), "each taken once");
+}
+
+/// The puller with the defaults (lazy screening, batched import) and an
+/// execution layer that offers range imports.
+async fn default_puller(keys: &[BlsSecretKey], set: &ValidatorSet, servers: &mut [Rig]) -> Rig {
+    let mut a = puller(keys, set, servers, 0, 0, true).await;
+    a.svc.sync_lazy_verify = crate::sync_pipeline::SYNC_LAZY_VERIFY_DEFAULT;
+    a.svc.sync_batch_import = crate::sync_pipeline::SYNC_BATCH_IMPORT_DEFAULT;
+    a.el.set_behaviour(MockBehaviour {
+        range_imports: true,
+        new_payload_delay: Some(Duration::from_millis(2)),
+        ..Default::default()
+    });
+    a
+}
+
+/// A chain whose blocks from `first` on carry a certificate that does not
+/// verify (signed over another hash than it names).
+fn forged_from(builder: &Rig, honest: &[(B256, Header, alloy_primitives::Bytes)], first: u64, count: u64) -> Vec<(B256, Header, alloy_primitives::Bytes)> {
+    let mut forged = honest[..first as usize - 1].to_vec();
+    let mut parent = forged[first as usize - 2].0;
+    for number in first..=count {
+        let qc = header_qc(&builder.svc, &builder.keys, &[0], number - 1, parent, B256::repeat_byte(7));
+        let block = block_with_extra(number, parent, number, qc);
+        parent = block.0;
+        forged.push(block);
+    }
+    forged
+}
+
+/// The executed hashes, each once, in first-seen order.
+fn executed_once(rig: &Rig) -> Vec<B256> {
+    let mut seen = HashSet::new();
+    executed(rig).into_iter().filter(|h| seen.insert(*h)).collect()
+}
+
+/// Defaults, honest chain: one complete pull, executed in runs, in order,
+/// with a fraction of the certificates verified and no peer blamed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_pull_runs_an_honest_chain_in_runs() {
+    let (keys, set) = keys(1);
+    let builder = node_in(&keys, &set, 0, None).await;
+    let count = 400;
+    let blocks = anchored_chain(&builder, count);
+    drop(builder);
+    let mut servers = vec![server_with(&keys, &set, &blocks).await];
+    let mut a = default_puller(&keys, &set, &mut servers).await;
+    let mut events = Vec::new();
+    pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| synced(events).is_some()).await;
+    assert_eq!(synced(&events), Some((count - 1, true)), "{events:?}");
+    let hashes: Vec<B256> = blocks[..count as usize - 1].iter().map(|b| b.0).collect();
+    assert_eq!(executed(&a), hashes, "every block once, in order");
+    assert!(!a.el.range_imports().is_empty(), "the pull went in runs");
+    let times = a.svc.last_catch_up_times.clone().expect("the pull's timing");
+    assert!(times.checked > 0 && times.checked * 8 <= count, "verified {} of {count}", times.checked);
+    assert!(a.svc.sync_faults.is_empty() && a.svc.refused_range_peers.is_empty());
+}
+
+/// Defaults, a forged middle block: the forger serves the honest chain but
+/// with block 150 replaced by another block on the same parent, whose own
+/// certificate is genuine, so screening alone would pass it. Block 151 does
+/// not extend it. The forger is scored, disconnected and refused for the
+/// gap; the replacement block never executes; the honest peer finishes the
+/// chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_middle_block_scores_and_drops_its_peer_and_never_executes() {
+    let (keys, set) = keys(1);
+    let builder = node_in(&keys, &set, 0, None).await;
+    let count = 300;
+    let honest = anchored_chain(&builder, count);
+    let mut forged = honest.clone();
+    let qc = header_qc(&builder.svc, &builder.keys, &[0], 149, honest[148].0, honest[148].0);
+    forged[149] = block_with_extra(150, honest[148].0, 1_150, qc);
+    assert_ne!(forged[149].0, honest[149].0);
+    drop(builder);
+    // The forger alone first, so it serves the range holding block 150.
+    let mut servers = vec![server_with(&keys, &set, &forged).await];
+    let forger = peer_of(&servers[0]);
+    let mut a = default_puller(&keys, &set, &mut servers).await;
+    let mut events = Vec::new();
+    pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| synced(events).is_some()).await;
+    assert!(!executed(&a).contains(&forged[149].0), "the forged middle block reached the execution layer");
+    assert!(a.svc.sync_faults.get(&forger).is_some_and(|n| *n >= 1), "the forger is scored: {:?}", a.svc.sync_faults);
+    assert!(a.svc.refused_range_peers.contains_key(&forger), "and refused for the gap");
+    assert!(!a.svc.transport.connected_peer_ids().contains(&forger), "and disconnected");
+    // An honest peer finishes the chain.
+    servers.push(server_with(&keys, &set, &honest).await);
+    a.svc.transport.dial(servers[1].addr.clone()).expect("dial");
+    let mut events = Vec::new();
+    pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| {
+        synced(events).is_some_and(|(height, complete)| complete && height == count - 1)
+    })
+    .await;
+    assert!(!executed(&a).contains(&forged[149].0), "the forged middle block reached the execution layer");
+    let hashes: Vec<B256> = honest[..count as usize - 1].iter().map(|b| b.0).collect();
+    assert_eq!(executed_once(&a), hashes, "the honest chain, in order");
+}
+
+/// Defaults, a forged anchor: every block the forger serves past block 1
+/// carries a certificate that does not verify, beside an honest peer. The
+/// forger's run fails at its verified block: it is scored and disconnected,
+/// the honest peer is not blamed, and nothing forged executes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_anchor_scores_and_drops_its_peer() {
+    let (keys, set) = keys(1);
+    let builder = node_in(&keys, &set, 0, None).await;
+    let count = 300;
+    let honest = anchored_chain(&builder, count);
+    let forged = forged_from(&builder, &honest, 2, count);
+    drop(builder);
+    let mut servers = vec![server_with(&keys, &set, &forged).await, server_with(&keys, &set, &honest).await];
+    let forger = peer_of(&servers[0]);
+    let honest_peer = peer_of(&servers[1]);
+    let mut a = default_puller(&keys, &set, &mut servers).await;
+    let mut events = Vec::new();
+    pump_many(&mut a, &mut servers, &mut events, 60, |_, _| false, |_, events| {
+        synced(events).is_some_and(|(height, complete)| complete && height == count - 1)
+    })
+    .await;
+    let forged_hashes: HashSet<B256> = forged[1..].iter().map(|b| b.0).collect();
+    assert!(executed(&a).iter().all(|h| !forged_hashes.contains(h)), "a forged block reached the execution layer");
+    let hashes: Vec<B256> = honest[..count as usize - 1].iter().map(|b| b.0).collect();
+    assert_eq!(executed_once(&a), hashes, "the honest chain, in order");
+    assert!(a.svc.sync_faults.get(&forger).is_some_and(|n| *n >= 1), "the forger is scored: {:?}", a.svc.sync_faults);
+    assert!(!a.svc.transport.connected_peer_ids().contains(&forger), "and disconnected");
+    assert!(!a.svc.sync_faults.contains_key(&honest_peer), "the honest peer is not blamed");
+}
+
+/// Defaults, a peer switch: two honest peers, one of which stalls after its
+/// first range. Its ranges go to the other; the pull is complete, in runs,
+/// every block once in order, and no one is scored for the switch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_pull_survives_a_peer_switch_without_blame() {
+    let (keys, set) = keys(1);
+    let builder = node_in(&keys, &set, 0, None).await;
+    let count = 600;
+    let blocks = anchored_chain(&builder, count);
+    drop(builder);
+    let mut servers = vec![server_with(&keys, &set, &blocks).await, server_with(&keys, &set, &blocks).await];
+    let mut a = default_puller(&keys, &set, &mut servers).await;
+    let mut events = Vec::new();
+    let frozen = |i: usize, s: &Rig| i == 1 && s.seen.iter().filter(|k| **k == "range_request").count() >= 2;
+    pump_many(&mut a, &mut servers, &mut events, 60, frozen, |_, events| synced(events).is_some()).await;
+    assert_eq!(synced(&events), Some((count - 1, true)), "{events:?}");
+    let hashes: Vec<B256> = blocks[..count as usize - 1].iter().map(|b| b.0).collect();
+    assert_eq!(executed(&a), hashes, "every block once, in height order");
+    assert!(!a.el.range_imports().is_empty(), "the pull went in runs");
+    assert!(a.svc.sync_faults.is_empty(), "a stalled peer is not a forger: {:?}", a.svc.sync_faults);
 }

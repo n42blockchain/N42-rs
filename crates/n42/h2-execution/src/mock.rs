@@ -105,6 +105,10 @@ pub struct MockBehaviour {
     /// Whether this execution layer reads a range in one call
     /// (`blocks_by_range`); `false` answers `None`, as a stock one does.
     pub bulk_ranges: bool,
+    /// Whether this execution layer imports a committed run in one call
+    /// (`import_range`, each block as `new_payload` would take it); `false`
+    /// answers `None`, as a stock one does.
+    pub range_imports: bool,
 }
 
 impl Default for MockBehaviour {
@@ -127,6 +131,7 @@ impl Default for MockBehaviour {
             forkchoice_delay: None,
             check_refused: false,
             bulk_ranges: false,
+            range_imports: false,
         }
     }
 }
@@ -141,6 +146,8 @@ struct MockState {
     /// The head the last build was asked to extend, so the block built for it
     /// says so: the driver refuses a build on another parent.
     next_parent: B256,
+    /// The runs `import_range` took, by length.
+    range_imports: Vec<usize>,
 }
 
 /// An [`ExecutionLayer`] that records calls instead of executing.
@@ -176,6 +183,11 @@ impl MockExecutionLayer {
     /// Replaces the behaviour mid-test.
     pub fn set_behaviour(&self, behaviour: MockBehaviour) {
         *self.behaviour.lock().expect("mock behaviour lock") = behaviour;
+    }
+
+    /// The runs `import_range` took so far, by length, in order.
+    pub fn range_imports(&self) -> Vec<usize> {
+        self.state.lock().expect("mock state lock").range_imports.clone()
     }
 
     /// Every Engine API call made so far, in order.
@@ -483,6 +495,29 @@ impl ExecutionLayer for MockExecutionLayer {
 
     async fn block_by_number(&self, number: u64) -> Result<Option<ChainBlock>, ElError> {
         Ok(self.state.lock().expect("mock state lock").blocks.get(&number).cloned())
+    }
+
+    async fn import_range(&self, payloads: Vec<ExecutionData>) -> Result<Option<crate::RangeImport>, ElError> {
+        if !self.behaviour.lock().expect("mock behaviour lock").range_imports {
+            return Ok(None);
+        }
+        self.state.lock().expect("mock state lock").range_imports.push(payloads.len());
+        // Each block as `new_payload` takes it (the same recorded call, gate,
+        // delay and verdict), stopping at the first that is not VALID.
+        let mut out = crate::RangeImport::default();
+        for payload in payloads {
+            let number = payload.payload.block_number();
+            match self.new_payload(payload).await {
+                Ok(status) if status.is_valid() => out.imported += 1,
+                Ok(status) => {
+                    out.refused = Some(format!("block {number}: {status:?}"));
+                    break;
+                }
+                Err(err) if out.imported == 0 => return Err(err),
+                Err(_) => break,
+            }
+        }
+        Ok(Some(out))
     }
 
     async fn blocks_by_range(&self, start: u64, count: u64, max_bytes: usize) -> Result<Option<Vec<ChainBlock>>, ElError> {

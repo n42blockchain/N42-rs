@@ -8411,8 +8411,8 @@ mod tests {
     #[test]
     fn a_certificate_signer_is_not_named_silent() {
         let mut keys = SilentKeys::default();
-        let votes = |voter: u32| if voter < 4 { Some(100) } else { None };
-        let certificates = |voter: u32| if voter == 4 { Some(100) } else { None };
+        let votes = |voter: u32| (voter < 4).then_some(100);
+        let certificates = |voter: u32| (voter == 4).then_some(100);
         let seen = |voter: u32| last_participation(votes(voter), certificates(voter));
         assert!(keys.observe(90, 7, 0, seen).is_empty());
         assert_eq!(

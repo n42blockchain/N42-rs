@@ -171,11 +171,20 @@ pub const PREFAULT_KNOBS: &[(&str, &str)] = &[
     ("N42_QMDB_OFFSET_SEGMENTS_AHEAD", "1"),
 ];
 
+/// The QMDB layout knob a profile-1 member sets when the environment leaves
+/// it unset: the tree's entries in `qmdb/entries.log` (8 B of offset and a bit
+/// per slot in memory) instead of the heap (~160 B per entry, a `Vec` that
+/// grows by doubling: 1 GiB at the heavy catch-up's peak). A heap-mode
+/// datadir migrates once at the first start (`QmdbNodeState`'s version-1
+/// checkpoint migration) and stays in file mode afterwards, whatever the
+/// environment says; roots and wire bytes are the same.
+pub const LAYOUT_KNOBS: &[(&str, &str)] = &[("N42_QMDB_ENTRY_FILE", "1")];
+
 /// Sets, where the environment leaves them unset, `RAYON_NUM_THREADS` to
 /// [`MemoryDefaults::cores`] -- every rayon pool built with the default size
 /// follows it: the global pool (which clap's chain parser starts for the
 /// genesis root), reth's RPC blocking pool -- and every [`PREFAULT_KNOBS`]
-/// entry. Returns what it set, as `NAME=value`.
+/// and [`LAYOUT_KNOBS`] entry. Returns what it set, as `NAME=value`.
 ///
 /// # Safety
 ///
@@ -187,7 +196,8 @@ pub unsafe fn set_env_defaults(defaults: &MemoryDefaults) -> Vec<String> {
     let mut set = Vec::new();
     let cores = defaults.cores.map(|cores| cores.to_string());
     let rayon = cores.as_deref().map(|cores| ("RAYON_NUM_THREADS", cores));
-    for (name, value) in rayon.into_iter().chain(PREFAULT_KNOBS.iter().copied()) {
+    let knobs = PREFAULT_KNOBS.iter().chain(LAYOUT_KNOBS).copied();
+    for (name, value) in rayon.into_iter().chain(knobs) {
         if std::env::var_os(name).is_none() {
             // SAFETY: the caller guarantees no concurrent environment access.
             unsafe { std::env::set_var(name, value) };

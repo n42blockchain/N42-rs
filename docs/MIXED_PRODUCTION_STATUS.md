@@ -253,3 +253,53 @@ caught up ~300 blocks in 18 s and voted 0.3 s later; n42-26 304 blocks in 13 s, 
 gov5 member 15 at the head 30 s after restart, voting after 27 s. Heights 0..410 equal on all eight dumps, deltas
 8 x335 / 32 x74 (absent leaders) / 48 x1 (startup), 0 refusals, 45,000 transactions with 0 errors.
 
+
+## v1.1 gate 4b — join by full block sync from genesis (2026-11-26, PASSED)
+
+Mixed round T0 04:42:00 EST, genesis `genesis-gate4b.json` (sha256 ee123441…ffe14, hash 0x62829812…e9dd), gate-6 set:
+gov5 v0, v1 + verifier 4 (main fe5e02ed, binary 00aa020a…, byte-identical to ecaa51f7), n42-rs v2 (main 004ac1167,
+h2_validator 5326bb5e…), n42-26 v3 (64b5b10 + PR #48 + e3d22dd, c20104ef…). Load 25,800 tx, 0 errors.
+Each member wiped once (keys kept, genesis re-initialised, restarted at once), one down at a time:
+
+| Wipe | Range pulled (/2) | Served by | commit_qc/1 anchor | At head | First vote (after head) |
+| --- | --- | --- | --- | --- | --- |
+| n42-rs v2, 04:52:00 | 1..71, 617 KB | gov5 v1 | #71, gov5 v1 | 04:52:04.3 | 04:52:08 (4 s) |
+| gov5 v1, 05:02:00 | 1..146, 1.39 MB | gov5 v0 | #146, gov5 v0 | 05:02:08 | 05:02:24 (16 s) |
+| n42-26 v3, 05:12:01 | 1..220, 2.15 MB | gov5 v1 | #220, gov5 v1 | 05:12:29 | 05:13:04 (35 s) |
+
+Headers 0..368 equal on all seven dumps (gov5 node0..4, n42-rs v2, n42-26 v3), 0 mismatches, 0 off-grid; one slot
+missed (block 222, v3's own slot during its wipe). No `/1` used. The pre-run (04:02, `genesis-pre4b.json`) found the
+n42-26 tail-release stall (range timer deadline slid under tx gossip; fixed in e3d22dd with tests) and the n42-rs
+`/2` busy code (0x02 -> 0x04 "1000", 004ac1167).
+
+Open for v1.1 after 4b: (a) [closed by 4b-S below] every `/2` and `commit_qc/1` in this round was served by gov5 — n42-rs and n42-26 as SERVERS to
+another client are covered only by vectors and same-client loopback tests, a mixed leg with gov5 serving disabled is
+still due; (b) the scale leg (long history; chain-94 shared state `gov5-work/p1scale/out/`); (c) n42-26's 35 s from head
+to first vote and gov5's repeated `/2 145..146` asks are noted, not failures.
+
+### Gate 4b-S — non-gov5 clients as servers (2026-11-26, PASSED)
+
+T0 05:46:00 EST, genesis `genesis-gate4bS.json` (sha256 cebbf1ed…2e3c, hash 0x86d68d21…c15c). gov5 0064ffd3
+(68cdfe04…, = fe5e02ed + `N42_SYNC_RANGE_SERVE=off`, which leaves `/1`, `/2` and `commit_qc/1` unregistered) on
+v0/v1/v4, so only n42-rs v2 (004ac1167) and n42-26 v3 (e3d22dd) could serve. The switch reached gov5's nodes only
+after a one-by-one restart at 05:48:40-50 (gov5's harness stripped `N42_*`); nothing was served by gov5 before it.
+
+| Wipe | Refused by (no protocol) | Range pulled (/2) | Served by | Tail anchor | First vote after head |
+| --- | --- | --- | --- | --- | --- |
+| gov5 v1, 05:56:01 | gov5 v0, v4 | 1..62 | n42-26 v3 | commit_qc/1 #62, n42-26 v3 | 8 s |
+| n42-rs v2, 06:06:00 | gov5 v0, v1, v4 | 1..137, 1.38 MB, 1.5 s | n42-26 v3 | commit_qc/1 #137, n42-26 v3 | 3.4 s |
+| n42-26 v3, 06:16:01 | gov5 v1, v4 | 1..211, 180 ms | n42-rs v2 | live QCs | 3.6 s |
+
+Also n42-rs v2 served gov5 v4 `/2` 16..17 at 05:50 (v4's switch restart). Headers 0..287 equal on all seven dumps,
+0 mismatches; no slot missed during a wipe (block 17's 80 s gap is gov5's switch restart). Load 21,000 tx (5 send
+errors + 10 late receipts from that restart, all mined).
+
+Cross-client serving now exercised in mixed rounds: `/2` gov5->both, n42-26->both, n42-rs->both; `commit_qc/1`
+gov5->both, n42-26->both. n42-rs as a `commit_qc/1` server to another client is still covered only by the gov5
+vectors and same-client loopback tests. Notes (not failures): gov5's client retries a protocol-refusing peer ~10
+times in a second (gov5 todo); n42-26's e3d22dd has no serve-side log for `commit_qc/1`.
+
+
+v1.1 releases (2026-11-26): gov5 main fe5e02ed (node binary 00aa020a…, byte-identical to ecaa51f7; the serve switch
+`N42_SYNC_RANGE_SERVE` is on branch 0064ffd3); n42-rs main 004ac1167 (sync v1.1) + docs; n42-26 main 053b4f6 (PR #48,
+tree = e3d22dd, gate binary c20104ef…; follow-ups in PR #49: commit_qc/1 serve log, deferred-check timing).

@@ -43,6 +43,11 @@ pub const CROSS_BLOCK_CACHE_KNOB: &str = "N42_P1_CROSS_BLOCK_CACHE_MB";
 /// member (default [`DEFAULT_ROCKSDB_CACHE_MB`]).
 pub const ROCKSDB_CACHE_KNOB: &str = "N42_P1_ROCKSDB_CACHE_MB";
 
+/// `N42_P1_RPC_CACHE_MB=<n>`: the byte bound of each of the RPC state
+/// cache's block, receipt and block-access-list caches on a profile-1 member
+/// (default [`DEFAULT_RPC_CACHE_MB`]).
+pub const RPC_CACHE_KNOB: &str = "N42_P1_RPC_CACHE_MB";
+
 /// The cores a profile-1 member sizes its pools by.
 pub const DEFAULT_CORES: usize = 8;
 
@@ -54,6 +59,12 @@ pub const DEFAULT_CROSS_BLOCK_CACHE_MB: usize = 256;
 /// in MiB (reth's default is 128).
 pub const DEFAULT_ROCKSDB_CACHE_MB: usize = 32;
 
+/// Each RPC state cache's byte bound on a profile-1 member, in MiB (reth's
+/// are 2 GiB of blocks, 1 GiB of receipts, 500 MiB of block access lists).
+/// Every canonical block's receipts are copied into it, so a catch-up of
+/// heavy blocks filled the receipt cache to ~750 MiB (`docs/P1_MEMORY.md`).
+pub const DEFAULT_RPC_CACHE_MB: usize = 64;
+
 /// What a profile-1 member sizes by, after the knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryDefaults {
@@ -63,6 +74,8 @@ pub struct MemoryDefaults {
     pub cross_block_cache_mb: usize,
     /// The `RocksDB` block cache, MiB.
     pub rocksdb_cache_mb: usize,
+    /// Each RPC state cache's byte bound, MiB.
+    pub rpc_cache_mb: usize,
 }
 
 impl MemoryDefaults {
@@ -78,7 +91,8 @@ impl MemoryDefaults {
         };
         let cross_block_cache_mb = n42_env::parse(CROSS_BLOCK_CACHE_KNOB, DEFAULT_CROSS_BLOCK_CACHE_MB);
         let rocksdb_cache_mb = n42_env::parse(ROCKSDB_CACHE_KNOB, DEFAULT_ROCKSDB_CACHE_MB);
-        Some(Self { cores, cross_block_cache_mb, rocksdb_cache_mb })
+        let rpc_cache_mb = n42_env::parse(RPC_CACHE_KNOB, DEFAULT_RPC_CACHE_MB);
+        Some(Self { cores, cross_block_cache_mb, rocksdb_cache_mb, rpc_cache_mb })
     }
 
     /// The defaults for a process started with `args` (the program name
@@ -157,11 +171,20 @@ pub const PREFAULT_KNOBS: &[(&str, &str)] = &[
     ("N42_QMDB_OFFSET_SEGMENTS_AHEAD", "1"),
 ];
 
+/// The QMDB layout knob a profile-1 member sets when the environment leaves
+/// it unset: the tree's entries in `qmdb/entries.log` (8 B of offset and a bit
+/// per slot in memory) instead of the heap (~160 B per entry, a `Vec` that
+/// grows by doubling: 1 GiB at the heavy catch-up's peak). A heap-mode
+/// datadir migrates once at the first start (`QmdbNodeState`'s version-1
+/// checkpoint migration) and stays in file mode afterwards, whatever the
+/// environment says; roots and wire bytes are the same.
+pub const LAYOUT_KNOBS: &[(&str, &str)] = &[("N42_QMDB_ENTRY_FILE", "1")];
+
 /// Sets, where the environment leaves them unset, `RAYON_NUM_THREADS` to
 /// [`MemoryDefaults::cores`] -- every rayon pool built with the default size
 /// follows it: the global pool (which clap's chain parser starts for the
 /// genesis root), reth's RPC blocking pool -- and every [`PREFAULT_KNOBS`]
-/// entry. Returns what it set, as `NAME=value`.
+/// and [`LAYOUT_KNOBS`] entry. Returns what it set, as `NAME=value`.
 ///
 /// # Safety
 ///
@@ -173,7 +196,8 @@ pub unsafe fn set_env_defaults(defaults: &MemoryDefaults) -> Vec<String> {
     let mut set = Vec::new();
     let cores = defaults.cores.map(|cores| cores.to_string());
     let rayon = cores.as_deref().map(|cores| ("RAYON_NUM_THREADS", cores));
-    for (name, value) in rayon.into_iter().chain(PREFAULT_KNOBS.iter().copied()) {
+    let knobs = PREFAULT_KNOBS.iter().chain(LAYOUT_KNOBS).copied();
+    for (name, value) in rayon.into_iter().chain(knobs) {
         if std::env::var_os(name).is_none() {
             // SAFETY: the caller guarantees no concurrent environment access.
             unsafe { std::env::set_var(name, value) };
@@ -264,7 +288,7 @@ mod tests {
 
     #[test]
     fn malloc_conf_leaves_an_operator_arena_count_alone() {
-        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32 };
+        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32, rpc_cache_mb: 64 };
         let ours = "narenas:8,background_thread:true";
         assert_eq!(malloc_conf_to_apply(&defaults, None).as_deref(), Some(ours));
         assert_eq!(malloc_conf_to_apply(&defaults, Some(" ")).as_deref(), Some(ours));

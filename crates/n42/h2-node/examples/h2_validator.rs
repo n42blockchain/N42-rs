@@ -248,6 +248,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // subscriber spawns none) and no QMDB knob has been read.
         let mut done = unsafe { n42_qmdb_reth::profile1_memory::set_env_defaults(defaults) };
         done.extend(std::env::var("MALLOC_CONF").ok().map(|conf| format!("MALLOC_CONF={conf}")));
+        // blst's verification pool (quorum certificates, committee evidence)
+        // is one thread per CPU and has no setting: make it first, at this size.
+        if let Some(cores) = defaults.cores {
+            match n42_h2_primitives::bls::pool::size_verification_pool(cores) {
+                Ok(threads) => done.push(format!("blst pool {threads}")),
+                Err(err) => eprintln!("h2_validator: profile 1: blst's pool keeps its size ({err})"),
+            }
+        }
         if !done.is_empty() {
             eprintln!("h2_validator: profile 1 memory defaults: {} (N42_P1_MEMORY=0 turns them off)", done.join(", "));
         }

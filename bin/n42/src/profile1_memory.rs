@@ -12,12 +12,13 @@
 //! - `--cpu-cores` (tokio's workers and reth's CPU, RPC, blocking, proof and
 //!   prewarming pools) and `--engine.cross-block-cache-size` take the
 //!   profile's values, and so does `--db.rocksdb-block-cache-size`
-//!   ([`apply_to_node_command`]; a flag on the command line wins).
+//!   ([`apply_to_node_command`]; a flag on the command line wins), and so
+//!   do the RPC state cache's byte bounds.
 
 use std::num::NonZeroUsize;
 
 use n42_qmdb_reth::profile1_memory::{flag_given, MemoryDefaults};
-use reth_node_core::args::{DatabaseArgs, EngineArgs};
+use reth_node_core::args::{DatabaseArgs, EngineArgs, RpcStateCacheArgs};
 
 /// The flag that sizes reth's pools by a core count.
 pub const CPU_CORES_FLAG: &str = "--cpu-cores";
@@ -25,6 +26,10 @@ pub const CPU_CORES_FLAG: &str = "--cpu-cores";
 pub const CROSS_BLOCK_CACHE_FLAG: &str = "--engine.cross-block-cache-size";
 /// The flag that sizes the `RocksDB` block cache.
 pub const ROCKSDB_CACHE_FLAG: &str = "--db.rocksdb-block-cache-size";
+/// The flags that bound the RPC state cache's blocks, receipts and block
+/// access lists in bytes.
+pub const RPC_CACHE_FLAGS: [&str; 3] =
+    ["--rpc-cache.max-blocks-bytes", "--rpc-cache.max-receipts-bytes", "--rpc-cache.max-bals-bytes"];
 
 /// The process's arguments (program name excluded), lossy UTF-8.
 pub fn process_args() -> Vec<String> {
@@ -38,6 +43,7 @@ pub fn apply_to_node_command(
     args: &[String],
     engine: &mut EngineArgs,
     db: &mut DatabaseArgs,
+    rpc_cache: &mut RpcStateCacheArgs,
 ) -> Vec<String> {
     let mut set = Vec::new();
     if let Some(cores) = defaults.cores.and_then(NonZeroUsize::new)
@@ -54,6 +60,18 @@ pub fn apply_to_node_command(
         db.rocksdb_block_cache_size = Some(defaults.rocksdb_cache_mb << 20);
         set.push(format!("{ROCKSDB_CACHE_FLAG} {}MB", defaults.rocksdb_cache_mb));
     }
+    let bytes = defaults.rpc_cache_mb << 20;
+    let [blocks, receipts, bals] = RPC_CACHE_FLAGS;
+    for (flag, field) in [
+        (blocks, &mut rpc_cache.max_blocks_bytes),
+        (receipts, &mut rpc_cache.max_receipts_bytes),
+        (bals, &mut rpc_cache.max_bals_bytes),
+    ] {
+        if !flag_given(args, flag) {
+            *field = bytes;
+            set.push(format!("{flag} {}MB", defaults.rpc_cache_mb));
+        }
+    }
     set
 }
 
@@ -67,21 +85,25 @@ mod tests {
 
     #[test]
     fn unset_flags_take_the_profile_values() {
-        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32 };
+        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32, rpc_cache_mb: 64 };
         let mut engine = EngineArgs::default();
         let mut db = DatabaseArgs::default();
-        let set = apply_to_node_command(&defaults, &args(&["node", "--chain", "g.json"]), &mut engine, &mut db);
+        let mut rpc = RpcStateCacheArgs::default();
+        let set = apply_to_node_command(&defaults, &args(&["node", "--chain", "g.json"]), &mut engine, &mut db, &mut rpc);
         assert_eq!(engine.cpu_cores, NonZeroUsize::new(8));
         assert_eq!(engine.cross_block_cache_size, 256);
         assert_eq!(db.rocksdb_block_cache_size, Some(32 << 20));
-        assert_eq!(set.len(), 3);
+        assert_eq!((rpc.max_blocks_bytes, rpc.max_receipts_bytes, rpc.max_bals_bytes), (64 << 20, 64 << 20, 64 << 20));
+        assert_eq!(set.len(), 6);
     }
 
     #[test]
     fn an_operator_flag_wins() {
-        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32 };
+        let defaults = MemoryDefaults { cores: Some(8), cross_block_cache_mb: 256, rocksdb_cache_mb: 32, rpc_cache_mb: 64 };
         let mut engine = EngineArgs { cpu_cores: NonZeroUsize::new(32), cross_block_cache_size: 1024, ..Default::default() };
         let mut db = DatabaseArgs { rocksdb_block_cache_size: Some(1 << 30), ..Default::default() };
+        let mut rpc = RpcStateCacheArgs::default();
+        let reth_receipts = rpc.max_receipts_bytes;
         let set = apply_to_node_command(
             &defaults,
             &args(&[
@@ -91,22 +113,27 @@ mod tests {
                 "--engine.cross-block-cache-size=1024",
                 "--db.rocksdb-block-cache-size",
                 "1GB",
+                "--rpc-cache.max-receipts-bytes=1GB",
             ]),
             &mut engine,
             &mut db,
+            &mut rpc,
         );
         assert_eq!(engine.cpu_cores, NonZeroUsize::new(32));
         assert_eq!(engine.cross_block_cache_size, 1024);
         assert_eq!(db.rocksdb_block_cache_size, Some(1 << 30));
-        assert!(set.is_empty());
+        assert_eq!(rpc.max_receipts_bytes, reth_receipts);
+        assert_eq!(rpc.max_blocks_bytes, 64 << 20);
+        assert_eq!(set.len(), 2);
     }
 
     #[test]
     fn host_cores_leave_cpu_cores_unset() {
-        let defaults = MemoryDefaults { cores: None, cross_block_cache_mb: 256, rocksdb_cache_mb: 32 };
+        let defaults = MemoryDefaults { cores: None, cross_block_cache_mb: 256, rocksdb_cache_mb: 32, rpc_cache_mb: 64 };
         let mut engine = EngineArgs::default();
         let mut db = DatabaseArgs::default();
-        apply_to_node_command(&defaults, &args(&["node"]), &mut engine, &mut db);
+        let mut rpc = RpcStateCacheArgs::default();
+        apply_to_node_command(&defaults, &args(&["node"]), &mut engine, &mut db, &mut rpc);
         assert_eq!(engine.cpu_cores, None);
         assert_eq!(engine.cross_block_cache_size, 256);
     }

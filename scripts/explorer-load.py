@@ -89,12 +89,18 @@ class Rpc:
                     raise
         raise RuntimeError("unreachable")
 
-    def batch(self, calls):
+    def batch(self, calls, parse=True):
+        """With parse=False an answer with no error and no null result is not
+        decoded (its calls are counted as answered): the load generator then
+        costs the bytes, not a JSON decode, so a fast node is not hidden
+        behind the client."""
         body = json.dumps([{"jsonrpc": "2.0", "id": i, "method": m, "params": p}
                            for i, (m, p) in enumerate(calls)]).encode()
         status, raw = self.post(body)
         if status != 200:
             return status, raw, None
+        if not parse and b'"error"' not in raw and b'"result":null' not in raw:
+            return status, raw, [{}] * len(calls)
         out = json.loads(raw)
         if isinstance(out, dict):  # a batch-level error
             return status, raw, [out] * len(calls)
@@ -229,7 +235,7 @@ def worker(url, items, counter, deadline, q, max_items, rtt_ms=0.0, mbps=0.0):
             continue
         t0 = time.perf_counter()
         try:
-            status, raw, out = rpc.batch(calls)
+            status, raw, out = rpc.batch(calls, parse=False)
             net_delay(rtt_ms, mbps, len(raw))
             dt = time.perf_counter() - t0
             if out is None:
@@ -237,7 +243,7 @@ def worker(url, items, counter, deadline, q, max_items, rtt_ms=0.0, mbps=0.0):
                                f"HTTP {status}: {raw[:200]!r}"))
                 continue
             errs = [r["error"] for r in out if "error" in r]
-            nulls = sum(1 for r in out if "error" not in r and r.get("result") is None)
+            nulls = sum(1 for r in out if "error" not in r and "result" in r and r["result"] is None)
             first = None
             if errs:
                 first = json.dumps(errs[0])[:200]
@@ -296,9 +302,9 @@ def cmd_run(o):
     ntx = sum(len(r["txs"]) for r in index)
     sets = parse_sets(o.set)
     fetchers = o.fetchers.split(",")
-    deadline = time.time() + o.duration
     q = mp.Queue()
     procs, plan = [], {}
+    deadline = time.time() + o.duration
     for f in fetchers:
         batch, conc = DEFAULTS[f]
         batch = sets.get(f, {}).get("batch", batch)
@@ -385,6 +391,9 @@ def cmd_dump(o):
 
 
 def main():
+    # fork: the workers inherit the work list instead of unpickling it each
+    # (Python 3.14 defaults to forkserver, which made the client the bound).
+    mp.set_start_method("fork")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rpc", required=True)
     ap.add_argument("--cache", default="/data/n42-build/explorer-rpc/cache")

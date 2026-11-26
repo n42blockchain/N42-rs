@@ -391,6 +391,16 @@ never reads them. Each sets a default the operator can still override with the f
 | `N42_P1_CROSS_BLOCK_CACHE_MB` | 256 | integer (MiB) | `--engine.cross-block-cache-size` of a profile-1 member when the flag is not given (reth: 4096). | `qmdb-reth:profile1_memory.rs` | default |
 | `N42_P1_ROCKSDB_CACHE_MB` | 32 | integer (MiB) | `--db.rocksdb-block-cache-size` of a profile-1 member when the flag is not given (reth: 128 MiB). | `qmdb-reth:profile1_memory.rs` | default |
 
+## Explorer RPC (bin/n42, engine-types)
+
+What a node serving a block explorer's indexer sets (`docs/EXPLORER_RPC_PERF.md`). Read once at start-up.
+
+| Knob | Default | Values | Meaning | Where read | Status |
+|---|---|---|---|---|---|
+| `N42_RPC_BATCH_CONCURRENCY` | 1 (jsonrpsee's sequential batches) | integer | Calls of one JSON-RPC batch run at a time on the HTTP/WS server (`ConcurrentBatchLayer`); answers keep request order and the `--rpc.max-response-size` bound. An explorer node sets 16. | `engine-types:rpc_batch.rs` | default |
+| `N42_TRACE_BLOCK_CACHE_TXS` | 200000 | integer, `0` = off | `debug_traceTransaction` (callTracer, flatCallTracer, prestateTracer) answered from a once-per-block trace; bounds the cached per-transaction results (LRU by block). Off: reth's handler, which replays the block's prefix for every transaction. | `bin/n42:trace_cache.rs` | default |
+| `N42_TRACE_BLOCK_CACHE_MIN_TXS` | 4 | integer | Blocks with fewer transactions take reth's per-transaction path. | `bin/n42:trace_cache.rs` | default |
+
 ## Test and bench helpers
 
 | Knob | Default | Values | Meaning | Where read | Status |

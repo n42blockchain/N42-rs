@@ -323,6 +323,8 @@ pub enum EngineOutput {
         validator: u32,
         hash1: B256,
         hash2: B256,
+        /// The two signed messages (E15), to be persisted by the node.
+        evidence: Box<super::equivocation::EquivocationEvidence>,
     },
     /// An epoch transition has occurred. The validator set may have changed.
     EpochTransition {
@@ -459,13 +461,16 @@ pub struct ConsensusEngine {
     pub(super) unauthenticated: Option<(ViewNumber, &'static str)>,
     /// Tracks which block hash each validator voted for (equivocation detection).
     /// Tracks R1 (Vote) per validator per view for equivocation detection.
-    pub(super) equivocation_tracker: HashMap<u32, B256>,
+    /// Keyed by the voted block hash; the value keeps the first signed vote as
+    /// evidence (E15).
+    pub(super) equivocation_tracker: super::equivocation::EquivocationTracker,
     /// Tracks R2 (CommitVote) per validator per view for equivocation detection.
-    pub(super) commit_equivocation_tracker: HashMap<u32, B256>,
-    /// Tracks `(signed_message_commitment, block_hash)` per proposer in the
-    /// current view. The commitment includes validator changes, so reusing a
-    /// block hash with a different reconfiguration payload is still detected.
-    pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256)>,
+    pub(super) commit_equivocation_tracker: super::equivocation::EquivocationTracker,
+    /// Tracks the signed-message commitment per proposer in the current view,
+    /// with the first signed proposal as evidence. The commitment includes
+    /// validator changes, so reusing a block hash with a different
+    /// reconfiguration payload is still detected.
+    pub(super) proposal_equivocation_tracker: super::equivocation::EquivocationTracker,
     /// The signed-message commitment of the proposal this view has taken;
     /// a repeat of it (any peer can replay the leader's) is dropped.
     pub(super) processed_proposal: Option<B256>,
@@ -538,6 +543,8 @@ pub struct ConsensusEngine {
     vote_log_failures_in_a_row: u32,
     /// Vote-log failures since start.
     vote_log_failures_total: u64,
+    /// Timeout certificates this node formed from a timeout quorum since start.
+    pub(super) tcs_formed_total: u64,
     /// Why this node no longer votes, proposes or times out, if it does not
     /// (see [`Self::halt_voting`]). It keeps following.
     voting_halted: Option<&'static str>,
@@ -653,6 +660,7 @@ impl ConsensusEngine {
             vote_log_fatal_after: DEFAULT_VOTE_LOG_FATAL_AFTER,
             vote_log_failures_in_a_row: 0,
             vote_log_failures_total: 0,
+            tcs_formed_total: 0,
             voting_halted: None,
         }
     }
@@ -788,6 +796,7 @@ impl ConsensusEngine {
             vote_log_fatal_after: DEFAULT_VOTE_LOG_FATAL_AFTER,
             vote_log_failures_in_a_row: 0,
             vote_log_failures_total: 0,
+            tcs_formed_total: 0,
             voting_halted: None,
         }
     }
@@ -1189,6 +1198,11 @@ impl ConsensusEngine {
     /// aborts its vote, as before.
     pub fn set_vote_log_fatal_after(&mut self, failures: u32) {
         self.vote_log_fatal_after = failures;
+    }
+
+    /// Timeout certificates this node formed from a timeout quorum since start (J2).
+    pub const fn tcs_formed_total(&self) -> u64 {
+        self.tcs_formed_total
     }
 
     /// Vote-log failures since start.
@@ -3368,6 +3382,7 @@ mod tests {
         engine
             .try_form_tc_and_advance(1, 2)
             .expect("TC should form and advance");
+        assert_eq!(engine.tcs_formed_total(), 1, "a TC formed here is counted (J2)");
 
         let outputs: Vec<_> = std::iter::from_fn(|| output_rx.try_recv().ok()).collect();
         let emitted_new_view = outputs.iter().find_map(|output| match output {
@@ -3390,6 +3405,71 @@ mod tests {
             .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xAA), None))
             .expect("non-leader block ready should succeed");
         assert_eq!(engine.current_phase(), Phase::WaitingForProposal);
+    }
+
+    /// The leader of view 1 in a four-member set, with its key and outputs.
+    fn view1_leader() -> (
+        ConsensusEngine,
+        Vec<n42_h2_primitives::BlsSecretKey>,
+        ValidatorSet,
+        mpsc::Receiver<EngineOutput>,
+    ) {
+        (0..4)
+            .map(|i| make_engine(4, i))
+            .find(|(engine, ..)| engine.is_current_leader())
+            .expect("a four-member set has a leader for view 1")
+    }
+
+    fn signed_proposals(rx: &mut mpsc::Receiver<EngineOutput>) -> Vec<Proposal> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|output| match output {
+                EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(p)) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// F6: a leader that builds again on the same parent in the view it has
+    /// already proposed in (a same-parent rebuild) signs no second proposal.
+    #[test]
+    fn f6_a_same_parent_rebuild_signs_no_second_proposal_in_the_view() {
+        let (mut engine, _, _, mut rx) = view1_leader();
+        engine
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xA1), None))
+            .expect("first block");
+        engine
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xA2), None))
+            .expect("the rebuilt block is ignored, not an error");
+        let proposals = signed_proposals(&mut rx);
+        assert_eq!(proposals.len(), 1, "one signed proposal per (view, proposer)");
+        assert_eq!(proposals[0].block_hash, B256::repeat_byte(0xA1));
+        assert_eq!(engine.last_voted_view(), 1);
+    }
+
+    /// F6 across a restart: the vote-log watermark the leader's own proposal
+    /// recorded keeps a restarted leader from signing another in that view.
+    #[test]
+    fn f6_a_restarted_leader_signs_no_second_proposal_in_the_view() {
+        let (engine, sks, vs, _rx) = view1_leader();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut restarted = ConsensusEngine::with_recovered_state(
+            engine.my_index,
+            sks[engine.my_index as usize].clone(),
+            crate::EpochManager::new(vs),
+            60_000,
+            120_000,
+            tx,
+            1,
+            engine.locked_qc().clone(),
+            engine.last_committed_qc().clone(),
+            0,
+            1,
+        );
+        assert!(restarted.is_current_leader());
+        restarted
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xB2), None))
+            .expect("ignored, not an error");
+        assert!(signed_proposals(&mut rx).is_empty());
     }
 
     #[test]
@@ -3579,7 +3659,10 @@ mod tests {
                     validator: 1,
                     hash1,
                     hash2,
+                    evidence,
                 } if *hash1 == first_hash && *hash2 == second_hash
+                    && evidence.kind == super::super::equivocation::EquivocationKind::Proposal
+                    && evidence.verify(engine.signing_profile)
             )));
             assert!(
                 !second_outputs.iter().any(|output| matches!(
@@ -3641,6 +3724,7 @@ mod tests {
                 validator: 1,
                 hash1,
                 hash2,
+                ..
             } if hash1 != hash2
         )));
         assert!(!outputs.iter().any(|output| matches!(
@@ -4813,7 +4897,10 @@ mod tests {
                     validator: 0,
                     hash1,
                     hash2,
+                    evidence,
                 } if *hash1 == first_hash && *hash2 == second_hash
+                    && evidence.kind == super::super::equivocation::EquivocationKind::Vote
+                    && evidence.verify(engine.signing_profile)
             )));
         }
     }
@@ -4873,7 +4960,10 @@ mod tests {
                     validator: 0,
                     hash1,
                     hash2,
+                    evidence,
                 } if *hash1 == first_hash && *hash2 == second_hash
+                    && evidence.kind == super::super::equivocation::EquivocationKind::CommitVote
+                    && evidence.verify(engine.signing_profile)
             )));
         }
     }

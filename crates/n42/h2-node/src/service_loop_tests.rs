@@ -418,6 +418,81 @@ async fn a_failed_build_is_not_retried_inside_the_same_view() {
     assert_eq!(rig.el.calls().len(), attempts, "not tried again");
 }
 
+/// F6: once the engine signed this view's proposal (its own vote in the view
+/// is recorded), a leader whose proposal guard was cleared -- a restart, or a
+/// rebuild on the same parent -- builds and signs nothing more in that view.
+#[tokio::test]
+async fn a_leader_signs_one_proposal_per_view_even_when_its_guard_is_cleared() {
+    let (keys, set) = keys(4);
+    let mut rig = None;
+    for index in 0..4 {
+        let candidate = node_in(&keys, &set, index, None).await;
+        if candidate.svc.engine().is_current_leader() {
+            rig = Some(candidate);
+            break;
+        }
+    }
+    let rig = rig.expect("a four-member set has a leader for view 1");
+    let mut svc = rig.svc.with_payload_attributes(|context| Some(attributes_for(&context)));
+    let view = svc.engine().current_view();
+    let mut events = Vec::new();
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert_eq!(svc.engine().current_view(), view, "four members: the view waits for votes");
+    assert_eq!(svc.engine().last_voted_view(), view, "the proposal recorded the leader's vote");
+    let builds = |calls: Vec<ElCall>| calls.iter().filter(|c| matches!(c, ElCall::ResolvePayload(_))).count();
+    let before = builds(rig.el.calls());
+
+    svc.proposed_view = None;
+    within(svc.propose_if_leader(&mut events)).await.expect("ok");
+    assert_eq!(builds(rig.el.calls()), before, "no second build for a view already proposed in");
+    assert_eq!(svc.proposed_view, Some(view));
+    let proposals = svc.outbox.iter().filter(|m| matches!(m, Msg::Proposal(p) if p.view == view)).count();
+    assert_eq!(proposals, 1, "one signed proposal per (view, proposer)");
+}
+
+/// E15: an equivocation the engine reports is kept in the datadir's log,
+/// once per offence, and survives a restart.
+#[tokio::test]
+async fn an_equivocation_is_persisted_once_with_its_signed_pair() {
+    let rig = node(1, 0, None).await;
+    let dir = std::env::temp_dir().join(format!("n42-svc-equivocations-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let log = crate::equivocations::EquivocationLog::open(&dir).expect("open");
+    let mut svc = rig.svc.with_equivocation_log(log);
+    let sk = BlsSecretKey::random().expect("bls keygen");
+    let profile = n42_h2_consensus::protocol::quorum::ConsensusSigningProfile::Native;
+    let side = |hash: B256| {
+        let message = profile.vote_message(4, hash);
+        let signature = profile.sign(&sk, &message);
+        n42_h2_consensus::SignedValue::new(hash, message, &signature)
+    };
+    let output = || EngineOutput::EquivocationDetected {
+        view: 4,
+        validator: 0,
+        hash1: B256::repeat_byte(1),
+        hash2: B256::repeat_byte(2),
+        evidence: Box::new(n42_h2_consensus::EquivocationEvidence {
+            kind: n42_h2_consensus::EquivocationKind::Vote,
+            view: 4,
+            validator: 0,
+            public_key: alloy_primitives::Bytes::copy_from_slice(&sk.public_key().to_bytes()),
+            first: side(B256::repeat_byte(1)),
+            second: side(B256::repeat_byte(2)),
+        }),
+    };
+    let mut events = Vec::new();
+    within(svc.handle_output(output(), &mut events)).await.expect("handled");
+    within(svc.handle_output(output(), &mut events)).await.expect("handled");
+    assert_eq!(svc.equivocation_log().len(), 1, "one record per offence");
+    let reopened = crate::equivocations::EquivocationLog::open(&dir).expect("reopen");
+    let response = reopened.response();
+    assert_eq!(response.total, 1);
+    assert_eq!(response.evidence[0].first.block_hash, B256::repeat_byte(1));
+    assert_eq!(response.evidence[0].second.block_hash, B256::repeat_byte(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn a_non_leader_clears_any_deferral_and_builds_nothing() {
     let (keys, set) = keys(4);

@@ -715,6 +715,14 @@ pub struct H2Service<E> {
     halt_on_commit_invalid: bool,
     /// Vote-log failures already added to [`METRIC_VOTE_LOG_FAILURES_TOTAL`].
     vote_log_failures_exported: u64,
+    /// Timeout certificates already added to `n42_tc_formed_total` (J2).
+    tcs_formed_exported: u64,
+    /// Observed equivocations (E15): the signed pairs, in the datadir when
+    /// one is given ([`Self::with_equivocation_log`]).
+    equivocations: crate::equivocations::EquivocationLog,
+    /// Blocks already counted in `n42_blocks_refused_total`, so one block
+    /// refused on several paths counts once (cleared when large).
+    refused_blocks: std::collections::HashSet<B256>,
     /// Commits whose consensus checkpoint could not be written, so were not
     /// finalised (also [`METRIC_CHECKPOINT_FAILURES_TOTAL`]).
     checkpoint_failures: u64,
@@ -2006,6 +2014,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             fatal: None,
             halt_on_commit_invalid: halt_on_commit_invalid_from_env(),
             vote_log_failures_exported: 0,
+            tcs_formed_exported: 0,
+            equivocations: crate::equivocations::EquivocationLog::in_memory(),
+            refused_blocks: std::collections::HashSet::new(),
             checkpoint_failures: 0,
             halt_reported: false,
         }
@@ -2018,6 +2029,68 @@ impl<E: ExecutionLayer> H2Service<E> {
     pub const fn with_halt_on_commit_invalid(mut self, on: bool) -> Self {
         self.halt_on_commit_invalid = on;
         self
+    }
+
+    /// Records observed equivocations in `log` (`h2_validator`:
+    /// `<datadir>/equivocations.jsonl`, [`crate::equivocations`]) instead of
+    /// memory only; `n42_equivocations_total` starts at what it holds.
+    #[must_use]
+    pub fn with_equivocation_log(mut self, log: crate::equivocations::EquivocationLog) -> Self {
+        metrics::counter!(crate::ops::METRIC_EQUIVOCATIONS_TOTAL).absolute(log.len() as u64);
+        self.equivocations = log;
+        self
+    }
+
+    /// The observed equivocations (E15), for the `n42_equivocations` RPC.
+    pub fn equivocation_log(&self) -> crate::equivocations::EquivocationLog {
+        self.equivocations.clone()
+    }
+
+    /// Persists one observed equivocation and counts it (E15, J2).
+    fn record_equivocation(
+        &self,
+        evidence: n42_h2_consensus::EquivocationEvidence,
+        hash1: B256,
+        hash2: B256,
+    ) {
+        let record = crate::equivocations::EquivocationRecord::new(evidence, hash1, hash2);
+        let (kind, view, validator) = (record.kind.label(), record.view, record.validator_index);
+        match self.equivocations.record(record) {
+            Ok(true) => {
+                metrics::counter!(crate::ops::METRIC_EQUIVOCATIONS_TOTAL).increment(1);
+                warn!(target: "n42.h2.node", kind, view, validator, ?hash1, ?hash2, "equivocation recorded");
+            }
+            Ok(false) => {}
+            Err(err) => {
+                error!(target: "n42.h2.node", kind, view, validator, %err, "equivocation evidence could not be written");
+            }
+        }
+    }
+
+    /// Counts a refused block once in `n42_blocks_refused_total` (J2).
+    fn note_block_refused(&mut self, block_hash: B256, reason: &str) {
+        // A halted node refuses every block for itself, not for the block.
+        if self.safety_halt.is_some() {
+            return;
+        }
+        if self.refused_blocks.len() >= 4096 {
+            self.refused_blocks.clear();
+        }
+        if self.refused_blocks.insert(block_hash) {
+            crate::ops::note_block_refused(reason);
+        }
+    }
+
+    /// Sets the chain gauges and the TC counter of J2.
+    fn export_chain_metrics(&mut self) {
+        if let Some(number) = self.block_numbers.get(&self.driver.head()) {
+            metrics::gauge!(crate::ops::METRIC_HEAD_NUMBER).set(*number as f64);
+        }
+        let formed = self.engine.tcs_formed_total();
+        if formed > self.tcs_formed_exported {
+            metrics::counter!(crate::ops::METRIC_TC_FORMED_TOTAL).increment(formed - self.tcs_formed_exported);
+            self.tcs_formed_exported = formed;
+        }
     }
 
     /// Keeps the safety halt's evidence in `path` (`h2_validator`:
@@ -2202,6 +2275,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             metrics::counter!(METRIC_VOTE_LOG_FAILURES_TOTAL).increment(failures - self.vote_log_failures_exported);
             self.vote_log_failures_exported = failures;
         }
+        self.export_chain_metrics();
         self.halt_on_commit_refusal();
         if self.safety_halt.is_some()
             && self.safety_halt_logged.is_none_or(|at| at.elapsed() >= crate::safety_halt::HALT_LOG_EVERY)
@@ -2837,6 +2911,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if leader {
                     self.driver.discard_prepared();
                 }
+                metrics::counter!(crate::ops::METRIC_VIEW_TIMEOUTS_TOTAL).increment(1);
                 self.engine.on_timeout()?;
             }
             () = tokio::time::sleep_until(propose_at), if self.proposal_deferred => {
@@ -3145,6 +3220,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 });
                 match decoded {
                     Ok((block, rlp)) if let Some(reason) = self.profile1_import_refusal(&block.header, Some(rlp.len())) => {
+                        self.note_block_refused(block.block_hash, &reason);
                         debug!(target: "n42.h2.node", block_hash = ?block.block_hash, %reason, "dropped a block body refused by profile 1");
                     }
                     Ok((block, rlp)) => {
@@ -3399,6 +3475,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // sent it under is checked by the decode, not trusted.
                     match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
                         Ok(block) if let Some(reason) = self.profile1_import_refusal(&block.header, Some(chunk.rlp.len())) => {
+                            self.note_block_refused(hash, &reason);
                             debug!(target: "n42.h2.node", %peer, ?hash, %reason, "peer answered a block request with a block profile 1 refuses");
                         }
                         Ok(block) if block.block_hash == hash => {
@@ -3446,6 +3523,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // already been emptied by whichever copy came first.
                 match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
                     Ok(block) if let Some(reason) = self.profile1_import_refusal(&block.header, Some(chunk.rlp.len())) => {
+                        self.note_block_refused(block.block_hash, &reason);
                         debug!(target: "n42.h2.node", %peer, hash = ?block.block_hash, %reason, "a pushed body profile 1 refuses");
                     }
                     Ok(block) => {
@@ -3878,6 +3956,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             // in never told the engine, and an unknown parent withholds the
             // vote (audit 2026-10 round 2, R2-R1).
             if let Some(reason) = self.vote_refusal(block_hash) {
+                self.note_block_refused(*block_hash, &reason);
                 warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no vote");
                 return Ok(());
             }
@@ -3938,7 +4017,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // The status handshake advertises the committed height; a
                 // peer deciding whether this node is worth syncing from reads
                 // it, and gov5 waits for a peer at or above its own height.
+                metrics::gauge!(crate::ops::METRIC_COMMITTED_VIEW).set(view as f64);
                 if let Some(number) = self.block_numbers.get(&block_hash).copied() {
+                    metrics::gauge!(crate::ops::METRIC_COMMITTED_NUMBER).set(number as f64);
                     self.transport.set_advertised_height(number);
                     self.committed_height = Some(self.committed_height.map_or(number, |height| height.max(number)));
                     self.note_range_mode_commit();
@@ -3971,6 +4052,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     local_view,
                     target_view,
                 });
+            }
+            EngineOutput::EquivocationDetected { hash1, hash2, evidence, .. } => {
+                self.record_equivocation(*evidence, hash1, hash2);
             }
             _ => {}
         }
@@ -4388,6 +4472,17 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         let view = self.engine.current_view();
         if self.proposed_view == Some(view) || !self.engine.is_current_leader() {
+            self.proposal_deferred = false;
+            self.defer_reason = None;
+            return Ok(());
+        }
+        // F6: the engine signs at most one proposal per view; its own vote in
+        // the view, persisted in the vote log, is the watermark. A leader that
+        // already voted in this view (it proposed before a restart) builds
+        // nothing: a second sealed block for the view would never be proposed.
+        if self.engine.last_voted_view() >= view {
+            debug!(target: "n42.h2.node", view, "already voted in this view; no second proposal");
+            self.proposed_view = Some(view);
             self.proposal_deferred = false;
             self.defer_reason = None;
             return Ok(());
@@ -4812,6 +4907,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     event.as_ref()
                     && let Some(reason) = self.vote_refusal(block_hash)
                 {
+                    self.note_block_refused(*block_hash, &reason);
                     warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no vote");
                     return Ok(());
                 }
@@ -7132,6 +7228,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let (block_hash, header) =
             n42_h2_consensus::decode_block_body_header(&rlp, self.header_profile)?;
         if let Some(reason) = self.profile1_import_refusal(&header, Some(rlp.len())) {
+            self.note_block_refused(block_hash, &reason);
             return Err(n42_h2_consensus::BlockBodyError::HeaderProfile(self.header_profile, reason));
         }
         if self.body_store.contains_key(&block_hash) {
@@ -7341,6 +7438,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let (block_hash, header) =
             n42_h2_consensus::decode_compact_body_header(&bytes, self.header_profile)?;
         if let Some(reason) = self.profile1_import_refusal(&header, None) {
+            self.note_block_refused(block_hash, &reason);
             return Err(n42_h2_consensus::BlockBodyError::HeaderProfile(self.header_profile, reason));
         }
         // A second copy must not replace the frame of record: that one may
@@ -7461,6 +7559,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             // check every vote of this node passes (R3-C2).
             if self.engine.two_phase_vote_gate() && self.safety_halt.is_none() {
                 if let Some(reason) = self.vote_refusal(&block_hash) {
+                    self.note_block_refused(block_hash, &reason);
                     warn!(target: "n42.h2.node", ?block_hash, %reason, "block's header refused; no header vote");
                 } else if let Err(err) = self.engine.header_known(block_hash, header.parent_hash) {
                     report_engine_error(&err, "header vote", &mut self.fatal);

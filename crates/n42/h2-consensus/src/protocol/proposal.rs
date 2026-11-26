@@ -595,7 +595,9 @@ impl ConsensusEngine {
         tracing::debug!(target: "n42::cl::proposal", view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
 
         if !self.round_state.may_commit_vote_in(view) {
-            tracing::warn!(target: "n42::cl::proposal", view,
+            // Expected: a PrepareQC can arrive more than once (topic and
+            // direct), and only the first copy yields a commit vote.
+            tracing::debug!(target: "n42::cl::proposal", view,
                 last_commit_voted = self.round_state.last_commit_voted_view(),
                 "suppressed duplicate commit vote (already commit-voted in this view)");
             return Ok(());

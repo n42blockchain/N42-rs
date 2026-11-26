@@ -27,6 +27,7 @@ pub mod engine_types;
 pub mod n42_evm;
 pub mod pool;
 pub mod rpc;
+pub mod rpc_batch;
 pub mod built_executions;
 pub mod canon_lag;
 pub mod canonical_head;

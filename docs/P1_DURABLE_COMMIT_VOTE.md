@@ -58,8 +58,10 @@ height (pruned on every commit at `n42Engine_persistedBlock`), normally one or t
   written at each commit (`checkpoint_from`). gov5's V6 lock rule raises the in-memory lock as soon as a
   valid PrepareQC arrives, before this node has made the block durable, and a later R1 vote (next view)
   would then have written that lock. Both writers now take `ConsensusEngine::persistable_lock()`: the lock
-  when its block is durable here (or the lock is genesis), else the highest lock that was
-  (`durable_lock`, seeded from the restored lock at start-up). So a restart never holds a lock on a block
+  when its block is durable here (or the lock is genesis), else the higher of the highest lock that was
+  (`durable_lock`, seeded from the restored lock at start-up) and the committed QC -- never below the
+  committed QC (AM35 item 6). A timeout certificate's high QC raises only the in-memory lock and so
+  reaches disk the same way. So a restart never holds a lock on a block
   it cannot serve. Writing the lower lock is safe because only a commit vote has to survive a restart with
   its lock, and this node commit-votes only on a durable block -- whose lock is then the persistable one.
   Off profile 1 `persistable_lock()` is the lock. Tests:
@@ -97,6 +99,19 @@ The make-durable walk stops at an ancestor at or below the persisted height. Tha
 height: the walk itself goes by parent hash, and the layer makes canonical only what consensus committed
 (or a verified catch-up pulled), so the persisted block at that height is on the chain the walk follows
 whenever the walked block can still be committed.
+
+Also by hash (AM35 item 6): the make-durable walk ends at a persisted ancestor only when the layer's
+canonical block at that number *is* that ancestor (`block_by_number(n).hash == ancestor`), and reads
+a header it lacks from the layer. At restart every replayed journal block is reported imported and
+durable to the engine, and the restored lock's and commit's blocks are reported imported when the layer
+holds them by hash -- so no vote gate waits forever on a block the node already holds (gov5's "halt one
+block higher"). The leader's parent is the highest QC's block by hash (`proposal_parent`), its header
+read by hash; the one height comparison there (`stale_build_parent`) only refuses a parent below the
+committed height.
+
+Trigger line for the cross-client timed-kill gate (T2): on profile 1, after the block is durable and
+the lock is written, right before the commit vote is signed, target `n42::am35` logs
+`commit vote released after durable lock view=<v> block_hash=<hash>` (the same text n42-26 logs).
 
 ## Cost
 

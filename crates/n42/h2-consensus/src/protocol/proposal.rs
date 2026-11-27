@@ -13,6 +13,43 @@ impl ConsensusEngine {
     /// follower can observe Decide first and Proposal second for the same view.
     /// Without this recovery path, the follower misses the leader's committed
     /// validator changes and diverges at the next epoch boundary.
+    /// A proposal of a closed view: checked against the proposer's other
+    /// proposal of that view, verified in the view or kept late (E15). Its
+    /// signature is checked only on a conflict, so a repeat of the proposal
+    /// the view took costs a hash and a lookup.
+    pub(super) fn note_late_proposal(&mut self, proposal: &Proposal) -> ConsensusResult<()> {
+        let view = self.round_state.current_view();
+        if !(proposal.view < view && view - proposal.view <= super::equivocation::LATE_WINDOW)
+            || proposal.proposer != self.leader_index_for_view(proposal.view)
+        {
+            return Ok(());
+        }
+        if self.signing_profile.is_gov5()
+            && proposal.validator_changes.as_ref().is_some_and(|changes| !changes.is_empty())
+        {
+            return Ok(());
+        }
+        let message = self
+            .signing_profile
+            .proposal_message(proposal.view, proposal.block_hash, &proposal.validator_changes);
+        let commitment = B256::from(*blake3::hash(&message).as_bytes());
+        let make = || super::equivocation::SignedValue::new(proposal.block_hash, message.clone(), &proposal.signature);
+        match self.late_proposals.check(proposal.view, proposal.proposer, commitment, false, make) {
+            super::equivocation::LateCheck::Conflict { first, verified } => {
+                let second = super::equivocation::SignedValue::new(proposal.block_hash, message, &proposal.signature);
+                self.settle_late_conflict(
+                    super::equivocation::EquivocationKind::Proposal,
+                    proposal.view,
+                    proposal.proposer,
+                    (first, verified),
+                    (second, false),
+                )?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub(super) fn recover_late_committed_proposal(
         &mut self,
         proposal: &Proposal,

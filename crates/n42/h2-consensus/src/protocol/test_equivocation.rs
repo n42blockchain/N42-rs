@@ -190,6 +190,99 @@ mod tests {
     }
 
     #[test]
+    fn a_double_vote_after_the_view_closed_is_still_proven() {
+        let keys = keys();
+        let hash = B256::repeat_byte(0xD4);
+        // First counted in the view and the twin late, or both late; on the
+        // plain path and through the batch verifier's queue.
+        for (first_in_view, batched) in [(true, false), (false, false), (true, true), (false, true)] {
+            let (mut leader, mut rx) = engine(1, &keys);
+            leader.set_vote_aggregate(batched);
+            let (voter, _) = engine(2, &keys);
+            let profile = leader.signing_profile();
+            let vote = ConsensusMessage::Vote(Vote { view: 1, block_hash: hash, voter: 2, signature: profile.sign(&keys[2], &profile.vote_message(1, hash)) });
+            let twin = voter.sign_equivocating_twin(&vote).expect("own vote");
+            let deliver = |engine: &mut ConsensusEngine, message: ConsensusMessage| {
+                let message = if batched { engine.queue_vote(message) } else { Some(message) };
+                if let Some(message) = message {
+                    let _ = engine.process_event(ConsensusEvent::Message(message));
+                }
+                let _ = engine.flush_votes();
+            };
+            if first_in_view {
+                deliver(&mut leader, vote.clone());
+            }
+            leader.advance_to_view(2).expect("advance");
+            drain(&mut rx);
+            deliver(&mut leader, vote.clone());
+            deliver(&mut leader, vote);
+            assert!(!drain(&mut rx).iter().any(|o| matches!(o, EngineOutput::EquivocationDetected { .. })), "a repeat is no conflict");
+            deliver(&mut leader, twin);
+            assert_eq!(
+                detected(&drain(&mut rx), EquivocationKind::Vote, profile),
+                (hash, twin_block_hash(hash)),
+                "first in view: {first_in_view}, batched: {batched}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_double_proposal_after_the_view_closed_is_still_proven() {
+        let keys = keys();
+        let hash = B256::repeat_byte(0xE5);
+        for first_in_view in [true, false] {
+            let (proposer, _) = engine(1, &keys);
+            let (mut follower, mut rx) = engine(2, &keys);
+            let profile = follower.signing_profile();
+            let proposal = ConsensusMessage::Proposal(Proposal {
+                view: 1,
+                block_hash: hash,
+                justify_qc: QuorumCertificate::genesis(),
+                proposer: 1,
+                signature: profile.sign(&keys[1], &profile.proposal_message(1, hash, &None)),
+                prepare_qc: None,
+                tx_root_hash: None,
+                validator_changes: None,
+            });
+            let twin = proposer.sign_equivocating_twin(&proposal).expect("own proposal");
+            if first_in_view {
+                follower.process_event(ConsensusEvent::Message(proposal.clone())).expect("in view");
+            }
+            follower.advance_to_view(2).expect("advance");
+            drain(&mut rx);
+            let _ = follower.process_event(ConsensusEvent::Message(proposal.clone()));
+            let _ = follower.process_event(ConsensusEvent::Message(proposal));
+            assert!(!drain(&mut rx).iter().any(|o| matches!(o, EngineOutput::EquivocationDetected { .. })), "a repeat is no conflict");
+            let _ = follower.process_event(ConsensusEvent::Message(twin));
+            assert_eq!(
+                detected(&drain(&mut rx), EquivocationKind::Proposal, profile),
+                (hash, twin_block_hash(hash)),
+                "first in view: {first_in_view}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forged_late_first_gives_way_to_the_real_vote() {
+        let keys = keys();
+        let hash = B256::repeat_byte(0xF6);
+        let (mut leader, mut rx) = engine(1, &keys);
+        let profile = leader.signing_profile();
+        leader.advance_to_view(2).expect("advance");
+        // A forged commit vote for voter 2 arrives first, unverified.
+        let forged = CommitVote { view: 1, block_hash: B256::repeat_byte(9), voter: 2, signature: profile.sign(&keys[3], &profile.commit_message(1, B256::repeat_byte(9), B256::ZERO)) };
+        let _ = leader.process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(forged)));
+        let real = CommitVote { view: 1, block_hash: hash, voter: 2, signature: profile.sign(&keys[2], &profile.commit_message(1, hash, B256::ZERO)) };
+        let _ = leader.process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(real.clone())));
+        assert!(!drain(&mut rx).iter().any(|o| matches!(o, EngineOutput::EquivocationDetected { .. })), "a forgery is no evidence");
+        // The real one took the slot: its twin is proven.
+        let (voter, _) = engine(2, &keys);
+        let twin = voter.sign_equivocating_twin(&ConsensusMessage::CommitVote(real)).expect("own");
+        let _ = leader.process_event(ConsensusEvent::Message(twin));
+        assert_eq!(detected(&drain(&mut rx), EquivocationKind::CommitVote, profile), (hash, twin_block_hash(hash)));
+    }
+
+    #[test]
     fn a_double_proposal_is_proven_by_a_follower() {
         let keys = keys();
         let (proposer, _) = engine(1, &keys);

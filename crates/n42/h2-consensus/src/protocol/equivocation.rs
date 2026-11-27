@@ -124,47 +124,90 @@ pub(super) fn check_equivocation(
     }
 }
 
-/// How many views back a late commit vote is still checked for a conflict.
-pub(super) const LATE_COMMIT_WINDOW: u64 = 8;
+/// How many views back a late vote, commit vote or proposal is still checked
+/// for a conflict.
+pub(super) const LATE_WINDOW: u64 = 8;
 
-/// Round-2 evidence across the view boundary. A leader advances the view the
-/// moment its CommitQC forms, so a validator's commit vote outside the quorum
-/// (or the second of a conflicting pair) arrives in a closed view and used to
-/// be dropped unseen. Kept here for [`LATE_COMMIT_WINDOW`] views: the verified
-/// tracker of each closed view this node collected in, and the late commit
-/// votes as they came, unverified (a signature is checked only when two of one
-/// voter conflict, so honest late votes cost a map insert).
-#[derive(Debug, Default)]
-pub(super) struct LateCommitVotes {
-    closed: std::collections::VecDeque<(u64, EquivocationTracker)>,
-    late: HashMap<(u64, u32), (B256, BlsSignature)>,
+/// What [`LateTracker::check`] found for a message of a closed view.
+#[derive(Debug)]
+pub(super) enum LateCheck {
+    /// The voter's message of that view already seen, again.
+    Repeat,
+    /// The voter's first message of that view: kept.
+    Kept,
+    /// A different message from the same voter in that view: the first, and
+    /// whether its signature was checked when it was kept.
+    Conflict { first: SignedValue, verified: bool },
 }
 
-impl LateCommitVotes {
-    /// Keeps `tracker`, the verified commit votes of `view`, now closed.
+/// One kind's evidence across the view boundary. The engine leaves a view
+/// as soon as it is decided, so a message outside the quorum (or the second
+/// of a conflicting pair, after the first was counted) arrives in a closed
+/// view, where it used to be dropped unseen. Kept here for [`LATE_WINDOW`]
+/// views: the verified tracker of each closed view, and the late messages
+/// as they came, verified or not (a signature not yet checked is checked
+/// only when two of one validator conflict, so an honest late message costs
+/// a map insert).
+#[derive(Debug, Default)]
+pub(super) struct LateTracker {
+    closed: std::collections::VecDeque<(u64, EquivocationTracker)>,
+    late: HashMap<(u64, u32), (B256, SignedValue, bool)>,
+}
+
+impl LateTracker {
+    /// Keeps `tracker`, the verified messages of `view`, now closed.
     pub(super) fn close_view(&mut self, view: u64, tracker: EquivocationTracker) {
         if !tracker.is_empty() {
             self.closed.push_back((view, tracker));
         }
-        while self.closed.front().is_some_and(|(closed, _)| closed + LATE_COMMIT_WINDOW < view) {
+        while self.closed.front().is_some_and(|(closed, _)| closed + LATE_WINDOW < view) {
             self.closed.pop_front();
         }
-        self.late.retain(|(late, _), _| late + LATE_COMMIT_WINDOW >= view);
+        self.late.retain(|(late, _), _| late + LATE_WINDOW >= view);
     }
 
-    /// The verified first commit vote of `voter` in closed `view`.
-    pub(super) fn closed(&self, view: u64, voter: u32) -> Option<&(B256, SignedValue)> {
-        self.closed.iter().find(|(closed, _)| *closed == view).and_then(|(_, tracker)| tracker.get(&voter))
+    /// Checks `voter`'s message `commitment` in closed `view` against what
+    /// is kept, keeping it (built by `make`, `verified` or not) if it is the
+    /// first.
+    pub(super) fn check(
+        &mut self,
+        view: u64,
+        voter: u32,
+        commitment: B256,
+        verified: bool,
+        make: impl FnOnce() -> SignedValue,
+    ) -> LateCheck {
+        let closed = self.closed.iter().find(|(closed, _)| *closed == view).and_then(|(_, tracker)| tracker.get(&voter));
+        if let Some((first, signed)) = closed {
+            return if *first == commitment {
+                LateCheck::Repeat
+            } else {
+                LateCheck::Conflict { first: signed.clone(), verified: true }
+            };
+        }
+        match self.late.get(&(view, voter)) {
+            Some((first, _, _)) if *first == commitment => LateCheck::Repeat,
+            Some((_, signed, verified)) => LateCheck::Conflict { first: signed.clone(), verified: *verified },
+            None => {
+                self.late.insert((view, voter), (commitment, make(), verified));
+                LateCheck::Kept
+            }
+        }
     }
 
-    /// The unverified late commit vote of `voter` in `view`.
-    pub(super) fn late(&self, view: u64, voter: u32) -> Option<&(B256, BlsSignature)> {
-        self.late.get(&(view, voter))
+    /// Whether `voter`'s message in closed `view` is known to differ from
+    /// `commitment` (lookups only).
+    pub(super) fn conflicts(&self, view: u64, voter: u32, commitment: B256) -> bool {
+        let closed = self.closed.iter().find(|(closed, _)| *closed == view).and_then(|(_, tracker)| tracker.get(&voter));
+        match closed {
+            Some((first, _)) => *first != commitment,
+            None => self.late.get(&(view, voter)).is_some_and(|(first, _, _)| *first != commitment),
+        }
     }
 
-    /// Keeps a late commit vote, unverified, as `voter`'s first in `view`.
-    pub(super) fn keep_late(&mut self, view: u64, voter: u32, block_hash: B256, signature: BlsSignature) {
-        self.late.insert((view, voter), (block_hash, signature));
+    /// Replaces a kept first message whose signature did not verify.
+    pub(super) fn replace(&mut self, view: u64, voter: u32, commitment: B256, signed: SignedValue, verified: bool) {
+        self.late.insert((view, voter), (commitment, signed, verified));
     }
 }
 

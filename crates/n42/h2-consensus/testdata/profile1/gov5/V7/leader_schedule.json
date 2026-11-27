@@ -1,0 +1,2286 @@
+{
+  "vector": "V7",
+  "standard": "N42 mixed production standard profile 1; vector V7 (leader schedule: A15, A18, A22, SYNC §10.2/§10.4 without S6/S8, AM32)",
+  "rules": [
+    "A15: leader(v) = (v / max(T, 1)) mod n; T = config.hotstuff.leaderTenure, n = validators of the view's set.",
+    "Tenure window of v: w = v / T, views w*T .. w*T + T - 1, all led by leader(v).",
+    "A18: epoch(v) = (v - 1) / E for v \u003e= 1 (view 0 is epoch 0); boundary view b: b \u003e 1 and (b - 1) mod E = 0.",
+    "A22 / SYNC §10.2: view_after_tc(x) = x + 1 if not active or T \u003c= 1; else min(W, B) with W = (x / T + 1) * T and B = ((x - 1) / E + 1) * E + 1 (only if E \u003e 0 and x \u003e= 1); x + 1 if W overflows u64 or W \u003c x + 1. Profile 1: active for every x (A = 0).",
+    "A QC (or Decide) for view q moves to q + 1. A node adopts a piggybacked TC(x) only if view_after_tc(x) is above its current view."
+  ],
+  "profiles": [
+    {
+      "genesisFile": "internal/testdata/profile1/standard_genesis.json",
+      "validators": 4,
+      "leaderTenure": 8,
+      "epochLength": 200,
+      "rotateOnTimeoutActive": true,
+      "rotateOnTimeoutFromView": 0,
+      "baseTimeoutMs": 6000,
+      "maxTimeoutMs": 30000
+    },
+    {
+      "genesisFile": "V1/genesis_8s.json",
+      "validators": 4,
+      "leaderTenure": 1,
+      "epochLength": 10800,
+      "rotateOnTimeoutActive": true,
+      "rotateOnTimeoutFromView": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000
+    }
+  ],
+  "leaderSchedule": [
+    {
+      "name": "profile-1 standard genesis (n = 4, T = 8)",
+      "n": 4,
+      "tenure": 8,
+      "views": [
+        {
+          "view": 0,
+          "leader": 0
+        },
+        {
+          "view": 1,
+          "leader": 0
+        },
+        {
+          "view": 2,
+          "leader": 0
+        },
+        {
+          "view": 3,
+          "leader": 0
+        },
+        {
+          "view": 4,
+          "leader": 0
+        },
+        {
+          "view": 5,
+          "leader": 0
+        },
+        {
+          "view": 6,
+          "leader": 0
+        },
+        {
+          "view": 7,
+          "leader": 0
+        },
+        {
+          "view": 8,
+          "leader": 1
+        },
+        {
+          "view": 9,
+          "leader": 1
+        },
+        {
+          "view": 10,
+          "leader": 1
+        },
+        {
+          "view": 11,
+          "leader": 1
+        },
+        {
+          "view": 12,
+          "leader": 1
+        },
+        {
+          "view": 13,
+          "leader": 1
+        },
+        {
+          "view": 14,
+          "leader": 1
+        },
+        {
+          "view": 15,
+          "leader": 1
+        },
+        {
+          "view": 16,
+          "leader": 2
+        },
+        {
+          "view": 17,
+          "leader": 2
+        },
+        {
+          "view": 18,
+          "leader": 2
+        },
+        {
+          "view": 19,
+          "leader": 2
+        },
+        {
+          "view": 20,
+          "leader": 2
+        },
+        {
+          "view": 21,
+          "leader": 2
+        },
+        {
+          "view": 22,
+          "leader": 2
+        },
+        {
+          "view": 23,
+          "leader": 2
+        },
+        {
+          "view": 24,
+          "leader": 3
+        },
+        {
+          "view": 25,
+          "leader": 3
+        },
+        {
+          "view": 26,
+          "leader": 3
+        },
+        {
+          "view": 27,
+          "leader": 3
+        },
+        {
+          "view": 28,
+          "leader": 3
+        },
+        {
+          "view": 29,
+          "leader": 3
+        },
+        {
+          "view": 30,
+          "leader": 3
+        },
+        {
+          "view": 31,
+          "leader": 3
+        },
+        {
+          "view": 32,
+          "leader": 0
+        },
+        {
+          "view": 33,
+          "leader": 0
+        },
+        {
+          "view": 34,
+          "leader": 0
+        },
+        {
+          "view": 35,
+          "leader": 0
+        },
+        {
+          "view": 36,
+          "leader": 0
+        },
+        {
+          "view": 37,
+          "leader": 0
+        },
+        {
+          "view": 38,
+          "leader": 0
+        },
+        {
+          "view": 39,
+          "leader": 0
+        },
+        {
+          "view": 40,
+          "leader": 1
+        },
+        {
+          "view": 41,
+          "leader": 1
+        },
+        {
+          "view": 42,
+          "leader": 1
+        },
+        {
+          "view": 43,
+          "leader": 1
+        },
+        {
+          "view": 44,
+          "leader": 1
+        },
+        {
+          "view": 45,
+          "leader": 1
+        },
+        {
+          "view": 46,
+          "leader": 1
+        },
+        {
+          "view": 47,
+          "leader": 1
+        },
+        {
+          "view": 48,
+          "leader": 2
+        },
+        {
+          "view": 49,
+          "leader": 2
+        },
+        {
+          "view": 50,
+          "leader": 2
+        },
+        {
+          "view": 51,
+          "leader": 2
+        },
+        {
+          "view": 52,
+          "leader": 2
+        },
+        {
+          "view": 53,
+          "leader": 2
+        },
+        {
+          "view": 54,
+          "leader": 2
+        },
+        {
+          "view": 55,
+          "leader": 2
+        },
+        {
+          "view": 56,
+          "leader": 3
+        },
+        {
+          "view": 57,
+          "leader": 3
+        },
+        {
+          "view": 58,
+          "leader": 3
+        },
+        {
+          "view": 59,
+          "leader": 3
+        },
+        {
+          "view": 60,
+          "leader": 3
+        },
+        {
+          "view": 61,
+          "leader": 3
+        },
+        {
+          "view": 62,
+          "leader": 3
+        },
+        {
+          "view": 63,
+          "leader": 3
+        },
+        {
+          "view": 64,
+          "leader": 0
+        },
+        {
+          "view": 65,
+          "leader": 0
+        },
+        {
+          "view": 66,
+          "leader": 0
+        },
+        {
+          "view": 67,
+          "leader": 0
+        },
+        {
+          "view": 68,
+          "leader": 0
+        },
+        {
+          "view": 69,
+          "leader": 0
+        },
+        {
+          "view": 70,
+          "leader": 0
+        },
+        {
+          "view": 71,
+          "leader": 0
+        },
+        {
+          "view": 72,
+          "leader": 1
+        },
+        {
+          "view": 199,
+          "leader": 0
+        },
+        {
+          "view": 200,
+          "leader": 1
+        },
+        {
+          "view": 201,
+          "leader": 1
+        },
+        {
+          "view": 207,
+          "leader": 1
+        },
+        {
+          "view": 208,
+          "leader": 2
+        },
+        {
+          "view": 1000,
+          "leader": 1
+        },
+        {
+          "view": 1048576,
+          "leader": 0
+        }
+      ]
+    },
+    {
+      "name": "V1 genesis_8s (n = 4, T = 1)",
+      "n": 4,
+      "tenure": 1,
+      "views": [
+        {
+          "view": 0,
+          "leader": 0
+        },
+        {
+          "view": 1,
+          "leader": 1
+        },
+        {
+          "view": 2,
+          "leader": 2
+        },
+        {
+          "view": 3,
+          "leader": 3
+        },
+        {
+          "view": 4,
+          "leader": 0
+        },
+        {
+          "view": 5,
+          "leader": 1
+        },
+        {
+          "view": 6,
+          "leader": 2
+        },
+        {
+          "view": 7,
+          "leader": 3
+        },
+        {
+          "view": 8,
+          "leader": 0
+        },
+        {
+          "view": 9,
+          "leader": 1
+        },
+        {
+          "view": 10,
+          "leader": 2
+        },
+        {
+          "view": 11,
+          "leader": 3
+        },
+        {
+          "view": 12,
+          "leader": 0
+        },
+        {
+          "view": 10799,
+          "leader": 3
+        },
+        {
+          "view": 10800,
+          "leader": 0
+        },
+        {
+          "view": 10801,
+          "leader": 1
+        }
+      ]
+    },
+    {
+      "name": "SYNC §10.4 (n = 7, T = 8)",
+      "n": 7,
+      "tenure": 8,
+      "views": [
+        {
+          "view": 0,
+          "leader": 0
+        },
+        {
+          "view": 1,
+          "leader": 0
+        },
+        {
+          "view": 2,
+          "leader": 0
+        },
+        {
+          "view": 3,
+          "leader": 0
+        },
+        {
+          "view": 4,
+          "leader": 0
+        },
+        {
+          "view": 5,
+          "leader": 0
+        },
+        {
+          "view": 6,
+          "leader": 0
+        },
+        {
+          "view": 7,
+          "leader": 0
+        },
+        {
+          "view": 8,
+          "leader": 1
+        },
+        {
+          "view": 9,
+          "leader": 1
+        },
+        {
+          "view": 10,
+          "leader": 1
+        },
+        {
+          "view": 11,
+          "leader": 1
+        },
+        {
+          "view": 12,
+          "leader": 1
+        },
+        {
+          "view": 13,
+          "leader": 1
+        },
+        {
+          "view": 14,
+          "leader": 1
+        },
+        {
+          "view": 15,
+          "leader": 1
+        },
+        {
+          "view": 16,
+          "leader": 2
+        },
+        {
+          "view": 17,
+          "leader": 2
+        },
+        {
+          "view": 18,
+          "leader": 2
+        },
+        {
+          "view": 19,
+          "leader": 2
+        },
+        {
+          "view": 20,
+          "leader": 2
+        },
+        {
+          "view": 21,
+          "leader": 2
+        },
+        {
+          "view": 22,
+          "leader": 2
+        },
+        {
+          "view": 23,
+          "leader": 2
+        },
+        {
+          "view": 24,
+          "leader": 3
+        },
+        {
+          "view": 25,
+          "leader": 3
+        },
+        {
+          "view": 26,
+          "leader": 3
+        },
+        {
+          "view": 27,
+          "leader": 3
+        },
+        {
+          "view": 28,
+          "leader": 3
+        },
+        {
+          "view": 29,
+          "leader": 3
+        },
+        {
+          "view": 30,
+          "leader": 3
+        },
+        {
+          "view": 31,
+          "leader": 3
+        },
+        {
+          "view": 32,
+          "leader": 4
+        },
+        {
+          "view": 33,
+          "leader": 4
+        },
+        {
+          "view": 34,
+          "leader": 4
+        },
+        {
+          "view": 35,
+          "leader": 4
+        },
+        {
+          "view": 36,
+          "leader": 4
+        },
+        {
+          "view": 37,
+          "leader": 4
+        },
+        {
+          "view": 38,
+          "leader": 4
+        },
+        {
+          "view": 39,
+          "leader": 4
+        },
+        {
+          "view": 40,
+          "leader": 5
+        },
+        {
+          "view": 41,
+          "leader": 5
+        },
+        {
+          "view": 42,
+          "leader": 5
+        },
+        {
+          "view": 43,
+          "leader": 5
+        },
+        {
+          "view": 44,
+          "leader": 5
+        },
+        {
+          "view": 45,
+          "leader": 5
+        },
+        {
+          "view": 46,
+          "leader": 5
+        },
+        {
+          "view": 47,
+          "leader": 5
+        },
+        {
+          "view": 48,
+          "leader": 6
+        },
+        {
+          "view": 49,
+          "leader": 6
+        },
+        {
+          "view": 50,
+          "leader": 6
+        },
+        {
+          "view": 51,
+          "leader": 6
+        },
+        {
+          "view": 52,
+          "leader": 6
+        },
+        {
+          "view": 53,
+          "leader": 6
+        },
+        {
+          "view": 54,
+          "leader": 6
+        },
+        {
+          "view": 55,
+          "leader": 6
+        },
+        {
+          "view": 56,
+          "leader": 0
+        },
+        {
+          "view": 57,
+          "leader": 0
+        },
+        {
+          "view": 58,
+          "leader": 0
+        },
+        {
+          "view": 59,
+          "leader": 0
+        },
+        {
+          "view": 60,
+          "leader": 0
+        },
+        {
+          "view": 61,
+          "leader": 0
+        },
+        {
+          "view": 62,
+          "leader": 0
+        },
+        {
+          "view": 63,
+          "leader": 0
+        },
+        {
+          "view": 64,
+          "leader": 1
+        },
+        {
+          "view": 96,
+          "leader": 5
+        },
+        {
+          "view": 98,
+          "leader": 5
+        },
+        {
+          "view": 101,
+          "leader": 5
+        },
+        {
+          "view": 104,
+          "leader": 6
+        }
+      ]
+    },
+    {
+      "name": "n = 100, T = 1 (gate 5d)",
+      "n": 100,
+      "tenure": 1,
+      "views": [
+        {
+          "view": 55,
+          "leader": 55
+        },
+        {
+          "view": 56,
+          "leader": 56
+        },
+        {
+          "view": 57,
+          "leader": 57
+        },
+        {
+          "view": 58,
+          "leader": 58
+        },
+        {
+          "view": 59,
+          "leader": 59
+        },
+        {
+          "view": 60,
+          "leader": 60
+        },
+        {
+          "view": 61,
+          "leader": 61
+        },
+        {
+          "view": 62,
+          "leader": 62
+        },
+        {
+          "view": 63,
+          "leader": 63
+        },
+        {
+          "view": 64,
+          "leader": 64
+        },
+        {
+          "view": 99,
+          "leader": 99
+        },
+        {
+          "view": 100,
+          "leader": 0
+        },
+        {
+          "view": 101,
+          "leader": 1
+        }
+      ]
+    },
+    {
+      "name": "tenure 0 reads as 1 (n = 4)",
+      "n": 4,
+      "tenure": 0,
+      "views": [
+        {
+          "view": 0,
+          "leader": 0
+        },
+        {
+          "view": 1,
+          "leader": 1
+        },
+        {
+          "view": 2,
+          "leader": 2
+        },
+        {
+          "view": 3,
+          "leader": 3
+        },
+        {
+          "view": 4,
+          "leader": 0
+        },
+        {
+          "view": 5,
+          "leader": 1
+        },
+        {
+          "view": 6,
+          "leader": 2
+        },
+        {
+          "view": 7,
+          "leader": 3
+        },
+        {
+          "view": 8,
+          "leader": 0
+        }
+      ]
+    },
+    {
+      "name": "large views (n = 7, T = 8)",
+      "n": 7,
+      "tenure": 8,
+      "views": [
+        {
+          "view": 4294967296,
+          "leader": 4
+        },
+        {
+          "view": 18446744073709551607,
+          "leader": 0
+        },
+        {
+          "view": 18446744073709551614,
+          "leader": 1
+        },
+        {
+          "view": 18446744073709551615,
+          "leader": 1
+        }
+      ]
+    }
+  ],
+  "tenureWindows": [
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 0,
+      "window": 0,
+      "firstView": 0,
+      "lastView": 7,
+      "leader": 0
+    },
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 7,
+      "window": 0,
+      "firstView": 0,
+      "lastView": 7,
+      "leader": 0
+    },
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 8,
+      "window": 1,
+      "firstView": 8,
+      "lastView": 15,
+      "leader": 1
+    },
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 15,
+      "window": 1,
+      "firstView": 8,
+      "lastView": 15,
+      "leader": 1
+    },
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 16,
+      "window": 2,
+      "firstView": 16,
+      "lastView": 23,
+      "leader": 2
+    },
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 31,
+      "window": 3,
+      "firstView": 24,
+      "lastView": 31,
+      "leader": 3
+    },
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 32,
+      "window": 4,
+      "firstView": 32,
+      "lastView": 39,
+      "leader": 0
+    },
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 199,
+      "window": 24,
+      "firstView": 192,
+      "lastView": 199,
+      "leader": 0
+    },
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 200,
+      "window": 25,
+      "firstView": 200,
+      "lastView": 207,
+      "leader": 1
+    },
+    {
+      "n": 4,
+      "tenure": 8,
+      "view": 201,
+      "window": 25,
+      "firstView": 200,
+      "lastView": 207,
+      "leader": 1
+    },
+    {
+      "n": 7,
+      "tenure": 8,
+      "view": 8,
+      "window": 1,
+      "firstView": 8,
+      "lastView": 15,
+      "leader": 1
+    },
+    {
+      "n": 7,
+      "tenure": 8,
+      "view": 11,
+      "window": 1,
+      "firstView": 8,
+      "lastView": 15,
+      "leader": 1
+    },
+    {
+      "n": 7,
+      "tenure": 8,
+      "view": 15,
+      "window": 1,
+      "firstView": 8,
+      "lastView": 15,
+      "leader": 1
+    },
+    {
+      "n": 7,
+      "tenure": 8,
+      "view": 48,
+      "window": 6,
+      "firstView": 48,
+      "lastView": 55,
+      "leader": 6
+    },
+    {
+      "n": 7,
+      "tenure": 8,
+      "view": 55,
+      "window": 6,
+      "firstView": 48,
+      "lastView": 55,
+      "leader": 6
+    },
+    {
+      "n": 7,
+      "tenure": 8,
+      "view": 56,
+      "window": 7,
+      "firstView": 56,
+      "lastView": 63,
+      "leader": 0
+    },
+    {
+      "n": 7,
+      "tenure": 8,
+      "view": 98,
+      "window": 12,
+      "firstView": 96,
+      "lastView": 103,
+      "leader": 5
+    }
+  ],
+  "epochs": [
+    {
+      "epochLength": 200,
+      "view": 0,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 200,
+      "view": 1,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 200,
+      "view": 2,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 200,
+      "view": 200,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 200,
+      "view": 201,
+      "epoch": 1,
+      "isBoundary": true
+    },
+    {
+      "epochLength": 200,
+      "view": 202,
+      "epoch": 1,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 200,
+      "view": 400,
+      "epoch": 1,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 200,
+      "view": 401,
+      "epoch": 2,
+      "isBoundary": true
+    },
+    {
+      "epochLength": 10800,
+      "view": 1,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 10800,
+      "view": 10800,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 10800,
+      "view": 10801,
+      "epoch": 1,
+      "isBoundary": true
+    },
+    {
+      "epochLength": 10800,
+      "view": 21601,
+      "epoch": 2,
+      "isBoundary": true
+    },
+    {
+      "epochLength": 10,
+      "view": 1,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 10,
+      "view": 2,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 10,
+      "view": 10,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 10,
+      "view": 11,
+      "epoch": 1,
+      "isBoundary": true
+    },
+    {
+      "epochLength": 10,
+      "view": 12,
+      "epoch": 1,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 10,
+      "view": 21,
+      "epoch": 2,
+      "isBoundary": true
+    },
+    {
+      "epochLength": 50,
+      "view": 50,
+      "epoch": 0,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 50,
+      "view": 51,
+      "epoch": 1,
+      "isBoundary": true
+    },
+    {
+      "epochLength": 50,
+      "view": 98,
+      "epoch": 1,
+      "isBoundary": false
+    },
+    {
+      "epochLength": 50,
+      "view": 101,
+      "epoch": 2,
+      "isBoundary": true
+    },
+    {
+      "epochLength": 50,
+      "view": 104,
+      "epoch": 2,
+      "isBoundary": false
+    }
+  ],
+  "viewAfterTC": [
+    {
+      "source": "SYNC-10.4",
+      "tcView": 8,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": false,
+      "result": 9,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 8,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": true,
+      "result": 16,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 9,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": true,
+      "result": 16,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 15,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": true,
+      "result": 16,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 16,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": true,
+      "result": 24,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 7,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": true,
+      "result": 8,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 0,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": true,
+      "result": 8,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 5,
+      "tenure": 1,
+      "epochLength": 0,
+      "active": true,
+      "result": 6,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 5,
+      "tenure": 0,
+      "epochLength": 0,
+      "active": true,
+      "result": 6,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 8,
+      "tenure": 8,
+      "epochLength": 10,
+      "active": true,
+      "result": 11,
+      "clampedToEpochBoundary": true
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 10,
+      "tenure": 8,
+      "epochLength": 10,
+      "active": true,
+      "result": 11,
+      "clampedToEpochBoundary": true
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 11,
+      "tenure": 8,
+      "epochLength": 10,
+      "active": true,
+      "result": 16,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 17,
+      "tenure": 8,
+      "epochLength": 10,
+      "active": true,
+      "result": 21,
+      "clampedToEpochBoundary": true
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 100,
+      "tenure": 32,
+      "epochLength": 0,
+      "active": true,
+      "result": 128,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 18446744073709551614,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": true,
+      "result": 18446744073709551615,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "SYNC-10.4",
+      "tcView": 18446744073709551612,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": true,
+      "result": 18446744073709551613,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 0,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 8,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 1,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 8,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 7,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 8,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 8,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 16,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 9,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 16,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 15,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 16,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 16,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 24,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 191,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 192,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 192,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 200,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 193,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 200,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 197,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 200,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 198,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 200,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 199,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 200,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 200,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 201,
+      "clampedToEpochBoundary": true
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 201,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 208,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 202,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 208,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 207,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 208,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 208,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 216,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 399,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 400,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 400,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 401,
+      "clampedToEpochBoundary": true
+    },
+    {
+      "source": "profile-1 standard genesis",
+      "tcView": 401,
+      "tenure": 8,
+      "epochLength": 200,
+      "active": true,
+      "result": 408,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "V1 genesis_8s (T = 1)",
+      "tcView": 0,
+      "tenure": 1,
+      "epochLength": 10800,
+      "active": true,
+      "result": 1,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "V1 genesis_8s (T = 1)",
+      "tcView": 57,
+      "tenure": 1,
+      "epochLength": 10800,
+      "active": true,
+      "result": 58,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "V1 genesis_8s (T = 1)",
+      "tcView": 10800,
+      "tenure": 1,
+      "epochLength": 10800,
+      "active": true,
+      "result": 10801,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "AM32",
+      "tcView": 96,
+      "tenure": 8,
+      "epochLength": 50,
+      "active": true,
+      "result": 101,
+      "clampedToEpochBoundary": true
+    },
+    {
+      "source": "AM32",
+      "tcView": 98,
+      "tenure": 8,
+      "epochLength": 50,
+      "active": true,
+      "result": 101,
+      "clampedToEpochBoundary": true
+    },
+    {
+      "source": "AM32",
+      "tcView": 100,
+      "tenure": 8,
+      "epochLength": 50,
+      "active": true,
+      "result": 101,
+      "clampedToEpochBoundary": true
+    },
+    {
+      "source": "AM32",
+      "tcView": 101,
+      "tenure": 8,
+      "epochLength": 50,
+      "active": true,
+      "result": 104,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "AM32",
+      "tcView": 103,
+      "tenure": 8,
+      "epochLength": 50,
+      "active": true,
+      "result": 104,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "AM32",
+      "tcView": 98,
+      "tenure": 8,
+      "epochLength": 100,
+      "active": true,
+      "result": 101,
+      "clampedToEpochBoundary": true
+    },
+    {
+      "source": "AM32",
+      "tcView": 101,
+      "tenure": 8,
+      "epochLength": 100,
+      "active": true,
+      "result": 104,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "edge",
+      "tcView": 0,
+      "tenure": 8,
+      "epochLength": 10,
+      "active": true,
+      "result": 8,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "edge",
+      "tcView": 1,
+      "tenure": 8,
+      "epochLength": 10,
+      "active": true,
+      "result": 8,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "edge",
+      "tcView": 18446744073709551607,
+      "tenure": 8,
+      "epochLength": 0,
+      "active": true,
+      "result": 18446744073709551608,
+      "clampedToEpochBoundary": false
+    },
+    {
+      "source": "edge",
+      "tcView": 18446744073709551614,
+      "tenure": 1,
+      "epochLength": 0,
+      "active": true,
+      "result": 18446744073709551615,
+      "clampedToEpochBoundary": false
+    }
+  ],
+  "sequences": [
+    {
+      "id": "S1",
+      "description": "leader 1 dead",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 0,
+      "dead": [
+        "L1 from view 0"
+      ],
+      "steps": [
+        {
+          "event": "QC",
+          "view": 1,
+          "leaderOfView": 0,
+          "nextView": 2,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 2,
+          "leaderOfView": 0,
+          "nextView": 3,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 3,
+          "leaderOfView": 0,
+          "nextView": 4,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 4,
+          "leaderOfView": 0,
+          "nextView": 5,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 5,
+          "leaderOfView": 0,
+          "nextView": 6,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 6,
+          "leaderOfView": 0,
+          "nextView": 7,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 7,
+          "leaderOfView": 0,
+          "nextView": 8,
+          "nextLeader": 1
+        },
+        {
+          "event": "TC",
+          "view": 8,
+          "leaderOfView": 1,
+          "nextView": 16,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 16,
+          "leaderOfView": 2,
+          "nextView": 17,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 17,
+          "leaderOfView": 2,
+          "nextView": 18,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 18,
+          "leaderOfView": 2,
+          "nextView": 19,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 19,
+          "leaderOfView": 2,
+          "nextView": 20,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 20,
+          "leaderOfView": 2,
+          "nextView": 21,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 21,
+          "leaderOfView": 2,
+          "nextView": 22,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 22,
+          "leaderOfView": 2,
+          "nextView": 23,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 23,
+          "leaderOfView": 2,
+          "nextView": 24,
+          "nextLeader": 3
+        },
+        {
+          "event": "QC",
+          "view": 24,
+          "leaderOfView": 3,
+          "nextView": 25,
+          "nextLeader": 3
+        }
+      ]
+    },
+    {
+      "id": "S2",
+      "description": "leaders 1 and 2 dead",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 0,
+      "dead": [
+        "L1 from view 0",
+        "L2 from view 0"
+      ],
+      "steps": [
+        {
+          "event": "QC",
+          "view": 7,
+          "leaderOfView": 0,
+          "nextView": 8,
+          "nextLeader": 1
+        },
+        {
+          "event": "TC",
+          "view": 8,
+          "leaderOfView": 1,
+          "nextView": 16,
+          "nextLeader": 2
+        },
+        {
+          "event": "TC",
+          "view": 16,
+          "leaderOfView": 2,
+          "nextView": 24,
+          "nextLeader": 3
+        },
+        {
+          "event": "QC",
+          "view": 24,
+          "leaderOfView": 3,
+          "nextView": 25,
+          "nextLeader": 3
+        },
+        {
+          "event": "QC",
+          "view": 25,
+          "leaderOfView": 3,
+          "nextView": 26,
+          "nextLeader": 3
+        }
+      ]
+    },
+    {
+      "id": "S3",
+      "description": "leader 1 dies mid-tenure (silent from view 11)",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 0,
+      "dead": [
+        "L1 from view 11"
+      ],
+      "steps": [
+        {
+          "event": "QC",
+          "view": 7,
+          "leaderOfView": 0,
+          "nextView": 8,
+          "nextLeader": 1
+        },
+        {
+          "event": "QC",
+          "view": 8,
+          "leaderOfView": 1,
+          "nextView": 9,
+          "nextLeader": 1
+        },
+        {
+          "event": "QC",
+          "view": 9,
+          "leaderOfView": 1,
+          "nextView": 10,
+          "nextLeader": 1
+        },
+        {
+          "event": "QC",
+          "view": 10,
+          "leaderOfView": 1,
+          "nextView": 11,
+          "nextLeader": 1
+        },
+        {
+          "event": "TC",
+          "view": 11,
+          "leaderOfView": 1,
+          "nextView": 16,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 16,
+          "leaderOfView": 2,
+          "nextView": 17,
+          "nextLeader": 2
+        }
+      ]
+    },
+    {
+      "id": "S4",
+      "description": "timeout on the window's last view (leader 1 silent from view 15)",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 0,
+      "dead": [
+        "L1 from view 15"
+      ],
+      "steps": [
+        {
+          "event": "QC",
+          "view": 14,
+          "leaderOfView": 1,
+          "nextView": 15,
+          "nextLeader": 1
+        },
+        {
+          "event": "TC",
+          "view": 15,
+          "leaderOfView": 1,
+          "nextView": 16,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 16,
+          "leaderOfView": 2,
+          "nextView": 17,
+          "nextLeader": 2
+        }
+      ]
+    },
+    {
+      "id": "S5",
+      "description": "wrap-around: leader 6 dead",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 0,
+      "dead": [
+        "L6 from view 0"
+      ],
+      "steps": [
+        {
+          "event": "QC",
+          "view": 47,
+          "leaderOfView": 5,
+          "nextView": 48,
+          "nextLeader": 6
+        },
+        {
+          "event": "TC",
+          "view": 48,
+          "leaderOfView": 6,
+          "nextView": 56,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 56,
+          "leaderOfView": 0,
+          "nextView": 57,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 57,
+          "leaderOfView": 0,
+          "nextView": 58,
+          "nextLeader": 0
+        }
+      ]
+    },
+    {
+      "id": "S7",
+      "description": "epoch clamp, E = 10: leader 1 dead",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 10,
+      "dead": [
+        "L1 from view 0"
+      ],
+      "steps": [
+        {
+          "event": "QC",
+          "view": 7,
+          "leaderOfView": 0,
+          "nextView": 8,
+          "nextLeader": 1
+        },
+        {
+          "event": "TC",
+          "view": 8,
+          "leaderOfView": 1,
+          "nextView": 11,
+          "nextLeader": 1
+        },
+        {
+          "event": "TC",
+          "view": 11,
+          "leaderOfView": 1,
+          "nextView": 16,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 16,
+          "leaderOfView": 2,
+          "nextView": 17,
+          "nextLeader": 2
+        }
+      ]
+    },
+    {
+      "id": "S9",
+      "description": "tenure 1, leader 3 dead",
+      "n": 7,
+      "tenure": 1,
+      "epochLength": 0,
+      "dead": [
+        "L3 from view 0"
+      ],
+      "steps": [
+        {
+          "event": "QC",
+          "view": 1,
+          "leaderOfView": 1,
+          "nextView": 2,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 2,
+          "leaderOfView": 2,
+          "nextView": 3,
+          "nextLeader": 3
+        },
+        {
+          "event": "TC",
+          "view": 3,
+          "leaderOfView": 3,
+          "nextView": 4,
+          "nextLeader": 4
+        },
+        {
+          "event": "QC",
+          "view": 4,
+          "leaderOfView": 4,
+          "nextView": 5,
+          "nextLeader": 5
+        },
+        {
+          "event": "QC",
+          "view": 5,
+          "leaderOfView": 5,
+          "nextView": 6,
+          "nextLeader": 6
+        },
+        {
+          "event": "QC",
+          "view": 6,
+          "leaderOfView": 6,
+          "nextView": 7,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 7,
+          "leaderOfView": 0,
+          "nextView": 8,
+          "nextLeader": 1
+        },
+        {
+          "event": "QC",
+          "view": 8,
+          "leaderOfView": 1,
+          "nextView": 9,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 9,
+          "leaderOfView": 2,
+          "nextView": 10,
+          "nextLeader": 3
+        },
+        {
+          "event": "TC",
+          "view": 10,
+          "leaderOfView": 3,
+          "nextView": 11,
+          "nextLeader": 4
+        },
+        {
+          "event": "QC",
+          "view": 11,
+          "leaderOfView": 4,
+          "nextView": 12,
+          "nextLeader": 5
+        }
+      ]
+    },
+    {
+      "id": "AM32",
+      "description": "rehearsal: L5 killed at view 98, E = 50: TC(98) clamps to boundary 101 (same leader), TC(101) -\u003e 104",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 50,
+      "dead": [
+        "L5 from view 98"
+      ],
+      "steps": [
+        {
+          "event": "QC",
+          "view": 96,
+          "leaderOfView": 5,
+          "nextView": 97,
+          "nextLeader": 5
+        },
+        {
+          "event": "QC",
+          "view": 97,
+          "leaderOfView": 5,
+          "nextView": 98,
+          "nextLeader": 5
+        },
+        {
+          "event": "TC",
+          "view": 98,
+          "leaderOfView": 5,
+          "nextView": 101,
+          "nextLeader": 5
+        },
+        {
+          "event": "TC",
+          "view": 101,
+          "leaderOfView": 5,
+          "nextView": 104,
+          "nextLeader": 6
+        },
+        {
+          "event": "QC",
+          "view": 104,
+          "leaderOfView": 6,
+          "nextView": 105,
+          "nextLeader": 6
+        },
+        {
+          "event": "QC",
+          "view": 105,
+          "leaderOfView": 6,
+          "nextView": 106,
+          "nextLeader": 6
+        }
+      ]
+    },
+    {
+      "id": "P1-std",
+      "description": "standard genesis (n = 4, T = 8, E = 200): leader 1 dead; its window 200..207 holds boundary 201: TC(200) clamps to 201 (same leader), TC(201) -\u003e 208",
+      "n": 4,
+      "tenure": 8,
+      "epochLength": 200,
+      "dead": [
+        "L1 from view 0"
+      ],
+      "steps": [
+        {
+          "event": "QC",
+          "view": 186,
+          "leaderOfView": 3,
+          "nextView": 187,
+          "nextLeader": 3
+        },
+        {
+          "event": "QC",
+          "view": 187,
+          "leaderOfView": 3,
+          "nextView": 188,
+          "nextLeader": 3
+        },
+        {
+          "event": "QC",
+          "view": 188,
+          "leaderOfView": 3,
+          "nextView": 189,
+          "nextLeader": 3
+        },
+        {
+          "event": "QC",
+          "view": 189,
+          "leaderOfView": 3,
+          "nextView": 190,
+          "nextLeader": 3
+        },
+        {
+          "event": "QC",
+          "view": 190,
+          "leaderOfView": 3,
+          "nextView": 191,
+          "nextLeader": 3
+        },
+        {
+          "event": "QC",
+          "view": 191,
+          "leaderOfView": 3,
+          "nextView": 192,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 192,
+          "leaderOfView": 0,
+          "nextView": 193,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 193,
+          "leaderOfView": 0,
+          "nextView": 194,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 194,
+          "leaderOfView": 0,
+          "nextView": 195,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 195,
+          "leaderOfView": 0,
+          "nextView": 196,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 196,
+          "leaderOfView": 0,
+          "nextView": 197,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 197,
+          "leaderOfView": 0,
+          "nextView": 198,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 198,
+          "leaderOfView": 0,
+          "nextView": 199,
+          "nextLeader": 0
+        },
+        {
+          "event": "QC",
+          "view": 199,
+          "leaderOfView": 0,
+          "nextView": 200,
+          "nextLeader": 1
+        },
+        {
+          "event": "TC",
+          "view": 200,
+          "leaderOfView": 1,
+          "nextView": 201,
+          "nextLeader": 1
+        },
+        {
+          "event": "TC",
+          "view": 201,
+          "leaderOfView": 1,
+          "nextView": 208,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 208,
+          "leaderOfView": 2,
+          "nextView": 209,
+          "nextLeader": 2
+        },
+        {
+          "event": "QC",
+          "view": 209,
+          "leaderOfView": 2,
+          "nextView": 210,
+          "nextLeader": 2
+        }
+      ]
+    },
+    {
+      "id": "S10",
+      "description": "restart: a node persisted at view 16 after TC(8) needs only the view",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 0,
+      "dead": null,
+      "steps": [
+        {
+          "event": "TC",
+          "view": 8,
+          "leaderOfView": 1,
+          "nextView": 16,
+          "nextLeader": 2
+        }
+      ]
+    },
+    {
+      "id": "S11",
+      "description": "QC and TC for view 8 (race): nodes at 9 adopt the piggybacked TC(8) because view_after_tc(8) \u003e 9; a node already at 16 ignores it",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 0,
+      "dead": null,
+      "steps": [
+        {
+          "event": "QC",
+          "view": 8,
+          "leaderOfView": 1,
+          "nextView": 9,
+          "nextLeader": 1
+        },
+        {
+          "event": "TC",
+          "view": 8,
+          "leaderOfView": 1,
+          "nextView": 16,
+          "nextLeader": 2
+        },
+        {
+          "event": "adoptTC",
+          "view": 9,
+          "leaderOfView": 1,
+          "nextView": 16,
+          "nextLeader": 2
+        },
+        {
+          "event": "ignoreTC",
+          "view": 16,
+          "leaderOfView": 2,
+          "nextView": 16,
+          "nextLeader": 2
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "Generated by gov5 TestProfile1VectorV7 (internal/profile1_v7_test.go) from hotstuff.LeaderForViewWithTenure, hotstuff.ViewAfterTimeout and hotstuff.EpochManager; profiles are read with gov5's genesis loader.",
+    "viewAfterTC rows with source SYNC-10.4 are the spec table's inputs; result is gov5's.",
+    "Sequences reproduce SYNC §10.4 S1-S5, S7, S9-S11 (n = 7, T = 8) and AM32's rehearsal (TC(98) -\u003e 101 -\u003e 104, the clamp landing on the same dead leader); S6 and S8 (switch off, activation view) do not exist on Profile 1."
+  ]
+}

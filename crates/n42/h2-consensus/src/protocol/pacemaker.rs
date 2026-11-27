@@ -4,8 +4,19 @@ use tokio::time::{Instant, Sleep};
 
 /// Active Pacemaker for the HotStuff-2 consensus protocol.
 ///
-/// Manages view timeouts with exponential backoff (Jolteon-style):
-/// `timeout = min(base_timeout * 2^consecutive_timeouts, max_timeout)`
+/// Manages view timeouts with grouped exponential backoff (AM33, agreed by
+/// gov5, n42-26 and n42-rs on 2026-11-26 for v1.2):
+/// `timeout(c) = min(base_eff * 2^floor(c / g), max_timeout)` with
+/// `g = min(f + 1, 3)`, `f = floor((n - 1) / 3)` and `n` the size of the
+/// validator set the engine holds when it starts the view timer
+/// ([`Self::set_committee_size`]). `c` is the consecutive-timeout count
+/// (`RoundState`): it grows on each local view timeout and resets on a
+/// commit QC and on a QC-based view jump, never on a TC. The group makes a
+/// run of absent leaders cost `base` each until `g` of them in a row show a
+/// real timing problem; only then does the timeout double
+/// (`docs/AM33_DRAFT_CONSECUTIVE_ABSENT_LEADERS.md`, vector
+/// `testdata/profile1/gov5/AM33`). Without a committee size `g` is 1, the
+/// rule before AM33.
 ///
 /// Adaptive mode: when `observe_commit_latency` is called with real measurements,
 /// the effective base timeout is adjusted to `max(base_timeout, p95_observed * 2)`.
@@ -24,6 +35,8 @@ pub struct Pacemaker {
     recent_latencies: Vec<Duration>,
     /// Cursor for circular buffer insertion.
     latency_cursor: usize,
+    /// Validator-set size the backoff group is derived from; 0 = unknown.
+    committee_size: usize,
 }
 
 impl Pacemaker {
@@ -41,7 +54,39 @@ impl Pacemaker {
             deadline: Instant::now() + base_timeout,
             recent_latencies: Vec::with_capacity(Self::LATENCY_WINDOW),
             latency_cursor: 0,
+            committee_size: 0,
         }
+    }
+
+    /// A pacemaker whose backoff group is derived from a validator set of
+    /// `committee_size` (see [`Self::set_committee_size`]).
+    pub fn with_committee_size(base_timeout_ms: u64, max_timeout_ms: u64, committee_size: usize) -> Self {
+        let mut pacemaker = Self::new(base_timeout_ms, max_timeout_ms);
+        pacemaker.committee_size = committee_size;
+        pacemaker
+    }
+
+    /// AM33's backoff group for a validator set of `n`: `min(f + 1, 3)` with
+    /// `f = floor((n - 1) / 3)`; 1 when `n` is unknown (0). gov5's
+    /// `hotstuff.BackoffGroupSize`.
+    pub const fn backoff_group_size(n: usize) -> u32 {
+        if n == 0 {
+            return 1;
+        }
+        let f = (n - 1) / 3;
+        if f + 1 < 3 { (f + 1) as u32 } else { 3 }
+    }
+
+    /// Sets the validator-set size the backoff group is derived from (gov5's
+    /// `SetCommitteeSize`). The engine sets it from the set it holds each
+    /// time it starts a view timer.
+    pub fn set_committee_size(&mut self, n: usize) {
+        self.committee_size = n;
+    }
+
+    /// The backoff group in force; see [`Self::backoff_group_size`].
+    pub const fn backoff_group(&self) -> u32 {
+        Self::backoff_group_size(self.committee_size)
     }
 
     /// Records an observed commit latency (view start → BlockCommitted).
@@ -86,10 +131,11 @@ impl Pacemaker {
 
     /// Returns the timeout duration for the given number of consecutive timeouts.
     ///
-    /// Uses exponential backoff: `effective_base * 2^consecutive_timeouts`, capped at `max_timeout`.
+    /// AM33: `effective_base * 2^floor(consecutive_timeouts / g)`, capped at
+    /// `max_timeout`; `g` is [`Self::backoff_group`].
     pub fn timeout_duration(&self, consecutive_timeouts: u32) -> Duration {
         let base = self.effective_base_timeout();
-        let exp = consecutive_timeouts.min(Self::MAX_BACKOFF_EXPONENT);
+        let exp = (consecutive_timeouts / self.backoff_group()).min(Self::MAX_BACKOFF_EXPONENT);
         let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
         let timeout_ms = (base.as_millis() as u64).saturating_mul(multiplier);
         Duration::from_millis(timeout_ms.min(self.max_timeout.as_millis() as u64))
@@ -103,6 +149,7 @@ impl Pacemaker {
             view,
             timeout_ms = duration.as_millis() as u64,
             consecutive_timeouts,
+            backoff_group = self.backoff_group(),
             "pacemaker timer reset"
         );
     }
@@ -141,6 +188,8 @@ mod tests {
         assert_eq!(pm.timeout_duration(0), Duration::from_millis(1000));
     }
 
+    // The tests below set no committee size, so g = 1: one doubling per
+    // timeout, AM33's rule for n <= 3 (and the rule before AM33).
     #[test]
     fn test_timeout_duration_backoff() {
         let pm = Pacemaker::new(1000, 60000);
@@ -155,6 +204,27 @@ mod tests {
         assert_eq!(pm.timeout_duration(10), Duration::from_millis(30000));
         assert_eq!(pm.timeout_duration(5), Duration::from_millis(30000));
         assert_eq!(pm.timeout_duration(4), Duration::from_millis(16000));
+    }
+
+    /// AM33: the exponent grows once per `g = min(f + 1, 3)` timeouts.
+    #[test]
+    fn test_am33_grouped_backoff() {
+        let groups: Vec<u32> = [0, 1, 2, 3, 4, 6, 7, 100, 512].iter().map(|&n| Pacemaker::backoff_group_size(n)).collect();
+        assert_eq!(groups, [1, 1, 1, 1, 2, 2, 3, 3, 3]);
+        let mut pm = Pacemaker::new(24_000, 96_000);
+        pm.set_committee_size(4);
+        let by_c: Vec<u64> = (0..7).map(|c| pm.timeout_duration(c).as_millis() as u64).collect();
+        assert_eq!(by_c, [24_000, 24_000, 48_000, 48_000, 96_000, 96_000, 96_000]);
+        pm.set_committee_size(100);
+        let by_c: Vec<u64> = (0..7).map(|c| pm.timeout_duration(c).as_millis() as u64).collect();
+        assert_eq!(by_c, [24_000, 24_000, 24_000, 48_000, 48_000, 48_000, 96_000]);
+        // The adaptive base is kept; the group divides only the exponent.
+        for _ in 0..10 {
+            pm.observe_commit_latency(Duration::from_millis(15_000));
+        }
+        assert_eq!(pm.timeout_duration(2), Duration::from_millis(30_000));
+        assert_eq!(pm.timeout_duration(3), Duration::from_millis(60_000));
+        assert_eq!(pm.timeout_duration(u32::MAX), Duration::from_millis(96_000));
     }
 
     #[test]

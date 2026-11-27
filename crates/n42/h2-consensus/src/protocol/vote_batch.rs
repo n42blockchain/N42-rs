@@ -45,6 +45,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use super::state_machine::{ConsensusEngine, VOTERS_SEEN_WINDOW};
+use super::equivocation::{EquivocationKind, SignedValue};
 use crate::error::ConsensusResult;
 
 /// A Round 1 vote kept for the voters ledger without being verified.
@@ -96,7 +97,13 @@ impl ConsensusEngine {
                     return Some(ConsensusMessage::Vote(vote));
                 }
                 if vote.view < view {
-                    self.park_vote(vote, false);
+                    // The second of a conflicting pair is settled (and
+                    // verified) here; anything else waits for the batch.
+                    match self.late_vote_conflict(&vote) {
+                        Ok(true) => {}
+                        Ok(false) => self.park_vote(vote, false),
+                        Err(err) => tracing::debug!(target: "n42::cl::voting", %err, "late vote evidence not emitted"),
+                    }
                     return None;
                 }
                 // Followers drop votes unverified, as `process_vote` does.
@@ -105,6 +112,17 @@ impl ConsensusEngine {
                 }
                 if self.validator_set_for_view(view).get_public_key(vote.voter).is_err() {
                     return None;
+                }
+                // Every vote of the view, before the QC or after it, is held
+                // against the voter's other one first (E15): lookups, and a
+                // signature check only on a conflict. A proven second is
+                // dropped, as the in-view check drops it.
+                let profile = self.signing_profile;
+                let make = || SignedValue::new(vote.block_hash, profile.vote_message(view, vote.block_hash), &vote.signature);
+                match self.queued_conflict(EquivocationKind::Vote, view, vote.voter, vote.block_hash, make) {
+                    Ok(true) => return None,
+                    Ok(false) => {}
+                    Err(err) => tracing::debug!(target: "n42::cl::voting", %err, "vote evidence not emitted"),
                 }
                 let for_collector = self
                     .vote_collector
@@ -134,6 +152,19 @@ impl ConsensusEngine {
                 }
                 if self.validator_set_for_view(view).get_public_key(cv.voter).is_err() {
                     return None;
+                }
+                // As for a Round-1 vote: a twin whose group never reaches the
+                // quorum would otherwise wait in the queue until the view
+                // closed and be dropped there unseen.
+                let profile = self.signing_profile;
+                let changes_hash = self.cached_changes_hash(&cv.block_hash);
+                let make = || {
+                    SignedValue::new(cv.block_hash, profile.commit_message(view, cv.block_hash, changes_hash), &cv.signature)
+                };
+                match self.queued_conflict(EquivocationKind::CommitVote, view, cv.voter, cv.block_hash, make) {
+                    Ok(true) => return None,
+                    Ok(false) => {}
+                    Err(err) => tracing::debug!(target: "n42::cl::voting", %err, "commit vote evidence not emitted"),
                 }
                 if self
                     .commit_collector
@@ -385,7 +416,9 @@ impl ConsensusEngine {
         // cannot keep a genuine later vote out of the progress ledger.
         if parked.iter().filter(|p| p.vote.voter == vote.voter).count() >= PARKED_PER_VALIDATOR {
             if vote.view < current {
-                self.note_late_vote(&vote);
+                if let Err(err) = self.note_late_vote(&vote) {
+                    tracing::debug!(target: "n42::cl::voting", %err, "late vote evidence not emitted");
+                }
             } else if let Err(err) = self.process_vote(vote) {
                 tracing::debug!(target: "n42::cl::voting", %err, "parked vote overflow refused");
             }

@@ -505,9 +505,15 @@ pub struct ConsensusEngine {
     pub(super) equivocation_tracker: super::equivocation::EquivocationTracker,
     /// Tracks R2 (CommitVote) per validator per view for equivocation detection.
     pub(super) commit_equivocation_tracker: super::equivocation::EquivocationTracker,
+    /// Round-1 votes of closed views this node led, for the conflicts that
+    /// arrive after the view (E15; [`super::equivocation::LateTracker`]).
+    pub(super) late_votes: super::equivocation::LateTracker,
     /// Commit votes of closed views, for the conflicts that arrive after the
-    /// CommitQC (E15; [`super::equivocation::LateCommitVotes`]).
-    pub(super) late_commit_votes: super::equivocation::LateCommitVotes,
+    /// CommitQC (E15).
+    pub(super) late_commit_votes: super::equivocation::LateTracker,
+    /// Proposals of closed views, for a second proposal that arrives after
+    /// the view (E15).
+    pub(super) late_proposals: super::equivocation::LateTracker,
     /// Tracks the signed-message commitment per proposer in the current view,
     /// with the first signed proposal as evidence. The commitment includes
     /// validator changes, so reusing a block hash with a different
@@ -648,6 +654,7 @@ impl ConsensusEngine {
         vote_log: Arc<dyn VoteLogWriter>,
     ) -> Self {
         let local_public_key = secret_key.public_key();
+        let committee_size = epoch_manager.current_validator_set().len() as usize;
         Self {
             my_index,
             secret_key,
@@ -665,7 +672,7 @@ impl ConsensusEngine {
             held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::new(),
-            pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
+            pacemaker: Pacemaker::with_committee_size(base_timeout_ms, max_timeout_ms, committee_size),
             vote_collector: None,
             commit_collector: None,
             timeout_collector: None,
@@ -681,7 +688,9 @@ impl ConsensusEngine {
             unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
+            late_votes: Default::default(),
             late_commit_votes: Default::default(),
+            late_proposals: Default::default(),
             proposal_equivocation_tracker: HashMap::new(),
             processed_proposal: None,
             vote_log_retry: None,
@@ -778,6 +787,7 @@ impl ConsensusEngine {
             );
         }
         let local_public_key = secret_key.public_key();
+        let committee_size = epoch_manager.current_validator_set().len() as usize;
         Self {
             my_index,
             secret_key,
@@ -802,7 +812,7 @@ impl ConsensusEngine {
                 last_voted_view,
                 last_commit_voted_view,
             ),
-            pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
+            pacemaker: Pacemaker::with_committee_size(base_timeout_ms, max_timeout_ms, committee_size),
             vote_collector: None,
             commit_collector: None,
             timeout_collector: None,
@@ -818,7 +828,9 @@ impl ConsensusEngine {
             unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
+            late_votes: Default::default(),
             late_commit_votes: Default::default(),
+            late_proposals: Default::default(),
             proposal_equivocation_tracker: HashMap::new(),
             processed_proposal: None,
             vote_log_retry: None,
@@ -1634,14 +1646,17 @@ impl ConsensusEngine {
         });
         if let Some(view) = stale_msg_view {
             // edition-2021: N42-26 writes this as a let-chain.
-            if let ConsensusMessage::Proposal(ref proposal) = msg
-                && self.recover_late_committed_proposal(proposal)? {
+            if let ConsensusMessage::Proposal(ref proposal) = msg {
+                // A second proposal of a closed view (E15), whatever else it is.
+                self.note_late_proposal(proposal)?;
+                if self.recover_late_committed_proposal(proposal)? {
                     return Ok(());
                 }
+            }
             // A late or progress vote for a view this node led: not for the
             // protocol, but for the voters ledger (the stragglers' grace).
             if let ConsensusMessage::Vote(ref vote) = msg {
-                self.note_late_vote(vote);
+                self.note_late_vote(vote)?;
             }
             // A commit vote of a view this node led, after its CommitQC:
             // checked for a conflict with the voter's other one (E15).
@@ -2126,8 +2141,7 @@ impl ConsensusEngine {
         }
 
         self.round_state.advance_view(new_view);
-        self.pacemaker
-            .reset_for_view(new_view, self.round_state.consecutive_timeouts());
+        self.arm_view_timer(new_view);
         self.vote_collector = None;
         self.commit_collector = None;
         self.timeout_collector = None;
@@ -2156,10 +2170,12 @@ impl ConsensusEngine {
             // FIFO; with the evidence gone they would only accumulate.
             self.imported_parents.clear();
         }
-        self.equivocation_tracker.clear();
+        let closed = std::mem::take(&mut self.equivocation_tracker);
+        self.late_votes.close_view(closing_view, closed);
         let closed = std::mem::take(&mut self.commit_equivocation_tracker);
         self.late_commit_votes.close_view(closing_view, closed);
-        self.proposal_equivocation_tracker.clear();
+        let closed = std::mem::take(&mut self.proposal_equivocation_tracker);
+        self.late_proposals.close_view(closing_view, closed);
         self.processed_proposal = None;
         self.held_prepare_qc = None;
 
@@ -2210,6 +2226,13 @@ impl ConsensusEngine {
 
     pub(super) fn validator_set(&self) -> &ValidatorSet {
         self.epoch_manager.current_validator_set()
+    }
+
+    /// Starts `view`'s timer at `timeout(c)` with `c` as it stands, the
+    /// backoff group taken from the validator set held now (AM33).
+    pub(super) fn arm_view_timer(&mut self, view: ViewNumber) {
+        self.pacemaker.set_committee_size(self.validator_set().len() as usize);
+        self.pacemaker.reset_for_view(view, self.round_state.consecutive_timeouts());
     }
 
     pub(super) fn validator_set_for_view(&self, view: ViewNumber) -> &ValidatorSet {

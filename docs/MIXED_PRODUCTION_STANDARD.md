@@ -993,3 +993,42 @@ boundary: the TC is clamped to the boundary view, which still belongs to the sam
 TC(101) -> 104 at +48 s; spec S7). M3a now reads "≤ 1 base timeout per TC handover, plus the §10.2 backoff when a
 boundary clamp lands on the same dead leader". No protocol change.
 
+
+## Amendment AM33 (2026-11-26, agreed by gov5, n42-26 and n42-rs; v1.2): view-timeout backoff per group of TCs
+
+SYNC §10.2's timeout becomes `min(base_eff · 2^floor(c / g), max)` with `g = min(f+1, 3)` and
+`f = floor((n−1)/3)`, where `n` is the size of the validator set of the view being timed. At an epoch boundary
+`g` follows the new set. `base_eff` is the local adaptive base: `max(base, 2·p95 commit latency)`, capped at
+`max`. All three clients already compute it this way, and it makes absolute timeouts node-local.
+`c` increments on each local view timeout. It resets to 0 on a commit QC (Decide) and on a QC-based view jump.
+A TC never resets it, including a TC embedded in SyncInfo.
+Vectors: `qs-scratch/profile1/vectors/AM33/timeout_backoff.json` (gov5, 2026-11-27). Design and review:
+`docs/AM33_DRAFT_CONSECUTIVE_ABSENT_LEADERS.md`.
+Gate (v1.2): a mixed rerun of 5d shows six consecutive absent leaders cost ≤ 216 s at base 24 s. Today 5d's
+timeouts sum to 456 s; the recorded 464 s gap includes the block interval.
+
+## Amendment AM34 (2026-11-26, standard owner by delegation; findings from gov5's E2 vector cut)
+
+1. **B4 against AM27.** The B4 note "V3/V5 gain a pair of consecutive blocks with EQUAL timestamps" is void.
+   Under AM27's slot grid, timestamps rise strictly by whole slots, so an equal-timestamp child is invalid, and
+   V5 carries that refusal. No client may accept one.
+2. **M3a after AM33.** AM32's "plus the §10.2 backoff" still holds, but with `g ≥ 2` the second TC of a boundary
+   clamp on the same dead leader is not doubled. M3a's bound for that case is 2·base (48 s at base 24 s), not
+   base + 2·base.
+3. **View overflow.** A TC or QC for view 2^64−1 is invalid; no client signs, accepts or advances past it.
+   `view_after_tc` is defined only for views below 2^64−1. (gov5's implementation wraps to 0 today.)
+4. **Topics (G2, V9).** On profile 1 a client subscribes only to the G2 topics.
+   - `blob_sidecar` is not one of them. gov5 subscribes to it today; gov5 to drop.
+   - A topic registered without a scoring branch (gov5's `zk_proof`) must not be advertised. gov5 to drop it
+     or score it.
+   - Peer scoring off when discovery is off is gov5 behaviour, recorded in V9. Scoring stays a local choice
+   The mobileverify cohort topics (`mobileverify_cohort_{index,reveal,cert}`) are not G2 topics either: profile 1
+   does not subscribe to them, even with a cohort mode switched on (gov5 to drop; a cohort mode for profile 1 would
+   be a new amendment with its own vectors).
+     that is not part of the wire contract.
+5. **Receipts root (V2).** A plain value transfer's receipt carries the EIP-7708 transfer log from
+   `0xff…fe` on the forks where EIP-7708 is active. Every client's receipts root includes it; V2 pins the bytes.
+6. **Late messages (E15).** A conflicting pair split across the view boundary must still be proven. A leader keeps
+   the R1 votes and commit votes of views it led, and every node keeps the proposals, for at least the last 3
+   views. Each is verified only when it conflicts with a recorded one. Found by the n42-rs injector; gov5,
+   n42-26 and n42-rs all had the gap for commit votes.

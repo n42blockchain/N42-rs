@@ -234,8 +234,7 @@ impl ConsensusEngine {
                 "observer (or stale my_index): skipping timeout broadcast"
             );
             self.round_state.timeout();
-            self.pacemaker
-                .reset_for_view(view, self.round_state.consecutive_timeouts());
+            self.arm_view_timer(view);
             return Ok(());
         }
 
@@ -244,8 +243,7 @@ impl ConsensusEngine {
             // Re-broadcasting ensures validators who missed the first message (network
             // jitter, late join) can still collect our vote for TC formation.
             tracing::warn!(target: "n42::cl::timeout", view, "view timed out (repeat, re-broadcasting timeout)");
-            self.pacemaker
-                .reset_for_view(view, self.round_state.consecutive_timeouts());
+            self.arm_view_timer(view);
 
             let message = self.signing_profile.timeout_message(view);
             let signature = self.signing_profile.sign(&self.secret_key, &message);
@@ -288,8 +286,7 @@ impl ConsensusEngine {
         // Reset pacemaker BEFORE processing to prevent the select! loop from spinning
         // on a deadline that stays in the past. If process_timeout forms a TC and calls
         // advance_to_view, the pacemaker will be reset again — a harmless double reset.
-        self.pacemaker
-            .reset_for_view(view, self.round_state.consecutive_timeouts());
+        self.arm_view_timer(view);
 
         // Clear pending block data: similar to Tendermint's "prevote nil".
         self.pending_proposal = None;
@@ -549,7 +546,8 @@ impl ConsensusEngine {
         tracing::info!(target: "n42::cl::timeout", current_view, target_view, "piggybacked TC: catching up to the fleet");
         self.note_certificate_signers(tc.view, &tc.signers);
         self.round_state.update_locked_qc(&tc.high_qc);
-        self.round_state.reset_consecutive_timeouts();
+        // AM33: a TC never resets the consecutive-timeout count, one adopted
+        // from a piggyback included (gov5 dropped its SyncInfo reset).
         self.advance_to_view(target_view)?;
         let actual_view = self.round_state.current_view();
         self.emit(EngineOutput::ViewChanged { new_view: actual_view })?;

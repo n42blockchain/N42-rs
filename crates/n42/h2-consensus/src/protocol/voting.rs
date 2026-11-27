@@ -1,7 +1,7 @@
 use alloy_primitives::{Bytes, B256};
 use n42_h2_primitives::consensus::{CommitVote, ConsensusMessage, PrepareQC, Vote, ViewNumber};
 
-use super::equivocation::{check_equivocation, EquivocationEvidence, EquivocationKind, SignedValue};
+use super::equivocation::{check_equivocation, EquivocationEvidence, EquivocationKind, LateCheck, SignedValue};
 use super::state_machine::{ConsensusEngine, EngineOutput};
 use crate::error::{ConsensusError, ConsensusResult};
 
@@ -37,17 +37,19 @@ impl ConsensusEngine {
     /// up (see `voters_seen`). A real vote that was merely slow or a progress
     /// vote (`progress_vote_message`) both say the voter has imported the
     /// block; verified before it is noted, so a peer cannot vouch for
-    /// another's progress. Anything else is ignored.
-    pub(super) fn note_late_vote(&mut self, vote: &Vote) {
+    /// another's progress. Anything else is ignored. A real vote (not a
+    /// progress vote) is also checked against the voter's other vote of that
+    /// view (E15), with the signature already verified here.
+    pub(super) fn note_late_vote(&mut self, vote: &Vote) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
         if !(vote.view < view
             && view - vote.view <= super::state_machine::VOTERS_SEEN_WINDOW as u64
             && self.is_leader_for_view(vote.view))
         {
-            return;
+            return Ok(());
         }
         let view_set = self.validator_set_for_view(vote.view);
-        let Ok(pk) = view_set.get_public_key(vote.voter) else { return };
+        let Ok(pk) = view_set.get_public_key(vote.voter) else { return Ok(()) };
         let late = self.signing_profile.vote_message(vote.view, vote.block_hash);
         let progress = self.signing_profile.progress_vote_message(vote.view, vote.block_hash);
         let started = std::time::Instant::now();
@@ -57,11 +59,75 @@ impl ConsensusEngine {
         let ok = progress_ok || self.signing_profile.verify_single(pk, &late, &vote.signature);
         self.view_timing
             .note_verify(started, if progress_ok { 1 } else { 2 }, false, false);
-        if ok {
-            self.note_voter(vote.view, vote.voter);
-        } else {
+        if !ok {
             self.unauthenticated = Some((vote.view, "late vote signature"));
+            return Ok(());
         }
+        self.note_voter(vote.view, vote.voter);
+        if progress_ok || vote.view + super::equivocation::LATE_WINDOW < view {
+            return Ok(());
+        }
+        let make = || SignedValue::new(vote.block_hash, late.clone(), &vote.signature);
+        if let LateCheck::Conflict { first, verified } =
+            self.late_votes.check(vote.view, vote.voter, vote.block_hash, true, make)
+        {
+            let second = SignedValue::new(vote.block_hash, late, &vote.signature);
+            self.settle_late_conflict(EquivocationKind::Vote, vote.view, vote.voter, (first, verified), (second, true))?;
+        }
+        Ok(())
+    }
+
+    /// A late Round-1 vote held for the batch verifier (unverified): checked
+    /// for a conflict first, by lookups; true when it was settled here as
+    /// the second of a proven pair and need not be parked (a vote that did
+    /// not prove one is parked as before: it may be a progress vote).
+    pub(super) fn late_vote_conflict(&mut self, vote: &Vote) -> ConsensusResult<bool> {
+        let view = self.round_state.current_view();
+        if !(vote.view < view
+            && view - vote.view <= super::equivocation::LATE_WINDOW
+            && self.is_leader_for_view(vote.view))
+        {
+            return Ok(false);
+        }
+        let profile = self.signing_profile;
+        let make = || SignedValue::new(vote.block_hash, profile.vote_message(vote.view, vote.block_hash), &vote.signature);
+        match self.late_votes.check(vote.view, vote.voter, vote.block_hash, false, make) {
+            LateCheck::Conflict { first, verified } => {
+                let second = make();
+                self.settle_late_conflict(EquivocationKind::Vote, vote.view, vote.voter, (first, verified), (second, false))
+            }
+            LateCheck::Repeat | LateCheck::Kept => Ok(false),
+        }
+    }
+
+    /// A vote or commit vote of the current view held for the batch
+    /// verifier (`N42_VOTE_AGGREGATE_VERIFY`, on by default on profile 1),
+    /// unverified: checked against the voter's verified message of the view,
+    /// or the first one queued (kept unverified in the late tracker, which
+    /// carries it on when the view closes). True when it proved a pair and
+    /// is not to be queued.
+    pub(super) fn queued_conflict(
+        &mut self,
+        kind: EquivocationKind,
+        view: ViewNumber,
+        voter: u32,
+        block_hash: B256,
+        make: impl Fn() -> SignedValue,
+    ) -> ConsensusResult<bool> {
+        let (verified, late) = match kind {
+            EquivocationKind::Vote => (&self.equivocation_tracker, &mut self.late_votes),
+            EquivocationKind::CommitVote => (&self.commit_equivocation_tracker, &mut self.late_commit_votes),
+            EquivocationKind::Proposal => return Ok(false),
+        };
+        let first = match verified.get(&voter) {
+            Some((hash, _)) if *hash == block_hash => return Ok(false),
+            Some((_, signed)) => (signed.clone(), true),
+            None => match late.check(view, voter, block_hash, false, &make) {
+                LateCheck::Conflict { first, verified } => (first, verified),
+                LateCheck::Repeat | LateCheck::Kept => return Ok(false),
+            },
+        };
+        self.settle_late_conflict(kind, view, voter, first, (make(), false))
     }
 
     /// A commit vote of a closed view this node led: checked against the
@@ -71,41 +137,66 @@ impl ConsensusEngine {
     pub(super) fn note_late_commit_vote(&mut self, cv: &CommitVote) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
         if !(cv.view < view
-            && view - cv.view <= super::equivocation::LATE_COMMIT_WINDOW
+            && view - cv.view <= super::equivocation::LATE_WINDOW
             && self.is_leader_for_view(cv.view))
         {
             return Ok(());
         }
-        let Ok(pk) = self.validator_set_for_view(cv.view).get_public_key(cv.voter).cloned() else { return Ok(()) };
         let profile = self.signing_profile;
-        let first = match self.late_commit_votes.closed(cv.view, cv.voter) {
-            Some((hash, _)) if *hash == cv.block_hash => return Ok(()),
-            Some((_, signed)) => signed.clone(),
-            None => match self.late_commit_votes.late(cv.view, cv.voter).cloned() {
-                None => {
-                    self.late_commit_votes.keep_late(cv.view, cv.voter, cv.block_hash, cv.signature.clone());
-                    return Ok(());
-                }
-                Some((hash, _)) if hash == cv.block_hash => return Ok(()),
-                Some((hash, signature)) => {
-                    let message = profile.commit_message(cv.view, hash, self.cached_changes_hash(&hash));
-                    if !profile.verify_single(&pk, &message, &signature) {
-                        // A forged first: the slot goes to this one.
-                        self.late_commit_votes.keep_late(cv.view, cv.voter, cv.block_hash, cv.signature.clone());
-                        return Ok(());
-                    }
-                    SignedValue::new(hash, message, &signature)
-                }
-            },
-        };
-        let message = profile.commit_message(cv.view, cv.block_hash, self.cached_changes_hash(&cv.block_hash));
-        if !profile.verify_single(&pk, &message, &cv.signature) {
-            self.unauthenticated = Some((cv.view, "late commit vote signature"));
-            return Ok(());
+        let changes_hash = self.cached_changes_hash(&cv.block_hash);
+        let make = || SignedValue::new(cv.block_hash, profile.commit_message(cv.view, cv.block_hash, changes_hash), &cv.signature);
+        match self.late_commit_votes.check(cv.view, cv.voter, cv.block_hash, false, make) {
+            LateCheck::Conflict { first, verified } => {
+                let second = make();
+                self.settle_late_conflict(EquivocationKind::CommitVote, cv.view, cv.voter, (first, verified), (second, false))?;
+                Ok(())
+            }
+            LateCheck::Repeat | LateCheck::Kept => Ok(()),
         }
-        let second = SignedValue::new(cv.block_hash, message, &cv.signature);
-        let hashes = (first.block_hash, second.block_hash);
-        self.emit_equivocation(EquivocationKind::CommitVote, cv.view, cv.voter, (first, second), hashes)
+    }
+
+    /// A conflict found in a closed view: the signatures not yet checked are
+    /// checked now (a first that fails gives its slot to the second), then
+    /// the pair is emitted as evidence (E15). True when it was.
+    pub(super) fn settle_late_conflict(
+        &mut self,
+        kind: EquivocationKind,
+        view: ViewNumber,
+        validator: u32,
+        (first, first_verified): (SignedValue, bool),
+        (second, second_verified): (SignedValue, bool),
+    ) -> ConsensusResult<bool> {
+        let profile = self.signing_profile;
+        let Ok(pk) = self.validator_set_for_view(view).get_public_key(validator).cloned() else { return Ok(false) };
+        let commitment = |signed: &SignedValue| match kind {
+            EquivocationKind::Proposal => B256::from(*blake3::hash(&signed.message).as_bytes()),
+            EquivocationKind::Vote | EquivocationKind::CommitVote => signed.block_hash,
+        };
+        if !first_verified && !first.verify(profile, &pk) {
+            // A forged (or, before batching, a progress-vote) first: the
+            // slot goes to the second, as unverified as it is.
+            let tracker = match kind {
+                EquivocationKind::Vote => &mut self.late_votes,
+                EquivocationKind::CommitVote => &mut self.late_commit_votes,
+                EquivocationKind::Proposal => &mut self.late_proposals,
+            };
+            tracker.replace(view, validator, commitment(&second), second, second_verified);
+            return Ok(false);
+        }
+        if !second_verified && !second.verify(profile, &pk) {
+            tracing::debug!(target: "n42::cl::voting", view, validator, kind = kind.label(),
+                "late conflicting message does not verify; ignored");
+            return Ok(false);
+        }
+        // Two proposals of one block that differ only in signed validator
+        // changes name the two message commitments, as in the view.
+        let hashes = if first.block_hash == second.block_hash {
+            (commitment(&first), commitment(&second))
+        } else {
+            (first.block_hash, second.block_hash)
+        };
+        self.emit_equivocation(kind, view, validator, (first, second), hashes)?;
+        Ok(true)
     }
 
     /// Processes a Round 1 (Prepare) vote from a validator.
@@ -123,7 +214,7 @@ impl ConsensusEngine {
         let view = self.round_state.current_view();
 
         if vote.view != view {
-            self.note_late_vote(&vote);
+            self.note_late_vote(&vote)?;
             return Err(ConsensusError::ViewMismatch {
                 current: view,
                 received: vote.view,

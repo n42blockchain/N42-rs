@@ -17,14 +17,27 @@
 > Releases: gov5 main 5eb5aba9 (binary 854a1982…), n42-rs main 6a793112e, n42-26 main 9feef34 (binary 9bba532a…;
 > AM28 fields in PR #47, approved by the owner, merge pending in n42-26's session).
 >
-> **v1.1 (AM31) — gates passed 2026-11-26, one coverage gap open:** `bodies_by_range/2` + `commit_qc/1` in all
-> three clients with `/1` fallback; gate 4b (0..368 equal), 4b-S non-gov5 servers (0..287), scale leg S1 (3.67M tx,
-> 0..3129, every client rejoined from genesis), 4b-R / 4b-R2 re-checks of n42-rs's new catch-up defaults (0..623,
-> 0..296). Releases: gov5 main 5464ee6e (includes the serve switch and the steady-RSS fix), n42-rs main e9f15edc4,
-> n42-26 main 80ecf52. **Open:** n42-rs as a `commit_qc/1` server to another client has not happened in a mixed
-> round (vectors + loopback only). Moved to v1.2 by AM31: p2p state sync, a mixed equivocation round. Still open
-> from v1: gov5 proposal-equivocation detection (M3d) and the §7 items (E2 set changes, B11 follower rule, kept-tail
-> bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a negative leader).
+> ## v1.1 CLOSED (2026-11-26 21:20 EST)
+>
+> `bodies_by_range/2` + `commit_qc/1` run in all three clients, client and server, with `/1` kept as fallback.
+> Mixed rounds:
+>
+> | Round | What it showed | Headers equal |
+> | --- | --- | --- |
+> | gate 4b | full-block sync from genesis | 0..368 |
+> | 4b-S | non-gov5 clients as servers | 0..287 |
+> | scale leg S1 | 3.67M tx; every client rejoined from genesis | 0..3129 |
+> | 4b-R / 4b-R2 | n42-rs catch-up defaults | 0..623 / 0..296 |
+> | Q1 | n42-rs as the only server | 0..203 |
+>
+> In Q1, n42-26 v3's 20:53 resync pulled 1..56 over `/2` from n42-rs v2 and anchored its tail with v2's
+> `commit_qc/1` (#56). That was the last coverage gap.
+>
+> Releases: gov5 main 5464ee6e, n42-rs main 30f1cac4a, n42-26 main 80ecf52.
+> Moved to v1.2 by AM31: p2p state sync and a mixed equivocation round; the n42-rs injector is on main
+> (`docs/P1_EQUIVOCATION_INJECTOR.md`). AM33 (backoff per group of TCs) and AM34 are v1.2 rules.
+> Still open from v1: the §7 items (vectors now published by gov5; runs pending) and the negative-leader round
+> M3d. Work list: `docs/PLAN_P1_REMAINING_2026_11.md`.
 >
 > **Risks carried:** (1) liveness — k consecutive absent leaders stall about 24 + 48 + 96·(k−2) s (5d: 464 s for six);
 > mitigation candidates for v1.1: cap backoff across consecutive TCs, or a leader order that interleaves operators.
@@ -373,3 +386,22 @@ hash 0x3a4c3076…). **Headers 0..296 equal on all 7 dumps, mismatch 0**; 322k t
   1.96 s = 112 blk/s, anchored by n42-26 v3's commit_qc/1; **first vote 18:58:08, 1.5 s after the pull**
   (4b-R: 28 s). gov5 served 277 blocks / 24.5 MB in one request per node; no refusal, score, rate limit or
   INVALID caused by v2 on gov5.
+
+### Q1 — n42-rs as the only `/2` + `commit_qc/1` server (2026-11-26 20:45-21:17, PASSED)
+
+Genesis gate6/genesis-q1cqc.json (sha256 a9b1c0ed…, hash 0x04669856…). Binaries: gov5 5464ee6e with
+`N42_SYNC_RANGE_SERVE=off` on every gov5 node (checked in /proc environ and the "range serving disabled" line;
+gov5 served 0), n42-rs main e9f15edc4 (n42 1a7ba3fa…, h2_validator 1ee5fe72…), n42-26 80ecf52.
+**Headers 0..203 equal on all 7 dumps**; 232k tx, 0 errors.
+
+- **20:53, n42-26 v3** (an accidental live-datadir wipe on n42-26's side, which disturbed its window 20:45-20:53):
+  - `/1` asked of gov5 v1 and v4, refused because serving was off;
+  - `/2` 1..56 from n42-rs v2 in 66 ms;
+  - **`commit_qc/1` for #56 from n42-rs v2 (QC 151 B + 1 header) anchored the tail**;
+  - caught up to head 58 with 0 faults, first vote 20:53:56.
+- **21:05:30, gov5 node4** (non-validator, wiped while n42-26 v3 was down 21:05-21:09):
+  - one `/2` request 1..145 at 21:05:42, served by n42-rs v2 (peer 16Uiu2HAm5qn… in v2's log);
+  - its tail was authorised by the live Decide it followed, so no `commit_qc/1` was needed;
+  - reached the wipe-time head in 13.4 s.
+- No refusal, score change or INVALID naming v2 on gov5.
+

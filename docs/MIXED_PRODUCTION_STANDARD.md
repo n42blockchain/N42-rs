@@ -1062,6 +1062,11 @@ Rule (profile 1):
 4. The leader's own block is covered the same way: its own commit vote also waits for its durable write.
 5. An implementation must not offer a profile-1 mode that defers or skips the durable write (gov5 refuses
    `N42_MDBX_SYNC=safe-nosync` on profile-1 chains; n42-rs refuses persistence-threshold overrides there).
+6. A persisted lock names a block the member holds durably, except the lock written with a commit vote
+   (whose block item 1 makes durable). A snapshot or R1 journal that would persist a lock on a block not yet
+   durable keeps the last qualifying lock instead, never below the committed QC; the in-memory lock still
+   governs votes. Recovery matches the locked and committed blocks against the applied chain by hash, not
+   by height (found in gov5 by applying n42-26's review, 2026-11-27).
 
 Gate: a whole-set SIGKILL of a mixed set under load recovers without intervention, heads equal, at least
 five times with the kill timed right after a commit and five times timed between a PrepareQC and its commit

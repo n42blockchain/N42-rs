@@ -37,6 +37,9 @@ fn value(nonce: u64, balance: u64) -> Vec<u8> {
     encode_gov5_account_value(nonce, &U256::from(balance).to_be_bytes::<32>(), &alloy_primitives::KECCAK256_EMPTY.0)
 }
 
+/// The forest, a row of nanoseconds a timed block, the head and the timed total.
+type Timed = (QmdbForest, Vec<[u64; 14]>, B256, u64);
+
 fn quantile(values: &[u64], q: f64) -> u64 {
     let mut values = values.to_vec();
     values.sort_unstable();
@@ -83,11 +86,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Off rayon's pool, as the import's root worker is.
-    let worker = std::thread::spawn(move || -> Result<(QmdbForest, Vec<[u64; 14]>, B256, u64), String> {
+    let worker = std::thread::spawn(move || -> Result<Timed, String> {
         let mut parent = B256::with_last_byte(1);
         let mut rows = Vec::with_capacity(rounds as usize);
         let mut pending_canonical = Vec::new();
-        let mut wall_us = 0u64;
+        let mut wall_ns = 0u64;
         for block in 1..=warm + rounds {
             let mut ops = QmdbOps::new();
             for k in 0..updates {
@@ -100,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let hash = B256::from(U256::from(block + 1));
             let at = Instant::now();
             let prepared = forest.compute_operations(parent, ops).map_err(|e| e.to_string())?;
-            let compute_us = at.elapsed().as_nanos() as u64;
+            let compute_ns = at.elapsed().as_nanos() as u64;
             let root = prepared.root;
             forest.insert(hash, block, prepared).map_err(|e| e.to_string())?;
             let total = at.elapsed().as_nanos() as u64;
@@ -108,10 +111,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (move_us, p) = forest.last_compute();
             let (note_us, delta_us, apply_us) = forest.last_compute_tail();
             if block > warm {
-                wall_us += total;
+                wall_ns += total;
                 rows.push([
                     total,
-                    compute_us,
+                    compute_ns,
                     move_us * 1000,
                     apply_us * 1000,
                     p.sort_us * 1000,
@@ -129,12 +132,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             parent = hash;
             pending_canonical.push(hash);
             if pending_canonical.len() as u64 >= run {
-                for hash in pending_canonical.drain(..) {
+                for hash in std::mem::take(&mut pending_canonical) {
                     forest.set_canonical(hash).map_err(|e| e.to_string())?;
                 }
             }
         }
-        Ok((forest, rows, parent, wall_us))
+        Ok((forest, rows, parent, wall_ns))
     });
     let (forest, rows, head, wall_ns) = worker.join().map_err(|_| "the worker panicked")??;
     let names = [

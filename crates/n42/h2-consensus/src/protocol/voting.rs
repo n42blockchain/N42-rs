@@ -393,7 +393,14 @@ impl ConsensusEngine {
             self.vote_log_retry =
                 Some(super::state_machine::VoteLogRetry::LeaderCommitVote { view, block_hash });
         }
+        let wrote = logged.is_ok();
         self.note_vote_log(logged)?;
+        if wrote && self.vote_rules.commit_vote_needs_durable_block() {
+            // AM35 E9 trigger T2 (fixed text, matched by the cross-client
+            // timed-kill gate): the block is durable and the lock is written;
+            // the commit vote is signed next.
+            tracing::info!(target: "n42::am35", view, block_hash = %block_hash, "commit vote released after durable lock");
+        }
         let changes_hash = self.cached_changes_hash(&block_hash);
         let commit_msg = self
             .signing_profile

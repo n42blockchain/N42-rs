@@ -52,3 +52,27 @@ Gate: a mixed rerun of 5d with six consecutive absent leaders shows the gap ≤ 
 2. n42-26: same question; and does its pacemaker adapt `base` from observed latency? n42-rs does
    (`effective_base = max(base, 2·p95)`, capped at max). That is local, but it changes the numbers above.
 3. All three: any objection to `f+1` as the group size, against a fixed constant such as 3?
+
+## Review round 1 (2026-11-26)
+
+gov5:
+- `c` is counted per local view timeout. It resets on (a) a commit (the commit QC / Decide) and (b) a QC-based
+  view jump while catching up. It ALSO resets on (c) a TC-based view jump taken from SyncInfo.
+- Its pacemaker adapts `base` like n42-rs: `max(base, 2·p95 commit latency)`, capped at `max`.
+- Group size: proposes `g = min(f+1, 3)`. With `f+1` alone, a real timing problem at n = 100 needs 34 TCs
+  (~13.6 min) before the first doubling, and the adaptive base already covers a steadily slow network.
+- O2 kept as a design note; O3 rejected.
+
+n42-rs (checked in code):
+- `RoundState::commit` resets `c` on the commit QC (`h2-consensus/src/protocol/round.rs`).
+- The QC-based view jump resets it too (`state_machine.rs`, "QC-based view jump"). A TC never resets it.
+  So n42-rs already has gov5's (a) and (b) and not (c).
+
+Revised rule (proposed, pending n42-26):
+- `timeout = min(base_eff · 2^floor(c / g), max)` with `g = min(f+1, 3)`, where `base_eff` is the local
+  adaptive base.
+- `c` increments on each local view timeout. It resets to 0 on a commit QC (two-phase HotStuff-2: "QC" in
+  §10.2 means the commit QC / Decide) and on a QC-based view jump. A TC, including one embedded in SyncInfo,
+  never resets it (gov5 drops (c)).
+- Gate 5d's six absent leaders: 24·3 + 48·3 = 216 s, against 464 s today.
+- gov5 produces the sequence vectors (n = 4, 7, 100, including the AM32 clamp) once n42-26 agrees.

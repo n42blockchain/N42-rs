@@ -169,6 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut base_timeout_ms: Option<u64> = None;
     let mut max_timeout_ms: Option<u64> = None;
     let mut period_secs: u64 = 1;
+    let mut test_equivocate_flag = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -231,6 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mobile_cert_blocks = args.next().ok_or("--mobileverify.cert-blocks needs a number")?.parse()?
             }
             "--propose" => propose = true,
+            n42_h2_node::test_equivocate::FLAG => test_equivocate_flag = true,
             "--observer" => observer = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -338,6 +340,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let base_timeout_ms = base_timeout_ms.unwrap_or(4_000);
     let max_timeout_ms = max_timeout_ms.unwrap_or(base_timeout_ms * 4);
+    // TEST ONLY (docs/P1_EQUIVOCATION_INJECTOR.md): both switches, a test
+    // chain, or the validator does not start.
+    let test_equivocation = n42_h2_node::test_equivocate::TestEquivocation::configure(
+        std::env::var(n42_h2_node::test_equivocate::ENV).ok().as_deref(),
+        test_equivocate_flag,
+        identity.chain_id,
+    )?;
+    if let Some(config) = &test_equivocation {
+        let line = format!(
+            "TEST EQUIVOCATION INJECTOR ON: {} on chain {}; this validator WILL sign conflicting messages",
+            config.describe(),
+            identity.chain_id
+        );
+        let rule = "!".repeat(line.len());
+        eprintln!("{rule}\n{line}\n{rule}");
+    }
     // A chain rule, read from the genesis with the rest of them; 1 without a
     // genesis, which is gov5's round-robin.
     let leader_tenure = hotstuff_config
@@ -691,6 +709,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             service = service.with_equivocation_log(log);
         }
+        if let Some(config) = test_equivocation {
+            service = service.with_test_equivocation(config)?;
+            println!("TEST INJECTOR: equivocating ({})", config.describe());
+        }
         // The operations surface (J1/J2): Prometheus metrics and the
         // validator's JSON-RPC, one server per address given.
         {
@@ -903,6 +925,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("synced       : height {height}{}", if complete { "" } else { " (stopped short)" });
                     }
                     ServiceEvent::Published { .. } => {}
+                    ServiceEvent::EquivocationInjected { view, kind, first, second } => {
+                        eprintln!("TEST EQUIVOCATION kind={} view={view} first={first} second={second}", kind.label());
+                    }
                 }
             }
         }
@@ -1124,4 +1149,7 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --worker-threads <n>      tokio worker threads (default: min(cores, 4))
   --fault-tolerance <u32>   override f; defaults to (n-1)/3
   --timeout-ms <u64>        base view timeout (default: genesis hotstuff.baseTimeout, else 4000)
+  --test-equivocate         TEST ONLY: with N42_TEST_EQUIVOCATE=<vote|commit_vote|proposal>:<view|every-n>,
+                            sign a conflicting twin of that message (chains 1143, 1144, 1337, 31337 only;
+                            docs/P1_EQUIVOCATION_INJECTOR.md)
 ";

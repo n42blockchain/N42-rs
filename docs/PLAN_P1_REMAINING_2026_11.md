@@ -19,7 +19,7 @@ Releases at the time of writing: gov5 main 5464ee6e, n42-rs main e9f15edc4, n42-
 
 | # | Item | Who | Done when | State |
 | --- | --- | --- | --- | --- |
-| B1 | n42-rs catch-up bound by the network, not execution | n42-rs | empty-chain pull at or above link rate on a 100 Mbit/s budget (today ~47 Mbit/s); the floor is one QMDB root per block (~0.12 ms) | open: needs a design for a per-run root that keeps per-block versions for persistence, history reads and the engine tree (`docs/P1_CATCHUP_PERF.md` step 7) |
+| B1 | n42-rs catch-up bound by the network, not execution | n42-rs | empty-chain pull at or above link rate on a 100 Mbit/s budget (today ~47 Mbit/s); the floor is one QMDB root per block (~0.12 ms) | design done (`docs/P1_RUN_ROOT_DESIGN.md`): the root's cost was pool hand-offs and a whole-twig rehash, cut on `design/p1-run-root` (5-operation root 85-105 -> 11 us, same roots, per-block versions unchanged); a per-run root is not needed and not recommended. Open: one paired empty-chain leg to confirm the pull (projected EL cost 143 -> ~50 us a block) |
 | B2 | Batch import for blocks over 16 KiB of transactions | n42-rs | range import re-measured against the engine path on heavy blocks since the step-3 root worker; cap raised if it wins (at most ~14 % on 4b-R's pull) | open |
 | B3 | Estimate and, if feasible, measure a chain-94-sized catch-up | n42-rs | blocks/s, MB/s, peak RSS and disk on a long heavy history (S1-like or the `gov5-work/p1scale` state) with current main | open |
 | B4 | gov5 catch-up speed (S1: 25.7 blk/s) and catch-up peak (4 GB) | gov5 | gov5's own measurement against S1 | gov5 working |

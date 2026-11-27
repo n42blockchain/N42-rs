@@ -671,6 +671,14 @@ batch, next newPayload). On full blocks the engine's per-block tasks dominate
 payload-convert 12 ms, post-execution validation 9 ms, persistence 194 ms
 per cycle of ~5.5 blocks.
 
+Status of the root (2026-11-26, `docs/P1_RUN_ROOT_DESIGN.md`): the ~0.12 ms
+is not hashing the state needs. It is a dozen hand-offs to the worker pool
+and a whole-twig rehash for five leaves. Branch `design/p1-run-root` applies
+a small block on the calling thread and rehashes only the touched paths
+(`N42_QMDB_SMALL_APPLY_OPS`, default 256): 85-105 us to 11 us in the
+micro-benchmark, same roots, every per-block version kept. A per-run root
+is not needed. The pull has not been re-measured with it.
+
 Status after step 7 (2026-11-26): lazy screening and runs are the
 defaults. Eager screening runs its BLS checks in parallel. An empty block
 costs the EL 0.15 ms in a run, and the pull reaches 5,500-6,000 blocks/s

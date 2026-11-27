@@ -72,6 +72,21 @@ as quoted in the standard).
 > earned on the pre-AM24 vectors (genesis `0x6f733745…7e4f`) and holds for AM24 only once that client posts a
 > pass on the regenerated ones (gov5: its PR #6 on `feat/profile1`; n42-26: its `feat/profile1-genesis`).
 
+## M90b: 90-minute steady-load memory round (2026-11-26 22:50 - 2026-11-27 00:26 EST)
+
+Gate-6 set at ~150 tx/s for 92 min (gov5 main ef2f6bb0, n42-26 17e3a7c = PR #51, n42-rs main d8a5e54d2).
+Headers 0..701 equal on all 7 dumps, gov5 refusals 0, n42-rs 1 timeout and 0 refusals, 808k tx with 0
+errors. Memory (RSS):
+
+| Client | Start | End | Rate at the end | Reading |
+| --- | --- | --- | --- | --- |
+| n42-rs v2 EL / validator | 181 / 41 MiB | 682 / 51 MiB | EL ~2.5 MiB/min, slowing; validator flat | not flat within 92 min; RocksDB memtable history (B6) is the known candidate |
+| n42-26 v3 | 337 MiB | 1,804 MiB | ~3.5 MiB/min (jemalloc) | PR #51 caps hold but are not reached (~2,900 blocks needed); RocksDB memtable 238 -> 375 MiB |
+| gov5 v0 / v1 / verifier | 557 / 408 / 537 MiB (23:02) | 1,261 / 1,652 / 1,139 MiB | rising | txpool leak (included txs never staled in the priced heaps), fixed in gov5 main 08ecf671 |
+
+Next: one round of at least 6.5 h (so n42-26's caps engage) with gov5 08ecf671 and the n42-rs memtable
+knob if its legs pass (plan B5, B6, B7).
+
 ## M3d: mixed equivocation round (2026-11-26 22:00-22:40 EST) -- PASSED
 
 Gate-6 set (chain 1144, genesis-m3d.json sha256 96369975...26cd2, hash 0x9a1ea7f0...3eb13): gov5 v0, v1 and a

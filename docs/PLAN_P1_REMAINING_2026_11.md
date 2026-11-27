@@ -23,9 +23,9 @@ Releases at the time of writing: gov5 main 5464ee6e, n42-rs main e9f15edc4, n42-
 | B2 | Batch import for blocks over 16 KiB of transactions | n42-rs | range import re-measured against the engine path on heavy blocks since the step-3 root worker; cap raised if it wins (at most ~14 % on 4b-R's pull) | in progress (catch-up agent, perf/p1-catchup) |
 | B3 | Estimate and, if feasible, measure a chain-94-sized catch-up | n42-rs | blocks/s, MB/s, peak RSS and disk on a long heavy history (S1-like or the `gov5-work/p1scale` state) with current main | in progress (catch-up agent, after B2) |
 | B4 | gov5 catch-up speed (S1: 25.7 blk/s) and catch-up peak (4 GB) | gov5 | gov5's own measurement against S1 | gov5 agent on perf/p1-catchup; first numbers 2026-11-27 |
-| B5 | n42-26 steady-load memory (1.1 GB at 40 min, rising slowly) and catch-up | n42-26 | plateau shown over >= 90 min at 150 tx/s | n42-26 to schedule |
+| B5 | n42-26 steady-load memory (1.1 GB at 40 min, rising slowly) and catch-up | n42-26 | plateau shown over >= 90 min at 150 tx/s | M90b: n42-26 337 -> 1,804 MiB in 96 min, caps not reached; next a >= 6.5 h round |
 | B6 | n42-rs EL peak during heavy catch-up: RocksDB memtables (~480 MB) | n42-rs | either a smaller budget that does not stall (upstream write stall + pinned memtables; `N42_ROCKSDB_WRITE_BUFFER_STALL`) or a documented decision to keep 4 GiB | cause found: OptimisticTransactionDB keeps 2x128 MiB of flushed memtables per CF as conflict history (never used); knob N42_ROCKSDB_MEMTABLE_MB on perf/p1-memory-2; heavy-catch-up legs queued after 00:32 EST, then profile-1 default |
-| B7 | n42-rs steady-state RSS re-measured with the RPC cache cap and QMDB entry file (memory step 2) | n42-rs | one >= 60 min 150 tx/s leg | measured in mixed round M90b (22:50-00:26 EST 11-26), v2 RSS to m90b-v2-rss.tsv |
+| B7 | n42-rs steady-state RSS re-measured with the RPC cache cap and QMDB entry file (memory step 2) | n42-rs | one >= 60 min 150 tx/s leg | M90b: EL 181 -> 682 MiB in 92 min (2.5 MiB/min at the end, slowing), validator flat 54 MiB; not flat yet: >= 6.5 h round with the B6 knob |
 
 ## C. Explorer (testnet, remote machine)
 

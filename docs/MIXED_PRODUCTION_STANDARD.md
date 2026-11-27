@@ -1124,3 +1124,8 @@ AM36 precisions (2026-11-27, after n42-26's implementation review, PR #58):
    does not decode).
 9. All three clients implement AM36: n42-26 PR #58 (13773ef), gov5 fix/p1-validate-then-forward, n42-rs
    (stale-view check and mobileverify decode still to add).
+10. Signer bitmaps (QC, TC, every nested certificate): a 2-byte little-endian count n followed by ceil(n/8)
+    bytes, bit i = signer i (LSB first within a byte), where n is the size of the validator set of the
+    certificate's view (today the fixed genesis set, AM5; the view's set once E2 lands). A non-genesis
+    certificate whose n differs from that set size is rejected; so is an index outside the set. n42-rs
+    emits exactly this (h2-consensus `wire_bridge.rs` `encode_bitmap`, sized by the collector's set size).

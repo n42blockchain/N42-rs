@@ -195,16 +195,6 @@ impl LateTracker {
         }
     }
 
-    /// Whether `voter`'s message in closed `view` is known to differ from
-    /// `commitment` (lookups only).
-    pub(super) fn conflicts(&self, view: u64, voter: u32, commitment: B256) -> bool {
-        let closed = self.closed.iter().find(|(closed, _)| *closed == view).and_then(|(_, tracker)| tracker.get(&voter));
-        match closed {
-            Some((first, _)) => *first != commitment,
-            None => self.late.get(&(view, voter)).is_some_and(|(first, _, _)| *first != commitment),
-        }
-    }
-
     /// Replaces a kept first message whose signature did not verify.
     pub(super) fn replace(&mut self, view: u64, voter: u32, commitment: B256, signed: SignedValue, verified: bool) {
         self.late.insert((view, voter), (commitment, signed, verified));

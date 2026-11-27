@@ -172,6 +172,9 @@ cmd_leg() {
   done | tee -a "$out/box.txt"
   echo "disk: el $(du -sm "$P1_DIR/m3/el" | cut -f1) MiB, consensus $(du -sm "$P1_DIR/m3/consensus" 2>/dev/null | cut -f1) MiB" | tee -a "$out/box.txt"
   cp "$P1_DIR/m3/v.log" "$out/v3.log"; cp "$P1_DIR/m3/el.log" "$out/el3.log"
+  # Every block executed here had its root checked against the header the
+  # producers computed; a mismatch is refused and shows up here.
+  echo "root mismatches / invalid in el3: $(/usr/bin/grep -ciE 'root mismatch|mismatched.*root|invalid (block|payload)' "$out/el3.log")" | tee -a "$out/box.txt"
   P1_MEMBERS="0 1 3" "$P1" down > "$out/down.log" 2>&1
   cmd_report "$name" | tee "$out/report.txt"
 }

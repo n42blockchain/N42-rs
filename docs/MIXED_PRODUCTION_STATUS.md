@@ -44,6 +44,18 @@
 > (2) Host — a full `/data` killed two members mid-round (round scripts now refuse under 50 GB free).
 > (3) gov5's consensus topic once used a 32-message queue (fixed, now warns on drops) — any client's subscriber
 > queue must hold a full vote burst at n = 100.
+>
+> ## v1.2 state (2026-11-27 review)
+>
+> | Rule | gov5 | n42-rs | n42-26 |
+> | --- | --- | --- | --- |
+> | AM33 timeout backoff | main | main | main b64f650 |
+> | AM34 late equivocation (item 6) | main | main | main e5932de |
+> | AM34 items 3-5, vectors V2/V7/V9 | main | main | open |
+> | AM35 durable commit vote (PROPOSED) | main 08ecf671 | branch, 5 commits | uncommitted WIP |
+>
+> AM35's gate (timed whole-set SIGKILL, 10 kills) has no kill tool yet. Order and owners:
+> `docs/PLAN_P1_REMAINING_2026_11.md` items E5-E9 and F1-F3.
 
 
 **2026-11-24 21:15 EST — gate 2 PASSED.** Mixed round 3 (gov5 v0/v1 + n42-rs v2/v3, genesis-mixed-3 0xe6b358e8…): heights 0..227 byte-equal on all four, each validator led 57-58 blocks, 0 refusals, timeouts only at startup. Round 2 (12:00) was void and found the n42-rs justify-extension defect (fixed, main d8185220d) and a gov5 rebuild-on-genesis defect (fixed, gov5 1d72bf1b). Open from round 3: A17 timestamp stamping point (gov5 stamps at build start, n42-rs at publication), proposal AM26.

@@ -918,7 +918,9 @@ impl TransportCore {
     }
 
     /// Asks `peer` for a range of blocks. The answer arrives as
-    /// [`TransportEvent::RangeFetched`].
+    /// [`TransportEvent::RangeFetched`]. The node asks through
+    /// [`Self::request_range_bounded`]; this form stays for tests and tools.
+    #[allow(dead_code)]
     pub fn request_range(&mut self, peer: PeerId, request: RangeRequest) {
         self.request_range_bounded(peer, request, 0);
     }

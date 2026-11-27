@@ -723,7 +723,7 @@ fn main() {
                             let full: std::sync::Arc<dyn reth_consensus::FullConsensus<n42_tx_types::N42Primitives> + Send + Sync> =
                                 ctx.node().consensus().clone();
                             let lean = std::sync::Arc::new(lean);
-                            let prefetch: std::sync::Arc<dyn Fn(&[(u64, alloy_primitives::B256, alloy_primitives::B256)]) + Send + Sync> = {
+                            let prefetch: std::sync::Arc<n42::catchup_import::PrefetchLinks> = {
                                 let lean = lean.clone();
                                 std::sync::Arc::new(move |parents| lean.prefetch_committee_links(parents))
                             };

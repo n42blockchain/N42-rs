@@ -52,6 +52,12 @@ use reth_provider::{HashedPostStateProvider as _, HeaderProvider, StateProviderF
 use reth_trie::updates::TrieUpdates;
 use serde::{Deserialize, Serialize};
 
+/// A parent block's `(number, hash, receipts root)`: the key of its committee link.
+pub type ParentKey = (u64, B256, B256);
+
+/// Computes the committee links of a run's parents ahead of the import.
+pub type PrefetchLinks = dyn Fn(&[ParentKey]) + Send + Sync;
+
 /// `N42_CATCHUP_IMPORT=0` withdraws `n42Engine_importRange` (it answers
 /// `null`, and the validator imports block by block). On by default: the
 /// method is only ever called by a validator that pulls a committed range.
@@ -117,7 +123,7 @@ pub fn import_range<Provider, Evm, ChainSpec>(
     full: &(dyn FullConsensus<N42Primitives> + Send + Sync),
     chain_spec: &ChainSpec,
     times_us: &mut [u64; 7],
-    prefetch: &(dyn Fn(&[(u64, B256, B256)]) + Sync),
+    prefetch: &(dyn Fn(&[ParentKey]) + Sync),
     hand_off: &mut dyn FnMut(Executed) -> Result<(), String>,
 ) -> RangeImport
 where
@@ -433,13 +439,14 @@ pub fn set_forkchoice(forkchoice: Forkchoice) {
 /// would, runs [`import_range`] on a blocking thread, hands each executed
 /// block to the engine's executed-insert stream in order, and moves the head
 /// to the last one. One call runs at a time.
+#[allow(clippy::too_many_arguments)]
 pub fn serve<Provider, Evm>(
     provider: Provider,
     evm_config: Evm,
     qmdb: n42_qmdb_reth::QmdbNodeState,
     lean: Arc<dyn FullConsensus<N42Primitives> + Send + Sync>,
     full: Arc<dyn FullConsensus<N42Primitives> + Send + Sync>,
-    prefetch: Arc<dyn Fn(&[(u64, B256, B256)]) + Send + Sync>,
+    prefetch: Arc<PrefetchLinks>,
     chain_spec: Arc<n42_header::N42ChainSpec>,
     validator: Arc<n42_engine_types::engine_validator::N42EngineValidator<n42_header::N42ChainSpec>>,
 ) -> crate::engine_ext::ImportRange

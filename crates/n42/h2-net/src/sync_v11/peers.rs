@@ -159,6 +159,7 @@ impl V11State {
 
 /// The `/2` request that carries a `/1` range request, or `None` when it
 /// cannot (a count outside 1..1024).
+#[cfg(test)]
 pub(crate) fn v2_for(request: &RangeRequest) -> Option<RangeV2Request> {
     v2_for_bounded(request, 0)
 }

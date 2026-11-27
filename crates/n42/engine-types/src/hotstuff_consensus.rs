@@ -98,8 +98,11 @@ pub fn chain_header_rules<C: EthChainSpec>(chain_spec: &C) -> HeaderRules {
 /// computed ahead, by the parent's (number, hash, receipts root): the link is
 /// a pure function of the three, so a kept one is the one the check would
 /// compute. One chain per process; bounded (cleared when full).
-static COMMITTEE_LINKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u64, B256, B256), B256>>> =
+static COMMITTEE_LINKS: std::sync::LazyLock<std::sync::Mutex<CommitteeLinks>> =
     std::sync::LazyLock::new(Default::default);
+
+/// Parent `(number, hash, receipts root)` -> the committee link its child carries.
+type CommitteeLinks = std::collections::HashMap<(u64, B256, B256), B256>;
 
 /// [`COMMITTEE_LINKS`]' bound.
 const COMMITTEE_LINKS_MAX: usize = 4096;

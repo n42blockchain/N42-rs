@@ -586,6 +586,10 @@ fn collect_signer_keys<'a>(
     view: ViewNumber,
     cert_kind: CertKind,
 ) -> ConsensusResult<Vec<&'a BlsPublicKey>> {
+    // AM34: a TC or QC for view 2^64-1 is invalid (no view follows it).
+    if view == ViewNumber::MAX {
+        return Err(cert_kind.invalid_error(view, "AM34: no certificate for the last view (2^64-1)".to_string()));
+    }
     let expected_len = validator_set.len() as usize;
     if signers.len() != expected_len {
         let reason = format!(
@@ -1378,6 +1382,50 @@ mod tests {
             verify_tc(&tc, &vs).is_err(),
             "a TC bitmap below quorum must be rejected before pairing verification"
         );
+    }
+
+    /// AM34 (V7 republished without the `tcView = 2^64-1` edge row): a TC
+    /// or QC for the last view is refused even when its signatures verify.
+    #[test]
+    fn test_am34_certificates_for_the_last_view_are_refused() {
+        let (sks, vs) = test_validator_set(4);
+        let view = u64::MAX;
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        let msg = timeout_signing_message(view);
+        for i in 0..3u32 {
+            collector.add_timeout(i, sks[i as usize].sign(&msg), QuorumCertificate::genesis()).unwrap();
+        }
+        let tc = collector.build_tc(&vs);
+        assert!(
+            matches!(&tc, Err(ConsensusError::InvalidTC { view: u64::MAX, .. }))
+                || matches!(tc.as_ref().map(|tc| verify_tc(tc, &vs)), Ok(Err(ConsensusError::InvalidTC { view: u64::MAX, .. }))),
+            "{tc:?}"
+        );
+
+        let block = B256::repeat_byte(9);
+        let vote_msg = signing_message(view, &block);
+        let sigs: Vec<_> = (0..3u32).map(|i| sks[i as usize].sign(&vote_msg)).collect();
+        let refs: Vec<_> = sigs.iter().collect();
+        let mut signers = bitvec::bitvec![u8, bitvec::order::Msb0; 0; vs.len() as usize];
+        for i in 0..3 {
+            signers.set(i, true);
+        }
+        let qc = QuorumCertificate {
+            view,
+            block_hash: block,
+            aggregate_signature: AggregateSignature::aggregate(&refs).unwrap(),
+            signers,
+        };
+        assert!(matches!(verify_qc(&qc, &vs), Err(ConsensusError::InvalidQC { view: u64::MAX, .. })));
+        // The view before it is still certifiable.
+        let view = u64::MAX - 1;
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        for i in 0..3u32 {
+            collector
+                .add_timeout(i, sks[i as usize].sign(&timeout_signing_message(view)), QuorumCertificate::genesis())
+                .unwrap();
+        }
+        verify_tc(&collector.build_tc(&vs).expect("TC"), &vs).expect("TC for 2^64-2 verifies");
     }
 
     #[test]

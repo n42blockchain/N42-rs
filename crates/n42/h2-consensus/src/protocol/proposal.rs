@@ -209,9 +209,10 @@ impl ConsensusEngine {
         // retry after the disk recovers would otherwise be refused. It comes
         // before any other change, so the view is still waiting for this
         // proposal, which the next event retries (audit 2026-10 R2-C7).
+        let lock = self.lock_for_log();
         let logged = self
             .vote_log
-            .record_vote(view, self.round_state.locked_qc())
+            .record_vote(view, &lock)
             .inspect_err(|_| self.round_state.rollback_vote(previous));
         if logged.is_err() {
             self.vote_log_retry = Some(super::state_machine::VoteLogRetry::OwnBlock {
@@ -666,9 +667,10 @@ impl ConsensusEngine {
         let previous = self.round_state.record_commit_vote(view);
         // A failed log write must not leave the watermark advanced: the
         // retry after the disk recovers would otherwise be refused.
+        let lock = self.lock_for_log();
         let logged = self
             .vote_log
-            .record_commit_vote(view, self.round_state.locked_qc())
+            .record_commit_vote(view, &lock)
             .inspect_err(|_| self.round_state.rollback_commit_vote(previous));
         self.note_vote_log(logged)?;
 
@@ -725,9 +727,10 @@ impl ConsensusEngine {
         let previous = self.round_state.record_vote(view);
         // A failed log write must not leave the watermark advanced: the
         // retry after the disk recovers would otherwise be refused.
+        let lock = self.lock_for_log();
         let logged = self
             .vote_log
-            .record_vote(view, self.round_state.locked_qc())
+            .record_vote(view, &lock)
             .inspect_err(|_| self.round_state.rollback_vote(previous));
         self.note_vote_log(logged)?;
 
@@ -771,6 +774,8 @@ impl ConsensusEngine {
                 }
             }
         }
+        // The lock on this block may reach disk from now on.
+        let _ = self.lock_for_log();
         let current = self.round_state.current_view();
         if self.held_prepare_qc.as_ref().is_some_and(|held| held.block_hash == block_hash)
             && let Some(held) = self.held_prepare_qc.take()

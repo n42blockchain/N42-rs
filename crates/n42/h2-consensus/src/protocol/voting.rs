@@ -384,9 +384,10 @@ impl ConsensusEngine {
         let previous = self.round_state.record_commit_vote(view);
         // A failed log write must not leave the watermark advanced: the
         // retry after the disk recovers would otherwise be refused.
+        let lock = self.lock_for_log();
         let logged = self
             .vote_log
-            .record_commit_vote(view, self.round_state.locked_qc())
+            .record_commit_vote(view, &lock)
             .inspect_err(|_| self.round_state.rollback_commit_vote(previous));
         if logged.is_err() {
             self.vote_log_retry =

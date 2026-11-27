@@ -475,6 +475,10 @@ pub struct ConsensusEngine {
     /// AM35: the leader's own commit vote, held until its block is durable:
     /// (view, block hash).
     pub(super) held_leader_commit: Option<(ViewNumber, B256)>,
+    /// AM35: the highest lock seen whose block was durable here (or the
+    /// lock this node restarted with): what the vote log and the checkpoint
+    /// write while the current lock names a block not durable here.
+    pub(super) durable_lock: QuorumCertificate,
     /// Outputs `emit` could not put in a full output channel, in order. The
     /// channel's consumer is the task that runs this engine, so waiting for
     /// it to drain cannot work; nothing is dropped instead, and the consumer
@@ -691,6 +695,7 @@ impl ConsensusEngine {
             durable_blocks: HashSet::new(),
             durable_fifo: VecDeque::new(),
             held_leader_commit: None,
+            durable_lock: QuorumCertificate::genesis(),
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::new(),
             pacemaker: Pacemaker::with_committee_size(base_timeout_ms, max_timeout_ms, committee_size),
@@ -827,6 +832,7 @@ impl ConsensusEngine {
             durable_blocks: HashSet::new(),
             durable_fifo: VecDeque::new(),
             held_leader_commit: None,
+            durable_lock: locked_qc.clone(),
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::from_snapshot(
                 recovered_view,
@@ -1456,6 +1462,38 @@ impl ConsensusEngine {
 
     pub fn locked_qc(&self) -> &QuorumCertificate {
         self.round_state.locked_qc()
+    }
+
+    /// AM35: the lock as it may reach disk (vote log, checkpoint). Off
+    /// profile 1 the lock. On profile 1 the lock when its block is durable
+    /// here, else the highest lock that was: a lock on disk names a block a
+    /// restart can serve. Writing a lower lock is safe because this node
+    /// commit-votes only for a durable block, and only a commit vote has to
+    /// survive a restart with its lock (the vote log's reason to carry it).
+    pub fn persistable_lock(&self) -> &QuorumCertificate {
+        let lock = self.round_state.locked_qc();
+        if self.lock_is_durable(lock) || lock.view <= self.durable_lock.view {
+            lock
+        } else {
+            &self.durable_lock
+        }
+    }
+
+    fn lock_is_durable(&self, lock: &QuorumCertificate) -> bool {
+        !self.vote_rules.commit_vote_needs_durable_block()
+            || lock.view == 0
+            || self.durable_blocks.contains(&lock.block_hash)
+    }
+
+    /// Remembers the current lock as the durable one when its block is
+    /// durable here (see [`Self::persistable_lock`]); returns the lock to
+    /// write.
+    pub(super) fn lock_for_log(&mut self) -> QuorumCertificate {
+        let lock = self.round_state.locked_qc();
+        if self.lock_is_durable(lock) && lock.view > self.durable_lock.view {
+            self.durable_lock = lock.clone();
+        }
+        self.persistable_lock().clone()
     }
 
     /// The block this node's next proposal has to extend: the block its

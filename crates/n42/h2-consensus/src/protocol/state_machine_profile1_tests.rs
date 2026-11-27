@@ -436,11 +436,16 @@ fn profile1_commit_vote_waits_for_the_durable_block() {
     assert_eq!(commit_votes(&out), 0, "imported but not durable: held");
     assert!(durability_wanted(&out, block), "the engine asks for the block's durable write");
     assert_eq!(e.last_commit_voted_view(), 0, "nothing recorded while held");
+    // Locked in memory (gov5's V6 lock rule), but not on disk: the vote log
+    // and the checkpoint write the lock only once its block is durable.
+    assert_eq!(e.locked_qc().view, 1);
+    assert_eq!(e.persistable_lock().view, 0, "a lock on a block not durable here is not written");
     e.process_event(ConsensusEvent::BlockDurable(other)).expect("another block durable");
     assert_eq!(commit_votes(&outputs(&mut rx)), 0, "another block's durability releases nothing");
     e.process_event(ConsensusEvent::BlockDurable(block)).expect("durable");
     assert_eq!(commit_votes(&outputs(&mut rx)), 1, "durable and imported: the commit vote goes");
     assert_eq!(e.last_commit_voted_view(), 1);
+    assert_eq!(e.persistable_lock().view, 1, "durable: the lock is written with the vote");
 
     // Durable first, then the PrepareQC, then the import.
     let (mut e, sks, vs, mut rx) = engine(me, true, VoteRules::PROFILE1);
@@ -506,4 +511,52 @@ fn profile1_the_leaders_own_commit_vote_waits_for_the_durable_block() {
             assert_eq!(e.last_commit_voted_view(), 1, "today: cast with the PrepareQC");
         }
     }
+}
+
+/// AM35 pitfall (a): a lock this node holds on a block that is not durable
+/// here never reaches the vote log. A follower locked on view 1's PrepareQC
+/// (block not durable, commit vote held) that R1-votes in view 2 writes its
+/// older, durable lock; once view 2's block is durable the vote log carries
+/// the lock again.
+#[test]
+fn profile1_the_vote_log_never_carries_a_lock_on_a_block_not_durable_here() {
+    #[derive(Default, Debug)]
+    struct Log(std::sync::Mutex<Vec<(u64, u64)>>);
+    impl crate::VoteLogWriter for Log {
+        fn record_vote(&self, view: u64, lock: &QuorumCertificate) -> ConsensusResult<()> {
+            self.0.lock().unwrap().push((view, lock.view));
+            Ok(())
+        }
+        fn record_commit_vote(&self, view: u64, lock: &QuorumCertificate) -> ConsensusResult<()> {
+            self.0.lock().unwrap().push((view, lock.view));
+            Ok(())
+        }
+    }
+    let (x, y) = (B256::repeat_byte(0xB6), B256::repeat_byte(0xB7));
+    let me = follower_of(&[1, 2]);
+    let (probe, sks, vs, _) = engine(me, true, VoteRules::PROFILE1);
+    let log = Arc::new(Log::default());
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mut e = ConsensusEngine::with_epoch_manager_and_vote_log(
+        me, sks[me as usize].clone(), crate::EpochManager::new(vs.clone()), 60_000, 120_000, tx, log.clone(),
+    );
+    e.enable_h2_v4_signing(H2V4ChainIdentity { chain_id: 1144, genesis_hash: B256::repeat_byte(0x44) });
+    e.set_vote_rules(VoteRules::PROFILE1);
+    drop(probe);
+    let qc1 = prepare_qc(&e, &sks, &vs, 1, x);
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: x, qc: qc1.clone() })))
+        .expect("the PrepareQC");
+    e.advance_to_view(2).expect("view 2");
+    propose(&mut e, &sks, 2, y, qc1).expect("the proposal");
+    e.remember_parent(y, x);
+    e.process_event(ConsensusEvent::BlockChecked(y)).expect("the check");
+    assert_eq!(votes_for(&outputs(&mut rx), y), 1, "the R1 vote");
+    assert_eq!(*log.0.lock().unwrap(), vec![(2, 0)], "the R1 vote logged the durable lock (genesis), not view 1's");
+    e.process_event(ConsensusEvent::BlockDurable(x)).expect("x durable");
+    let qc2 = prepare_qc(&e, &sks, &vs, 2, y);
+    e.process_event(ConsensusEvent::BlockImported(y)).expect("the import");
+    e.process_event(ConsensusEvent::BlockDurable(y)).expect("y durable");
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 2, block_hash: y, qc: qc2 })))
+        .expect("the PrepareQC");
+    assert_eq!(log.0.lock().unwrap().last(), Some(&(2, 2)), "the commit vote logs its lock, durable");
 }

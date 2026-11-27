@@ -7600,7 +7600,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         let mut bytes = 0usize;
         let written = chain.len();
         for (number, hash, parent) in chain.into_iter().rev() {
-            let Some(body) = self.queued_body(hash).await else {
+            // The body store (or, taken elided, the own block's body), else
+            // the execution layer: a body that reached this node only in
+            // compact form is not in the store.
+            let body = match self.queued_body(hash).await {
+                Some(body) => Some(body),
+                None => block_from_execution_layer(self.driver.execution_layer(), hash).await,
+            };
+            let Some(body) = body else {
                 self.durability_wait(block_hash, "a body to journal is not here");
                 return;
             };
@@ -7626,8 +7633,8 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     fn durability_wait(&mut self, block_hash: B256, reason: &str) {
-        debug!(target: "n42.h2.node", ?block_hash, reason, "durable commit vote: not durable yet; tried again on the next drain");
         if !self.durability_pending.contains(&block_hash) {
+            info!(target: "n42.h2.node", ?block_hash, reason, "durable commit vote: not durable yet; tried again on every drain");
             // Bounded: only the current view's block matters to the engine.
             if self.durability_pending.len() >= 16 {
                 self.durability_pending.remove(0);

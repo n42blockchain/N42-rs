@@ -1038,7 +1038,7 @@ timeouts sum to 456 s; the recorded 464 s gap includes the block interval.
    views. Each is verified only when it conflicts with a recorded one. Found by the n42-rs injector; gov5,
    n42-26 and n42-rs all had the gap for commit votes.
 
-## Amendment AM35 (2026-11-27, PROPOSED by n42-rs; gov5 and n42-26 reviewed; journal equivalent added): a commit vote means a durable block
+## Amendment AM35 (2026-11-27, ADOPTED by the owner; proposed by n42-rs, reviewed by gov5 and n42-26): a commit vote means a durable block
 
 Found by plan item E4 (whole-set restart). An all-Rust set killed at once (SIGKILL of every validator and
 execution layer) halted for good: the set had committed block 35, every execution layer had persisted only

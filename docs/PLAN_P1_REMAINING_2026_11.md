@@ -24,8 +24,8 @@ Releases at the time of writing: gov5 main 5464ee6e, n42-rs main e9f15edc4, n42-
 | B3 | Estimate and, if feasible, measure a chain-94-sized catch-up | n42-rs | blocks/s, MB/s, peak RSS and disk on a long heavy history (S1-like or the `gov5-work/p1scale` state) with current main | in progress (catch-up agent, after B2) |
 | B4 | gov5 catch-up speed (S1: 25.7 blk/s) and catch-up peak (4 GB) | gov5 | gov5's own measurement against S1 | gov5 agent on perf/p1-catchup; first numbers 2026-11-27 |
 | B5 | n42-26 steady-load memory (1.1 GB at 40 min, rising slowly) and catch-up | n42-26 | plateau shown over >= 90 min at 150 tx/s | n42-26 to schedule |
-| B6 | n42-rs EL peak during heavy catch-up: RocksDB memtables (~480 MB) | n42-rs | either a smaller budget that does not stall (upstream write stall + pinned memtables; `N42_ROCKSDB_WRITE_BUFFER_STALL`) or a documented decision to keep 4 GiB | in progress (memory agent, perf/p1-memory-2, after B7) |
-| B7 | n42-rs steady-state RSS re-measured with the RPC cache cap and QMDB entry file (memory step 2) | n42-rs | one >= 60 min 150 tx/s leg | in progress (memory agent, perf/p1-memory-2); 4b-R2 read ~520 MiB at 28 min |
+| B6 | n42-rs EL peak during heavy catch-up: RocksDB memtables (~480 MB) | n42-rs | either a smaller budget that does not stall (upstream write stall + pinned memtables; `N42_ROCKSDB_WRITE_BUFFER_STALL`) or a documented decision to keep 4 GiB | cause found: OptimisticTransactionDB keeps 2x128 MiB of flushed memtables per CF as conflict history (never used); knob N42_ROCKSDB_MEMTABLE_MB on perf/p1-memory-2; heavy-catch-up legs queued after 00:32 EST, then profile-1 default |
+| B7 | n42-rs steady-state RSS re-measured with the RPC cache cap and QMDB entry file (memory step 2) | n42-rs | one >= 60 min 150 tx/s leg | measured in mixed round M90b (22:50-00:26 EST 11-26), v2 RSS to m90b-v2-rss.tsv |
 
 ## C. Explorer (testnet, remote machine)
 
@@ -39,15 +39,15 @@ Releases at the time of writing: gov5 main 5464ee6e, n42-rs main e9f15edc4, n42-
 | # | Item | Who | State |
 | --- | --- | --- | --- |
 | D1 | Peer-to-peer state sync (`qmdb_*`, `code_by_hash`) | all three | feasibility notes exist (`docs/P1_STATESYNC_FEASIBILITY_n42rs.md`, gov5's, n42-26's HANDOFF post) |
-| D2 | Mixed equivocation round | all three | in progress: n42-rs test-only injector (branch feat/p1-equivocation-injector); gov5 agrees one injector is enough |
+| D2 | Mixed equivocation round | all three | injector + late/aggregate equivocation fixes on main (d8a5e54d2); mixed round M3d 22:00-22:40 EST 11-26 |
 
 ## E. Open since v1 (status doc, §7 and risks)
 
 | # | Item | Who | State |
 | --- | --- | --- | --- |
-| E1 | gov5 proposal-equivocation detection (M3d) | gov5 | DONE in gov5 main since 2026-11-25 (b5cf49a7, 5eb5aba9); only the mixed M3d round remains, after D2 |
-| E2 | §7: validator-set changes (E2), B11 follower rule, kept-tail bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a negative leader | all three | vectors V2, V7, V9 and the V5 additions (B4 equal timestamps, B13 state gas, AM25 requests) from gov5 by 2026-11-27 18:00 EST; then all three run them |
-| E3 | Liveness risk: k consecutive absent leaders stall ~24 + 48 + 96·(k−2) s | standard | AM33 draft circulated (docs/AM33_DRAFT_CONSECUTIVE_ABSENT_LEADERS.md: double once per f+1 TCs); awaiting gov5 / n42-26 review |
+| E1 | gov5 proposal-equivocation detection (M3d) | gov5 | DONE (gov5 b5cf49a7); gov5 late R1/commit votes + proposals in ef2f6bb0; mixed M3d 22:00 |
+| E2 | §7: validator-set changes (E2), B11 follower rule, kept-tail bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a negative leader | all three | vectors published 11-26; n42-rs passes V2, V7, V9 (2 GossipSub fixes), AM33 (main d8a5e54d2); n42-26 pending |
+| E3 | Liveness risk: k consecutive absent leaders stall ~24 + 48 + 96·(k−2) s | standard | AM33 adopted (standard); gov5 60521778 and n42-rs d8a5e54d2 implement it; n42-26 pending |
 
 ## Closed while writing this list
 

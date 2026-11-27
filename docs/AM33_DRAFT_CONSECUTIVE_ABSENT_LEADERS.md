@@ -76,3 +76,11 @@ Revised rule (proposed, pending n42-26):
   never resets it (gov5 drops (c)).
 - Gate 5d's six absent leaders: 24·3 + 48·3 = 216 s, against 464 s today.
 - gov5 produces the sequence vectors (n = 4, 7, 100, including the AM32 clamp) once n42-26 agrees.
+
+## Agreed (2026-11-26 21:10 EST)
+
+n42-26 counts `c` the same way (reset on a commit and on a QC-based view jump, never on a TC), adapts `base`
+the same way, and accepts `g = min(f+1, 3)`. The revised rule above is agreed by all three clients for v1.2.
+Next: gov5 publishes the O1 sequence vectors (n = 4, 7, 100, including the AM32 clamp), and gov5 drops its
+TC-SyncInfo reset. Then each client changes its pacemaker exponent to `floor(c / g)` against those vectors,
+and a mixed 5d-style rerun checks that six consecutive absent leaders leave a gap of ≤ 216 s at base 24 s.

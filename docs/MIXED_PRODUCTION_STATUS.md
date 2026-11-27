@@ -498,3 +498,16 @@ client's killer SIGKILLed only its own members (n42-rs 2-9 ms after the trigger,
 - No committed block lost on any gov5 member (each member's last commit before every kill is canonical).
 - Headers: 0..95 equal on 8 dumps (n42-rs, gov5 x6, n42-26); 0..112 equal between n42-rs and gov5 x3.
 - n42-rs: 10/10 recovered on 7e9e3c165. The gate as a whole is rerun as e9h (05:00 EST) with n42-26 272ca33.
+
+## E9 gate PASSED: rerun e9h (2026-11-27 04:50 EST)
+
+Same shape as e9g with n42-26 v3 on PR #57 272ca33 (AM35 + lock-lag fix + main with #51/#58); gov5
+vtf-78c76e2e (= gov5 main 78c76e2e), n42-rs integ/p1-am35-am36 7e9e3c165. Ten whole-set SIGKILLs: kills 1-5
+on a commit line, kills 6-10 on a follower's commit-vote release (gov5 held-commit-vote line x3, n42-rs AM35
+release line x2). Kill latency after the trigger: n42-rs 1-7 ms, gov5 4-11 ms, n42-26 4-12 ms.
+- Every kill RECOVERED: all five ELs +3 past the restart height (14, 23, 31, 40, 48, 57, 65, 74, 82, 91) in
+  48 or 63 s.
+- No committed block lost: every gov5 member's last commit before each kill is canonical.
+- Headers 0..104 equal on 5 dumps (n42-rs v2, gov5 node0/1/4, n42-26 v3).
+- Result: AM35 gate passed for all three clients. n42-rs merged integ/p1-am35-am36 into main as 9b373ce00
+  (code identical to 7e9e3c165) under the owner's pre-approval.

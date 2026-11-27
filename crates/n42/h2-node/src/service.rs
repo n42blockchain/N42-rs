@@ -259,6 +259,9 @@ pub enum ServiceEvent {
 /// together.
 pub struct H2Service<E> {
     transport: H2V4Transport,
+    /// Profile 1 (AM36 item 6): the transport's view of this node's latest
+    /// commit QC, raised every step so a stale message is not forwarded.
+    commit_view_hint: Option<n42_h2_net::CommitViewHint>,
     engine: ConsensusEngine,
     driver: ExecutionDriver<E>,
     /// Our own blocks as the execution layer takes them, from the driver's
@@ -685,6 +688,14 @@ pub struct H2Service<E> {
     safety_halt_file: Option<std::path::PathBuf>,
     /// When the halt's `error!` line was last written.
     safety_halt_logged: Option<std::time::Instant>,
+    /// AM35: the block journal a profile-1 commit vote waits on
+    /// ([`crate::block_journal`]); `None` for a node without a datadir.
+    block_journal: Option<crate::block_journal::BlockJournal>,
+    /// AM35: blocks the engine wants durable that could not be journalled
+    /// yet (a body or an ancestor not here); tried again on every drain.
+    durability_pending: Vec<B256>,
+    /// Whether the "no journal" warning was written.
+    durability_warned: bool,
     /// Commits decided before this node held their block's header: checked
     /// against the committed chain once the header arrives (bounded).
     unchecked_commits: std::collections::HashMap<B256, QuorumCertificate>,
@@ -1989,7 +2000,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 .map(|decoded| decoded.execution_data())
                 .map_err(|err| err.to_string())
         }));
+        let commit_view_hint = transport.commit_view_hint();
         Self {
+            commit_view_hint,
             transport,
             engine,
             own_imports: driver.take_own_imports(),
@@ -2114,6 +2127,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             safety_halt: None,
             safety_halt_file: None,
             safety_halt_logged: None,
+            block_journal: None,
+            durability_pending: Vec::new(),
+            durability_warned: false,
             unchecked_commits: std::collections::HashMap::new(),
             sync_head: None,
             range_buckets: std::collections::HashMap::new(),
@@ -2284,6 +2300,21 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.apply_safety_halt(halt);
         }
         self
+    }
+
+    /// AM35: the journal a profile-1 commit vote waits on (see
+    /// [`crate::block_journal`]). Without one a node answers the engine's
+    /// durability requests at once: it keeps nothing across a restart
+    /// anyway (no datadir, no vote log).
+    #[must_use]
+    pub fn with_block_journal(mut self, journal: crate::block_journal::BlockJournal) -> Self {
+        self.block_journal = Some(journal);
+        self
+    }
+
+    /// The block journal, if the node keeps one.
+    pub const fn block_journal(&self) -> Option<&crate::block_journal::BlockJournal> {
+        self.block_journal.as_ref()
     }
 
     /// Why this node is halted on proof of a conflicting commit, if it is.
@@ -2834,6 +2865,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.driver.cache_payload(block_hash, payload);
     }
 
+    /// Profile 1: tells the transport the latest commit QC's view (AM36
+    /// item 6). One relaxed atomic store; nothing without profile 1.
+    fn raise_commit_view_hint(&self) {
+        if let Some(hint) = &self.commit_view_hint {
+            hint.raise(self.engine.last_committed_qc().view);
+        }
+    }
+
     /// Runs one iteration: waits for the next thing to happen, handles it, and
     /// drains everything it caused.
     ///
@@ -2872,6 +2911,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             still_advancing = remaining == 0;
         }
+        self.raise_commit_view_hint();
 
         // A range reply half imported is finished the same way: the swarm
         // gets one poll and the step returns to import the next batch.
@@ -3985,6 +4025,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         for action in self.driver.retry_failed_imports().await {
             self.apply_driver_action(action, events)?;
         }
+        for block_hash in std::mem::take(&mut self.durability_pending) {
+            self.make_durable(block_hash).await;
+        }
         self.drain_pulled_imports(events, None).await;
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
@@ -4131,10 +4174,18 @@ impl<E: ExecutionLayer> H2Service<E> {
             // forkchoice: nothing of the conflicting commit is written.
             return Ok(());
         }
+        // AM35: a commit vote waits for this block's durable write.
+        if let EngineOutput::DurabilityWanted(block_hash) = output {
+            self.make_durable(block_hash).await;
+            return Ok(());
+        }
         // The engine's committed QC has moved: the next header this node
         // seals carries it, whatever happens to the commit below.
         if matches!(output, EngineOutput::BlockCommitted { .. }) {
             self.refresh_header_qc();
+        }
+        if let EngineOutput::BlockCommitted { block_hash, .. } = &output {
+            self.prune_block_journal(*block_hash);
         }
         // Durability first, and only for the output that announces finality.
         // See the module docs: the Engine API has no way to un-finalise a block.
@@ -7506,6 +7557,229 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.engine
             .leader_public_key_for_view(view)
             .is_some_and(|leader| n42_h2_consensus::verify_seal(header, &leader).is_ok())
+    }
+
+    /// AM35: makes `block_hash` and every ancestor durable here, then tells
+    /// the engine ([`ConsensusEvent::BlockDurable`]), which releases the
+    /// commit vote it holds. An ancestor at or below the execution layer's
+    /// persisted height is durable there; any other one not journalled yet
+    /// is journalled with the block, ancestors first. A body or header not
+    /// here yet leaves the block pending, tried again on the next drain.
+    async fn make_durable(&mut self, block_hash: B256) {
+        /// The most blocks one request journals (the block and the
+        /// ancestors above the persisted height that are not journalled).
+        const MAX_WALK: usize = 64;
+        if self.block_journal.is_none() {
+            if !self.durability_warned {
+                self.durability_warned = true;
+                warn!(target: "n42.h2.node", "no block journal (no datadir): commit votes are not held for a durable write; this node keeps nothing across a restart");
+            }
+            self.report_durable(block_hash);
+            return;
+        }
+        let started = std::time::Instant::now();
+        let persisted = match self.driver.persisted_height() {
+            n42_h2_execution::PersistedHeight::Known(number) => Some(number),
+            _ => None,
+        };
+        let el = self.driver.execution_layer_arc();
+        let mut chain: Vec<(u64, B256, B256)> = Vec::new();
+        let mut current = block_hash;
+        let mut complete = false;
+        while chain.len() < MAX_WALK {
+            let journal = self.block_journal.as_ref().expect("checked above");
+            if journal.contains(&current) {
+                complete = true;
+                break;
+            }
+            if current == self.identity.genesis_hash && current != block_hash {
+                complete = true;
+                break;
+            }
+            // The header here, else the execution layer's (after a restart
+            // the layer holds blocks this node has no header for).
+            let header = match self.block_headers.get(&current) {
+                Some(header) => Some((header.number, header.parent_hash)),
+                None => match el.block_by_hash(current).await {
+                    Ok(Some(block)) => Some((block.header.number, block.header.parent_hash)),
+                    _ => None,
+                },
+            };
+            let Some((number, parent)) = header else { break };
+            // Persisted by hash, not by height: the layer's canonical block
+            // at this number is this one, and the number is persisted.
+            if let Some(persisted) = persisted
+                && number <= persisted
+                // The layer's canonical block at this number is this one.
+                && matches!(el.block_by_number(number).await, Ok(Some(block)) if block.header.hash_slow() == current)
+            {
+                complete = true;
+                break;
+            }
+            chain.push((number, current, parent));
+            current = parent;
+        }
+        if !complete {
+            self.durability_wait(block_hash, "an ancestor is neither journalled, persisted nor known here");
+            return;
+        }
+        let mut bytes = 0usize;
+        let written = chain.len();
+        for (number, hash, parent) in chain.into_iter().rev() {
+            // The body store (or, taken elided, the own block's body), else
+            // the execution layer: a body that reached this node only in
+            // compact form is not in the store.
+            let body = match self.queued_body(hash).await {
+                Some(body) => Some(body),
+                None => block_from_execution_layer(self.driver.execution_layer(), hash).await,
+            };
+            let Some(body) = body else {
+                self.durability_wait(block_hash, "a body to journal is not here");
+                return;
+            };
+            bytes += body.len();
+            let journal = self.block_journal.as_mut().expect("checked above");
+            if let Err(err) = journal.append(number, hash, parent, &body) {
+                error!(target: "n42.h2.node", %err, ?hash, "could not journal a block; its commit vote stays held");
+                self.durability_wait(block_hash, "the journal write failed");
+                return;
+            }
+        }
+        let elapsed = started.elapsed();
+        metrics::histogram!("n42_h2_block_journal_seconds").record(elapsed.as_secs_f64());
+        info!(
+            target: "n42.h2.node",
+            ?block_hash,
+            journalled = written,
+            bytes,
+            journal_us = elapsed.as_micros() as u64,
+            "durable commit vote: block journalled"
+        );
+        self.report_durable(block_hash);
+    }
+
+    fn durability_wait(&mut self, block_hash: B256, reason: &str) {
+        if !self.durability_pending.contains(&block_hash) {
+            info!(target: "n42.h2.node", ?block_hash, reason, "durable commit vote: not durable yet; tried again on every drain");
+            // Bounded: only the current view's block matters to the engine.
+            if self.durability_pending.len() >= 16 {
+                self.durability_pending.remove(0);
+            }
+            self.durability_pending.push(block_hash);
+        }
+    }
+
+    fn report_durable(&mut self, block_hash: B256) {
+        if let Err(err) = self.engine.process_event(ConsensusEvent::BlockDurable(block_hash)) {
+            report_engine_error(&err, "durable block", &mut self.fatal);
+        }
+    }
+
+    /// Drops, by hash, the journalled blocks a restart no longer needs once
+    /// `committed` is committed: those on its chain (walked by parent hash)
+    /// at or below the execution layer's persisted height -- the layer holds
+    /// them, its canonical chain being the committed one -- and the siblings
+    /// at or below the committed height, which no certificate can commit.
+    fn prune_block_journal(&mut self, committed: B256) {
+        let n42_h2_execution::PersistedHeight::Known(persisted) = self.driver.persisted_height() else { return };
+        let Some(journal) = self.block_journal.as_ref() else { return };
+        let Some(lowest) = journal.lowest() else { return };
+        let Some(committed_number) = self.block_headers.get(&committed).map(|h| h.number) else { return };
+        let mut chain = std::collections::HashSet::new();
+        let mut current = committed;
+        while let Some(header) = self.block_headers.get(&current) {
+            if header.number < lowest {
+                break;
+            }
+            chain.insert(current);
+            current = header.parent_hash;
+        }
+        let journal = self.block_journal.as_mut().expect("checked above");
+        let removed = journal.prune_where(|number, hash| {
+            (number <= persisted && chain.contains(hash)) || (number <= committed_number && !chain.contains(hash))
+        });
+        if removed > 0 {
+            debug!(target: "n42.h2.node", persisted, committed_number, removed, left = journal.len(), "block journal pruned");
+        }
+    }
+
+    /// AM35 at start: every journalled block above the execution layer's
+    /// head that it does not hold is imported into it again (lowest first,
+    /// as a pulled block:
+    /// head only, neither safe nor finalized) and kept to serve, before
+    /// the node serves, votes or builds. Returns how many were imported.
+    /// A block that does not import stops the replay: those above it
+    /// descend from it.
+    pub async fn restore_block_journal(&mut self) -> Result<usize, ServiceError> {
+        let Some(journal) = self.block_journal.as_ref() else { return Ok(0) };
+        let entries = journal
+            .entries()
+            .map_err(|err| ServiceError::Fatal { reason: "block_journal", detail: err.to_string() })?;
+        // Keyed by hash: a block the layer holds is not imported again. One
+        // it lacks at or below its head is executed back in without a
+        // forkchoice, which would move the head back; one above it is
+        // imported as a pulled block and made the head.
+        let el_head = self.driver.execution_layer().latest_block_number().await.ok().flatten();
+        let mut imported = 0;
+        let mut restored = Vec::new();
+        for entry in entries {
+            let block = match decode_block_rlp_raw(&entry.body, self.header_profile) {
+                Ok(block) if block.block_hash == entry.hash => block,
+                Ok(block) => {
+                    warn!(target: "n42.h2.node", file_hash = ?entry.hash, body_hash = ?block.block_hash, "a journalled body does not hash to its file name; skipped");
+                    continue;
+                }
+                Err(err) => {
+                    warn!(target: "n42.h2.node", hash = ?entry.hash, %err, "a journalled body does not decode; skipped");
+                    continue;
+                }
+            };
+            let held = matches!(self.driver.execution_layer().block_by_hash(entry.hash).await, Ok(Some(_)));
+            if !held && el_head.is_some_and(|head| entry.number <= head) {
+                // Not on the canonical chain at its height: executed back into
+                // the layer (served and voted on by hash), not made the head.
+                let el = self.driver.execution_layer_arc();
+                if let Err(err) = ExecutionDriver::pulled_new_payload(&*el, block.execution_data()).await {
+                    warn!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, %err, "could not re-import a journalled side block; skipped");
+                    continue;
+                }
+                imported += 1;
+                info!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, "journalled side block re-imported (not made the head)");
+            } else if !held {
+                if let Err(err) = self.import_pulled_timed(block.execution_data()).await {
+                    warn!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, %err, "could not re-import a journalled block; the replay stops here");
+                    break;
+                }
+                imported += 1;
+                info!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, "journalled block re-imported");
+            }
+            self.remember_imported(entry.hash);
+            self.note_imported(entry.number);
+            self.remember_block(entry.hash, &block.header);
+            self.remember_body(entry.hash, entry.body.clone());
+            self.engine.remember_parent(entry.hash, entry.parent);
+            // The engine's gates see it as imported and durable (it is in
+            // the layer and in the journal): a vote waiting on it after the
+            // restart is not held forever.
+            restored.push(entry.hash);
+        }
+        // The restored lock's and commit's blocks, matched against the layer
+        // by hash: one the layer holds is imported for the engine's gates
+        // (its durability is settled on demand by `make_durable`).
+        for hash in [self.engine.locked_qc().block_hash, self.engine.last_committed_qc().block_hash] {
+            if hash != B256::ZERO
+                && !restored.contains(&hash)
+                && matches!(self.driver.execution_layer().block_by_hash(hash).await, Ok(Some(_)))
+            {
+                self.remember_imported(hash);
+                self.engine.process_event(ConsensusEvent::BlockImported(hash))?;
+            }
+        }
+        for hash in restored {
+            self.engine.process_event(ConsensusEvent::BlockImported(hash))?;
+            self.engine.process_event(ConsensusEvent::BlockDurable(hash))?;
+        }
+        Ok(imported)
     }
 
     fn remember_imported(&mut self, block_hash: B256) {

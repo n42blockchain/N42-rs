@@ -374,7 +374,8 @@ fn v6_round1_refused_block() {
 }
 
 /// `round2_gate`: after Round 1, prepare_qc_v2 casts no commit vote until
-/// this node's own import of block 2; then gov5's commit_vote_v2.
+/// this node's own import of block 2 (and, AM35, its durable write); then
+/// gov5's commit_vote_v2.
 #[test]
 fn v6_round2_gate() {
     let v6 = load();
@@ -390,8 +391,11 @@ fn v6_round2_gate() {
     engine.process_event(ConsensusEvent::Message(pqc)).expect("prepare_qc_v2 accepted");
     assert!(commit_votes(&outputs(&mut rx)).is_empty(), "no commit vote on the check alone");
     engine.process_event(ConsensusEvent::BlockImported(block)).expect("the import");
+    // AM35: and on the block's durable write here (the node's journal).
+    assert!(commit_votes(&outputs(&mut rx)).is_empty(), "no commit vote before the block is durable (AM35)");
+    engine.process_event(ConsensusEvent::BlockDurable(block)).expect("durable");
     let cast = commit_votes(&outputs(&mut rx));
-    assert_eq!(cast.len(), 1, "the commit vote on the own import");
+    assert_eq!(cast.len(), 1, "the commit vote on the own import and the durable write");
     let gov5 = v6.wire("commit_vote_v2");
     let H2Message::CommitVote(want) = &gov5 else { panic!("a commit vote") };
     assert_eq!(cast[0].signature, want.signature, "commit_vote_v2 byte for byte");

@@ -536,7 +536,8 @@ fn crc32(bytes: &[u8]) -> u32 {
 pub fn checkpoint_from(engine: &n42_h2_consensus::ConsensusEngine) -> ConsensusCheckpoint {
     ConsensusCheckpoint {
         view: engine.current_view(),
-        locked_qc: engine.locked_qc().clone(),
+        // AM35: the lock only once its block is durable here.
+        locked_qc: engine.persistable_lock().clone(),
         last_committed_qc: engine.last_committed_qc().clone(),
         consecutive_timeouts: engine.consecutive_timeouts(),
         last_voted_view: engine.last_voted_view(),

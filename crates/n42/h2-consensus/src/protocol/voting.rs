@@ -356,6 +356,13 @@ impl ConsensusEngine {
             prepare_qc_msg,
         )))?;
 
+        // AM35 (profile 1): the leader's own commit vote waits for its
+        // block's durable write too.
+        if !self.block_durable_for_commit(&block_hash) {
+            tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "durable commit vote: holding the leader's commit vote until its block is durable");
+            self.held_leader_commit = Some((view, block_hash));
+            return self.emit(EngineOutput::DurabilityWanted(block_hash));
+        }
         if !self.cast_leader_commit_vote(view, block_hash)? {
             return Ok(());
         }
@@ -377,15 +384,23 @@ impl ConsensusEngine {
         let previous = self.round_state.record_commit_vote(view);
         // A failed log write must not leave the watermark advanced: the
         // retry after the disk recovers would otherwise be refused.
+        let lock = self.lock_for_log();
         let logged = self
             .vote_log
-            .record_commit_vote(view, self.round_state.locked_qc())
+            .record_commit_vote(view, &lock)
             .inspect_err(|_| self.round_state.rollback_commit_vote(previous));
         if logged.is_err() {
             self.vote_log_retry =
                 Some(super::state_machine::VoteLogRetry::LeaderCommitVote { view, block_hash });
         }
+        let wrote = logged.is_ok();
         self.note_vote_log(logged)?;
+        if wrote && self.vote_rules.commit_vote_needs_durable_block() {
+            // AM35 E9 trigger T2 (fixed text, matched by the cross-client
+            // timed-kill gate): the block is durable and the lock is written;
+            // the commit vote is signed next.
+            tracing::info!(target: "n42::am35", view, block_hash = %block_hash, role = "leader", "commit vote released after durable lock");
+        }
         let changes_hash = self.cached_changes_hash(&block_hash);
         let commit_msg = self
             .signing_profile

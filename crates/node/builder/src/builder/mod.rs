@@ -1181,7 +1181,34 @@ fn effective_tree_config<C: EthChainSpec>(
     let tree_config = config.tree_config();
     let qmdb = reth_chainspec::qmdb::state_scheme(config.chain.genesis()) ==
         reth_chainspec::qmdb::StateScheme::Qmdb;
-    if qmdb { qmdb_tree_config(tree_config) } else { tree_config }
+    let tree_config = if qmdb { qmdb_tree_config(tree_config) } else { tree_config };
+    if reth_chainspec::qmdb::is_profile1(config.chain.genesis()) {
+        profile1_tree_config(tree_config)
+    } else {
+        tree_config
+    }
+}
+
+/// A profile-1 chain's engine tree configuration (`docs/MIXED_PRODUCTION_STANDARD.md` AM35): every
+/// canonical block is persisted as soon as it is canonical (persistence threshold 0, in-memory
+/// buffer target 0), so a whole-set crash finds every committed block on disk. The validator's
+/// commit vote waits for its own synced copy of the block (its block journal), so this is not
+/// what the vote relies on; it keeps the window in which a committed block lives only in memory
+/// to the one save in flight, and the journal short. A value above 0 for either flag is refused at
+/// start-up on such a chain (`n42_qmdb_reth::profile1::FORBIDDEN_FLAGS`); this applies 0 whatever
+/// reached the tree config.
+fn profile1_tree_config(
+    tree_config: reth_engine_primitives::TreeConfig,
+) -> reth_engine_primitives::TreeConfig {
+    if (tree_config.persistence_threshold(), tree_config.memory_block_buffer_target()) != (0, 0) {
+        info!(
+            target: "reth::cli",
+            persistence_threshold = 0,
+            memory_block_buffer_target = 0,
+            "Profile-1 chain: every canonical block is persisted at once (AM35)"
+        );
+    }
+    tree_config.with_persistence_threshold(0).with_memory_block_buffer_target(0)
 }
 
 /// The persistence threshold a QMDB chain runs at unless the operator sets one: the fleet7 bench
@@ -1280,5 +1307,22 @@ mod qmdb_tree_config_tests {
         let kept = qmdb_tree_config(tight);
         assert_eq!(kept.persistence_threshold(), DEFAULT_MEMORY_BLOCK_BUFFER_TARGET);
         assert_eq!(kept.memory_block_buffer_target(), DEFAULT_MEMORY_BLOCK_BUFFER_TARGET);
+    }
+
+    #[test]
+    fn a_profile1_chain_persists_every_canonical_block() {
+        for config in [
+            qmdb_tree_config(TreeConfig::default()),
+            TreeConfig::default()
+                .with_num_state_masking_blocks(0)
+                .with_persistence_threshold(8)
+                .with_memory_block_buffer_target(6),
+            TreeConfig::default().with_persistence_threshold(0).with_memory_block_buffer_target(0),
+            TreeConfig::default(),
+        ] {
+            let p1 = profile1_tree_config(config);
+            assert_eq!((p1.persistence_threshold(), p1.memory_block_buffer_target()), (0, 0));
+            assert_eq!(p1.num_state_masking_blocks(), 0);
+        }
     }
 }

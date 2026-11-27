@@ -681,6 +681,9 @@ pub const FORBIDDEN_ENV: &[Rule] = &[
     Rule { name: "N42_SYNC_ANCHOR", when: When::NotOneOf(&["", "enforce", "on", "1", "true"]), reason: "anchored ranges are enforced (section 3)" },
     Rule { name: "N42_SETTLEMENT_TAGS", when: When::NotOneOf(&["", "split"]), reason: "safe and finalized are the split tags; legacy reports uncertified blocks as finalized (E14, AM19)" },
     Rule { name: "N42_DEFERRED_DEPTH*", when: When::Set, reason: "the depth is config.hotstuff.deferredExecutionDepth (A10; gov5's name)" },
+    Rule { name: "N42_ROCKSDB_NOSYNC", when: When::NotOneOf(OFF), reason: "no profile-1 mode may defer or skip the durable write (AM35)" },
+    Rule { name: "RETH_DB_SYNC_MODE", when: When::NotOneOf(&["", "durable"]), reason: "safe-no-sync skips the durable write (AM35)" },
+    Rule { name: "RETH_ENGINE_PERSISTENCE_THRESHOLD", when: When::NotOneOf(&["", "0"]), reason: "every canonical block is persisted at once on profile 1; a threshold defers the durable write (AM35)" },
 ];
 
 /// Command-line flags refused on a profile-1 chain. `n42` and `h2_validator`
@@ -694,6 +697,9 @@ pub const FORBIDDEN_FLAGS: &[Rule] = &[
     Rule { name: "--genesis", when: When::Set, reason: "the genesis hash is computed from the genesis file (A1)" },
     Rule { name: "--validators", when: When::Set, reason: "the validator set is config.hotstuff.validators (A3, AM5)" },
     Rule { name: "--straggler-grace-ms", when: When::NotOneOf(&["0"]), reason: "the straggler grace sends progress votes, which are not in profile 1 (E9)" },
+    Rule { name: "--engine.persistence-threshold", when: When::NotOneOf(&["0"]), reason: "every canonical block is persisted at once on profile 1; a threshold defers the durable write (AM35)" },
+    Rule { name: "--engine.memory-block-buffer-target", when: When::NotOneOf(&["0"]), reason: "every canonical block is persisted at once on profile 1; a buffer target defers the durable write (AM35)" },
+    Rule { name: "--db.sync-mode", when: When::NotOneOf(&["durable"]), reason: "safe-no-sync and utterly-no-sync skip the durable write (AM35)" },
 ];
 
 /// Refuses, on a profile-1 genesis, any of [`FORBIDDEN_ENV`] in `vars` and
@@ -1093,6 +1099,9 @@ mod tests {
             ("N42_SYNC_ANCHOR", "off"),
             ("N42_DEFERRED_DEPTH_K", "2"),
             ("N42_SETTLEMENT_TAGS", "legacy"),
+            ("N42_ROCKSDB_NOSYNC", "1"),
+            ("RETH_DB_SYNC_MODE", "safe-no-sync"),
+            ("RETH_ENGINE_PERSISTENCE_THRESHOLD", "8"),
         ] {
             let err = refuse_overrides(g, env(&[("N42_PROFILE", "x22"), (name, value)]), args(&[])).expect_err(name);
             assert!(err.to_string().contains(name), "{name}: {err}");
@@ -1107,6 +1116,11 @@ mod tests {
             &["--genesis", "0x00"],
             &["--validators", "v.json"],
             &["--straggler-grace-ms", "600"],
+            &["node", "--engine.persistence-threshold", "8"],
+            &["node", "--engine.persistence-threshold=2"],
+            &["node", "--engine.memory-block-buffer-target", "6"],
+            &["node", "--db.sync-mode", "safe-no-sync"],
+            &["node", "--db.sync-mode=utterly-no-sync"],
         ] {
             let err = refuse_overrides(g, env(&[]), args(flags)).expect_err(flags[flags.len() - 1]);
             let flag = flags.iter().find(|f| f.starts_with("--")).expect("a flag");
@@ -1139,7 +1153,11 @@ mod tests {
                 ("N42_PARALLEL_BUILD", "1"),
                 ("MALLOC_CONF", "thp:always"),
             ]),
-            args(&["node", "--chain", "x.json", "--straggler-grace-ms", "0", "--http", "--genesis-extra", "1", "--builder.extradata", "n42"]),
+            args(&[
+                "node", "--chain", "x.json", "--straggler-grace-ms", "0", "--http", "--genesis-extra", "1", "--builder.extradata", "n42",
+                // AM35: 0 and durable are what profile 1 runs anyway.
+                "--engine.persistence-threshold", "0", "--engine.memory-block-buffer-target=0", "--db.sync-mode", "durable",
+            ]),
         )
         .expect("nothing consensus-visible");
     }

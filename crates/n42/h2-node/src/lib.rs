@@ -33,6 +33,7 @@ pub mod sync_safety;
 pub mod test_equivocate;
 pub mod tx_source;
 
+pub mod block_journal;
 pub mod body_channel;
 pub use persistence::{ConsensusCheckpoint, ConsensusStore, FileVoteLog, StoreError, VoteRecord};
 pub use service::{H2Service, ServiceError, ServiceEvent, ProposalContext};

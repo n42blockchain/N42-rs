@@ -1737,3 +1737,139 @@ async fn a_profile1_genesis_yields_the_profile1_vote_rules() {
     let today = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&devnet).expect("a hotstuff block");
     assert_eq!(today.vote_rules(), n42_h2_consensus::VoteRules::TODAY);
 }
+
+fn journal_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("n42-am35-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// AM35: a durability request journals the block and every ancestor above
+/// the persisted height that is not journalled yet, ancestors first, synced,
+/// before the engine is told; a block whose ancestor's body is not here
+/// stays pending (and is tried again) instead of being reported durable.
+#[tokio::test]
+async fn a_durability_request_journals_the_block_and_its_unjournalled_ancestors() {
+    let dir = journal_dir("walk");
+    let rig = node(4, 0, None).await;
+    let rig_el = rig.el.clone();
+    let mut svc = rig
+        .svc
+        .with_vote_rules(n42_h2_consensus::VoteRules::PROFILE1)
+        .with_block_journal(crate::block_journal::BlockJournal::open(&dir).expect("journal"));
+    let (a, header_a, body_a) = block(1, ID.genesis_hash);
+    let (b, header_b, body_b) = block(2, a);
+    svc.remember_block(a, &header_a);
+    svc.remember_block(b, &header_b);
+    svc.remember_body(b, body_b.clone());
+
+    // A's body is not here: B is not durable, and is kept to try again.
+    svc.make_durable(b).await;
+    assert!(!svc.block_journal().expect("journal").contains(&b));
+    assert_eq!(svc.durability_pending, vec![b]);
+
+    // With A's body the retry journals both.
+    svc.remember_body(a, body_a.clone());
+    svc.make_durable(b).await;
+    let journal = svc.block_journal().expect("journal");
+    assert_eq!(journal.get(&a), Some((1, ID.genesis_hash)));
+    assert_eq!(journal.get(&b), Some((2, a)));
+    let entries = journal.entries().expect("entries");
+    assert_eq!(entries.iter().map(|e| e.hash).collect::<Vec<_>>(), vec![a, b]);
+    assert_eq!(entries[1].body, body_b);
+
+    // A block on a persisted parent journals only itself.
+    svc.driver.set_persisted_height(Arc::new(|| n42_h2_execution::PersistedHeight::Known(2)));
+    let el = rig_el.clone();
+    let (c, header_c, body_c) = block(3, b);
+    svc.remember_block(c, &header_c);
+    svc.remember_body(c, body_c);
+    // A sibling of B (same height, another hash): journalled while it was
+    // proposed, dropped by hash once B is committed.
+    let (side, header_side, body_side) = block(2, ID.genesis_hash);
+    svc.remember_block(side, &header_side);
+    svc.remember_body(side, body_side);
+    svc.make_durable(side).await;
+    assert!(svc.block_journal().expect("journal").contains(&side));
+    svc.prune_block_journal(b);
+    assert!(svc.block_journal().expect("journal").is_empty(), "the committed chain at the persisted height and its sibling pruned");
+    // Persisted by hash: the layer's canonical a, b end the walk at b.
+    for data in [MockExecutionLayer::built_block_on(1, ID.genesis_hash).execution_data, MockExecutionLayer::built_block_on(2, a).execution_data] {
+        n42_h2_execution::ExecutionDriver::pulled_new_payload(&el, data).await.expect("a, b");
+    }
+    svc.make_durable(c).await;
+    assert_eq!(svc.block_journal().expect("journal").len(), 1);
+    // A height alone ends nothing: a child of the pruned sibling walks on
+    // past height 2, whose canonical block there is b, not the sibling.
+    let (side2, header_side2, body_side2) = block(3, side);
+    svc.remember_block(side2, &header_side2);
+    svc.remember_body(side2, body_side2);
+    svc.make_durable(side2).await;
+    let journal = svc.block_journal().expect("journal");
+    assert!(journal.contains(&side2) && journal.contains(&side), "the sibling is journalled again, by hash");
+    assert_eq!(journal.len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AM35 at restart: a journalled block the execution layer does not hold is
+/// imported again (newPayload, then a head-only forkchoice) and kept to
+/// serve; one it holds is only kept.
+#[tokio::test]
+async fn a_restart_reimports_the_journalled_blocks_the_execution_layer_lost() {
+    let dir = journal_dir("restore");
+    let (a, header_a, body_a) = block(1, ID.genesis_hash);
+    {
+        let mut journal = crate::block_journal::BlockJournal::open(&dir).expect("journal");
+        journal.append(1, a, ID.genesis_hash, &body_a).expect("append");
+    }
+    let rig = node(4, 0, None).await;
+    let el = rig.el.clone();
+    let mut svc = rig
+        .svc
+        .with_vote_rules(n42_h2_consensus::VoteRules::PROFILE1)
+        .with_block_journal(crate::block_journal::BlockJournal::open(&dir).expect("journal"));
+    assert_eq!(svc.restore_block_journal().await.expect("restore"), 1);
+    let calls = el.calls();
+    assert!(calls.iter().any(|c| matches!(c, ElCall::NewPayload(h) if *h == a)), "{calls:?}");
+    assert!(calls.iter().any(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == a)), "{calls:?}");
+    assert!(svc.imported.contains(&a));
+    assert_eq!(svc.block_headers.get(&a), Some(&header_a));
+    assert!(svc.body_store.contains_key(&a), "served from the store");
+    assert!(svc.engine.has_imported_block(&a), "the engine's vote gates see the restored block as imported");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AM35 pitfall (b): replay is keyed by hash, not height. The execution
+/// layer holds a different block at the journalled block's height (its
+/// canonical one): the journalled block is still executed back in (served
+/// and voted on by hash), but no forkchoice names it -- that would move the
+/// layer's head back.
+#[tokio::test]
+async fn a_restart_replays_a_journalled_block_by_hash_when_the_layer_has_another_at_its_height() {
+    let dir = journal_dir("restore-by-hash");
+    let (a, _header_a, body_a) = block(1, ID.genesis_hash);
+    let other = MockExecutionLayer::built_block_on(1, B256::repeat_byte(0x99));
+    assert_ne!(other.execution_data.block_hash(), a);
+    {
+        let mut journal = crate::block_journal::BlockJournal::open(&dir).expect("journal");
+        journal.append(1, a, ID.genesis_hash, &body_a).expect("append");
+    }
+    let rig = node(4, 0, None).await;
+    let el = rig.el.clone();
+    n42_h2_execution::ExecutionDriver::pulled_new_payload(&el, other.execution_data.clone()).await.expect("the layer's own block 1");
+    assert_eq!(el.latest_block_number().await.expect("head"), Some(1));
+    let before = el.calls().len();
+    let mut svc = rig
+        .svc
+        .with_vote_rules(n42_h2_consensus::VoteRules::PROFILE1)
+        .with_block_journal(crate::block_journal::BlockJournal::open(&dir).expect("journal"));
+    assert_eq!(svc.restore_block_journal().await.expect("restore"), 1);
+    let calls = el.calls()[before..].to_vec();
+    assert!(calls.iter().any(|c| matches!(c, ElCall::NewPayload(h) if *h == a)), "re-executed by hash: {calls:?}");
+    assert!(
+        !calls.iter().any(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == a)),
+        "no forkchoice to a block below the layer's head: {calls:?}"
+    );
+    assert!(svc.body_store.contains_key(&a), "served from the store by hash");
+    let _ = std::fs::remove_dir_all(&dir);
+}

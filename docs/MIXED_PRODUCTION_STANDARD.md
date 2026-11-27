@@ -1079,7 +1079,7 @@ with a consensus-dir block journal synced with the lock (option A); n42-rs on br
 fix/p1-durable-commit-vote. Cost: one durable write on the commit-vote path per block (a journal append
 is about 1-5 ms; a full EL commit 15 ms empty to 0.5 s for a full block).
 
-## Amendment AM36 (2026-11-27, PROPOSED by n42-rs; raised by n42-26's F1 work; gov5 reviewed): validate, then forward
+## Amendment AM36 (2026-11-27, PROPOSED by n42-rs; raised by n42-26's F1 work; gov5 and n42-26 reviewed): validate, then forward
 
 Survey (code, 2026-11-27): n42-rs forwards a gossip message only after it decodes as its topic's type
 (`validate_messages`, h2-net `transport.rs`; it does not verify BLS before forwarding, and accepts the
@@ -1100,3 +1100,23 @@ Rule (profile 1, every G2 topic):
    review, 2026-11-27).
 4. The mobileverify topics decode as their packet / registration types under the same rule once a member
    runs the mobileverify service (I1/I2).
+
+AM36 precisions (2026-11-27, after n42-26's implementation review, PR #58):
+5. "Decodes with fields in range" is stateless only, per topic. Block: snappy length matches, size at most
+   the block byte limit, RLP decodes. HotStuff and H2-v4: the message decodes, the chain identity matches,
+   the message view and every nested QC/TC view differ from 2^64-1, a proposal's justify QC view is below the
+   proposal's view, a Decide's commit QC view equals its view, signer bitmaps have the committee's byte
+   length format. `transaction_v2`: every entry decodes. Checks that need state (signer index below the
+   committee size of that view, header view and slot, BLS) belong to the handler and may run before
+   forwarding only under item 2.
+6. "A view the member has already left" means a view strictly below the view of the member's latest commit
+   QC; the committed view itself is not stale (a member one view behind still needs its Decide and votes).
+   Messages for future views are accepted and forwarded with no cap at the network layer; the handler
+   buffers them as today.
+7. Topics without views (block, `transaction_v2`): no stale rule; a well-formed message is accepted, and
+   duplicates are dropped by the gossip message id.
+8. A `transaction_v2` batch with bytes that do not decode as a transaction is rejected; a batch whose entries
+   decode but name a type outside the chain's profile-1 set (legacy, 2930, 1559, 7702, plus 0x50 when the
+   genesis has `altSigTx`) is ignored, not rejected, so a client that knows one more type is not penalised.
+9. All three clients implement AM36: n42-26 PR #58 (13773ef), gov5 fix/p1-validate-then-forward, n42-rs
+   (stale-view check and mobileverify decode still to add).

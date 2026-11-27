@@ -178,6 +178,11 @@ pub struct TransportConfig {
     /// identify). On by default; off makes a v1-only peer, as gov5's main
     /// line and n42-26 are.
     pub sync_v11_serve: bool,
+    /// Profile 1: validate every gossip message before it is forwarded
+    /// (AM36, [`crate::validate`]). `None` keeps the earlier rule: a
+    /// consensus message is forwarded once it decodes, a body, a transaction
+    /// batch or a mobile message unread.
+    pub profile1: Option<crate::validate::Profile1Gossip>,
 }
 
 impl TransportConfig {
@@ -192,7 +197,15 @@ impl TransportConfig {
             mobileverify: false,
             sync_v11_client: None,
             sync_v11_serve: true,
+            profile1: None,
         }
+    }
+
+    /// Validates gossip before forwarding it, under profile 1's rules
+    /// (see [`Self::profile1`]).
+    pub fn with_profile1(mut self, profile1: crate::validate::Profile1Gossip) -> Self {
+        self.profile1 = Some(profile1);
+        self
     }
 
     /// Sets whether this node asks peers over sync v1.1 (see
@@ -622,6 +635,8 @@ pub(crate) struct TransportCore {
     txns_guards: HashMap<request_response::InboundRequestId, ServeGuard>,
     /// Sync v1.1: who speaks it, requests in flight, reply guards.
     v11: crate::sync_v11::peers::V11State,
+    /// Profile 1's validate-then-forward rules, when the chain is profile 1.
+    profile1: Option<crate::validate::Profile1Gossip>,
 }
 
 impl TransportCore {
@@ -789,6 +804,7 @@ impl TransportCore {
             v11: crate::sync_v11::peers::V11State::new(
                 config.sync_v11_client.unwrap_or_else(crate::sync_v11::peers::client_enabled),
             ),
+            profile1: config.profile1,
         })
     }
 
@@ -1209,6 +1225,70 @@ impl TransportCore {
         }
     }
 
+    /// Profile 1 (AM36): judges one gossip message, reports the verdict and
+    /// returns what the caller is handed. A rejected message surfaces as
+    /// [`TransportEvent::Rejected`]; an ignored one is dropped, except a
+    /// stale consensus message, which the engine still gets (AM34 item 6).
+    fn validate_profile1(
+        &mut self,
+        propagation_source: PeerId,
+        message_id: gossipsub::MessageId,
+        message: gossipsub::Message,
+    ) -> Option<TransportEvent> {
+        use crate::validate::{transactions_verdict, GossipVerdict};
+        let profile1 = self.profile1.as_ref().expect("checked by the caller");
+        let rejected = |reason: String| TransportEvent::Rejected { from: Some(propagation_source), reason };
+        let topic = &message.topic;
+        let (verdict, event) = if *topic == self.block_topic.hash() {
+            let verdict = profile1.block_verdict(&message.data);
+            (verdict, Some(TransportEvent::Block { from: message.source, data: message.data }))
+        } else if *topic == self.tx_topic.hash() {
+            let verdict = transactions_verdict(&message.data);
+            (verdict, Some(TransportEvent::Transactions { from: message.source, data: message.data }))
+        } else if let Some(kind) = self.mobile_topic_of(topic) {
+            let verdict = profile1.mobile_verdict(kind, &message.data);
+            let event = match kind {
+                MobileTopic::Packet => TransportEvent::MobilePacket { from: message.source, data: message.data },
+                MobileTopic::Registration => {
+                    TransportEvent::MobileRegistration { from: message.source, data: message.data }
+                }
+            };
+            (verdict, Some(event))
+        } else if *topic == self.native_topic.hash() {
+            match decode_gov5_gossip_message(&message.data) {
+                Ok(decoded) => (
+                    profile1.consensus_verdict(&decoded),
+                    Some(TransportEvent::Native { from: message.source, message: Box::new(decoded) }),
+                ),
+                Err(err) => (GossipVerdict::Reject(format!("native message: {err}")), None),
+            }
+        } else if *topic == self.topic.hash() {
+            match decode_gossip(&message.data, self.identity) {
+                Ok(envelope) => (
+                    profile1.consensus_verdict(&envelope.message),
+                    Some(TransportEvent::Envelope { from: message.source, envelope: Box::new(envelope) }),
+                ),
+                Err(err) => (crate::validate::envelope_error_verdict(&err), None),
+            }
+        } else {
+            (GossipVerdict::Ignore("not a topic this node follows"), None)
+        };
+        let _ = self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+            &message_id,
+            &propagation_source,
+            verdict.acceptance(),
+        );
+        match verdict {
+            GossipVerdict::Accept => event,
+            GossipVerdict::Reject(reason) => Some(rejected(reason)),
+            // Not forwarded, but a stale vote or proposal still reaches the
+            // engine's late-message checks.
+            GossipVerdict::Ignore(_) => {
+                event.filter(|e| matches!(e, TransportEvent::Native { .. } | TransportEvent::Envelope { .. }))
+            }
+        }
+    }
+
     /// Drives the swarm until something worth reporting happens.
     ///
     /// Returns `None` only if the swarm stream ends, which it does not do in
@@ -1236,6 +1316,16 @@ impl TransportCore {
                 }
             };
             match event {
+                SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                    propagation_source,
+                    message_id,
+                    message,
+                })) if self.profile1.is_some() => {
+                    match self.validate_profile1(propagation_source, message_id, message) {
+                        Some(event) => return Some(event),
+                        None => continue,
+                    }
+                }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source,
                     message_id,
@@ -1816,6 +1906,8 @@ pub struct H2V4Transport {
     identity: H2V4ChainIdentity,
     local_peer_id: PeerId,
     commit_qc_peers: crate::sync_v11::peers::CommitQcPeers,
+    /// Profile 1: the commit view the transport judges staleness by.
+    commit_view: Option<crate::validate::CommitViewHint>,
 }
 
 enum Inner {
@@ -1833,11 +1925,13 @@ impl H2V4Transport {
     /// the fleet gates inbound connections on a known peer id, which a
     /// validator's fleet generally does.
     pub fn with_keypair(config: TransportConfig, keypair: Keypair) -> Result<Self, TransportError> {
+        let commit_view = config.profile1.as_ref().map(|p| p.commit_view.clone());
         let core = TransportCore::with_keypair(config, keypair)?;
         Ok(Self {
             identity: core.identity(),
             local_peer_id: *core.local_peer_id(),
             commit_qc_peers: core.v11.commit_qc_peers(),
+            commit_view,
             inner: Inner::Inline(Box::new(core)),
         })
     }
@@ -1851,13 +1945,22 @@ impl H2V4Transport {
     /// machine leave the thread that awaits [`Self::next_event`]. Events keep
     /// the order the swarm produced them in.
     pub fn with_keypair_off_loop(config: TransportConfig, keypair: Keypair) -> Result<Self, TransportError> {
+        let commit_view = config.profile1.as_ref().map(|p| p.commit_view.clone());
         let core = TransportCore::with_keypair(config, keypair)?;
         Ok(Self {
             identity: core.identity(),
             local_peer_id: *core.local_peer_id(),
             commit_qc_peers: core.v11.commit_qc_peers(),
+            commit_view,
             inner: Inner::OffLoop(crate::pump::OffLoop::spawn(core)),
         })
+    }
+
+    /// Profile 1: the hint the consensus loop raises to its latest commit
+    /// QC's view, so the transport can tell a stale message (AM36 item 6).
+    /// `None` when the transport does not validate under profile 1.
+    pub fn commit_view_hint(&self) -> Option<crate::validate::CommitViewHint> {
+        self.commit_view.clone()
     }
 
     /// Whether the swarm runs on its own task.

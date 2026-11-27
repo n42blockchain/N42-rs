@@ -131,6 +131,7 @@ pub struct MobileVerify {
     registry: Arc<Registry>,
     coordinator: Arc<CohortCoordinator>,
     head: Arc<CommittedHead>,
+    packets: Arc<PacketCache>,
 }
 
 /// The two channel ends the service needs: inbound gossip goes to the relay
@@ -218,14 +219,26 @@ impl MobileVerify {
         tokio::spawn(commit_epochs(registry.clone(), cfg.collect_window, snapshot));
 
         let (in_tx, in_rx) = mpsc::channel(GOSSIP_QUEUE);
-        tokio::spawn(relay(in_rx, registry.clone(), packets, head.clone()));
+        tokio::spawn(relay(in_rx, registry.clone(), packets.clone(), head.clone()));
 
         info!(
             target: "n42::mobileverify",
             http = %cfg.http, window = cfg.packet_window, pow_bits = cfg.pow_bits,
             epoch_s = cfg.collect_window.as_secs(), "mobile verification surface enabled"
         );
-        Ok((Self { registry, coordinator, head }, MobileGossipChannels { inbound: in_tx, outbound: out_rx }))
+        Ok((Self { registry, coordinator, head, packets }, MobileGossipChannels { inbound: in_tx, outbound: out_rx }))
+    }
+
+    /// The profile-1 forward check for the packet topic (AM36 item 4, gov5's
+    /// packet validator): a packet that does not decode, whose header does
+    /// not decode or does not hash to its block hash is rejected; one
+    /// outside `[head - window, head + 2]` of the committed head is ignored;
+    /// the rest is accepted. Install it with
+    /// [`n42_h2_net::MobilePacketGate::install`].
+    pub fn packet_gossip_check(&self) -> n42_h2_net::MobilePacketCheck {
+        let packets = self.packets.clone();
+        let head = self.head.clone();
+        Arc::new(move |data: &[u8]| packet_verdict(&packets, head.head().map(|(n, _)| n), data))
     }
 
     /// A committed block: the head for `/latest`, the lookup for receipts,
@@ -309,6 +322,17 @@ pub fn write_snapshot(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// The verdict on one gossiped packet against the head `at`.
+fn packet_verdict(packets: &PacketCache, at: Option<u64>, data: &[u8]) -> n42_h2_net::GossipVerdict {
+    match n42_mobileverify::packet::validate_packet_bytes(data) {
+        Err(err) => n42_h2_net::GossipVerdict::Reject(err.to_string()),
+        Ok((_, number)) if !packets.accepts_peer_number(number, at) => {
+            n42_h2_net::GossipVerdict::Ignore("packet outside the head window")
+        }
+        Ok(_) => n42_h2_net::GossipVerdict::Accept,
+    }
+}
+
 /// Validates what the two topics deliver: a packet against the window around
 /// the committed head (gov5 `packetservice.go`), a registration by its proof
 /// of possession (`replication.go`).
@@ -351,6 +375,37 @@ async fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn packet(number: u64, lie: bool) -> Vec<u8> {
+        use n42_mobileverify::packet::header::{marshal_header, EMPTY_UNCLE_HASH};
+        let header = n42_h2_consensus::N42Header::from(alloy_consensus::Header {
+            number,
+            ommers_hash: EMPTY_UNCLE_HASH,
+            ..Default::default()
+        });
+        n42_mobileverify::StreamPacket {
+            block_hash: if lie { B256::repeat_byte(0xEE) } else { header.hash_slow() },
+            header: Bytes::from(marshal_header(&header)),
+            read_log: Bytes::from_static(&[0, 0, 0, 0]),
+            ..Default::default()
+        }
+        .encode()
+    }
+
+    /// AM36 item 4, gov5's packet validator: a packet that does not decode or
+    /// self-certify is rejected, one outside the head window ignored.
+    #[test]
+    fn a_gossiped_packet_is_judged_before_it_is_forwarded() {
+        use n42_h2_net::GossipVerdict;
+        let packets = PacketCache::new(16);
+        assert_eq!(packet_verdict(&packets, Some(100), &packet(100, false)), GossipVerdict::Accept);
+        assert_eq!(packet_verdict(&packets, Some(100), &packet(102, false)), GossipVerdict::Accept);
+        assert_eq!(packet_verdict(&packets, None, &packet(7, false)), GossipVerdict::Accept, "no head yet");
+        assert!(matches!(packet_verdict(&packets, Some(100), &packet(103, false)), GossipVerdict::Ignore(_)));
+        assert!(matches!(packet_verdict(&packets, Some(100), &packet(80, false)), GossipVerdict::Ignore(_)));
+        assert!(matches!(packet_verdict(&packets, Some(100), &packet(100, true)), GossipVerdict::Reject(_)));
+        assert!(matches!(packet_verdict(&packets, Some(100), b"junk"), GossipVerdict::Reject(_)));
+    }
 
     /// AM21/AM23: without a mobileverify service today's rules name no root
     /// (the build then fails on a MobileAnchor chain); profile 1 repeats the

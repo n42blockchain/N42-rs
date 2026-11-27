@@ -412,6 +412,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let validator_count = validators.len();
 
     let mut config = TransportConfig::new(identity).with_mobileverify(mobile_http.is_some());
+    // Profile 1 (AM36): every gossip message is validated before it is
+    // forwarded; the mobile packet check is installed once the surface runs.
+    let mobile_packet_gate = n42_h2_net::MobilePacketGate::new();
+    if header_rules.is_profile1() {
+        let header_profile =
+            if gov5_profile { n42_h2_net::HeaderProfile::Gov5H2 } else { n42_h2_net::HeaderProfile::Ethereum };
+        let mut gossip = n42_h2_net::Profile1Gossip::new(validator_count, header_profile);
+        gossip.mobile_packets = mobile_packet_gate.clone();
+        config = config.with_profile1(gossip);
+        println!("gossip       : validated before forwarding (profile 1, AM36)");
+    }
     config.idle_connection_timeout = Duration::from_secs(600);
     for addr in &peers {
         config = config.with_peer(addr.parse()?);
@@ -494,6 +505,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 self_reporter: entry.address.0.0,
             })
             .await?;
+            mobile_packet_gate.install(surface.packet_gossip_check());
             println!("mobileverify : http://{http}/mobileverify (epoch {mobile_collect_window_sec} s, packet window {mobile_packet_window})");
             (Some(Arc::new(surface)), Some(channels))
         } else {

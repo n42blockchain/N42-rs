@@ -44,6 +44,18 @@
 > (2) Host — a full `/data` killed two members mid-round (round scripts now refuse under 50 GB free).
 > (3) gov5's consensus topic once used a 32-message queue (fixed, now warns on drops) — any client's subscriber
 > queue must hold a full vote burst at n = 100.
+>
+> ## v1.2 state (2026-11-27 review)
+>
+> | Rule | gov5 | n42-rs | n42-26 |
+> | --- | --- | --- | --- |
+> | AM33 timeout backoff | main | main | main b64f650 |
+> | AM34 late equivocation (item 6) | main | main | main e5932de |
+> | AM34 items 3-5, vectors V2/V7/V9 | main | main | open |
+> | AM35 durable commit vote (PROPOSED) | main 08ecf671 | branch, 5 commits | uncommitted WIP |
+>
+> AM35's gate (timed whole-set SIGKILL, 10 kills) has no kill tool yet. Order and owners:
+> `docs/PLAN_P1_REMAINING_2026_11.md` items E5-E9 and F1-F3.
 
 
 **2026-11-24 21:15 EST — gate 2 PASSED.** Mixed round 3 (gov5 v0/v1 + n42-rs v2/v3, genesis-mixed-3 0xe6b358e8…): heights 0..227 byte-equal on all four, each validator led 57-58 blocks, 0 refusals, timeouts only at startup. Round 2 (12:00) was void and found the n42-rs justify-extension defect (fixed, main d8185220d) and a gov5 rebuild-on-genesis defect (fixed, gov5 1d72bf1b). Open from round 3: A17 timestamp stamping point (gov5 stamps at build start, n42-rs at publication), proposal AM26.
@@ -71,6 +83,32 @@ as quoted in the standard).
 > main (17b55fd0a) carries it with gov5's regenerated V1/V3/V4/V6. Every gov5 and n42-26 `vec` cell below was
 > earned on the pre-AM24 vectors (genesis `0x6f733745…7e4f`) and holds for AM24 only once that client posts a
 > pass on the regenerated ones (gov5: its PR #6 on `feat/profile1`; n42-26: its `feat/profile1-genesis`).
+
+## Gate 5e: AM33 rerun of gate 5d (2026-11-27 01:35-02:05 EST) -- PASSED
+
+Same 100-validator mix and schedule as 5d (gov5 0..29 on 2d2c9690 with AM33 and the restart fix, n42-rs
+30..98 on main d8a5e54d2 over 4 execution layers, n42-26 99 on b64f650 with AM33): 33 members absent at once
+(gov5 10..19, n42-rs 40..62) from T0+8m to T0+18m, leaving exactly q = 67. Headers 0..175 equal on all 8
+dumps (4 n42-rs layers, gov5 0/20/29, n42-26 v99), 100 distinct proposers, 0 refusals, every absent member
+back and voting after its restart. Block intervals: 172 x 8 s, one 32 s (one absent leader at the restart
+edge, 24 + 8), one 48 s (start-up) and one **224 s** for six consecutive absent leaders (views 57..62: TCs
+24, 24, 24, 48, 48, 48 s = 216 s plus the 8 s slot), exactly AM33's sequence with g = 3; 5d paid 464 s for
+the same six. Closes plan item E3.
+
+## M90b: 90-minute steady-load memory round (2026-11-26 22:50 - 2026-11-27 00:26 EST)
+
+Gate-6 set at ~150 tx/s for 92 min (gov5 main ef2f6bb0, n42-26 17e3a7c = PR #51, n42-rs main d8a5e54d2).
+Headers 0..701 equal on all 7 dumps, gov5 refusals 0, n42-rs 1 timeout and 0 refusals, 808k tx with 0
+errors. Memory (RSS):
+
+| Client | Start | End | Rate at the end | Reading |
+| --- | --- | --- | --- | --- |
+| n42-rs v2 EL / validator | 181 / 41 MiB | 682 / 51 MiB | EL ~2.5 MiB/min, slowing; validator flat | not flat within 92 min; RocksDB memtable history (B6) is the known candidate |
+| n42-26 v3 | 337 MiB | 1,804 MiB | ~3.5 MiB/min (jemalloc) | PR #51 caps hold but are not reached (~2,900 blocks needed); RocksDB memtable 238 -> 375 MiB |
+| gov5 v0 / v1 / verifier | 557 / 408 / 537 MiB (23:02) | 1,261 / 1,652 / 1,139 MiB | rising | txpool leak (included txs never staled in the priced heaps), fixed in gov5 main 08ecf671 |
+
+Next: one round of at least 6.5 h (so n42-26's caps engage) with gov5 08ecf671 and the n42-rs memtable
+knob if its legs pass (plan B5, B6, B7).
 
 ## M3d: mixed equivocation round (2026-11-26 22:00-22:40 EST) -- PASSED
 

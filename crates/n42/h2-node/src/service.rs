@@ -259,6 +259,9 @@ pub enum ServiceEvent {
 /// together.
 pub struct H2Service<E> {
     transport: H2V4Transport,
+    /// Profile 1 (AM36 item 6): the transport's view of this node's latest
+    /// commit QC, raised every step so a stale message is not forwarded.
+    commit_view_hint: Option<n42_h2_net::CommitViewHint>,
     engine: ConsensusEngine,
     driver: ExecutionDriver<E>,
     /// Our own blocks as the execution layer takes them, from the driver's
@@ -1997,7 +2000,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 .map(|decoded| decoded.execution_data())
                 .map_err(|err| err.to_string())
         }));
+        let commit_view_hint = transport.commit_view_hint();
         Self {
+            commit_view_hint,
             transport,
             engine,
             own_imports: driver.take_own_imports(),
@@ -2860,6 +2865,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.driver.cache_payload(block_hash, payload);
     }
 
+    /// Profile 1: tells the transport the latest commit QC's view (AM36
+    /// item 6). One relaxed atomic store; nothing without profile 1.
+    fn raise_commit_view_hint(&self) {
+        if let Some(hint) = &self.commit_view_hint {
+            hint.raise(self.engine.last_committed_qc().view);
+        }
+    }
+
     /// Runs one iteration: waits for the next thing to happen, handles it, and
     /// drains everything it caused.
     ///
@@ -2898,6 +2911,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             still_advancing = remaining == 0;
         }
+        self.raise_commit_view_hint();
 
         // A range reply half imported is finished the same way: the swarm
         // gets one poll and the step returns to import the next batch.

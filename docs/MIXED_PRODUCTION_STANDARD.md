@@ -1038,7 +1038,7 @@ timeouts sum to 456 s; the recorded 464 s gap includes the block interval.
    views. Each is verified only when it conflicts with a recorded one. Found by the n42-rs injector; gov5,
    n42-26 and n42-rs all had the gap for commit votes.
 
-## Amendment AM35 (2026-11-27, PROPOSED by n42-rs; gov5 supports; n42-26 checking): a commit vote means a durable block
+## Amendment AM35 (2026-11-27, ADOPTED by the owner; proposed by n42-rs, reviewed by gov5 and n42-26): a commit vote means a durable block
 
 Found by plan item E4 (whole-set restart). An all-Rust set killed at once (SIGKILL of every validator and
 execution layer) halted for good: the set had committed block 35, every execution layer had persisted only
@@ -1049,17 +1049,83 @@ has the same window for one block (its validators are told "executed" before the
 n42-26 persists every block immediately but asynchronously after the forkchoice update.
 
 Rule (profile 1):
-1. A member sends its commit (R2) vote for a block only after that block, and every ancestor, is durably
-   written by its execution layer (a crash at any instant after the vote leaves the block readable on
-   restart). The R1 vote may still follow execution, or the header rules, as today.
-2. Consequently a commit QC certifies a block held durably by at least q members, so any q of them
-   restarting together can serve it.
+1. A member sends its commit (R2) vote for block B only after (a) its lock (B's PrepareQC) and (b) B's block
+   data are durable: a crash at any instant after the vote leaves both readable on restart. Block data is
+   durable when either its execution layer has committed B with a full sync (static files, RocksDB and
+   MDBX each synced; SafeNoSync / UtterlyNoSync modes do not count), or the node has appended B's raw block
+   to its own journal and synced it with the lock write, and on restart re-imports every journalled block
+   above the execution layer's head before it serves, votes or builds. B's ancestors must be durable the
+   same way, checked by hash. The R1 vote may still follow execution, or the header rules, as today.
+2. Consequently every lock and commit QC that f+1 or more members hold names a block those members can
+   serve after any of them restart together; a whole-set restart never halts on a missing body.
 3. Finality reported to users (RPC `finalized`) is unchanged: certified and persisted locally.
+4. The leader's own block is covered the same way: its own commit vote also waits for its durable write.
+5. An implementation must not offer a profile-1 mode that defers or skips the durable write (gov5 refuses
+   `N42_MDBX_SYNC=safe-nosync` on profile-1 chains; n42-rs refuses persistence-threshold overrides there).
+6. A persisted lock names a block the member holds durably, except the lock written with a commit vote
+   (whose block item 1 makes durable). A snapshot or R1 journal that would persist a lock on a block not yet
+   durable keeps the last qualifying lock instead, never below the committed QC; the in-memory lock still
+   governs votes. Recovery matches the locked and committed blocks against the applied chain by hash, not
+   by height (found in gov5 by applying n42-26's review, 2026-11-27).
 
-Gate: a whole-set SIGKILL of a mixed set at an arbitrary instant under load recovers without intervention,
-heads equal, repeated at least five times with the kill timed against the commit (the gov5 window is about
-0.2 s, so random timing alone does not prove it).
+Gate: a whole-set SIGKILL of a mixed set under load recovers without intervention, heads equal, at least
+five times with the kill timed right after a commit and five times timed between a PrepareQC and its commit
+QC (the windows are 0.02-0.5 s, so random timing alone does not prove it).
 
-Clients: n42-rs gates the commit vote on its persistence poller (`n42Engine_persistedBlock`) and persists
-every block on profile 1 (threshold 0); gov5 gates the commit vote on its post-persist import notice;
-n42-26 gates it on the completed save. Cost: one durable write on the commit-vote path per block.
+Clients: all three had the hole (n42-rs up to 8 blocks; gov5 and n42-26 about one block: n42-26's R2 is
+released on new_payload before any forkchoice update, gov5's on its executed hook before the MDBX write).
+To be implemented: gov5 on its post-persist import notice (branch feat/p1-am35-durable-commit-vote); n42-26
+with a consensus-dir block journal synced with the lock (option A); n42-rs on branch
+fix/p1-durable-commit-vote. Cost: one durable write on the commit-vote path per block (a journal append
+is about 1-5 ms; a full EL commit 15 ms empty to 0.5 s for a full block).
+
+## Amendment AM36 (2026-11-27, PROPOSED by n42-rs; raised by n42-26's F1 work; gov5 and n42-26 reviewed): validate, then forward
+
+Survey (code, 2026-11-27): n42-rs forwards a gossip message only after it decodes as its topic's type
+(`validate_messages`, h2-net `transport.rs`; it does not verify BLS before forwarding, and accepts the
+mobileverify topics without decoding); gov5 validates the sync topics (blocks, transactions) before
+forwarding but registers no validator on the HotStuff, H2-v4 Decide and mobileverify topics; n42-26 forwards
+everything before validation.
+
+Rule (profile 1, every G2 topic):
+1. A member forwards a gossip message only after it decodes as the type its topic carries, with every field
+   in range (AM34 item 3's view bound included). A message that fails is rejected (the peer is penalised).
+2. Verifying signatures (BLS) before forwarding is allowed, not required: it adds latency to every relay
+   hop on the vote path. A member that verifies before forwarding hands the verified message to its
+   handler so nothing is verified twice.
+3. A well-formed message for a view the member has already left, or a duplicate, is not forwarded and not
+   penalised; the member still processes it locally where AM34 item 6 requires (late votes and proposals
+   within the retention window). Note: gossipsub's "Ignore" verdict also withholds local delivery, so an
+   implementation hands the stale message to its late-message store before returning Ignore (gov5's
+   review, 2026-11-27).
+4. The mobileverify topics decode as their packet / registration types under the same rule once a member
+   runs the mobileverify service (I1/I2).
+
+AM36 precisions (2026-11-27, after n42-26's implementation review, PR #58):
+5. "Decodes with fields in range" is stateless only, per topic. Block: snappy length matches, size at most
+   the block byte limit, RLP decodes. HotStuff and H2-v4: the message decodes, the chain identity matches,
+   the message view and every nested QC/TC view differ from 2^64-1, a proposal's justify QC view is below the
+   proposal's view, a Decide's commit QC view equals its view, signer bitmaps have the committee's byte
+   length format. `transaction_v2`: every entry decodes. Checks that need state (signer index below the
+   committee size of that view, header view and slot, BLS) belong to the handler and may run before
+   forwarding only under item 2.
+6. "A view the member has already left" means a view strictly below the view of the member's latest commit
+   QC; the committed view itself is not stale (a member one view behind still needs its Decide and votes).
+   Messages for future views are accepted and forwarded with no cap at the network layer; the handler
+   buffers them as today.
+7. Topics without views (block, `transaction_v2`): no stale rule; a well-formed message is accepted, and
+   duplicates are dropped by the gossip message id.
+8. A `transaction_v2` batch with bytes that do not decode as a transaction is rejected; a batch whose entries
+   decode but name a type outside the chain's profile-1 set (legacy 0x00, 2930 0x01, 1559 0x02, 7702 0x04;
+   0x50 is not in profile 1, A11/C4) is ignored, not rejected, so a client that knows one more type is not penalised.
+   An entry whose leading type byte is an EIP-2718 type (0x00..0x7f) that this client cannot decode at all
+   (for example 0x05) counts as "outside the set": ignored. Rejected are only entries that are not a valid
+   legacy RLP list or typed envelope (a truncated or malformed byte string, or a known type whose payload
+   does not decode).
+9. All three clients implement AM36: n42-26 PR #58 (13773ef), gov5 fix/p1-validate-then-forward, n42-rs
+   (stale-view check and mobileverify decode still to add).
+10. Signer bitmaps (QC, TC, every nested certificate): a 2-byte little-endian count n followed by ceil(n/8)
+    bytes, bit i = signer i (LSB first within a byte), where n is the size of the validator set of the
+    certificate's view (today the fixed genesis set, AM5; the view's set once E2 lands). A non-genesis
+    certificate whose n differs from that set size is rejected; so is an index outside the set. n42-rs
+    emits exactly this (h2-consensus `wire_bridge.rs` `encode_bitmap`, sized by the collector's set size).

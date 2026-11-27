@@ -96,7 +96,13 @@ impl ConsensusEngine {
                     return Some(ConsensusMessage::Vote(vote));
                 }
                 if vote.view < view {
-                    self.park_vote(vote, false);
+                    // The second of a conflicting pair is settled (and
+                    // verified) here; anything else waits for the batch.
+                    match self.late_vote_conflict(&vote) {
+                        Ok(true) => {}
+                        Ok(false) => self.park_vote(vote, false),
+                        Err(err) => tracing::debug!(target: "n42::cl::voting", %err, "late vote evidence not emitted"),
+                    }
                     return None;
                 }
                 // Followers drop votes unverified, as `process_vote` does.
@@ -385,7 +391,9 @@ impl ConsensusEngine {
         // cannot keep a genuine later vote out of the progress ledger.
         if parked.iter().filter(|p| p.vote.voter == vote.voter).count() >= PARKED_PER_VALIDATOR {
             if vote.view < current {
-                self.note_late_vote(&vote);
+                if let Err(err) = self.note_late_vote(&vote) {
+                    tracing::debug!(target: "n42::cl::voting", %err, "late vote evidence not emitted");
+                }
             } else if let Err(err) = self.process_vote(vote) {
                 tracing::debug!(target: "n42::cl::voting", %err, "parked vote overflow refused");
             }

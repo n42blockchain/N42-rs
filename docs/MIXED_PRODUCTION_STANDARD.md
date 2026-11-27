@@ -1037,3 +1037,29 @@ timeouts sum to 456 s; the recorded 464 s gap includes the block interval.
    the R1 votes and commit votes of views it led, and every node keeps the proposals, for at least the last 3
    views. Each is verified only when it conflicts with a recorded one. Found by the n42-rs injector; gov5,
    n42-26 and n42-rs all had the gap for commit votes.
+
+## Amendment AM35 (2026-11-27, PROPOSED by n42-rs; gov5 supports; n42-26 checking): a commit vote means a durable block
+
+Found by plan item E4 (whole-set restart). An all-Rust set killed at once (SIGKILL of every validator and
+execution layer) halted for good: the set had committed block 35, every execution layer had persisted only
+28 (n42-rs kept up to 8 blocks in memory), so blocks 29..35 carried a commit QC and existed nowhere; every
+member's highest QC named block 35 and nobody could serve it. The same kill with
+`--engine.persistence-threshold 0` recovered at once (heights 20 -> 42 in three minutes, heads equal). gov5
+has the same window for one block (its validators are told "executed" before the block's MDBX write);
+n42-26 persists every block immediately but asynchronously after the forkchoice update.
+
+Rule (profile 1):
+1. A member sends its commit (R2) vote for a block only after that block, and every ancestor, is durably
+   written by its execution layer (a crash at any instant after the vote leaves the block readable on
+   restart). The R1 vote may still follow execution, or the header rules, as today.
+2. Consequently a commit QC certifies a block held durably by at least q members, so any q of them
+   restarting together can serve it.
+3. Finality reported to users (RPC `finalized`) is unchanged: certified and persisted locally.
+
+Gate: a whole-set SIGKILL of a mixed set at an arbitrary instant under load recovers without intervention,
+heads equal, repeated at least five times with the kill timed against the commit (the gov5 window is about
+0.2 s, so random timing alone does not prove it).
+
+Clients: n42-rs gates the commit vote on its persistence poller (`n42Engine_persistedBlock`) and persists
+every block on profile 1 (threshold 0); gov5 gates the commit vote on its post-persist import notice;
+n42-26 gates it on the completed save. Cost: one durable write on the commit-vote path per block.

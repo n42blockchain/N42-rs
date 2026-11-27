@@ -1022,6 +1022,13 @@ timeouts sum to 456 s; the recorded 464 s gap includes the block interval.
    - A topic registered without a scoring branch (gov5's `zk_proof`) must not be advertised. gov5 to drop it
      or score it.
    - Peer scoring off when discovery is off is gov5 behaviour, recorded in V9. Scoring stays a local choice
+   The mobileverify cohort topics (`mobileverify_cohort_{index,reveal,cert}`) are not G2 topics either: profile 1
+   does not subscribe to them, even with a cohort mode switched on (gov5 to drop; a cohort mode for profile 1 would
+   be a new amendment with its own vectors).
      that is not part of the wire contract.
 5. **Receipts root (V2).** A plain value transfer's receipt carries the EIP-7708 transfer log from
    `0xff…fe` on the forks where EIP-7708 is active. Every client's receipts root includes it; V2 pins the bytes.
+6. **Late messages (E15).** A conflicting pair split across the view boundary must still be proven. A leader keeps
+   the R1 votes and commit votes of views it led, and every node keeps the proposals, for at least the last 3
+   views. Each is verified only when it conflicts with a recorded one. Found by the n42-rs injector; gov5,
+   n42-26 and n42-rs all had the gap for commit votes.

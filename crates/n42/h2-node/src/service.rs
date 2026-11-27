@@ -7551,7 +7551,6 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// persisted height is durable there; any other one not journalled yet
     /// is journalled with the block, ancestors first. A body or header not
     /// here yet leaves the block pending, tried again on the next drain.
-
     async fn make_durable(&mut self, block_hash: B256) {
         /// The most blocks one request journals (the block and the
         /// ancestors above the persisted height that are not journalled).

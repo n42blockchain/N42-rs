@@ -11,6 +11,8 @@
 #   PACKETD=<binary> with MOBILEVERIFY=1: gov5's cmd/mobileverify-packetd beside Rust validator 0
 #     (follows the EL on 18545 -- debug_getRawBlock, hence --http.api ...,debug -- and PUTs each
 #     block's StreamPacket to 127.0.0.1:21010, which publishes it to the fleet)
+#   EQUIVOCATE_VALIDATOR=<i> EQUIVOCATE=<kind>:<view|every-n> TEST ONLY: Rust member i signs a
+#     conflicting twin of its vote / commit_vote / proposal (docs/P1_EQUIVOCATION_INJECTOR.md)
 #   PACKETD_WS=1 with PACKETD: the main EL also serves WebSocket on 18546 (eth) and packetd
 #     subscribes to its newHeads there (-ws), the 250 ms head poll kept as fallback
 #
@@ -33,6 +35,9 @@ GENESIS=${DEVNET_GENESIS:-$REPO/crates/chainspec/res/genesis/n42_devnet.json}
 BIN=${DEVNET_BIN:-$REPO/target/debug}
 # MOBILEVERIFY=1: the phone surface on every member (validator i: port 2101<i>).
 mv_flag() { [ "${MOBILEVERIFY:-}" = 1 ] && echo "--mobileverify.http 127.0.0.1:2101$1"; }
+# The test-only equivocation injector: both its switches, for one member only.
+equiv_env() { [ -n "${EQUIVOCATE:-}" ] && [ "${EQUIVOCATE_VALIDATOR:-}" = "$1" ] && echo "N42_TEST_EQUIVOCATE=$EQUIVOCATE"; }
+equiv_flag() { [ -n "${EQUIVOCATE:-}" ] && [ "${EQUIVOCATE_VALIDATOR:-}" = "$1" ] && echo "--test-equivocate"; }
 GOV5_MV=; [ "${MOBILEVERIFY:-}" = 1 ] && GOV5_MV="--mobileverify --mobileverify.http 127.0.0.1:21020"
 # DEVNET_PAYLOAD_SERVE=1: each execution layer serves the raw payload channel
 # (N42_PAYLOAD_SERVE; main 127.0.0.1:18571, the late/absent member's 18581),
@@ -120,9 +125,9 @@ for i in $(seq 0 $LAST); do
         > $F/v$i-$TAG.log 2>&1) > /dev/null 2>&1 &
     continue
   fi
-  RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
+  env $(equiv_env $i) RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
     --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18551 --el-rpc http://127.0.0.1:18545 --jwt $F/jwt.hex \
-    --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} $(mv_flag $i) \
+    --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} $(mv_flag $i) $(equiv_flag $i) \
     > $F/v$i-$TAG.log 2>&1 &
   if [ $i = 0 ]; then
     for _ in $(seq 1 30); do grep -aq "node peer id" $F/v0-$TAG.log 2>/dev/null && break; sleep 1; done

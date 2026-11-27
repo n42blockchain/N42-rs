@@ -124,6 +124,50 @@ pub(super) fn check_equivocation(
     }
 }
 
+/// How many views back a late commit vote is still checked for a conflict.
+pub(super) const LATE_COMMIT_WINDOW: u64 = 8;
+
+/// Round-2 evidence across the view boundary. A leader advances the view the
+/// moment its CommitQC forms, so a validator's commit vote outside the quorum
+/// (or the second of a conflicting pair) arrives in a closed view and used to
+/// be dropped unseen. Kept here for [`LATE_COMMIT_WINDOW`] views: the verified
+/// tracker of each closed view this node collected in, and the late commit
+/// votes as they came, unverified (a signature is checked only when two of one
+/// voter conflict, so honest late votes cost a map insert).
+#[derive(Debug, Default)]
+pub(super) struct LateCommitVotes {
+    closed: std::collections::VecDeque<(u64, EquivocationTracker)>,
+    late: HashMap<(u64, u32), (B256, BlsSignature)>,
+}
+
+impl LateCommitVotes {
+    /// Keeps `tracker`, the verified commit votes of `view`, now closed.
+    pub(super) fn close_view(&mut self, view: u64, tracker: EquivocationTracker) {
+        if !tracker.is_empty() {
+            self.closed.push_back((view, tracker));
+        }
+        while self.closed.front().is_some_and(|(closed, _)| closed + LATE_COMMIT_WINDOW < view) {
+            self.closed.pop_front();
+        }
+        self.late.retain(|(late, _), _| late + LATE_COMMIT_WINDOW >= view);
+    }
+
+    /// The verified first commit vote of `voter` in closed `view`.
+    pub(super) fn closed(&self, view: u64, voter: u32) -> Option<&(B256, SignedValue)> {
+        self.closed.iter().find(|(closed, _)| *closed == view).and_then(|(_, tracker)| tracker.get(&voter))
+    }
+
+    /// The unverified late commit vote of `voter` in `view`.
+    pub(super) fn late(&self, view: u64, voter: u32) -> Option<&(B256, BlsSignature)> {
+        self.late.get(&(view, voter))
+    }
+
+    /// Keeps a late commit vote, unverified, as `voter`'s first in `view`.
+    pub(super) fn keep_late(&mut self, view: u64, voter: u32, block_hash: B256, signature: BlsSignature) {
+        self.late.insert((view, voter), (block_hash, signature));
+    }
+}
+
 #[cfg(test)]
 mod am28_kind_tests {
     use super::EquivocationKind;

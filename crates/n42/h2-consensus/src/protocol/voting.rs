@@ -64,6 +64,50 @@ impl ConsensusEngine {
         }
     }
 
+    /// A commit vote of a closed view this node led: checked against the
+    /// verified commit vote of the same voter kept from that view, or the
+    /// late one kept before it (E15). Signatures are verified only when two
+    /// conflict; an honest late commit vote is kept and nothing else.
+    pub(super) fn note_late_commit_vote(&mut self, cv: &CommitVote) -> ConsensusResult<()> {
+        let view = self.round_state.current_view();
+        if !(cv.view < view
+            && view - cv.view <= super::equivocation::LATE_COMMIT_WINDOW
+            && self.is_leader_for_view(cv.view))
+        {
+            return Ok(());
+        }
+        let Ok(pk) = self.validator_set_for_view(cv.view).get_public_key(cv.voter).cloned() else { return Ok(()) };
+        let profile = self.signing_profile;
+        let first = match self.late_commit_votes.closed(cv.view, cv.voter) {
+            Some((hash, _)) if *hash == cv.block_hash => return Ok(()),
+            Some((_, signed)) => signed.clone(),
+            None => match self.late_commit_votes.late(cv.view, cv.voter).cloned() {
+                None => {
+                    self.late_commit_votes.keep_late(cv.view, cv.voter, cv.block_hash, cv.signature.clone());
+                    return Ok(());
+                }
+                Some((hash, _)) if hash == cv.block_hash => return Ok(()),
+                Some((hash, signature)) => {
+                    let message = profile.commit_message(cv.view, hash, self.cached_changes_hash(&hash));
+                    if !profile.verify_single(&pk, &message, &signature) {
+                        // A forged first: the slot goes to this one.
+                        self.late_commit_votes.keep_late(cv.view, cv.voter, cv.block_hash, cv.signature.clone());
+                        return Ok(());
+                    }
+                    SignedValue::new(hash, message, &signature)
+                }
+            },
+        };
+        let message = profile.commit_message(cv.view, cv.block_hash, self.cached_changes_hash(&cv.block_hash));
+        if !profile.verify_single(&pk, &message, &cv.signature) {
+            self.unauthenticated = Some((cv.view, "late commit vote signature"));
+            return Ok(());
+        }
+        let second = SignedValue::new(cv.block_hash, message, &cv.signature);
+        let hashes = (first.block_hash, second.block_hash);
+        self.emit_equivocation(EquivocationKind::CommitVote, cv.view, cv.voter, (first, second), hashes)
+    }
+
     /// Processes a Round 1 (Prepare) vote from a validator.
     pub(super) fn process_vote(&mut self, vote: Vote) -> ConsensusResult<()> {
         self.process_vote_inner(vote, false)

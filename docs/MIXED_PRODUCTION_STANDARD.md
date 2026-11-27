@@ -1004,6 +1004,11 @@ SYNC §10.2's timeout becomes `min(base_eff · 2^floor(c / g), max)` with `g = m
 A TC never resets it, including a TC embedded in SyncInfo.
 Vectors: `qs-scratch/profile1/vectors/AM33/timeout_backoff.json` (gov5, 2026-11-27). Design and review:
 `docs/AM33_DRAFT_CONSECUTIVE_ABSENT_LEADERS.md`.
+
+AM33 clarifications (2026-11-27; n42-rs and n42-26 checked in code, gov5 to confirm): (a) after a restart `c`
+is restored from the snapshot, the first view timer is `base_eff` and every later arm uses `timeout(c)`;
+(b) a weak-sync jump (the f+1 future-timeout path) does not reset `c`, and the member times out the target
+view on arrival, which counts one timeout (`c += 1`).
 Gate (v1.2): a mixed rerun of 5d shows six consecutive absent leaders cost ≤ 216 s at base 24 s. Today 5d's
 timeouts sum to 456 s; the recorded 464 s gap includes the block interval.
 

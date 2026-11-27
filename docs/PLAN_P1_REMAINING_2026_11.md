@@ -19,13 +19,13 @@ Releases at the time of writing: gov5 main 5464ee6e, n42-rs main e9f15edc4, n42-
 
 | # | Item | Who | Done when | State |
 | --- | --- | --- | --- | --- |
-| B1 | n42-rs catch-up bound by the network, not execution | n42-rs | empty-chain pull at or above link rate on a 100 Mbit/s budget (today ~47 Mbit/s); the floor is one QMDB root per block (~0.12 ms) | open: needs a design for a per-run root that keeps per-block versions for persistence, history reads and the engine tree (`docs/P1_CATCHUP_PERF.md` step 7) |
-| B2 | Batch import for blocks over 16 KiB of transactions | n42-rs | range import re-measured against the engine path on heavy blocks since the step-3 root worker; cap raised if it wins (at most ~14 % on 4b-R's pull) | open |
-| B3 | Estimate and, if feasible, measure a chain-94-sized catch-up | n42-rs | blocks/s, MB/s, peak RSS and disk on a long heavy history (S1-like or the `gov5-work/p1scale` state) with current main | open |
-| B4 | gov5 catch-up speed (S1: 25.7 blk/s) and catch-up peak (4 GB) | gov5 | gov5's own measurement against S1 | gov5 working |
+| B1 | n42-rs catch-up bound by the network, not execution | n42-rs | empty-chain pull at or above link rate on a 100 Mbit/s budget (today ~47 Mbit/s); the floor is one QMDB root per block (~0.12 ms) | in progress: design agent (branch design/p1-run-root, doc docs/P1_RUN_ROOT_DESIGN.md) |
+| B2 | Batch import for blocks over 16 KiB of transactions | n42-rs | range import re-measured against the engine path on heavy blocks since the step-3 root worker; cap raised if it wins (at most ~14 % on 4b-R's pull) | in progress (catch-up agent, perf/p1-catchup) |
+| B3 | Estimate and, if feasible, measure a chain-94-sized catch-up | n42-rs | blocks/s, MB/s, peak RSS and disk on a long heavy history (S1-like or the `gov5-work/p1scale` state) with current main | in progress (catch-up agent, after B2) |
+| B4 | gov5 catch-up speed (S1: 25.7 blk/s) and catch-up peak (4 GB) | gov5 | gov5's own measurement against S1 | gov5 agent on perf/p1-catchup; first numbers 2026-11-27 |
 | B5 | n42-26 steady-load memory (1.1 GB at 40 min, rising slowly) and catch-up | n42-26 | plateau shown over >= 90 min at 150 tx/s | n42-26 to schedule |
-| B6 | n42-rs EL peak during heavy catch-up: RocksDB memtables (~480 MB) | n42-rs | either a smaller budget that does not stall (upstream write stall + pinned memtables; `N42_ROCKSDB_WRITE_BUFFER_STALL`) or a documented decision to keep 4 GiB | open, low priority |
-| B7 | n42-rs steady-state RSS re-measured with the RPC cache cap and QMDB entry file (memory step 2) | n42-rs | one >= 60 min 150 tx/s leg | partly: 4b-R2 read ~520 MiB at 28 min; a longer leg pending |
+| B6 | n42-rs EL peak during heavy catch-up: RocksDB memtables (~480 MB) | n42-rs | either a smaller budget that does not stall (upstream write stall + pinned memtables; `N42_ROCKSDB_WRITE_BUFFER_STALL`) or a documented decision to keep 4 GiB | in progress (memory agent, perf/p1-memory-2, after B7) |
+| B7 | n42-rs steady-state RSS re-measured with the RPC cache cap and QMDB entry file (memory step 2) | n42-rs | one >= 60 min 150 tx/s leg | in progress (memory agent, perf/p1-memory-2); 4b-R2 read ~520 MiB at 28 min |
 
 ## C. Explorer (testnet, remote machine)
 
@@ -39,15 +39,15 @@ Releases at the time of writing: gov5 main 5464ee6e, n42-rs main e9f15edc4, n42-
 | # | Item | Who | State |
 | --- | --- | --- | --- |
 | D1 | Peer-to-peer state sync (`qmdb_*`, `code_by_hash`) | all three | feasibility notes exist (`docs/P1_STATESYNC_FEASIBILITY_n42rs.md`, gov5's, n42-26's HANDOFF post) |
-| D2 | Mixed equivocation round | all three | blocked: no client has a double-sign injector; first step is an injector in one client behind a test-only flag |
+| D2 | Mixed equivocation round | all three | in progress: n42-rs test-only injector (branch feat/p1-equivocation-injector); gov5 agrees one injector is enough |
 
 ## E. Open since v1 (status doc, §7 and risks)
 
 | # | Item | Who | State |
 | --- | --- | --- | --- |
-| E1 | gov5 proposal-equivocation detection (M3d) | gov5 | open |
-| E2 | §7: validator-set changes (E2), B11 follower rule, kept-tail bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a negative leader | all three | open; vectors first (gov5 owns the fixture set) |
-| E3 | Liveness risk: k consecutive absent leaders stall ~24 + 48 + 96·(k−2) s | standard | candidates: cap backoff across consecutive TCs, or a leader order that interleaves operators; needs a spec amendment and vectors |
+| E1 | gov5 proposal-equivocation detection (M3d) | gov5 | DONE in gov5 main since 2026-11-25 (b5cf49a7, 5eb5aba9); only the mixed M3d round remains, after D2 |
+| E2 | §7: validator-set changes (E2), B11 follower rule, kept-tail bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a negative leader | all three | vectors V2, V7, V9 and the V5 additions (B4 equal timestamps, B13 state gas, AM25 requests) from gov5 by 2026-11-27 18:00 EST; then all three run them |
+| E3 | Liveness risk: k consecutive absent leaders stall ~24 + 48 + 96·(k−2) s | standard | AM33 draft circulated (docs/AM33_DRAFT_CONSECUTIVE_ABSENT_LEADERS.md: double once per f+1 TCs); awaiting gov5 / n42-26 review |
 
 ## Closed while writing this list
 

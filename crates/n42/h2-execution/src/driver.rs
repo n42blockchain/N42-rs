@@ -1271,6 +1271,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.settlement.set_persisted(source);
     }
 
+    /// This node's last persisted block as the installed source reads it
+    /// ([`Self::set_persisted_height`]); not reported without one.
+    pub fn persisted_height(&self) -> crate::settlement::PersistedHeight {
+        self.settlement.persisted_height()
+    }
+
     /// A node starting on a fresh chain: genesis is the floor of both tags.
     /// A restarted node leaves this out, so its first forkchoices do not
     /// move the tags its execution layer restored back to genesis.

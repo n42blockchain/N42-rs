@@ -878,6 +878,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
+        // AM35: on profile 1 a commit vote waits for its block's synced copy
+        // in the journal, and a restart re-imports every journalled block the
+        // execution layer lost before this node serves, votes or builds.
+        if vote_rules.profile1 {
+            match &datadir {
+                Some(dir) => {
+                    let path = std::path::Path::new(dir).join(n42_h2_node::block_journal::JOURNAL_DIR);
+                    let journal = n42_h2_node::block_journal::BlockJournal::open(&path)?;
+                    println!(
+                        "block journal: {} ({} block(s) held); a commit vote waits for its block's synced copy (AM35)",
+                        path.display(),
+                        journal.len()
+                    );
+                    service = service.with_block_journal(journal);
+                    let restored = service.restore_block_journal().await?;
+                    if restored > 0 {
+                        println!("block journal: {restored} block(s) the execution layer lost were imported again");
+                    }
+                }
+                None => println!("block journal: none (no --datadir); commit votes are not held for a durable write"),
+            }
+        }
+
         println!("running…\n");
         loop {
             let events = match service.step().await {

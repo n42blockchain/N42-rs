@@ -200,6 +200,11 @@ impl Settlement {
         self.mode = mode;
     }
 
+    /// The persisted height the installed source reads now.
+    pub(crate) fn persisted_height(&self) -> PersistedHeight {
+        self.persisted.as_ref().map_or(PersistedHeight::NotReported, |read| read())
+    }
+
     pub(crate) fn set_persisted(&mut self, source: PersistedSource) {
         self.persisted = Some(source);
     }

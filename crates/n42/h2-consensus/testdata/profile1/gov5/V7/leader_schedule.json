@@ -1577,15 +1577,6 @@
     },
     {
       "source": "edge",
-      "tcView": 18446744073709551615,
-      "tenure": 8,
-      "epochLength": 0,
-      "active": true,
-      "result": 0,
-      "clampedToEpochBoundary": false
-    },
-    {
-      "source": "edge",
       "tcView": 18446744073709551607,
       "tenure": 8,
       "epochLength": 0,

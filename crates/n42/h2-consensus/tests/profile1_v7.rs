@@ -13,10 +13,9 @@
 //! - SYNC §10.4's sequences, AM32's rehearsal and the standard genesis's
 //!   window-holds-a-boundary case, replayed step by step.
 //!
-//! One deliberate local difference: at `tc_view = u64::MAX` gov5's rule wraps
-//! to 0 (the vector's `edge` row, matched by the pure rule); the engine
-//! saturates there and stays at `u64::MAX`, because it never moves its view
-//! backwards. The spec defines no view after the last one.
+//! AM34: `view_after_tc` is defined only below 2^64-1 and a certificate for
+//! that view is invalid (the republished vector dropped its edge row; the
+//! refusal is tested in `protocol::quorum`).
 
 use alloy_primitives::{hex, Address};
 use n42_h2_consensus::{ConsensusEngine, EpochManager, LeaderSelector, ValidatorInfo, ValidatorSet};
@@ -26,7 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 /// SHA-256 of `leader_schedule.json` as gov5 published it.
-const SCHEDULE_SHA256: &str = "c835fa1672382b9e0438cd15e92e1020fda012dd14dad622c939a731c10697e5";
+const SCHEDULE_SHA256: &str = "a08180b1fc9625c0b6cd6128b775e40dcdf04a900b9ba3bf45aa9210340fd445";
 
 fn vector() -> Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/profile1/gov5/V7/leader_schedule.json");
@@ -142,7 +141,7 @@ fn epochs_match_gov5() {
 fn view_after_tc_matches_gov5() {
     let v = vector();
     let rows = v["viewAfterTC"].as_array().expect("viewAfterTC");
-    assert_eq!(rows.len(), 52);
+    assert_eq!(rows.len(), 51);
     for row in rows {
         let (x, tenure, length) = (number(&row["tcView"]), number(&row["tenure"]), number(&row["epochLength"]));
         let active = row["active"].as_bool().expect("bool");
@@ -160,13 +159,8 @@ fn view_after_tc_matches_gov5() {
         // The engine, configured as the row's chain.
         let (mut e, _rx) = engine(4, tenure, length);
         e.set_rotate_on_timeout(active.then_some(0), length);
-        let engine_result = e.view_after_tc(x);
-        if x == u64::MAX {
-            // gov5 wraps to 0; the engine never moves backwards (module doc).
-            assert_eq!((result, engine_result), (0, u64::MAX), "{what}: the documented local difference");
-        } else {
-            assert_eq!(engine_result, result, "{what}: engine");
-        }
+        assert!(x < u64::MAX, "{what}: AM34 leaves the last view undefined");
+        assert_eq!(e.view_after_tc(x), result, "{what}: engine");
     }
 }
 

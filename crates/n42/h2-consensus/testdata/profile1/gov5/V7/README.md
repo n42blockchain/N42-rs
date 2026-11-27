@@ -31,7 +31,7 @@ Each sequence step: `event` (QC / TC / adoptTC / ignoreTC), `view`, `leaderOfVie
 
 ## Notes
 
-- `view_after_tc(2^64 - 1)` is 0 in gov5 (`x + 1` wraps); the spec does not define a view after the last one.
+- AM34: a TC or QC for view `2^64 - 1` is invalid and `view_after_tc` is undefined there, so the set has no row for it (gov5 rejects such certificates; ViewAfterTimeout no longer wraps).
 - The AM32 epoch length (50) is chosen to reproduce the rehearsal's views (any E with a boundary at 101 and none in
   102..103 gives the same steps).
 - Timeouts (how long each TC takes) are in the AM33 vector.

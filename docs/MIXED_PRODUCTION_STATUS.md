@@ -356,3 +356,16 @@ hash 0x3fe4571d…). **Headers 0..623 equal on all 7 dumps, mismatch 0**; 733k t
   (S1 old build ~9 s; within M3's 60 s).
 - n42-26: pre-import votes 272 of 475 follower views (57 %); RSS 1.69 GB at 92 min (same trend as S1).
   gov5: RSS 1.6-1.8 GB on main (512-block cache full); fix/p1-steady-rss plateaus ~650 MB RssAnon (owner merge pending).
+
+### 4b-R2 — re-check on n42-rs main e8db589e5 (2026-11-26 18:28-19:10)
+
+n42-rs main e8db589e5 (memory step 2, byte-budgeted pull, live commit anchors the pulled tail; n42 a6080183…,
+h2_validator 9bef0215…), gov5 22bee6b3, n42-26 6d0ea9b. Genesis gate6/genesis-g4bR2.json (sha256 35e7b1f6…,
+hash 0x3a4c3076…). **Headers 0..296 equal on all 7 dumps, mismatch 0**; 322k tx, 0 errors; no missed slot at the wipe.
+
+- n42-rs v2 under ~150 tx/s (EL / validator MiB): 182/42 at start, 354/50 at 12 min, 447/51 at 24 min,
+  469/51 at 28 min — about 520 MiB in all (P50 on ffe484787: 571 MiB at 30 min).
+- 18:58:01 v2 wiped; fresh pull 1..221 heavy blocks (29.3 MB, 4 requests of ~8 MB under the 32 MiB budget) in
+  1.96 s = 112 blk/s, anchored by n42-26 v3's commit_qc/1; **first vote 18:58:08, 1.5 s after the pull**
+  (4b-R: 28 s). gov5 served 277 blocks / 24.5 MB in one request per node; no refusal, score, rate limit or
+  INVALID caused by v2 on gov5.

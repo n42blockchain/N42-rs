@@ -1268,7 +1268,7 @@ impl TransportCore {
                     profile1.consensus_verdict(&envelope.message),
                     Some(TransportEvent::Envelope { from: message.source, envelope: Box::new(envelope) }),
                 ),
-                Err(err) => (GossipVerdict::Reject(format!("envelope: {err}")), None),
+                Err(err) => (crate::validate::envelope_error_verdict(&err), None),
             }
         } else {
             (GossipVerdict::Ignore("not a topic this node follows"), None)

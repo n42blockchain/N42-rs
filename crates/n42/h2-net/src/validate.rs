@@ -173,6 +173,17 @@ impl Profile1Gossip {
     }
 }
 
+/// The verdict on an H2-v4 payload that did not decode for this chain
+/// (AM36 item 11, gov5's rule): another chain's identity is ignored, since
+/// the v4 topic name carries no chain and an honest member of another chain
+/// may publish on it; anything else is rejected.
+pub fn envelope_error_verdict(err: &n42_h2_wire::h2_v4::H2V4Error) -> GossipVerdict {
+    match err {
+        n42_h2_wire::h2_v4::H2V4Error::ChainIdentityMismatch => GossipVerdict::Ignore("another chain's identity"),
+        err => GossipVerdict::Reject(format!("envelope: {err}")),
+    }
+}
+
 /// gov5's registration: `pubkey(48) || pop(96)`. The proof of possession is
 /// verified on adoption, not here.
 pub const REGISTRATION_LEN: usize = 48 + 96;
@@ -560,6 +571,19 @@ mod tests {
         assert!(matches!(transactions_verdict(&batch(&[good, truncated])), GossipVerdict::Reject(_)));
         assert!(matches!(transactions_verdict(&batch(&[vec![0x85, 1, 2, 3, 4, 5]])), GossipVerdict::Reject(_)));
         assert!(matches!(transactions_verdict(b"\xffnot snappy"), GossipVerdict::Reject(_)));
+    }
+
+    #[test]
+    fn another_chains_v4_message_is_ignored_and_a_broken_one_rejected() {
+        use n42_h2_primitives::consensus::H2V4ChainIdentity;
+        use n42_h2_wire::h2_v4::{decode_gossip, encode_gossip, H2V4Envelope};
+        let ours = H2V4ChainIdentity { chain_id: 1, genesis_hash: B256::repeat_byte(1) };
+        let theirs = H2V4ChainIdentity { chain_id: 2, genesis_hash: B256::repeat_byte(2) };
+        let wire = encode_gossip(&H2V4Envelope { identity: theirs, changes_hash: B256::ZERO, message: vote(3) }).unwrap();
+        let err = decode_gossip(&wire, ours).unwrap_err();
+        assert!(matches!(envelope_error_verdict(&err), GossipVerdict::Ignore(_)));
+        let err = decode_gossip(b"junk", ours).unwrap_err();
+        assert!(matches!(envelope_error_verdict(&err), GossipVerdict::Reject(_)));
     }
 
     #[test]

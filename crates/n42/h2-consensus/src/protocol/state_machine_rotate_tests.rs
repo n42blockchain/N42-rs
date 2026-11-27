@@ -48,10 +48,24 @@ fn engine(
     tenure: u64,
     rotate_from: Option<u64>,
 ) -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {
+    engine_with(index, sks, vs, tenure, rotate_from, 0, BASE_MS, MAX_MS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn engine_with(
+    index: usize,
+    sks: &[n42_h2_primitives::BlsSecretKey],
+    vs: &ValidatorSet,
+    tenure: u64,
+    rotate_from: Option<u64>,
+    epoch_length: u64,
+    base_ms: u64,
+    max_ms: u64,
+) -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {
     let (tx, rx) = mpsc::channel(4096);
-    let mut engine = ConsensusEngine::new(index as u32, sks[index].clone(), vs.clone(), BASE_MS, MAX_MS, tx);
+    let mut engine = ConsensusEngine::new(index as u32, sks[index].clone(), vs.clone(), base_ms, max_ms, tx);
     engine.set_leader_tenure(tenure);
-    engine.set_rotate_on_timeout(rotate_from, 0);
+    engine.set_rotate_on_timeout(rotate_from, epoch_length);
     (engine, rx)
 }
 
@@ -171,6 +185,26 @@ fn rotate_on_timeout_piggybacked_tc_jumps_to_window() {
     assert!(!off.adopt_embedded_tc(&tc).expect("not adopted"), "classic: TC(8) leads only to 9");
 }
 
+/// AM33: a piggybacked TC moves the node but keeps its consecutive-timeout
+/// count (gov5 dropped the reset it took on a SyncInfo TC), and the timer
+/// of the view it enters is `timeout(c)` under the set's backoff group.
+#[test]
+fn am33_an_adopted_tc_keeps_the_timeout_count() {
+    let (sks, vs) = validators(7);
+    let tc = tc_for(8, &sks, &vs, &[0, 2, 3, 4, 5]);
+    let (mut e, _rx) = engine(6, &sks, &vs, 8, Some(0));
+    e.advance_to_view(8).expect("view 8");
+    e.on_timeout().expect("own timeout");
+    e.on_timeout().expect("a repeat is not a new timeout");
+    assert_eq!(e.consecutive_timeouts(), 1);
+    assert!(e.adopt_embedded_tc(&tc).expect("adopted"));
+    assert_eq!(e.current_view(), 16);
+    assert_eq!(e.consecutive_timeouts(), 1, "a TC never resets c");
+    assert_eq!(e.pacemaker().backoff_group(), 3, "n = 7: g = 3");
+    assert_eq!(e.pacemaker().timeout_duration(e.consecutive_timeouts()), std::time::Duration::from_millis(BASE_MS));
+    assert_eq!(e.pacemaker().timeout_duration(3), std::time::Duration::from_millis(2 * BASE_MS));
+}
+
 /// Forming a TC locally from timeouts: the node enters the rotated view, and
 /// only that view's leader signs the NewView (spec 10.2 items 1 and 2).
 #[test]
@@ -228,10 +262,21 @@ struct Sim {
     commits: BTreeMap<u64, Commit>,
     parents: HashMap<B256, B256>,
     queue: VecDeque<(usize, ConsensusEvent)>,
+    /// Leaders that stay in the network (vote, time out) but propose
+    /// nothing from the given view on.
+    silent_from: HashMap<usize, u64>,
+    /// When each node entered each view.
+    entered: HashMap<(usize, u64), u64>,
+    /// The timer each node started on entering each view.
+    timers: HashMap<(usize, u64), u64>,
 }
 
 impl Sim {
     fn new(n: usize, tenure: u64, rotate: Option<u64>) -> Self {
+        Self::with_timeouts(n, tenure, rotate, 0, BASE_MS, MAX_MS)
+    }
+
+    fn with_timeouts(n: usize, tenure: u64, rotate: Option<u64>, epoch_length: u64, base_ms: u64, max_ms: u64) -> Self {
         let (sks, vs) = validators(n);
         let mut sim = Self {
             sks,
@@ -242,15 +287,18 @@ impl Sim {
             rxs: Vec::new(),
             alive: vec![true; n],
             now: 0,
-            deadline: vec![BASE_MS; n],
+            deadline: vec![base_ms; n],
             seen_view: vec![0; n],
             proposed: HashSet::new(),
             commits: BTreeMap::new(),
             parents: HashMap::new(),
             queue: VecDeque::new(),
+            silent_from: HashMap::new(),
+            entered: HashMap::new(),
+            timers: HashMap::new(),
         };
         for i in 0..n {
-            let (e, rx) = engine(i, &sim.sks, &sim.vs, tenure, rotate);
+            let (e, rx) = engine_with(i, &sim.sks, &sim.vs, tenure, rotate, epoch_length, base_ms, max_ms);
             sim.engines.push(e);
             sim.rxs.push(rx);
         }
@@ -322,7 +370,8 @@ impl Sim {
             let mut proposed = false;
             for i in 0..self.engines.len() {
                 let view = self.engines[i].current_view();
-                if self.alive[i] && self.engines[i].is_current_leader() && !self.proposed.contains(&view) {
+                let silent = self.silent_from.get(&i).is_some_and(|from| view >= *from);
+                if self.alive[i] && !silent && self.engines[i].is_current_leader() && !self.proposed.contains(&view) {
                     self.proposed.insert(view);
                     self.now += BLOCK_MS;
                     let mut hash = [0u8; 32];
@@ -343,7 +392,10 @@ impl Sim {
             let view = self.engines[i].current_view();
             if view != self.seen_view[i] {
                 self.seen_view[i] = view;
-                self.deadline[i] = self.now + self.timeout_ms(i);
+                self.entered.entry((i, view)).or_insert(self.now);
+                let timer = self.timeout_ms(i);
+                self.timers.entry((i, view)).or_insert(timer);
+                self.deadline[i] = self.now + timer;
             }
         }
     }
@@ -423,7 +475,7 @@ impl Sim {
 /// owner of the next tenure (validator 1, views 8-15) is silent. With the
 /// rule validator 2 commits view 16 within two base timeouts of the last
 /// good block and the chain is steady after it; without it every view of the
-/// dead tenure times out with doubling backoff.
+/// dead tenure times out with AM33's grouped backoff.
 #[test]
 fn rotate_on_timeout_dead_tenure_leader() {
     for rotate in [Some(0), None] {
@@ -449,15 +501,20 @@ fn rotate_on_timeout_dead_tenure_leader() {
             }
         } else {
             assert_eq!(first.view, 16, "off: the dead tenure is waited out view by view");
-            // 8 timeouts with doubling: 1+2+4+8+10*4 = 55 s at base 1 s / max 10 s.
-            assert!(gap >= 40 * BASE_MS, "off: stall {gap} ms, expected the per-view backoff stall");
+            // 8 timeouts under AM33 (n = 7: g = 3, one doubling per three
+            // TCs): 1+1+1+2+2+2+4+4 = 17 s at base 1 s / max 10 s. Before
+            // AM33 each TC doubled: 1+2+4+8+10*4 = 55 s.
+            assert!(
+                (17 * BASE_MS..17 * BASE_MS + 2 * BLOCK_MS).contains(&gap),
+                "off: stall {gap} ms, expected AM33's per-view backoff stall of 17 s"
+            );
         }
     }
 }
 
 /// gov5 `TestRotateOnTimeoutTwoConsecutiveDeadLeaders` (spec S2): validators
-/// 1 and 2 are silent; the rule skips both windows for one base timeout plus
-/// one doubled one.
+/// 1 and 2 are silent; the rule skips both windows for two base timeouts
+/// (AM33, n = 7: the second TC is not doubled; before AM33 it was, 3 s).
 #[test]
 fn rotate_on_timeout_two_consecutive_dead_leaders() {
     let mut sim = Sim::new(7, 8, Some(0));
@@ -467,7 +524,7 @@ fn rotate_on_timeout_two_consecutive_dead_leaders() {
     let last = sim.last_commit_before(8);
     let first = sim.commits_after(7)[0];
     assert_eq!((first.view, first.leader), (24, 3));
-    assert!(first.at - last.at <= 4 * BASE_MS, "stall {} ms", first.at - last.at);
+    assert!(first.at - last.at <= 2 * BASE_MS + 2 * BLOCK_MS, "stall {} ms", first.at - last.at);
 }
 
 /// gov5 `TestRotateOnTimeoutDeadLeaderComesBack`: validator 1 misses its
@@ -515,4 +572,64 @@ fn rotate_on_timeout_tenure_one_unchanged() {
         })
         .collect();
     assert_eq!(runs[0], runs[1]);
+}
+
+/// AM33 (`testdata/profile1/gov5/AM33/timeout_backoff.json`) on engines: the
+/// vector's runs at n = 4 and 7 replayed on the virtual-clock network, the
+/// listed leaders silent (they vote and time out but propose nothing). Each
+/// view is entered at the step's view with its timer at the step's
+/// timeout, and the time from entering the first silent view to entering
+/// the live one is the run's `gapMs`. The engine's own pacemaker supplies
+/// every timer, so this checks where `c` grows and where it does not reset
+/// (a TC). The n = 100 runs are checked at the pacemaker
+/// (`tests/profile1_am33.rs`).
+#[test]
+fn am33_runs_on_engines() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/profile1/gov5/AM33/timeout_backoff.json");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).expect("AM33")).expect("json");
+    let num = |x: &serde_json::Value| x.as_u64().expect("number");
+    let mut ran = 0;
+    for run in v["runs"].as_array().expect("runs") {
+        let n = num(&run["n"]) as usize;
+        if n > 7 {
+            continue;
+        }
+        let id = run["id"].as_str().expect("id");
+        let mut sim = Sim::with_timeouts(
+            n,
+            num(&run["tenure"]),
+            Some(0),
+            num(&run["epochLength"]),
+            num(&run["baseTimeoutMs"]),
+            num(&run["maxTimeoutMs"]),
+        );
+        let start = num(&run["startView"]);
+        for dead in run["deadLeaders"].as_array().expect("dead") {
+            sim.silent_from.insert(num(dead) as usize, start);
+        }
+        let steps = run["steps"].as_array().expect("steps");
+        let last = steps.last().expect("a QC step");
+        assert_eq!(last["event"], "QC", "{id}");
+        let live_view = num(&last["view"]);
+        // A node that is no listed leader observes.
+        let observer = (0..n).find(|i| !sim.silent_from.contains_key(i)).expect("an observer");
+        assert!(
+            sim.run_until(10_000_000, |s| s.commits.contains_key(&live_view)),
+            "{id}: no commit at view {live_view}; views {:?}",
+            sim.engines.iter().map(|e| e.current_view()).collect::<Vec<_>>()
+        );
+        let entered = |view: u64| *sim.entered.get(&(observer, view)).unwrap_or_else(|| panic!("{id}: view {view} not entered"));
+        for (i, step) in steps.iter().enumerate() {
+            let view = num(&step["view"]);
+            assert_eq!(u64::from(sim.leader(view)), num(&step["leader"]), "{id} step {i}: leader");
+            assert_eq!(sim.timers.get(&(observer, view)).copied(), Some(num(&step["timeoutMs"])), "{id} step {i}: timer on entry");
+            if step["event"] == "TC" {
+                let next = num(&step["nextView"]);
+                assert_eq!(entered(next) - entered(view), num(&step["timeoutMs"]), "{id} step {i}: view {view}'s timer");
+            }
+        }
+        assert_eq!(entered(live_view) - entered(start), num(&run["gapMs"]), "{id}: gap");
+        ran += 1;
+    }
+    assert_eq!(ran, 17, "the n = 4 and 7 runs");
 }

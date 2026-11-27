@@ -1,0 +1,2027 @@
+{
+  "vector": "AM33",
+  "standard": "N42 mixed production standard, amendment AM33 (consecutive absent leaders, v1.2): timeout backoff grows once per g TCs",
+  "rules": [
+    "timeout(c) = min(base_eff * 2^floor(c / g), max), g = min(f + 1, 3), f = floor((n - 1) / 3), n = the validator-set size.",
+    "c increments on each local view timeout; it resets to 0 on a commit QC (Decide) and on a QC-based view jump; a TC, including one adopted from SyncInfo, never resets it.",
+    "A view's timer is timeout(c) with c as it stands on entering the view.",
+    "base_eff is the local adaptive base max(base, 2 * p95 commit latency) capped at max; these vectors have no latency samples, so base_eff = base."
+  ],
+  "groups": [
+    {
+      "n": 1,
+      "f": 0,
+      "g": 1
+    },
+    {
+      "n": 2,
+      "f": 0,
+      "g": 1
+    },
+    {
+      "n": 3,
+      "f": 0,
+      "g": 1
+    },
+    {
+      "n": 4,
+      "f": 1,
+      "g": 2
+    },
+    {
+      "n": 5,
+      "f": 1,
+      "g": 2
+    },
+    {
+      "n": 6,
+      "f": 1,
+      "g": 2
+    },
+    {
+      "n": 7,
+      "f": 2,
+      "g": 3
+    },
+    {
+      "n": 10,
+      "f": 3,
+      "g": 3
+    },
+    {
+      "n": 100,
+      "f": 33,
+      "g": 3
+    },
+    {
+      "n": 512,
+      "f": 170,
+      "g": 3
+    }
+  ],
+  "timeouts": [
+    {
+      "n": 4,
+      "g": 2,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "timeoutMsByC": [
+        24000,
+        24000,
+        48000,
+        48000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000
+      ],
+      "previousRuleMsByC": [
+        24000,
+        48000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000
+      ]
+    },
+    {
+      "n": 7,
+      "g": 3,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "timeoutMsByC": [
+        24000,
+        24000,
+        24000,
+        48000,
+        48000,
+        48000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000
+      ],
+      "previousRuleMsByC": [
+        24000,
+        48000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000
+      ]
+    },
+    {
+      "n": 100,
+      "g": 3,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "timeoutMsByC": [
+        24000,
+        24000,
+        24000,
+        48000,
+        48000,
+        48000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000
+      ],
+      "previousRuleMsByC": [
+        24000,
+        48000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000,
+        96000
+      ]
+    },
+    {
+      "n": 4,
+      "g": 2,
+      "baseTimeoutMs": 6000,
+      "maxTimeoutMs": 30000,
+      "timeoutMsByC": [
+        6000,
+        6000,
+        12000,
+        12000,
+        24000,
+        24000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000
+      ],
+      "previousRuleMsByC": [
+        6000,
+        12000,
+        24000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000
+      ]
+    },
+    {
+      "n": 7,
+      "g": 3,
+      "baseTimeoutMs": 6000,
+      "maxTimeoutMs": 30000,
+      "timeoutMsByC": [
+        6000,
+        6000,
+        6000,
+        12000,
+        12000,
+        12000,
+        24000,
+        24000,
+        24000,
+        30000,
+        30000,
+        30000,
+        30000
+      ],
+      "previousRuleMsByC": [
+        6000,
+        12000,
+        24000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000
+      ]
+    },
+    {
+      "n": 100,
+      "g": 3,
+      "baseTimeoutMs": 6000,
+      "maxTimeoutMs": 30000,
+      "timeoutMsByC": [
+        6000,
+        6000,
+        6000,
+        12000,
+        12000,
+        12000,
+        24000,
+        24000,
+        24000,
+        30000,
+        30000,
+        30000,
+        30000
+      ],
+      "previousRuleMsByC": [
+        6000,
+        12000,
+        24000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000,
+        30000
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "id": "gate-5d",
+      "description": "gate 5d: n = 100, T = 1, E = 10800, base 24 s / max 96 s; leaders 57..62 absent",
+      "n": 100,
+      "tenure": 1,
+      "epochLength": 10800,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        57,
+        58,
+        59,
+        60,
+        61,
+        62
+      ],
+      "startView": 57,
+      "steps": [
+        {
+          "view": 57,
+          "leader": 57,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 58
+        },
+        {
+          "view": 58,
+          "leader": 58,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 59
+        },
+        {
+          "view": 59,
+          "leader": 59,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 60
+        },
+        {
+          "view": 60,
+          "leader": 60,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 61
+        },
+        {
+          "view": 61,
+          "leader": 61,
+          "c": 4,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 62
+        },
+        {
+          "view": 62,
+          "leader": 62,
+          "c": 5,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 63
+        },
+        {
+          "view": 63,
+          "leader": 63,
+          "c": 6,
+          "timeoutMs": 96000,
+          "event": "QC",
+          "nextView": 64
+        }
+      ],
+      "gapMs": 216000,
+      "previousRuleGapMs": 456000
+    },
+    {
+      "id": "n4-T1-k1",
+      "description": "n = 4, T = 1, 1 consecutive absent leaders (1..1), base 24 s / max 96 s",
+      "n": 4,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "QC",
+          "nextView": 3
+        }
+      ],
+      "gapMs": 24000,
+      "previousRuleGapMs": 24000
+    },
+    {
+      "id": "n4-T1-k2",
+      "description": "n = 4, T = 1, 2 consecutive absent leaders (1..2), base 24 s / max 96 s",
+      "n": 4,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 4
+        }
+      ],
+      "gapMs": 48000,
+      "previousRuleGapMs": 72000
+    },
+    {
+      "id": "n4-T1-k3",
+      "description": "n = 4, T = 1, 3 consecutive absent leaders (1..3), base 24 s / max 96 s",
+      "n": 4,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 0,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 5
+        }
+      ],
+      "gapMs": 96000,
+      "previousRuleGapMs": 168000
+    },
+    {
+      "id": "n7-T1-k1",
+      "description": "n = 7, T = 1, 1 consecutive absent leaders (1..1), base 24 s / max 96 s",
+      "n": 7,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "QC",
+          "nextView": 3
+        }
+      ],
+      "gapMs": 24000,
+      "previousRuleGapMs": 24000
+    },
+    {
+      "id": "n7-T1-k2",
+      "description": "n = 7, T = 1, 2 consecutive absent leaders (1..2), base 24 s / max 96 s",
+      "n": 7,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "QC",
+          "nextView": 4
+        }
+      ],
+      "gapMs": 48000,
+      "previousRuleGapMs": 72000
+    },
+    {
+      "id": "n7-T1-k3",
+      "description": "n = 7, T = 1, 3 consecutive absent leaders (1..3), base 24 s / max 96 s",
+      "n": 7,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 5
+        }
+      ],
+      "gapMs": 72000,
+      "previousRuleGapMs": 168000
+    },
+    {
+      "id": "n7-T1-k4",
+      "description": "n = 7, T = 1, 4 consecutive absent leaders (1..4), base 24 s / max 96 s",
+      "n": 7,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 5
+        },
+        {
+          "view": 5,
+          "leader": 5,
+          "c": 4,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 6
+        }
+      ],
+      "gapMs": 120000,
+      "previousRuleGapMs": 264000
+    },
+    {
+      "id": "n7-T1-k5",
+      "description": "n = 7, T = 1, 5 consecutive absent leaders (1..5), base 24 s / max 96 s",
+      "n": 7,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 5
+        },
+        {
+          "view": 5,
+          "leader": 5,
+          "c": 4,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 6
+        },
+        {
+          "view": 6,
+          "leader": 6,
+          "c": 5,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 7
+        }
+      ],
+      "gapMs": 168000,
+      "previousRuleGapMs": 360000
+    },
+    {
+      "id": "n7-T1-k6",
+      "description": "n = 7, T = 1, 6 consecutive absent leaders (1..6), base 24 s / max 96 s",
+      "n": 7,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 5
+        },
+        {
+          "view": 5,
+          "leader": 5,
+          "c": 4,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 6
+        },
+        {
+          "view": 6,
+          "leader": 6,
+          "c": 5,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 7
+        },
+        {
+          "view": 7,
+          "leader": 0,
+          "c": 6,
+          "timeoutMs": 96000,
+          "event": "QC",
+          "nextView": 8
+        }
+      ],
+      "gapMs": 216000,
+      "previousRuleGapMs": 456000
+    },
+    {
+      "id": "n100-T1-k1",
+      "description": "n = 100, T = 1, 1 consecutive absent leaders (1..1), base 24 s / max 96 s",
+      "n": 100,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "QC",
+          "nextView": 3
+        }
+      ],
+      "gapMs": 24000,
+      "previousRuleGapMs": 24000
+    },
+    {
+      "id": "n100-T1-k2",
+      "description": "n = 100, T = 1, 2 consecutive absent leaders (1..2), base 24 s / max 96 s",
+      "n": 100,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "QC",
+          "nextView": 4
+        }
+      ],
+      "gapMs": 48000,
+      "previousRuleGapMs": 72000
+    },
+    {
+      "id": "n100-T1-k3",
+      "description": "n = 100, T = 1, 3 consecutive absent leaders (1..3), base 24 s / max 96 s",
+      "n": 100,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 5
+        }
+      ],
+      "gapMs": 72000,
+      "previousRuleGapMs": 168000
+    },
+    {
+      "id": "n100-T1-k4",
+      "description": "n = 100, T = 1, 4 consecutive absent leaders (1..4), base 24 s / max 96 s",
+      "n": 100,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 5
+        },
+        {
+          "view": 5,
+          "leader": 5,
+          "c": 4,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 6
+        }
+      ],
+      "gapMs": 120000,
+      "previousRuleGapMs": 264000
+    },
+    {
+      "id": "n100-T1-k5",
+      "description": "n = 100, T = 1, 5 consecutive absent leaders (1..5), base 24 s / max 96 s",
+      "n": 100,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 5
+        },
+        {
+          "view": 5,
+          "leader": 5,
+          "c": 4,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 6
+        },
+        {
+          "view": 6,
+          "leader": 6,
+          "c": 5,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 7
+        }
+      ],
+      "gapMs": 168000,
+      "previousRuleGapMs": 360000
+    },
+    {
+      "id": "n100-T1-k6",
+      "description": "n = 100, T = 1, 6 consecutive absent leaders (1..6), base 24 s / max 96 s",
+      "n": 100,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 5
+        },
+        {
+          "view": 5,
+          "leader": 5,
+          "c": 4,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 6
+        },
+        {
+          "view": 6,
+          "leader": 6,
+          "c": 5,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 7
+        },
+        {
+          "view": 7,
+          "leader": 7,
+          "c": 6,
+          "timeoutMs": 96000,
+          "event": "QC",
+          "nextView": 8
+        }
+      ],
+      "gapMs": 216000,
+      "previousRuleGapMs": 456000
+    },
+    {
+      "id": "n100-T1-k33",
+      "description": "n = 100, T = 1, 33 consecutive absent leaders (1..33), base 24 s / max 96 s",
+      "n": 100,
+      "tenure": 1,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33
+      ],
+      "startView": 1,
+      "steps": [
+        {
+          "view": 1,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 2
+        },
+        {
+          "view": 2,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 3
+        },
+        {
+          "view": 3,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 4
+        },
+        {
+          "view": 4,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 5
+        },
+        {
+          "view": 5,
+          "leader": 5,
+          "c": 4,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 6
+        },
+        {
+          "view": 6,
+          "leader": 6,
+          "c": 5,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 7
+        },
+        {
+          "view": 7,
+          "leader": 7,
+          "c": 6,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 8
+        },
+        {
+          "view": 8,
+          "leader": 8,
+          "c": 7,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 9
+        },
+        {
+          "view": 9,
+          "leader": 9,
+          "c": 8,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 10
+        },
+        {
+          "view": 10,
+          "leader": 10,
+          "c": 9,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 11
+        },
+        {
+          "view": 11,
+          "leader": 11,
+          "c": 10,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 12
+        },
+        {
+          "view": 12,
+          "leader": 12,
+          "c": 11,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 13
+        },
+        {
+          "view": 13,
+          "leader": 13,
+          "c": 12,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 14
+        },
+        {
+          "view": 14,
+          "leader": 14,
+          "c": 13,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 15
+        },
+        {
+          "view": 15,
+          "leader": 15,
+          "c": 14,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 16
+        },
+        {
+          "view": 16,
+          "leader": 16,
+          "c": 15,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 17
+        },
+        {
+          "view": 17,
+          "leader": 17,
+          "c": 16,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 18
+        },
+        {
+          "view": 18,
+          "leader": 18,
+          "c": 17,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 19
+        },
+        {
+          "view": 19,
+          "leader": 19,
+          "c": 18,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 20
+        },
+        {
+          "view": 20,
+          "leader": 20,
+          "c": 19,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 21
+        },
+        {
+          "view": 21,
+          "leader": 21,
+          "c": 20,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 22
+        },
+        {
+          "view": 22,
+          "leader": 22,
+          "c": 21,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 23
+        },
+        {
+          "view": 23,
+          "leader": 23,
+          "c": 22,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 24
+        },
+        {
+          "view": 24,
+          "leader": 24,
+          "c": 23,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 25
+        },
+        {
+          "view": 25,
+          "leader": 25,
+          "c": 24,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 26
+        },
+        {
+          "view": 26,
+          "leader": 26,
+          "c": 25,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 27
+        },
+        {
+          "view": 27,
+          "leader": 27,
+          "c": 26,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 28
+        },
+        {
+          "view": 28,
+          "leader": 28,
+          "c": 27,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 29
+        },
+        {
+          "view": 29,
+          "leader": 29,
+          "c": 28,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 30
+        },
+        {
+          "view": 30,
+          "leader": 30,
+          "c": 29,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 31
+        },
+        {
+          "view": 31,
+          "leader": 31,
+          "c": 30,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 32
+        },
+        {
+          "view": 32,
+          "leader": 32,
+          "c": 31,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 33
+        },
+        {
+          "view": 33,
+          "leader": 33,
+          "c": 32,
+          "timeoutMs": 96000,
+          "event": "TC",
+          "nextView": 34
+        },
+        {
+          "view": 34,
+          "leader": 34,
+          "c": 33,
+          "timeoutMs": 96000,
+          "event": "QC",
+          "nextView": 35
+        }
+      ],
+      "gapMs": 2808000,
+      "previousRuleGapMs": 3048000
+    },
+    {
+      "id": "n4-T8-k3",
+      "description": "n = 4, T = 8, E = 0: leaders 1..3 absent; each TC hands the next window on",
+      "n": 4,
+      "tenure": 8,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3
+      ],
+      "startView": 8,
+      "steps": [
+        {
+          "view": 8,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 16
+        },
+        {
+          "view": 16,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 24
+        },
+        {
+          "view": 24,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 32
+        },
+        {
+          "view": 32,
+          "leader": 0,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 33
+        }
+      ],
+      "gapMs": 96000,
+      "previousRuleGapMs": 168000
+    },
+    {
+      "id": "n7-T8-k3",
+      "description": "n = 7, T = 8, E = 0: leaders 1..3 absent; each TC hands the next window on",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3
+      ],
+      "startView": 8,
+      "steps": [
+        {
+          "view": 8,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 16
+        },
+        {
+          "view": 16,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 24
+        },
+        {
+          "view": 24,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 32
+        },
+        {
+          "view": 32,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 33
+        }
+      ],
+      "gapMs": 72000,
+      "previousRuleGapMs": 168000
+    },
+    {
+      "id": "n100-T8-k3",
+      "description": "n = 100, T = 8, E = 0: leaders 1..3 absent; each TC hands the next window on",
+      "n": 100,
+      "tenure": 8,
+      "epochLength": 0,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        1,
+        2,
+        3
+      ],
+      "startView": 8,
+      "steps": [
+        {
+          "view": 8,
+          "leader": 1,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 16
+        },
+        {
+          "view": 16,
+          "leader": 2,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 24
+        },
+        {
+          "view": 24,
+          "leader": 3,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 32
+        },
+        {
+          "view": 32,
+          "leader": 4,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 33
+        }
+      ],
+      "gapMs": 72000,
+      "previousRuleGapMs": 168000
+    },
+    {
+      "id": "am32-n4",
+      "description": "AM32 clamp: n = 4, T = 8, E = 50, leader L0 of window 96..103 silent from view 98: TC(98) -\u003e 101 (boundary, same leader), TC(101) -\u003e 104",
+      "n": 4,
+      "tenure": 8,
+      "epochLength": 50,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        0
+      ],
+      "startView": 98,
+      "steps": [
+        {
+          "view": 98,
+          "leader": 0,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 101
+        },
+        {
+          "view": 101,
+          "leader": 0,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 104
+        },
+        {
+          "view": 104,
+          "leader": 1,
+          "c": 2,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 105
+        }
+      ],
+      "gapMs": 48000,
+      "previousRuleGapMs": 72000
+    },
+    {
+      "id": "am32-n4-p1",
+      "description": "AM32 clamp at the standard genesis timeouts (base 6000 ms / max 30000 ms), n = 4",
+      "n": 4,
+      "tenure": 8,
+      "epochLength": 50,
+      "baseTimeoutMs": 6000,
+      "maxTimeoutMs": 30000,
+      "deadLeaders": [
+        0
+      ],
+      "startView": 98,
+      "steps": [
+        {
+          "view": 98,
+          "leader": 0,
+          "c": 0,
+          "timeoutMs": 6000,
+          "event": "TC",
+          "nextView": 101
+        },
+        {
+          "view": 101,
+          "leader": 0,
+          "c": 1,
+          "timeoutMs": 6000,
+          "event": "TC",
+          "nextView": 104
+        },
+        {
+          "view": 104,
+          "leader": 1,
+          "c": 2,
+          "timeoutMs": 12000,
+          "event": "QC",
+          "nextView": 105
+        }
+      ],
+      "gapMs": 12000,
+      "previousRuleGapMs": 18000
+    },
+    {
+      "id": "am32-n7",
+      "description": "AM32 clamp: n = 7, T = 8, E = 50, leader L5 of window 96..103 silent from view 98: TC(98) -\u003e 101 (boundary, same leader), TC(101) -\u003e 104",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 50,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        5
+      ],
+      "startView": 98,
+      "steps": [
+        {
+          "view": 98,
+          "leader": 5,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 101
+        },
+        {
+          "view": 101,
+          "leader": 5,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 104
+        },
+        {
+          "view": 104,
+          "leader": 6,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "QC",
+          "nextView": 105
+        }
+      ],
+      "gapMs": 48000,
+      "previousRuleGapMs": 72000
+    },
+    {
+      "id": "am32-n7-p1",
+      "description": "AM32 clamp at the standard genesis timeouts (base 6000 ms / max 30000 ms), n = 7",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 50,
+      "baseTimeoutMs": 6000,
+      "maxTimeoutMs": 30000,
+      "deadLeaders": [
+        5
+      ],
+      "startView": 98,
+      "steps": [
+        {
+          "view": 98,
+          "leader": 5,
+          "c": 0,
+          "timeoutMs": 6000,
+          "event": "TC",
+          "nextView": 101
+        },
+        {
+          "view": 101,
+          "leader": 5,
+          "c": 1,
+          "timeoutMs": 6000,
+          "event": "TC",
+          "nextView": 104
+        },
+        {
+          "view": 104,
+          "leader": 6,
+          "c": 2,
+          "timeoutMs": 6000,
+          "event": "QC",
+          "nextView": 105
+        }
+      ],
+      "gapMs": 12000,
+      "previousRuleGapMs": 18000
+    },
+    {
+      "id": "am32-n100",
+      "description": "AM32 clamp: n = 100, T = 8, E = 50, leader L12 of window 96..103 silent from view 98: TC(98) -\u003e 101 (boundary, same leader), TC(101) -\u003e 104",
+      "n": 100,
+      "tenure": 8,
+      "epochLength": 50,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        12
+      ],
+      "startView": 98,
+      "steps": [
+        {
+          "view": 98,
+          "leader": 12,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 101
+        },
+        {
+          "view": 101,
+          "leader": 12,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 104
+        },
+        {
+          "view": 104,
+          "leader": 13,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "QC",
+          "nextView": 105
+        }
+      ],
+      "gapMs": 48000,
+      "previousRuleGapMs": 72000
+    },
+    {
+      "id": "am32-n100-p1",
+      "description": "AM32 clamp at the standard genesis timeouts (base 6000 ms / max 30000 ms), n = 100",
+      "n": 100,
+      "tenure": 8,
+      "epochLength": 50,
+      "baseTimeoutMs": 6000,
+      "maxTimeoutMs": 30000,
+      "deadLeaders": [
+        12
+      ],
+      "startView": 98,
+      "steps": [
+        {
+          "view": 98,
+          "leader": 12,
+          "c": 0,
+          "timeoutMs": 6000,
+          "event": "TC",
+          "nextView": 101
+        },
+        {
+          "view": 101,
+          "leader": 12,
+          "c": 1,
+          "timeoutMs": 6000,
+          "event": "TC",
+          "nextView": 104
+        },
+        {
+          "view": 104,
+          "leader": 13,
+          "c": 2,
+          "timeoutMs": 6000,
+          "event": "QC",
+          "nextView": 105
+        }
+      ],
+      "gapMs": 12000,
+      "previousRuleGapMs": 18000
+    },
+    {
+      "id": "am32-n4-next-dead",
+      "description": "AM32 clamp followed by a second absent leader: n = 4, L0 and L1 silent",
+      "n": 4,
+      "tenure": 8,
+      "epochLength": 50,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        0,
+        1
+      ],
+      "startView": 98,
+      "steps": [
+        {
+          "view": 98,
+          "leader": 0,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 101
+        },
+        {
+          "view": 101,
+          "leader": 0,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 104
+        },
+        {
+          "view": 104,
+          "leader": 1,
+          "c": 2,
+          "timeoutMs": 48000,
+          "event": "TC",
+          "nextView": 112
+        },
+        {
+          "view": 112,
+          "leader": 2,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 113
+        }
+      ],
+      "gapMs": 96000,
+      "previousRuleGapMs": 168000
+    },
+    {
+      "id": "am32-n7-next-dead",
+      "description": "AM32 clamp followed by a second absent leader: n = 7, L5 and L6 silent",
+      "n": 7,
+      "tenure": 8,
+      "epochLength": 50,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        5,
+        6
+      ],
+      "startView": 98,
+      "steps": [
+        {
+          "view": 98,
+          "leader": 5,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 101
+        },
+        {
+          "view": 101,
+          "leader": 5,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 104
+        },
+        {
+          "view": 104,
+          "leader": 6,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 112
+        },
+        {
+          "view": 112,
+          "leader": 0,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 113
+        }
+      ],
+      "gapMs": 72000,
+      "previousRuleGapMs": 168000
+    },
+    {
+      "id": "am32-n100-next-dead",
+      "description": "AM32 clamp followed by a second absent leader: n = 100, L12 and L13 silent",
+      "n": 100,
+      "tenure": 8,
+      "epochLength": 50,
+      "baseTimeoutMs": 24000,
+      "maxTimeoutMs": 96000,
+      "deadLeaders": [
+        12,
+        13
+      ],
+      "startView": 98,
+      "steps": [
+        {
+          "view": 98,
+          "leader": 12,
+          "c": 0,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 101
+        },
+        {
+          "view": 101,
+          "leader": 12,
+          "c": 1,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 104
+        },
+        {
+          "view": 104,
+          "leader": 13,
+          "c": 2,
+          "timeoutMs": 24000,
+          "event": "TC",
+          "nextView": 112
+        },
+        {
+          "view": 112,
+          "leader": 14,
+          "c": 3,
+          "timeoutMs": 48000,
+          "event": "QC",
+          "nextView": 113
+        }
+      ],
+      "gapMs": 72000,
+      "previousRuleGapMs": 168000
+    }
+  ],
+  "notes": [
+    "Generated by gov5 TestProfile1VectorAM33 (internal/profile1_v7_test.go) from hotstuff.Pacemaker (TimeoutDuration, SetCommitteeSize), hotstuff.BackoffGroupSize, hotstuff.RoundState and hotstuff.ViewAfterTimeout.",
+    "previousRule* columns are the same code with no committee size (g = 1): the rule before AM33.",
+    "runs: the leaders listed are silent; every other leader forms a QC within its view. gapMs = sum of the timeouts of the TC views (the time from entering the first dead view to entering the live view)."
+  ]
+}

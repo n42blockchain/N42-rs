@@ -170,6 +170,7 @@ cmd_leg() {
   for pid in $(pgrep -f "^[${CB_BIN:0:1}]${CB_BIN:1}/(n42 node|examples/h2_validator) --datadir $P1_DIR/m3"); do
     echo "peak rss: $(tr '\0' ' ' < /proc/$pid/cmdline | cut -c1-60 | sed 's|.*/||') $(awk '/VmHWM/ {print $2, $3}' /proc/$pid/status)"
   done | tee -a "$out/box.txt"
+  echo "disk: el $(du -sm "$P1_DIR/m3/el" | cut -f1) MiB, consensus $(du -sm "$P1_DIR/m3/consensus" 2>/dev/null | cut -f1) MiB" | tee -a "$out/box.txt"
   cp "$P1_DIR/m3/v.log" "$out/v3.log"; cp "$P1_DIR/m3/el.log" "$out/el3.log"
   P1_MEMBERS="0 1 3" "$P1" down > "$out/down.log" 2>&1
   cmd_report "$name" | tee "$out/report.txt"

@@ -72,6 +72,28 @@ as quoted in the standard).
 > earned on the pre-AM24 vectors (genesis `0x6f733745…7e4f`) and holds for AM24 only once that client posts a
 > pass on the regenerated ones (gov5: its PR #6 on `feat/profile1`; n42-26: its `feat/profile1-genesis`).
 
+## M3d: mixed equivocation round (2026-11-26 22:00-22:40 EST) -- PASSED
+
+Gate-6 set (chain 1144, genesis-m3d.json sha256 96369975...26cd2, hash 0x9a1ea7f0...3eb13): gov5 v0, v1 and a
+verifier on gov5 main ef2f6bb0, n42-26 v3 on fc558d6 (PR #51 + #52), n42-rs v2 on main d8a5e54d2 with the
+test-only injector (`N42_TEST_EQUIVOCATE` + `--test-equivocate`, chain 1144 only). v2 signed a second,
+conflicting message in every view: commit votes 22:09-22:13, R1 votes 22:13-22:23, proposals 22:23-22:33,
+then clean. (v2 was down 22:03-22:09: the round tool unset every N42_* variable, so the validator refused
+`--test-equivocate` without its spec; fixed in the tool, v2's slots timed out meanwhile.)
+
+| Member | commit_vote | vote | proposal | standalone check |
+| --- | --- | --- | --- | --- |
+| gov5 v0 | 7 (every view it led) | 19 | 19 | 45/45 |
+| gov5 v1 | 7 | 19 | 19 | 45/45 |
+| n42-26 v3 | 7 (views 51..75) | 19 (79..151) | 19 (154..226) | 45/45 (gov5's verifier) |
+
+Every record names validator 2. The standalone check (gov5's verifier, outside any node) verifies both
+BLS signatures against the record's key, that key against genesis validator[2], and that the two signed
+messages differ; n42-26's records parse with gov5's own evidence type unchanged (AM28 shape). Votes and
+commit votes are recorded by the leader of the view, proposals by every member. Headers 0..257 equal on
+all 7 dumps, no twin committed, no halt, gov5 refusals 0, load 322k tx with 0 errors. Closes plan items D2
+and E1.
+
 ## Summary
 
 82 rows (89 item ids; alias rows such as `A3 / E1` count once). Levels per client:

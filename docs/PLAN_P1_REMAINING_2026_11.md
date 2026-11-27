@@ -39,13 +39,13 @@ Releases at the time of writing: gov5 main 5464ee6e, n42-rs main e9f15edc4, n42-
 | # | Item | Who | State |
 | --- | --- | --- | --- |
 | D1 | Peer-to-peer state sync (`qmdb_*`, `code_by_hash`) | all three | feasibility notes exist (`docs/P1_STATESYNC_FEASIBILITY_n42rs.md`, gov5's, n42-26's HANDOFF post) |
-| D2 | Mixed equivocation round | all three | injector + late/aggregate equivocation fixes on main (d8a5e54d2); mixed round M3d 22:00-22:40 EST 11-26 |
+| D2 | Mixed equivocation round | all three | DONE: mixed round M3d (2026-11-26 22:00-22:40 EST) passed, see status doc |
 
 ## E. Open since v1 (status doc, §7 and risks)
 
 | # | Item | Who | State |
 | --- | --- | --- | --- |
-| E1 | gov5 proposal-equivocation detection (M3d) | gov5 | DONE (gov5 b5cf49a7); gov5 late R1/commit votes + proposals in ef2f6bb0; mixed M3d 22:00 |
+| E1 | gov5 proposal-equivocation detection (M3d) | gov5 | DONE (gov5 b5cf49a7, ef2f6bb0); proven in M3d |
 | E2 | §7: validator-set changes (E2), B11 follower rule, kept-tail bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a negative leader | all three | vectors published 11-26; n42-rs passes V2, V7, V9 (2 GossipSub fixes), AM33 (main d8a5e54d2); n42-26 pending |
 | E3 | Liveness risk: k consecutive absent leaders stall ~24 + 48 + 96·(k−2) s | standard | AM33 adopted (standard); gov5 60521778 and n42-rs d8a5e54d2 implement it; n42-26 pending |
 

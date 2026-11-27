@@ -1079,7 +1079,7 @@ with a consensus-dir block journal synced with the lock (option A); n42-rs on br
 fix/p1-durable-commit-vote. Cost: one durable write on the commit-vote path per block (a journal append
 is about 1-5 ms; a full EL commit 15 ms empty to 0.5 s for a full block).
 
-## Amendment AM36 (2026-11-27, PROPOSED by n42-rs; raised by n42-26's F1 work; gov5 and n42-26 reviewed): validate, then forward
+## Amendment AM36 (2026-11-27, ADOPTED by the owner; proposed by n42-rs, raised by n42-26's F1 work, reviewed by gov5 and n42-26): validate, then forward
 
 Survey (code, 2026-11-27): n42-rs forwards a gossip message only after it decodes as its topic's type
 (`validate_messages`, h2-net `transport.rs`; it does not verify BLS before forwarding, and accepts the

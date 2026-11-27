@@ -59,7 +59,7 @@ fn scratch(name: &str) -> PathBuf {
 
 /// The fleet, every member proposing, `EQUIVOCATOR` running `injector`; each
 /// member's evidence log in `dir/<index>`.
-async fn build_fleet(injector: TestEquivocation, dir: &Path) -> Vec<H2Service<MockExecutionLayer>> {
+async fn build_fleet(injector: TestEquivocation, dir: &Path, aggregate: bool) -> Vec<H2Service<MockExecutionLayer>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -98,7 +98,9 @@ async fn build_fleet(injector: TestEquivocation, dir: &Path) -> Vec<H2Service<Mo
         std::fs::create_dir_all(&node_dir).expect("node dir");
         let mut service = H2Service::new(transport, engine, driver, output_rx, VALIDATORS)
             .with_payload_attributes(attributes)
-            .with_equivocation_log(EquivocationLog::open(&node_dir).expect("evidence log"));
+            .with_equivocation_log(EquivocationLog::open(&node_dir).expect("evidence log"))
+            // Batched vote verification (`N42_VOTE_AGGREGATE_VERIFY`, profile 1's default).
+            .with_vote_aggregate(aggregate);
         if index == EQUIVOCATOR {
             service = service.with_test_equivocation(injector).expect("dev chain");
         }
@@ -208,14 +210,20 @@ fn assert_evidence(dir: &Path, member: usize, kind: EquivocationKind, seen: &See
 }
 
 async fn equivocate(name: &str, spec: &str, kind: EquivocationKind, detectors: &[usize]) {
+    for aggregate in [false, true] {
+        equivocate_with(&format!("{name}-agg{}", u8::from(aggregate)), spec, kind, detectors, aggregate).await;
+    }
+}
+
+async fn equivocate_with(name: &str, spec: &str, kind: EquivocationKind, detectors: &[usize], aggregate: bool) {
     let dir = scratch(name);
-    let nodes = build_fleet(TestEquivocation::parse(spec).expect("spec"), &dir).await;
+    let nodes = build_fleet(TestEquivocation::parse(spec).expect("spec"), &dir, aggregate).await;
     let logs: Vec<EquivocationLog> = nodes.iter().map(H2Service::equivocation_log).collect();
     let (seen, done) = run(nodes, &logs, detectors, Duration::from_secs(120)).await;
     assert!(!seen.twins.is_empty(), "the injector never fired");
     assert!(
         done,
-        "fleet did not prove the fault and keep committing: twins {:?}, evidence {:?}, commits {}",
+        "fleet did not prove the fault and keep committing (aggregate {aggregate}): twins {:?}, evidence {:?}, commits {}",
         seen.twins,
         logs.iter().map(EquivocationLog::len).collect::<Vec<_>>(),
         seen.commits.len()

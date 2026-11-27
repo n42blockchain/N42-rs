@@ -100,6 +100,36 @@ impl ConsensusEngine {
         }
     }
 
+    /// A vote or commit vote of the current view held for the batch
+    /// verifier (`N42_VOTE_AGGREGATE_VERIFY`, on by default on profile 1),
+    /// unverified: checked against the voter's verified message of the view,
+    /// or the first one queued (kept unverified in the late tracker, which
+    /// carries it on when the view closes). True when it proved a pair and
+    /// is not to be queued.
+    pub(super) fn queued_conflict(
+        &mut self,
+        kind: EquivocationKind,
+        view: ViewNumber,
+        voter: u32,
+        block_hash: B256,
+        make: impl Fn() -> SignedValue,
+    ) -> ConsensusResult<bool> {
+        let (verified, late) = match kind {
+            EquivocationKind::Vote => (&self.equivocation_tracker, &mut self.late_votes),
+            EquivocationKind::CommitVote => (&self.commit_equivocation_tracker, &mut self.late_commit_votes),
+            EquivocationKind::Proposal => return Ok(false),
+        };
+        let first = match verified.get(&voter) {
+            Some((hash, _)) if *hash == block_hash => return Ok(false),
+            Some((_, signed)) => (signed.clone(), true),
+            None => match late.check(view, voter, block_hash, false, &make) {
+                LateCheck::Conflict { first, verified } => (first, verified),
+                LateCheck::Repeat | LateCheck::Kept => return Ok(false),
+            },
+        };
+        self.settle_late_conflict(kind, view, voter, first, (make(), false))
+    }
+
     /// A commit vote of a closed view this node led: checked against the
     /// verified commit vote of the same voter kept from that view, or the
     /// late one kept before it (E15). Signatures are verified only when two

@@ -29,6 +29,15 @@ pub const GOSSIP_SUB_MCACHE_LEN: usize = 6;
 pub const GOSSIP_SUB_MCACHE_GOSSIP: usize = 3;
 /// gov5 `gossipSubHeartbeatInterval`.
 pub const GOSSIP_SUB_HEARTBEAT: Duration = Duration::from_millis(700);
+/// go-libp2p-pubsub `GossipSubHeartbeatInitialDelay` default, which gov5
+/// keeps (profile-1 vector V9 `gossipSubParams.HeartbeatInitialDelay`);
+/// rust-libp2p's default is 5 s.
+pub const GOSSIP_SUB_HEARTBEAT_INITIAL_DELAY: Duration = Duration::from_millis(100);
+/// go-libp2p-pubsub `GossipSubIDontWantMessageThreshold` default, which gov5
+/// keeps (V9 `gossipSubParams.IDontWantMessageThreshold`): a message of at
+/// least this many bytes is announced with IDONTWANT. rust-libp2p's default
+/// is 1000.
+pub const GOSSIP_SUB_IDONTWANT_THRESHOLD: usize = 1024;
 /// gov5 `seenMessagesTTL` — deliberately 30s, not libp2p's 2min default, to
 /// keep the seen-cache from growing to hundreds of MB at fleet throughput.
 pub const SEEN_MESSAGES_TTL: Duration = Duration::from_secs(30);
@@ -203,6 +212,8 @@ fn gov5_gossipsub_config_with(
         .connection_handler_queue_len(bounds.handler_queue)
         .max_control_messages_sent(bounds.max_ihave)
         .heartbeat_interval(GOSSIP_SUB_HEARTBEAT)
+        .heartbeat_initial_delay(GOSSIP_SUB_HEARTBEAT_INITIAL_DELAY)
+        .idontwant_message_size_threshold(GOSSIP_SUB_IDONTWANT_THRESHOLD)
         .mesh_n(GOSSIP_SUB_D)
         .mesh_n_low(GOSSIP_SUB_D_LO)
         .mesh_n_high(GOSSIP_SUB_D_HI)
@@ -250,6 +261,8 @@ mod tests {
         let ours = gov5_gossipsub_config_with(B256::ZERO, QueueBounds::parse(None, None)).unwrap();
         let lib = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(GOSSIP_SUB_HEARTBEAT)
+            .heartbeat_initial_delay(GOSSIP_SUB_HEARTBEAT_INITIAL_DELAY)
+            .idontwant_message_size_threshold(GOSSIP_SUB_IDONTWANT_THRESHOLD)
             .mesh_n(GOSSIP_SUB_D)
             .mesh_n_low(GOSSIP_SUB_D_LO)
             .mesh_n_high(GOSSIP_SUB_D_HI)
@@ -287,6 +300,10 @@ mod tests {
         assert_eq!(cfg.history_length(), GOSSIP_SUB_MCACHE_LEN);
         assert_eq!(cfg.history_gossip(), GOSSIP_SUB_MCACHE_GOSSIP);
         assert_eq!(cfg.heartbeat_interval(), GOSSIP_SUB_HEARTBEAT);
+        // Profile-1 vector V9: HeartbeatInitialDelay 100 ms,
+        // IDontWantMessageThreshold 1024 (go-libp2p-pubsub defaults gov5 keeps).
+        assert_eq!(cfg.heartbeat_initial_delay(), Duration::from_millis(100));
+        assert_eq!(cfg.idontwant_message_size_threshold(), 1024);
         assert_eq!(cfg.duplicate_cache_time(), SEEN_MESSAGES_TTL);
         assert_eq!(cfg.max_transmit_size(), max_gossip_wire_size());
         assert!(matches!(

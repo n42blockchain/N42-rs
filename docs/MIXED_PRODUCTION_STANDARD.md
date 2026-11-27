@@ -1038,7 +1038,7 @@ timeouts sum to 456 s; the recorded 464 s gap includes the block interval.
    views. Each is verified only when it conflicts with a recorded one. Found by the n42-rs injector; gov5,
    n42-26 and n42-rs all had the gap for commit votes.
 
-## Amendment AM35 (2026-11-27, PROPOSED by n42-rs; gov5 supports; n42-26 checking): a commit vote means a durable block
+## Amendment AM35 (2026-11-27, PROPOSED by n42-rs; gov5 reviewed OK with items 4-5; n42-26 checking): a commit vote means a durable block
 
 Found by plan item E4 (whole-set restart). An all-Rust set killed at once (SIGKILL of every validator and
 execution layer) halted for good: the set had committed block 35, every execution layer had persisted only
@@ -1055,6 +1055,9 @@ Rule (profile 1):
 2. Consequently a commit QC certifies a block held durably by at least q members, so any q of them
    restarting together can serve it.
 3. Finality reported to users (RPC `finalized`) is unchanged: certified and persisted locally.
+4. The leader's own block is covered the same way: its commit vote also waits for its own durable write.
+5. An implementation must not offer a profile-1 mode that defers or skips the durable write (gov5 refuses
+   `N42_MDBX_SYNC=safe-nosync` on profile-1 chains; n42-rs refuses persistence-threshold overrides there).
 
 Gate: a whole-set SIGKILL of a mixed set at an arbitrary instant under load recovers without intervention,
 heads equal, repeated at least five times with the kill timed against the commit (the gov5 window is about

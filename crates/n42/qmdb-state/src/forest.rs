@@ -831,7 +831,7 @@ fn delta_of_applied(tree: &QmdbCompatTree, undo: &BlockUndo) -> ForestDelta {
     // A small block's delta is built on this thread
     // (`n42_twig_core::qmdb_compat::small_apply_ops`): a hand-off to the
     // pool costs more than the handful of slots it names.
-    let pooled = n42_twig_core::qmdb_compat::pooled((next_slot.saturating_sub(base_next_slot)) as usize + undo.retired_len());
+    let pooled = n42_twig_core::qmdb_compat::pooled((next_slot.saturating_sub(base_next_slot) as usize).max(undo.retired_len()));
     let appended: Vec<QmdbEntrySnapshot> = if tree.entry_file().is_some() {
         Vec::new()
     } else if pooled {

@@ -1203,7 +1203,7 @@ pub fn pooled(items: usize) -> bool {
 }
 
 /// Default of [`small_apply_ops`].
-pub const SMALL_APPLY_OPS: usize = 64;
+pub const SMALL_APPLY_OPS: usize = 256;
 
 static SMALL_APPLY_OPS_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
@@ -3943,9 +3943,10 @@ mod tests {
     /// A small apply -- on the calling thread, each twig rehashed only above
     /// the leaves it took, the upper tree refreshed from the dirty twigs --
     /// leaves the tree, the undo record and the root the pooled apply
-    /// leaves: blocks of 1 to 48 operations that create, update and delete
-    /// keys across several twigs, a larger block now and then (the pooled
-    /// path on both), and reverts, on the heap and in an entry file.
+    /// leaves: blocks of 1 to 48 operations, and of 200, that create, update
+    /// and delete keys across several twigs, a block over the bound now and
+    /// then (the pooled path on both), and reverts, on the heap and in an
+    /// entry file.
     #[test]
     fn a_small_apply_equals_the_pooled_one() {
         for in_file in [false, true] {
@@ -3984,7 +3985,11 @@ mod tests {
                 (pooled_undo, small_undo)
             };
             for block in 0..700u64 {
-                let count = if block % 97 == 96 { 300 } else { 1 + (next() % 48) as usize };
+                let count = match block {
+                    b if b % 97 == 96 => 300,
+                    b if b % 31 == 30 => 200,
+                    _ => 1 + (next() % 48) as usize,
+                };
                 let mut seen = std::collections::HashSet::new();
                 let mut operations = Vec::new();
                 while operations.len() < count {

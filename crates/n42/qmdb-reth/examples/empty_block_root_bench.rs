@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Off rayon's pool, as the import's root worker is.
-    let worker = std::thread::spawn(move || -> Result<(QmdbForest, Vec<[u64; 13]>, B256, u64), String> {
+    let worker = std::thread::spawn(move || -> Result<(QmdbForest, Vec<[u64; 14]>, B256, u64), String> {
         let mut parent = B256::with_last_byte(1);
         let mut rows = Vec::with_capacity(rounds as usize);
         let mut pending_canonical = Vec::new();
@@ -122,7 +122,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     p.index_us * 1000,
                     p.rehash_us * 1000,
                     p.root_us * 1000,
-                    (note_us + delta_us) * 1000,
+                    note_us * 1000,
+                    delta_us * 1000,
                 ]);
             }
             parent = hash;
@@ -149,7 +150,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "      index",
         "      rehash",
         "      upper",
-        "    note+delta",
+        "    note",
+        "    delta",
     ];
     println!("over {} blocks, microseconds (median / p90 / mean); sub-phases have 1 us resolution:", rows.len());
     for (i, name) in names.iter().enumerate() {

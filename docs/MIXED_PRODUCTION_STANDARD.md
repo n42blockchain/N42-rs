@@ -1116,8 +1116,8 @@ AM36 precisions (2026-11-27, after n42-26's implementation review, PR #58):
 7. Topics without views (block, `transaction_v2`): no stale rule; a well-formed message is accepted, and
    duplicates are dropped by the gossip message id.
 8. A `transaction_v2` batch with bytes that do not decode as a transaction is rejected; a batch whose entries
-   decode but name a type outside the chain's profile-1 set (legacy, 2930, 1559, 7702, plus 0x50 when the
-   genesis has `altSigTx`) is ignored, not rejected, so a client that knows one more type is not penalised.
+   decode but name a type outside the chain's profile-1 set (legacy 0x00, 2930 0x01, 1559 0x02, 7702 0x04;
+   0x50 is not in profile 1, A11/C4) is ignored, not rejected, so a client that knows one more type is not penalised.
    An entry whose leading type byte is an EIP-2718 type (0x00..0x7f) that this client cannot decode at all
    (for example 0x05) counts as "outside the set": ignored. Rejected are only entries that are not a valid
    legacy RLP list or typed envelope (a truncated or malformed byte string, or a known type whose payload

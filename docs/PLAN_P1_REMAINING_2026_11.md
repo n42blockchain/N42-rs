@@ -12,14 +12,14 @@ Releases at the time of writing: gov5 main 5464ee6e, n42-rs main e9f15edc4, n42-
 
 | # | Item | Who | Done when | State |
 | --- | --- | --- | --- | --- |
-| A1 | n42-rs as a `commit_qc/1` server to another client in a mixed round | n42-rs + gov5 + n42-26 | round Q1 (T0 2026-11-26 20:45 EST): gov5 serving off, n42-26 v3 down, gov5 node4 rejoins from genesis; its tail anchored by n42-rs v2's `commit_qc/1`; headers equal | running |
-| A2 | Declare v1.1 closed in the status doc and the standard's V1_RC table | n42-rs (standard owner by delegation) | A1 passed; summary + release commits recorded | after A1 |
+| A1 | n42-rs as a `commit_qc/1` server to another client in a mixed round | n42-rs + gov5 + n42-26 | round Q1 (T0 2026-11-26 20:45 EST): gov5 serving off, n42-26 v3 down, gov5 node4 rejoins from genesis; its tail anchored by n42-rs v2's `commit_qc/1`; headers equal | DONE: round Q1 (0..203 equal); n42-26 v3 anchored on n42-rs v2 `commit_qc/1` #56 |
+| A2 | Declare v1.1 closed in the status doc and the standard's V1_RC table | n42-rs (standard owner by delegation) | A1 passed; summary + release commits recorded | DONE 2026-11-26 21:20 (status doc top) |
 
 ## B. Performance targets (AM31, not gate criteria; idle-time work)
 
 | # | Item | Who | Done when | State |
 | --- | --- | --- | --- | --- |
-| B1 | n42-rs catch-up bound by the network, not execution | n42-rs | empty-chain pull at or above link rate on a 100 Mbit/s budget (today ~47 Mbit/s); the floor is one QMDB root per block (~0.12 ms) | in progress: design agent (branch design/p1-run-root, doc docs/P1_RUN_ROOT_DESIGN.md) |
+| B1 | n42-rs catch-up bound by the network, not execution | n42-rs | empty-chain pull at or above link rate on a 100 Mbit/s budget (today ~47 Mbit/s); the floor is one QMDB root per block (~0.12 ms) | small apply implemented on design/p1-run-root (root 85-103 -> 11-12 us per empty block; per-run root rejected, docs/P1_RUN_ROOT_DESIGN.md); next: paired empty-chain leg, then a mixed round, then merge |
 | B2 | Batch import for blocks over 16 KiB of transactions | n42-rs | range import re-measured against the engine path on heavy blocks since the step-3 root worker; cap raised if it wins (at most ~14 % on 4b-R's pull) | in progress (catch-up agent, perf/p1-catchup) |
 | B3 | Estimate and, if feasible, measure a chain-94-sized catch-up | n42-rs | blocks/s, MB/s, peak RSS and disk on a long heavy history (S1-like or the `gov5-work/p1scale` state) with current main | in progress (catch-up agent, after B2) |
 | B4 | gov5 catch-up speed (S1: 25.7 blk/s) and catch-up peak (4 GB) | gov5 | gov5's own measurement against S1 | gov5 agent on perf/p1-catchup; first numbers 2026-11-27 |

@@ -52,9 +52,19 @@ height (pruned on every commit at `n42Engine_persistedBlock`), normally one or t
   follower's commit vote, already held until the own import (A13), is also held until
   `ConsensusEvent::BlockDurable(B)`; the leader's own commit vote, cast when it forms the PrepareQC, is
   held the same way (`held_leader_commit`). When it holds a vote for this reason the engine emits
-  `EngineOutput::DurabilityWanted(B)`. The lock is in the vote log record written before the signature
-  (`record_commit_vote(view, locked_qc)`), and the PrepareQC raises the lock before that write, so (a) was
-  already true.
+  `EngineOutput::DurabilityWanted(B)`.
+- **The lock on disk** (n42-26's pitfall (a)). The lock reaches disk in two places: the vote log record
+  written before every signature (`record_vote` / `record_commit_vote(view, lock)`) and the checkpoint
+  written at each commit (`checkpoint_from`). gov5's V6 lock rule raises the in-memory lock as soon as a
+  valid PrepareQC arrives, before this node has made the block durable, and a later R1 vote (next view)
+  would then have written that lock. Both writers now take `ConsensusEngine::persistable_lock()`: the lock
+  when its block is durable here (or the lock is genesis), else the highest lock that was
+  (`durable_lock`, seeded from the restored lock at start-up). So a restart never holds a lock on a block
+  it cannot serve. Writing the lower lock is safe because only a commit vote has to survive a restart with
+  its lock, and this node commit-votes only on a durable block -- whose lock is then the persistable one.
+  Off profile 1 `persistable_lock()` is the lock. Tests:
+  `profile1_the_vote_log_never_carries_a_lock_on_a_block_not_durable_here`, and the persistable-lock
+  assertions in `profile1_commit_vote_waits_for_the_durable_block`.
 - **Service** (`n42-h2-node`, `H2Service::make_durable`). On `DurabilityWanted(B)` it walks from B down
   the parent links it holds: a block already journalled, the genesis block, or one at or below the
   execution layer's persisted height ends the walk; every other block on the way is journalled, ancestors
@@ -62,10 +72,18 @@ height (pruned on every commit at `n42Engine_persistedBlock`), normally one or t
   `BlockDurable(B)`. A body or header not here yet leaves B pending, tried again on the next drain; a
   failed write keeps the vote held (and says so at error level). A node without a datadir keeps no vote
   log either and answers at once.
-- **Restart** (`H2Service::restore_block_journal`, run by `h2_validator` before its loop). Every
-  journalled block the execution layer does not hold is imported again, lowest first, as a pulled block
-  (newPayload, then a head-only forkchoice: neither safe nor finalized), and its body, header and parent
-  are remembered so it is served and built on. This happens before the node serves, votes or builds.
+- **Restart** (`H2Service::restore_block_journal`, run by `h2_validator` before its loop). Replay is
+  keyed by hash (n42-26's pitfall (b)): every journalled block the execution layer does not hold *by hash*
+  is executed again, lowest first. One above the layer's head is imported as a pulled block (newPayload,
+  then a head-only forkchoice: neither safe nor finalized); one at or below the head -- a block that lost
+  its height to the committed chain, or one the layer dropped -- is executed back in with newPayload
+  only, no forkchoice, which would move the head back. Either way its body, header and parent are
+  remembered so it is served and built on. This happens before the node serves, votes or builds. Test:
+  `a_restart_replays_a_journalled_block_by_hash_when_the_layer_has_another_at_its_height`.
+- **Pruning** (on every `BlockCommitted(C)`), also by hash: the walk from C by parent hash names the
+  committed chain; its journalled blocks at or below the layer's persisted height go (the layer holds
+  them), and so do journalled blocks at or below C's height that are not on it (siblings no certificate
+  can commit any more). A journalled block above C stays.
 - **Execution layer** (`bin/n42`, vendored `reth-node-builder`). On a profile-1 genesis the engine tree
   runs at persistence threshold 0 and buffer target 0 (`profile1_tree_config`), so committed blocks reach
   disk as soon as they are canonical and the journal stays short. The start-up check
@@ -75,9 +93,10 @@ height (pruned on every commit at `n42Engine_persistedBlock`), normally one or t
   than silently overridden: an operator who set them meant something, and AM35 item 5 says no profile-1
   mode may defer the write. The tree config applies 0 anyway, whatever reached it.
 
-The ancestor check reads the persisted height by number. The execution layer makes canonical only what
-consensus committed (or what a verified catch-up pulled), so the block at a persisted height is the one
-on the chain the walk follows; the walk itself goes by hash.
+The make-durable walk stops at an ancestor at or below the persisted height. That one check reads a
+height: the walk itself goes by parent hash, and the layer makes canonical only what consensus committed
+(or a verified catch-up pulled), so the persisted block at that height is on the chain the walk follows
+whenever the walked block can still be committed.
 
 ## Cost
 

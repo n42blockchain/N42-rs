@@ -159,6 +159,37 @@ mod tests {
     }
 
     #[test]
+    fn a_double_commit_vote_after_the_view_closed_is_still_proven() {
+        let keys = keys();
+        let hash = B256::repeat_byte(0xC3);
+        // Both orders across the boundary: the first counted in the view and
+        // the twin late, and both late (outside the quorum).
+        for first_in_view in [true, false] {
+            let (mut leader, mut rx) = engine(1, &keys);
+            let (voter, _) = engine(2, &keys);
+            let profile = leader.signing_profile();
+            let signed = profile.commit_message(1, hash, B256::ZERO);
+            let commit = ConsensusMessage::CommitVote(CommitVote { view: 1, block_hash: hash, voter: 2, signature: profile.sign(&keys[2], &signed) });
+            let twin = voter.sign_equivocating_twin(&commit).expect("own commit vote");
+            if first_in_view {
+                leader.process_event(ConsensusEvent::Message(commit.clone())).expect("in view");
+            }
+            leader.advance_to_view(2).expect("advance");
+            drain(&mut rx);
+            // A repeat of the first is not a conflict.
+            let _ = leader.process_event(ConsensusEvent::Message(commit.clone()));
+            let _ = leader.process_event(ConsensusEvent::Message(commit));
+            assert!(!drain(&mut rx).iter().any(|o| matches!(o, EngineOutput::EquivocationDetected { .. })));
+            let _ = leader.process_event(ConsensusEvent::Message(twin));
+            assert_eq!(
+                detected(&drain(&mut rx), EquivocationKind::CommitVote, profile),
+                (hash, twin_block_hash(hash)),
+                "first in view: {first_in_view}"
+            );
+        }
+    }
+
+    #[test]
     fn a_double_proposal_is_proven_by_a_follower() {
         let keys = keys();
         let (proposer, _) = engine(1, &keys);

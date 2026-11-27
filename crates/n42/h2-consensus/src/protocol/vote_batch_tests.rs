@@ -413,3 +413,79 @@ fn forged_late_votes_cannot_block_a_genuine_progress_vote() {
     leader.settle_voters_seen(VIEW, None);
     assert_eq!(leader.voter_last_seen(late), Some(VIEW));
 }
+
+/// The detected pairs of Round `kind` in `rx`, as (voter, hash1, hash2).
+fn detected(rx: &mut mpsc::Receiver<EngineOutput>, kind: crate::EquivocationKind) -> Vec<(u32, B256, B256)> {
+    let mut out = Vec::new();
+    while let Ok(output) = rx.try_recv() {
+        if let EngineOutput::EquivocationDetected { validator, hash1, hash2, evidence, .. } = output
+            && evidence.kind == kind
+        {
+            assert!(evidence.verify(crate::protocol::quorum::ConsensusSigningProfile::Native), "the pair verifies");
+            out.push((validator, hash1, hash2));
+        }
+    }
+    out
+}
+
+/// A Round-1 vote that arrives after the PrepareQC, in its own view, and a
+/// twin for another block: proven in both orders, with batched verification
+/// on (profile 1's default) and off.
+#[test]
+fn a_double_vote_after_the_prepare_qc_is_proven_with_and_without_batching() {
+    let sks = keys();
+    let block_hash = B256::repeat_byte(0xA7);
+    let other = B256::repeat_byte(0xB7);
+    for batched in [true, false] {
+        for twin_first in [false, true] {
+            let (mut leader, mut rx) = leader_ready(&sks, batched, block_hash);
+            let voters: Vec<u32> = others().collect();
+            for voter in &voters[..14] {
+                feed(&mut leader, vote(&sks, *voter, block_hash));
+            }
+            leader.flush_votes().expect("flush");
+            assert_eq!(broadcast_bytes(&mut rx).len(), 1, "a PrepareQC formed");
+            assert_eq!(leader.current_view(), VIEW, "still in the view");
+            let late = voters[19];
+            let (a, b) = if twin_first { (other, block_hash) } else { (block_hash, other) };
+            feed(&mut leader, vote(&sks, late, a));
+            feed(&mut leader, vote(&sks, late, b));
+            leader.flush_votes().expect("flush");
+            assert_eq!(
+                detected(&mut rx, crate::EquivocationKind::Vote),
+                vec![(late, a, b)],
+                "batched: {batched}, twin first: {twin_first}"
+            );
+        }
+    }
+}
+
+/// Both votes of a pair queued before the PrepareQC (the twin's group never
+/// reaches a quorum and used to wait in the queue unseen), and the same for
+/// commit votes before the CommitQC.
+#[test]
+fn a_double_vote_and_commit_vote_queued_in_the_view_are_proven() {
+    let sks = keys();
+    let block_hash = B256::repeat_byte(0xA8);
+    let other = B256::repeat_byte(0xB8);
+    for batched in [true, false] {
+        let (mut leader, mut rx) = leader_ready(&sks, batched, block_hash);
+        let voters: Vec<u32> = others().collect();
+        let twin_voter = voters[0];
+        feed(&mut leader, vote(&sks, twin_voter, block_hash));
+        feed(&mut leader, vote(&sks, twin_voter, other));
+        assert_eq!(detected(&mut rx, crate::EquivocationKind::Vote), vec![(twin_voter, block_hash, other)], "batched: {batched}");
+        for voter in &voters[1..15] {
+            feed(&mut leader, vote(&sks, *voter, block_hash));
+        }
+        leader.flush_votes().expect("flush");
+        assert_eq!(broadcast_bytes(&mut rx).len(), 1, "a PrepareQC formed");
+        feed(&mut leader, commit_vote(&sks, twin_voter, block_hash));
+        feed(&mut leader, commit_vote(&sks, twin_voter, other));
+        assert_eq!(
+            detected(&mut rx, crate::EquivocationKind::CommitVote),
+            vec![(twin_voter, block_hash, other)],
+            "batched: {batched}"
+        );
+    }
+}

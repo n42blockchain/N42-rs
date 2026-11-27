@@ -828,13 +828,19 @@ fn delta_of_applied(tree: &QmdbCompatTree, undo: &BlockUndo) -> ForestDelta {
     // With the entries in the file, the file is the record of the
     // appended range (synced before the delta is written); the delta
     // names it by its bounds and carries nothing.
+    // A small block's delta is built on this thread
+    // (`n42_twig_core::qmdb_compat::small_apply_ops`): a hand-off to the
+    // pool costs more than the handful of slots it names.
+    let pooled = n42_twig_core::qmdb_compat::pooled((next_slot.saturating_sub(base_next_slot)) as usize + undo.retired_len());
     let appended: Vec<QmdbEntrySnapshot> = if tree.entry_file().is_some() {
         Vec::new()
-    } else {
+    } else if pooled {
         (base_next_slot..next_slot)
             .into_par_iter()
             .map(|slot| tree.entry_at(slot).expect("an appended slot is on the tree"))
             .collect()
+    } else {
+        (base_next_slot..next_slot).map(|slot| tree.entry_at(slot).expect("an appended slot is on the tree")).collect()
     };
     // The block only ever deactivates the slots its undo names (a
     // revival is a move, not a block), so no read: the flag is false.
@@ -848,6 +854,12 @@ fn delta_of_applied(tree: &QmdbCompatTree, undo: &BlockUndo) -> ForestDelta {
         .filter(|sorted| sorted.len() == undo.retired_len() && sorted.last().is_none_or(|last| *last < base_next_slot));
     let changed: Vec<(u64, bool)> = match presorted {
         Some(sorted) => sorted.par_iter().with_min_len(4096).map(|slot| (*slot, false)).collect(),
+        None if !pooled => {
+            let mut slots: Vec<u64> = undo.retired_slots().filter(|slot| *slot < base_next_slot).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            slots.into_iter().map(|slot| (slot, false)).collect()
+        }
         None => {
             let mut slots: Vec<u64> = Vec::with_capacity(undo.retired_len());
             slots.extend(undo.retired_slots().filter(|slot| *slot < base_next_slot));

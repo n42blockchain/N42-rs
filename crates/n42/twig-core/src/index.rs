@@ -233,10 +233,15 @@ fn partition_by_shard<'k, T: Send>(
         }
         counts
     };
+    // A small batch stays on the calling thread, here and below
+    // (`qmdb_compat::small_apply_ops`).
+    let pooled = crate::qmdb_compat::pooled(n);
     #[cfg(feature = "rayon")]
-    let counts: Vec<[u32; SHARDS]> = {
+    let counts: Vec<[u32; SHARDS]> = if pooled {
         use rayon::prelude::*;
         shards.par_chunks_mut(PARTITION_CHUNK).enumerate().map(count).collect()
+    } else {
+        shards.chunks_mut(PARTITION_CHUNK).enumerate().map(count).collect()
     };
     #[cfg(not(feature = "rayon"))]
     let counts: Vec<[u32; SHARDS]> = shards.chunks_mut(PARTITION_CHUNK).enumerate().map(count).collect();
@@ -267,10 +272,14 @@ fn partition_by_shard<'k, T: Send>(
         }
     };
     #[cfg(feature = "rayon")]
-    {
+    if pooled {
         use rayon::prelude::*;
         shards.par_chunks(PARTITION_CHUNK).zip(next.into_par_iter()).enumerate().for_each(scatter);
+    } else {
+        shards.chunks(PARTITION_CHUNK).zip(next).enumerate().for_each(scatter);
     }
+    #[cfg(not(feature = "rayon"))]
+    let _ = pooled;
     #[cfg(not(feature = "rayon"))]
     shards.chunks(PARTITION_CHUNK).zip(next).enumerate().for_each(scatter);
     // SAFETY: the scatter wrote every position below `n` exactly once (the
@@ -607,13 +616,17 @@ impl TagIndex {
         // longest hold in the block it happened. Each shard's table depends
         // only on its own keys, so the result is the same either way.
         #[cfg(feature = "rayon")]
-        {
+        if crate::qmdb_compat::pooled(additional) {
             use rayon::prelude::*;
             // A hint: a shard it cannot grow is left as it is, and the
             // insert that needs the room reports it.
             self.shards.par_iter_mut().for_each(|shard| {
                 let _ = shard.ensure_capacity(shard.len + per, max_bits);
             });
+        } else {
+            for shard in &mut self.shards {
+                let _ = shard.ensure_capacity(shard.len + per, max_bits);
+            }
         }
         #[cfg(not(feature = "rayon"))]
         for shard in &mut self.shards {
@@ -749,7 +762,7 @@ impl TagIndex {
             }
         };
         #[cfg(feature = "rayon")]
-        {
+        if crate::qmdb_compat::pooled(out.len()) {
             use rayon::prelude::*;
             match at {
                 Some(at) => out
@@ -759,8 +772,8 @@ impl TagIndex {
                     .for_each(|(chunk, (held, place))| work(chunk, held, Some(place))),
                 None => out.par_chunks_mut(GET_CHUNK).enumerate().for_each(|(chunk, held)| work(chunk, held, None)),
             }
+            return;
         }
-        #[cfg(not(feature = "rayon"))]
         match at {
             Some(at) => out
                 .chunks_mut(GET_CHUNK)
@@ -966,14 +979,11 @@ impl TagIndex {
             Ok(())
         };
         #[cfg(feature = "rayon")]
-        {
+        if crate::qmdb_compat::pooled(pairs.len()) {
             use rayon::prelude::*;
-            self.shards.par_iter_mut().enumerate().try_for_each(work)
+            return self.shards.par_iter_mut().enumerate().try_for_each(work);
         }
-        #[cfg(not(feature = "rayon"))]
-        {
-            self.shards.iter_mut().enumerate().try_for_each(work)
-        }
+        self.shards.iter_mut().enumerate().try_for_each(work)
     }
 
     /// Inserts `(key, slot)` pairs with distinct keys, one shard at a time
@@ -1020,14 +1030,11 @@ impl TagIndex {
             Ok(())
         };
         #[cfg(feature = "rayon")]
-        {
+        if crate::qmdb_compat::pooled(pairs.len()) {
             use rayon::prelude::*;
-            self.shards.par_iter_mut().enumerate().try_for_each(work)
+            return self.shards.par_iter_mut().enumerate().try_for_each(work);
         }
-        #[cfg(not(feature = "rayon"))]
-        {
-            self.shards.iter_mut().enumerate().try_for_each(work)
-        }
+        self.shards.iter_mut().enumerate().try_for_each(work)
     }
 }
 

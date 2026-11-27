@@ -474,3 +474,27 @@ Gate-6 set (gov5 v0, v1 + verifier, n42-rs v2, n42-26 v3), 25 min each, ~150 tx/
   0 Reject on gov5 and n42-26 (74,157 messages received on n42-26), no peer penalised.
 - smk2 (03:25 EST): all three on AM36 (n42-rs integ/p1-am35-am36 7e9e3c165). Headers 0..165 equal on 7 dumps;
   178k tx, 0 errors; 0 Reject / 0 Ignore on every client, no peer penalised. PASS.
+
+## E9 mixed whole-set SIGKILL gate, run e9g (2026-11-27 04:05 EST)
+
+Gate-6 set under ~150 tx/s: gov5 v0, v1 + verifier (vtf-78c76e2e: AM35 + AM36), n42-rs v2 (integ/p1-am35-am36
+7e9e3c165), n42-26 v3 (PR #57 72facd3, AM35 only). Watcher `e9-watch.sh` wrote `am35-trigger/e9-<n>`; each
+client's killer SIGKILLed only its own members (n42-rs 2-9 ms after the trigger, n42-26 8-12 ms, gov5
+45-232 ms) and restarted them with the same datadirs at trigger + 5 s (gov5 + 7.1 s).
+
+| kill | trigger | restart height | recovered (+3 on all five ELs) |
+| --- | --- | --- | --- |
+| 1-5 | a commit line (gov5) | 17, 25, 34, 43, 51 | 48, 65, 23, 48, 63 s |
+| 6, 8, 9 | n42-rs follower's AM35 release line | 60, 77, 86 | 23, 65, 23 s |
+| 7 | gov5 follower's held commit vote | 69 | 48 s |
+| 10 | gov5 follower's held commit vote | 94 | gov5 + n42-rs: yes (94 -> 103); n42-26 v3: EL stuck at 95 |
+
+- Kill 10 on n42-26 v3 (its diagnosis): v3's durable lock lagged the commit when it committed by Decide
+  without its own R2, so every snapshot save was refused; after the kill its snapshot (block 91) was below
+  reth's persisted head (94), catch-up sent a forkchoice below the head ("too deep reorg") and later
+  children were refused as parent-unknown. Consensus safety unaffected; the chain went on. Fixed in n42-26
+  272ca33 (lock raised to the commit QC; snapshot saved before the finalize forkchoice); the suffix
+  re-admission on recovery is a second, separate n42-26 fix.
+- No committed block lost on any gov5 member (each member's last commit before every kill is canonical).
+- Headers: 0..95 equal on 8 dumps (n42-rs, gov5 x6, n42-26); 0..112 equal between n42-rs and gov5 x3.
+- n42-rs: 10/10 recovered on 7e9e3c165. The gate as a whole is rerun as e9h (05:00 EST) with n42-26 272ca33.

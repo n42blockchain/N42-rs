@@ -17,10 +17,14 @@
 > Releases: gov5 main 5eb5aba9 (binary 854a1982…), n42-rs main 6a793112e, n42-26 main 9feef34 (binary 9bba532a…;
 > AM28 fields in PR #47, approved by the owner, merge pending in n42-26's session).
 >
-> **v1.1 (open):** gate 4b p2p state sync, `bodies_by_range/2`, `commit_qc/1` (AM29, AM30); a mixed equivocation
-> round (no client has a double-sign injector); gov5 proposal-equivocation detection (M3d); the §7 open items
-> (E2 set changes, B11 follower rule, kept-tail bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a
-> negative leader).
+> **v1.1 (AM31) — gates passed 2026-11-26, one coverage gap open:** `bodies_by_range/2` + `commit_qc/1` in all
+> three clients with `/1` fallback; gate 4b (0..368 equal), 4b-S non-gov5 servers (0..287), scale leg S1 (3.67M tx,
+> 0..3129, every client rejoined from genesis), 4b-R / 4b-R2 re-checks of n42-rs's new catch-up defaults (0..623,
+> 0..296). Releases: gov5 main 5464ee6e (includes the serve switch and the steady-RSS fix), n42-rs main e9f15edc4,
+> n42-26 main 80ecf52. **Open:** n42-rs as a `commit_qc/1` server to another client has not happened in a mixed
+> round (vectors + loopback only). Moved to v1.2 by AM31: p2p state sync, a mixed equivocation round. Still open
+> from v1: gov5 proposal-equivocation detection (M3d) and the §7 items (E2 set changes, B11 follower rule, kept-tail
+> bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a negative leader).
 >
 > **Risks carried:** (1) liveness — k consecutive absent leaders stall about 24 + 48 + 96·(k−2) s (5d: 464 s for six);
 > mitigation candidates for v1.1: cap backoff across consecutive TCs, or a leader order that interleaves operators.

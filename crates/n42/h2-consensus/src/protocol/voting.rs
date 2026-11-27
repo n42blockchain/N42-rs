@@ -356,6 +356,13 @@ impl ConsensusEngine {
             prepare_qc_msg,
         )))?;
 
+        // AM35 (profile 1): the leader's own commit vote waits for its
+        // block's durable write too.
+        if !self.block_durable_for_commit(&block_hash) {
+            tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "durable commit vote: holding the leader's commit vote until its block is durable");
+            self.held_leader_commit = Some((view, block_hash));
+            return self.emit(EngineOutput::DurabilityWanted(block_hash));
+        }
         if !self.cast_leader_commit_vote(view, block_hash)? {
             return Ok(());
         }

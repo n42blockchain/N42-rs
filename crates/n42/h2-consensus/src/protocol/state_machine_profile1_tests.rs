@@ -169,14 +169,17 @@ fn profile1_commit_vote_waits_for_the_own_import_not_the_check() {
         e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: block, qc })))
             .expect("the PrepareQC");
         assert_eq!(commit_votes(&outputs(&mut rx)), 0, "gate {gate}: held");
+        // Durable already (AM35), so only the import is left to wait for.
+        e.process_event(ConsensusEvent::BlockDurable(block)).expect("durable");
         e.process_event(ConsensusEvent::BlockChecked(block)).expect("the check");
         assert_eq!(commit_votes(&outputs(&mut rx)), 0, "gate {gate}: a check is not an execution");
         e.process_event(ConsensusEvent::BlockImported(block)).expect("the import");
         assert_eq!(commit_votes(&outputs(&mut rx)), 1, "gate {gate}: the import releases it");
     }
-    // Imported before the PrepareQC: the commit vote goes at once.
+    // Imported (and durable) before the PrepareQC: the commit vote goes at once.
     let (mut e, sks, vs, mut rx) = engine(me, true, VoteRules::PROFILE1);
     e.process_event(ConsensusEvent::BlockImported(block)).expect("the import");
+    e.process_event(ConsensusEvent::BlockDurable(block)).expect("durable");
     let qc = prepare_qc(&e, &sks, &vs, 1, block);
     e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: block, qc })))
         .expect("the PrepareQC");
@@ -407,4 +410,100 @@ fn after_a_genesis_tc_the_leader_builds_on_genesis() {
     // Without a named genesis block the engine names none.
     let (e, ..) = engine(me, true, VoteRules::PROFILE1);
     assert_eq!(e.proposal_parent(), B256::ZERO);
+}
+
+fn durability_wanted(out: &[EngineOutput], block: B256) -> bool {
+    out.iter().any(|o| matches!(o, EngineOutput::DurabilityWanted(h) if *h == block))
+}
+
+/// AM35: under profile 1 the follower's commit vote waits for the block to
+/// be durable here as well as imported, in either order; the engine asks for
+/// durability when it holds the vote for it, and a durable report for another
+/// block releases nothing. Today's rules do not ask.
+#[test]
+fn profile1_commit_vote_waits_for_the_durable_block() {
+    let block = B256::repeat_byte(0xB1);
+    let other = B256::repeat_byte(0xB2);
+    let me = follower_of(&[1]);
+
+    // Imported, then the PrepareQC: held, durability asked for.
+    let (mut e, sks, vs, mut rx) = engine(me, true, VoteRules::PROFILE1);
+    e.process_event(ConsensusEvent::BlockImported(block)).expect("the import");
+    let qc = prepare_qc(&e, &sks, &vs, 1, block);
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: block, qc })))
+        .expect("the PrepareQC");
+    let out = outputs(&mut rx);
+    assert_eq!(commit_votes(&out), 0, "imported but not durable: held");
+    assert!(durability_wanted(&out, block), "the engine asks for the block's durable write");
+    assert_eq!(e.last_commit_voted_view(), 0, "nothing recorded while held");
+    e.process_event(ConsensusEvent::BlockDurable(other)).expect("another block durable");
+    assert_eq!(commit_votes(&outputs(&mut rx)), 0, "another block's durability releases nothing");
+    e.process_event(ConsensusEvent::BlockDurable(block)).expect("durable");
+    assert_eq!(commit_votes(&outputs(&mut rx)), 1, "durable and imported: the commit vote goes");
+    assert_eq!(e.last_commit_voted_view(), 1);
+
+    // Durable first, then the PrepareQC, then the import.
+    let (mut e, sks, vs, mut rx) = engine(me, true, VoteRules::PROFILE1);
+    e.process_event(ConsensusEvent::BlockDurable(block)).expect("durable");
+    let qc = prepare_qc(&e, &sks, &vs, 1, block);
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: block, qc })))
+        .expect("the PrepareQC");
+    assert_eq!(commit_votes(&outputs(&mut rx)), 0, "durable but not imported: held");
+    e.process_event(ConsensusEvent::BlockImported(block)).expect("the import");
+    assert_eq!(commit_votes(&outputs(&mut rx)), 1, "the import releases it");
+
+    // A durable report after the view moved on casts nothing.
+    let (mut e, sks, vs, mut rx) = engine(me, true, VoteRules::PROFILE1);
+    e.process_event(ConsensusEvent::BlockImported(block)).expect("the import");
+    let qc = prepare_qc(&e, &sks, &vs, 1, block);
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: block, qc })))
+        .expect("the PrepareQC");
+    e.advance_to_view(2).expect("the next view");
+    let _ = outputs(&mut rx);
+    e.process_event(ConsensusEvent::BlockDurable(block)).expect("durable late");
+    assert_eq!(commit_votes(&outputs(&mut rx)), 0, "no commit vote for a view that passed");
+
+    // Today: no durability gate, no request.
+    let (mut e, sks, vs, mut rx) = engine(me, true, VoteRules::TODAY);
+    e.process_event(ConsensusEvent::BlockImported(block)).expect("the import");
+    let qc = prepare_qc(&e, &sks, &vs, 1, block);
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: block, qc })))
+        .expect("the PrepareQC");
+    let out = outputs(&mut rx);
+    assert_eq!(commit_votes(&out), 1, "today: the commit vote goes at once");
+    assert!(!durability_wanted(&out, block));
+}
+
+/// AM35 item 4: the leader's own commit vote waits for its own block's
+/// durable write. With three followers' votes the leader forms the PrepareQC
+/// and broadcasts it, but records no commit vote (and so cannot form the
+/// commit QC with it) until the block is durable here.
+#[test]
+fn profile1_the_leaders_own_commit_vote_waits_for_the_durable_block() {
+    let block = B256::repeat_byte(0xB3);
+    let (probe, ..) = engine(0, true, VoteRules::PROFILE1);
+    let leader = probe.leader_index_for_view(1);
+    for rules in [VoteRules::PROFILE1, VoteRules::TODAY] {
+        let (mut e, sks, _, mut rx) = engine(leader, true, rules);
+        e.process_event(ConsensusEvent::BlockReady(block, None)).expect("the leader's block");
+        let message = e.signing_profile.vote_message(1, block);
+        for voter in (0..4u32).filter(|i| *i != leader) {
+            let vote = Vote { view: 1, block_hash: block, voter, signature: e.signing_profile.sign(&sks[voter as usize], &message) };
+            e.process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote))).expect("a vote");
+        }
+        let out = outputs(&mut rx);
+        assert!(
+            out.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_)))),
+            "{rules:?}: the PrepareQC is formed and broadcast"
+        );
+        if rules.profile1 {
+            assert!(durability_wanted(&out, block), "the leader asks for its block's durable write");
+            assert_eq!(e.last_commit_voted_view(), 0, "the leader's commit vote is held");
+            e.process_event(ConsensusEvent::BlockDurable(block)).expect("durable");
+            assert_eq!(e.last_commit_voted_view(), 1, "durable: the leader's commit vote is cast");
+        } else {
+            assert!(!durability_wanted(&out, block));
+            assert_eq!(e.last_commit_voted_view(), 1, "today: cast with the PrepareQC");
+        }
+    }
 }

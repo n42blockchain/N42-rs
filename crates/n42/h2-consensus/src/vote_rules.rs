@@ -48,6 +48,15 @@ impl VoteRules {
         self.profile1
     }
 
+    /// AM35: the CommitVote (this node's own one as leader included) waits
+    /// until the block's data is durable here -- the node has journalled its
+    /// raw body, synced, or its execution layer has persisted it -- so a
+    /// crash at any instant after the vote leaves the block readable on
+    /// restart. The lock the vote carries is made durable by the vote log.
+    pub const fn commit_vote_needs_durable_block(self) -> bool {
+        self.profile1
+    }
+
     /// Progress votes may be sent and are read into the voters ledger.
     pub const fn progress_votes_allowed(self) -> bool {
         !self.profile1
@@ -102,6 +111,7 @@ mod tests {
         let today = VoteRules::TODAY;
         assert!(!today.round1_needs_check());
         assert!(!today.commit_vote_needs_own_import());
+        assert!(!today.commit_vote_needs_durable_block());
         assert!(today.progress_votes_allowed());
         assert!(today.direct_votes_allowed());
         assert!(today.vote_before_slot_allowed());
@@ -112,6 +122,7 @@ mod tests {
         let p1 = VoteRules::PROFILE1;
         assert!(p1.round1_needs_check());
         assert!(p1.commit_vote_needs_own_import());
+        assert!(p1.commit_vote_needs_durable_block());
         assert!(!p1.progress_votes_allowed());
         assert!(!p1.direct_votes_allowed());
         assert!(!p1.vote_before_slot_allowed());

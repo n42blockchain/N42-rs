@@ -219,6 +219,10 @@ pub enum ConsensusEvent {
     /// import evidence is withdrawn, so a later proposal of the same hash
     /// is checked again rather than voted for at once.
     BlockRejected(B256),
+    /// AM35: the block's data, and every ancestor's, is durable on this
+    /// node (answers [`EngineOutput::DurabilityWanted`]). Releases a commit
+    /// vote held for it.
+    BlockDurable(B256),
 }
 
 /// A vote message whose single-validator BLS signature was verified by the
@@ -370,6 +374,11 @@ pub enum EngineOutput {
         new_epoch: u64,
         validator_count: u32,
     },
+    /// AM35: a commit vote for this block is held until the block's data
+    /// (and every ancestor's) is durable here. The node makes it so and
+    /// answers with [`ConsensusEvent::BlockDurable`]. May be emitted more
+    /// than once for one block.
+    DurabilityWanted(B256),
 }
 
 /// Pending proposal state. Gov5-compatible H2 participants retain this until
@@ -457,6 +466,15 @@ pub struct ConsensusEngine {
     pub(super) executed_blocks: HashSet<B256>,
     /// The PrepareQC whose commit vote the two-phase gate holds.
     pub(super) held_prepare_qc: Option<PrepareQC>,
+    /// AM35: blocks whose data (and every ancestor's) the node reported
+    /// durable ([`ConsensusEvent::BlockDurable`]); bounded by
+    /// `durable_fifo`.
+    pub(super) durable_blocks: HashSet<B256>,
+    /// Insertion order of `durable_blocks`, for its bound.
+    pub(super) durable_fifo: VecDeque<B256>,
+    /// AM35: the leader's own commit vote, held until its block is durable:
+    /// (view, block hash).
+    pub(super) held_leader_commit: Option<(ViewNumber, B256)>,
     /// Outputs `emit` could not put in a full output channel, in order. The
     /// channel's consumer is the task that runs this engine, so waiting for
     /// it to drain cannot work; nothing is dropped instead, and the consumer
@@ -670,6 +688,9 @@ impl ConsensusEngine {
             genesis_block: B256::ZERO,
             executed_blocks: HashSet::new(),
             held_prepare_qc: None,
+            durable_blocks: HashSet::new(),
+            durable_fifo: VecDeque::new(),
+            held_leader_commit: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::new(),
             pacemaker: Pacemaker::with_committee_size(base_timeout_ms, max_timeout_ms, committee_size),
@@ -803,6 +824,9 @@ impl ConsensusEngine {
             genesis_block: B256::ZERO,
             executed_blocks: HashSet::new(),
             held_prepare_qc: None,
+            durable_blocks: HashSet::new(),
+            durable_fifo: VecDeque::new(),
+            held_leader_commit: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::from_snapshot(
                 recovered_view,
@@ -1507,6 +1531,7 @@ impl ConsensusEngine {
             ConsensusEvent::BlockImported(_) => "block_imported",
             ConsensusEvent::BlockChecked(_) => "block_checked",
             ConsensusEvent::BlockRejected(_) => "block_rejected",
+            ConsensusEvent::BlockDurable(_) => "block_durable",
         };
         let _span = tracing::info_span!(
             target: "n42.cl.consensus.event",
@@ -1526,6 +1551,7 @@ impl ConsensusEngine {
                 self.on_block_rejected(block_hash);
                 Ok(())
             }
+            ConsensusEvent::BlockDurable(block_hash) => self.on_block_durable(block_hash),
         }
     }
 
@@ -2178,6 +2204,7 @@ impl ConsensusEngine {
         self.late_proposals.close_view(closing_view, closed);
         self.processed_proposal = None;
         self.held_prepare_qc = None;
+        self.held_leader_commit = None;
 
         // Defense-in-depth: re-derive my_index from the current set on every view
         // advance. The epoch-boundary branch above only fires for live consensus
@@ -2504,6 +2531,7 @@ impl ConsensusEngine {
             EngineOutput::SyncRequired { .. } => "SyncRequired",
             EngineOutput::EquivocationDetected { .. } => "EquivocationDetected",
             EngineOutput::EpochTransition { .. } => "EpochTransition",
+            EngineOutput::DurabilityWanted(_) => "DurabilityWanted",
         }
     }
 }

@@ -653,6 +653,15 @@ impl ConsensusEngine {
             self.held_prepare_qc = Some(pqc);
             return Ok(());
         }
+        // AM35 (profile 1): and until the block's data is durable here, so
+        // the commit QC this vote helps form names a block the voters can
+        // serve after a crash. The lock is made durable below, with the vote.
+        if !self.block_durable_for_commit(&pqc.block_hash) {
+            let block_hash = pqc.block_hash;
+            tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "durable commit vote: holding the commit vote until the block is durable");
+            self.held_prepare_qc = Some(pqc);
+            return self.emit(EngineOutput::DurabilityWanted(block_hash));
+        }
         // Persist before signing for the same crash-safety reason as R1.
         let previous = self.round_state.record_commit_vote(view);
         // A failed log write must not leave the watermark advanced: the
@@ -740,6 +749,46 @@ impl ConsensusEngine {
             leader,
             ConsensusMessage::Vote(vote),
         ))
+    }
+
+    /// Whether the AM35 gate lets a commit vote for `block_hash` go: off
+    /// profile 1 always, on it once the node reported the block durable.
+    pub(super) fn block_durable_for_commit(&self, block_hash: &B256) -> bool {
+        !self.vote_rules.commit_vote_needs_durable_block() || self.durable_blocks.contains(block_hash)
+    }
+
+    /// AM35: the node reports `block_hash` durable (with its ancestors).
+    /// Releases the follower's held commit vote (which still waits for the
+    /// own import, if that has not landed) or the leader's own one.
+    pub(super) fn on_block_durable(&mut self, block_hash: B256) -> ConsensusResult<()> {
+        /// Durable blocks remembered; far more than the blocks in flight.
+        const MAX_DURABLE_BLOCKS: usize = 256;
+        if self.durable_blocks.insert(block_hash) {
+            self.durable_fifo.push_back(block_hash);
+            while self.durable_fifo.len() > MAX_DURABLE_BLOCKS {
+                if let Some(oldest) = self.durable_fifo.pop_front() {
+                    self.durable_blocks.remove(&oldest);
+                }
+            }
+        }
+        let current = self.round_state.current_view();
+        if self.held_prepare_qc.as_ref().is_some_and(|held| held.block_hash == block_hash)
+            && let Some(held) = self.held_prepare_qc.take()
+            && held.view == current
+        {
+            tracing::info!(target: "n42::interop::h2v4", view = held.view, %block_hash, "durable commit vote: block durable, casting the held commit vote");
+            return self.process_prepare_qc(held);
+        }
+        if self.held_leader_commit.is_some_and(|(_, held)| held == block_hash)
+            && let Some((view, _)) = self.held_leader_commit.take()
+            && view == current
+        {
+            tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "durable commit vote: own block durable, casting the leader's commit vote");
+            if self.cast_leader_commit_vote(view, block_hash)? {
+                return self.try_form_commit_qc();
+            }
+        }
+        Ok(())
     }
 
     /// Withdraws a block's import evidence (see `ConsensusEvent::BlockRejected`).

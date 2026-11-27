@@ -1,0 +1,268 @@
+{
+  "vector": "V9",
+  "standard": "N42 mixed production standard profile 1; vector V9 (GossipSub parameters: G2, G3, G4, B15)",
+  "library": "github.com/libp2p/go-libp2p-pubsub v0.18.0",
+  "genesisHash": "0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc",
+  "forkDigest": "188e9d93",
+  "topics": [
+    {
+      "name": "block",
+      "topic": "/n42/188e9d93/block/ssz_snappy",
+      "inG2": true,
+      "scoringParams": "block"
+    },
+    {
+      "name": "transaction_v2",
+      "topic": "/n42/188e9d93/transaction_v2/ssz_snappy",
+      "inG2": true,
+      "scoringParams": "lightweight",
+      "note": "joined when the node has a transaction pool"
+    },
+    {
+      "name": "blob_sidecar",
+      "topic": "/n42/188e9d93/blob_sidecar/ssz_snappy",
+      "inG2": false,
+      "scoringParams": "block",
+      "note": "gov5 subscribes to it on every chain (internal/sync registerSubscribers); not in G2, Profile 1 has no blobs (B9)"
+    },
+    {
+      "name": "hotstuff_consensus",
+      "topic": "/n42/188e9d93/hotstuff_consensus/ssz_snappy",
+      "inG2": true,
+      "scoringParams": "consensus"
+    },
+    {
+      "name": "h2/4",
+      "topic": "/n42/h2/4/ssz_snappy",
+      "inG2": true,
+      "scoringParams": "consensus",
+      "note": "no fork digest: the H2-v4 envelope carries chain id and genesis hash"
+    },
+    {
+      "name": "zk_proof",
+      "topic": "/n42/188e9d93/zk_proof/ssz_snappy",
+      "inG2": false,
+      "scoringParams": "refused: unrecognized topic for parameter registration: /n42/188e9d93/zk_proof/ssz_snappy",
+      "note": "in the topic registry, but no gov5 service joins it; topicScoreParams has no branch for it"
+    },
+    {
+      "name": "mobileverify_packet",
+      "topic": "/n42/188e9d93/mobileverify_packet/ssz_snappy",
+      "inG2": true,
+      "scoringParams": "lightweight"
+    },
+    {
+      "name": "mobileverify_registration",
+      "topic": "/n42/188e9d93/mobileverify_registration/ssz_snappy",
+      "inG2": true,
+      "scoringParams": "lightweight"
+    },
+    {
+      "name": "mobileverify_cohort_index",
+      "topic": "/n42/188e9d93/mobileverify_cohort_index/ssz_snappy",
+      "inG2": false,
+      "scoringParams": "lightweight",
+      "note": "joined by the mobileverify cohort coordinator when it runs (not in G2)"
+    },
+    {
+      "name": "mobileverify_cohort_reveal",
+      "topic": "/n42/188e9d93/mobileverify_cohort_reveal/ssz_snappy",
+      "inG2": false,
+      "scoringParams": "lightweight",
+      "note": "joined by the mobileverify cohort coordinator when it runs (not in G2)"
+    },
+    {
+      "name": "mobileverify_cohort_cert",
+      "topic": "/n42/188e9d93/mobileverify_cohort_cert/ssz_snappy",
+      "inG2": false,
+      "scoringParams": "lightweight",
+      "note": "joined by the mobileverify cohort coordinator when it runs (not in G2)"
+    }
+  ],
+  "messageIdRule": "message id = keccak256(genesisHash || topic || data)[:20] (G3); data = the message payload as published (snappy block of the encoded message)",
+  "messageIds": [
+    {
+      "topic": "/n42/188e9d93/hotstuff_consensus/ssz_snappy",
+      "data": "0x",
+      "messageId": "0x48479d9b3a3cfab747d35d0da20fd5c67f657f87"
+    },
+    {
+      "topic": "/n42/188e9d93/hotstuff_consensus/ssz_snappy",
+      "data": "0x00",
+      "messageId": "0xc874f7146fd8d5b2b7d35597fd6de76df727d7b7"
+    },
+    {
+      "topic": "/n42/188e9d93/block/ssz_snappy",
+      "data": "0xff00ff00",
+      "messageId": "0x8da2fa5fa94cf127322b2ac7872cce5761a13169"
+    },
+    {
+      "topic": "/n42/h2/4/ssz_snappy",
+      "data": "0x4e3432483256340102",
+      "messageId": "0x2bf60727b550a71828ad9c55681a2f9ba3b28118"
+    }
+  ],
+  "router": {
+    "maxDecodedMessageBytes": 67108864,
+    "maxMessageSizeBytes": 78293706,
+    "maxMessageSizeRule": "snappy.MaxEncodedLen(maxBlockBytes) = 32 + n + n/6 for n = maxBlockBytes",
+    "messageSignaturePolicy": "StrictNoSign",
+    "noAuthor": true,
+    "peerOutboundQueueSize": 1024,
+    "protocolSuffix": "/ssz_snappy",
+    "seenMessagesTTLMs": 30000,
+    "subscriptionFilterPrefix": "/n42/",
+    "timeCacheDurationMs": 385000,
+    "validateQueueSize": 1024
+  },
+  "gossipSubParams": {
+    "ConnectionTimeout": 30000,
+    "Connectors": 8,
+    "D": 8,
+    "Dhi": 12,
+    "DirectConnectInitialDelay": 1000,
+    "DirectConnectTicks": 300,
+    "Dlazy": 6,
+    "Dlo": 6,
+    "Dout": 2,
+    "Dscore": 4,
+    "FanoutTTL": 60000,
+    "GossipFactor": 0.25,
+    "GossipRetransmission": 3,
+    "GraftFloodThreshold": 10000,
+    "HeartbeatInitialDelay": 100,
+    "HeartbeatInterval": 700,
+    "HistoryGossip": 3,
+    "HistoryLength": 6,
+    "IDontWantMessageTTL": 3,
+    "IDontWantMessageThreshold": 1024,
+    "IWantFollowupTime": 3000,
+    "MaxIDontWantLength": 10,
+    "MaxIDontWantMessages": 1000,
+    "MaxIHaveLength": 5000,
+    "MaxIHaveMessages": 10,
+    "MaxPendingConnections": 128,
+    "OpportunisticGraftPeers": 2,
+    "OpportunisticGraftTicks": 60,
+    "PruneBackoff": 60000,
+    "PrunePeers": 16,
+    "SlowHeartbeatWarning": 0.1,
+    "UnsubscribeBackoff": 10000
+  },
+  "peerScoringEnabledWhen": "only when discovery is on (Service.peerScoringEnabled = !NoDiscovery); a node started with an explicit peer list and discovery off runs without peer scoring",
+  "peerScoreThresholds": {
+    "AcceptPXThreshold": 100,
+    "GossipThreshold": -4000,
+    "GraylistThreshold": -16000,
+    "OpportunisticGraftThreshold": 5,
+    "PublishThreshold": -8000,
+    "SkipAtomicValidation": false
+  },
+  "peerScoreParams": {
+    "AppSpecificScore": "always 0",
+    "AppSpecificWeight": 1,
+    "BehaviourPenaltyDecay": 0.6309573444801931,
+    "BehaviourPenaltyThreshold": 6,
+    "BehaviourPenaltyWeight": -15.92,
+    "DecayInterval": 8000,
+    "DecayToZero": 0.01,
+    "IPColocationFactorThreshold": 10,
+    "IPColocationFactorWeight": -35.11,
+    "RetainScore": 800000,
+    "SeenMsgTTL": 0,
+    "SkipAtomicValidation": false,
+    "TopicScoreCap": 32.72,
+    "skippedFields": [
+      "Topics",
+      "AppSpecificScore",
+      "IPColocationFactorWhitelist"
+    ]
+  },
+  "topicScoreParams": {
+    "block": {
+      "FirstMessageDeliveriesCap": 23,
+      "FirstMessageDeliveriesDecay": 0.7943282347242815,
+      "FirstMessageDeliveriesWeight": 1,
+      "InvalidMessageDeliveriesDecay": 0.9120108393559098,
+      "InvalidMessageDeliveriesWeight": -140.4475,
+      "MeshFailurePenaltyDecay": 0.3981071705534972,
+      "MeshFailurePenaltyWeight": 0,
+      "MeshMessageDeliveriesActivation": 32000,
+      "MeshMessageDeliveriesCap": 5,
+      "MeshMessageDeliveriesDecay": 0.3981071705534972,
+      "MeshMessageDeliveriesThreshold": 0.5,
+      "MeshMessageDeliveriesWeight": 0,
+      "MeshMessageDeliveriesWindow": 2000,
+      "SkipAtomicValidation": false,
+      "TimeInMeshCap": 450,
+      "TimeInMeshQuantum": 8000,
+      "TimeInMeshWeight": 0.022222222222222223,
+      "TopicWeight": 0.8
+    },
+    "consensus": {
+      "FirstMessageDeliveriesCap": 46,
+      "FirstMessageDeliveriesDecay": 0.7943282347242815,
+      "FirstMessageDeliveriesWeight": 1,
+      "InvalidMessageDeliveriesDecay": 0.9120108393559098,
+      "InvalidMessageDeliveriesWeight": -140.4475,
+      "MeshFailurePenaltyDecay": 0.3981071705534972,
+      "MeshFailurePenaltyWeight": 0,
+      "MeshMessageDeliveriesActivation": 32000,
+      "MeshMessageDeliveriesCap": 5,
+      "MeshMessageDeliveriesDecay": 0.3981071705534972,
+      "MeshMessageDeliveriesThreshold": 0.5,
+      "MeshMessageDeliveriesWeight": 0,
+      "MeshMessageDeliveriesWindow": 2000,
+      "SkipAtomicValidation": false,
+      "TimeInMeshCap": 450,
+      "TimeInMeshQuantum": 8000,
+      "TimeInMeshWeight": 0.022222222222222223,
+      "TopicWeight": 0.8
+    },
+    "lightweight": {
+      "FirstMessageDeliveriesCap": 100,
+      "FirstMessageDeliveriesDecay": 0.954992586021436,
+      "FirstMessageDeliveriesWeight": 0.5,
+      "InvalidMessageDeliveriesDecay": 0.9120108393559098,
+      "InvalidMessageDeliveriesWeight": -100,
+      "MeshFailurePenaltyDecay": 0,
+      "MeshFailurePenaltyWeight": 0,
+      "MeshMessageDeliveriesActivation": 0,
+      "MeshMessageDeliveriesCap": 0,
+      "MeshMessageDeliveriesDecay": 0,
+      "MeshMessageDeliveriesThreshold": 0,
+      "MeshMessageDeliveriesWeight": 0,
+      "MeshMessageDeliveriesWindow": 0,
+      "SkipAtomicValidation": false,
+      "TimeInMeshCap": 450,
+      "TimeInMeshQuantum": 8000,
+      "TimeInMeshWeight": 0.022222222222222223,
+      "TopicWeight": 0.1
+    },
+    "voluntaryExit": {
+      "FirstMessageDeliveriesCap": 5,
+      "FirstMessageDeliveriesDecay": 0.954992586021436,
+      "FirstMessageDeliveriesWeight": 2,
+      "InvalidMessageDeliveriesDecay": 0.9120108393559098,
+      "InvalidMessageDeliveriesWeight": -2000,
+      "MeshFailurePenaltyDecay": 0,
+      "MeshFailurePenaltyWeight": 0,
+      "MeshMessageDeliveriesActivation": 0,
+      "MeshMessageDeliveriesCap": 0,
+      "MeshMessageDeliveriesDecay": 0,
+      "MeshMessageDeliveriesThreshold": 0,
+      "MeshMessageDeliveriesWeight": 0,
+      "MeshMessageDeliveriesWindow": 0,
+      "SkipAtomicValidation": false,
+      "TimeInMeshCap": 450,
+      "TimeInMeshQuantum": 8000,
+      "TimeInMeshWeight": 0.022222222222222223,
+      "TopicWeight": 0.05
+    }
+  },
+  "notes": [
+    "Generated by gov5 TestProfile1VectorV9 (internal/p2p/profile1_v9_vectors_test.go) from pubsubGossipParam, pubsubOptions' constants, GossipMaxSize after encoder.SetMaxBlockBytes(maxBlockBytes), peerScoringParams, topicScoreParams and MsgID.",
+    "Durations are in milliseconds. gossipSubParams is the full GossipSubParams struct gov5 hands to the router (libp2p defaults where gov5 sets nothing).",
+    "Timeouts, mesh degree and scoring are local router behaviour, not consensus; a client that differs still interoperates but may prune or be pruned differently. Topic strings, message id and the size cap must match."
+  ]
+}

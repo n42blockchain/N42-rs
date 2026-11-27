@@ -1752,6 +1752,7 @@ fn journal_dir(name: &str) -> std::path::PathBuf {
 async fn a_durability_request_journals_the_block_and_its_unjournalled_ancestors() {
     let dir = journal_dir("walk");
     let rig = node(4, 0, None).await;
+    let rig_el = rig.el.clone();
     let mut svc = rig
         .svc
         .with_vote_rules(n42_h2_consensus::VoteRules::PROFILE1)
@@ -1779,6 +1780,7 @@ async fn a_durability_request_journals_the_block_and_its_unjournalled_ancestors(
 
     // A block on a persisted parent journals only itself.
     svc.driver.set_persisted_height(Arc::new(|| n42_h2_execution::PersistedHeight::Known(2)));
+    let el = rig_el.clone();
     let (c, header_c, body_c) = block(3, b);
     svc.remember_block(c, &header_c);
     svc.remember_body(c, body_c);
@@ -1791,8 +1793,21 @@ async fn a_durability_request_journals_the_block_and_its_unjournalled_ancestors(
     assert!(svc.block_journal().expect("journal").contains(&side));
     svc.prune_block_journal(b);
     assert!(svc.block_journal().expect("journal").is_empty(), "the committed chain at the persisted height and its sibling pruned");
+    // Persisted by hash: the layer's canonical a, b end the walk at b.
+    for data in [MockExecutionLayer::built_block_on(1, ID.genesis_hash).execution_data, MockExecutionLayer::built_block_on(2, a).execution_data] {
+        n42_h2_execution::ExecutionDriver::pulled_new_payload(&el, data).await.expect("a, b");
+    }
     svc.make_durable(c).await;
     assert_eq!(svc.block_journal().expect("journal").len(), 1);
+    // A height alone ends nothing: a child of the pruned sibling walks on
+    // past height 2, whose canonical block there is b, not the sibling.
+    let (side2, header_side2, body_side2) = block(3, side);
+    svc.remember_block(side2, &header_side2);
+    svc.remember_body(side2, body_side2);
+    svc.make_durable(side2).await;
+    let journal = svc.block_journal().expect("journal");
+    assert!(journal.contains(&side2) && journal.contains(&side), "the sibling is journalled again, by hash");
+    assert_eq!(journal.len(), 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1820,6 +1835,7 @@ async fn a_restart_reimports_the_journalled_blocks_the_execution_layer_lost() {
     assert!(svc.imported.contains(&a));
     assert_eq!(svc.block_headers.get(&a), Some(&header_a));
     assert!(svc.body_store.contains_key(&a), "served from the store");
+    assert!(svc.engine.has_imported_block(&a), "the engine's vote gates see the restored block as imported");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

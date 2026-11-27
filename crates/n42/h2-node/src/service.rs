@@ -7551,6 +7551,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// persisted height is durable there; any other one not journalled yet
     /// is journalled with the block, ancestors first. A body or header not
     /// here yet leaves the block pending, tried again on the next drain.
+
     async fn make_durable(&mut self, block_hash: B256) {
         /// The most blocks one request journals (the block and the
         /// ancestors above the persisted height that are not journalled).
@@ -7568,6 +7569,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             n42_h2_execution::PersistedHeight::Known(number) => Some(number),
             _ => None,
         };
+        let el = self.driver.execution_layer_arc();
         let mut chain: Vec<(u64, B256, B256)> = Vec::new();
         let mut current = block_hash;
         let mut complete = false;
@@ -7577,21 +7579,30 @@ impl<E: ExecutionLayer> H2Service<E> {
                 complete = true;
                 break;
             }
-            if current != block_hash {
-                if current == self.identity.genesis_hash {
-                    complete = true;
-                    break;
-                }
-                let number = self.block_headers.get(&current).map(|h| h.number).or_else(|| self.block_numbers.get(&current).copied());
-                if let (Some(number), Some(persisted)) = (number, persisted)
-                    && number <= persisted
-                {
-                    complete = true;
-                    break;
-                }
+            if current == self.identity.genesis_hash && current != block_hash {
+                complete = true;
+                break;
             }
-            let Some(header) = self.block_headers.get(&current) else { break };
-            let (number, parent) = (header.number, header.parent_hash);
+            // The header here, else the execution layer's (after a restart
+            // the layer holds blocks this node has no header for).
+            let header = match self.block_headers.get(&current) {
+                Some(header) => Some((header.number, header.parent_hash)),
+                None => match el.block_by_hash(current).await {
+                    Ok(Some(block)) => Some((block.header.number, block.header.parent_hash)),
+                    _ => None,
+                },
+            };
+            let Some((number, parent)) = header else { break };
+            // Persisted by hash, not by height: the layer's canonical block
+            // at this number is this one, and the number is persisted.
+            if let Some(persisted) = persisted
+                && number <= persisted
+                // The layer's canonical block at this number is this one.
+                && matches!(el.block_by_number(number).await, Ok(Some(block)) if block.header.hash_slow() == current)
+            {
+                complete = true;
+                break;
+            }
             chain.push((number, current, parent));
             current = parent;
         }
@@ -7697,6 +7708,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // imported as a pulled block and made the head.
         let el_head = self.driver.execution_layer().latest_block_number().await.ok().flatten();
         let mut imported = 0;
+        let mut restored = Vec::new();
         for entry in entries {
             let block = match decode_block_rlp_raw(&entry.body, self.header_profile) {
                 Ok(block) if block.block_hash == entry.hash => block,
@@ -7733,6 +7745,26 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.remember_block(entry.hash, &block.header);
             self.remember_body(entry.hash, entry.body.clone());
             self.engine.remember_parent(entry.hash, entry.parent);
+            // The engine's gates see it as imported and durable (it is in
+            // the layer and in the journal): a vote waiting on it after the
+            // restart is not held forever.
+            restored.push(entry.hash);
+        }
+        // The restored lock's and commit's blocks, matched against the layer
+        // by hash: one the layer holds is imported for the engine's gates
+        // (its durability is settled on demand by `make_durable`).
+        for hash in [self.engine.locked_qc().block_hash, self.engine.last_committed_qc().block_hash] {
+            if hash != B256::ZERO
+                && !restored.contains(&hash)
+                && matches!(self.driver.execution_layer().block_by_hash(hash).await, Ok(Some(_)))
+            {
+                self.remember_imported(hash);
+                self.engine.process_event(ConsensusEvent::BlockImported(hash))?;
+            }
+        }
+        for hash in restored {
+            self.engine.process_event(ConsensusEvent::BlockImported(hash))?;
+            self.engine.process_event(ConsensusEvent::BlockDurable(hash))?;
         }
         Ok(imported)
     }

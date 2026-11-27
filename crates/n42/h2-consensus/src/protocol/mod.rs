@@ -6,6 +6,7 @@ mod proposal;
 pub mod quorum;
 mod round;
 pub mod state_machine;
+pub mod test_equivocation;
 mod timeout;
 mod vote_batch;
 pub mod vote_hello;

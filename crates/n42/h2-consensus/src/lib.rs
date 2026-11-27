@@ -76,6 +76,7 @@ pub use protocol::state_machine::{
     VOTERS_SEEN_WINDOW,
 };
 pub use protocol::equivocation::{EquivocationEvidence, EquivocationKind, SignedValue};
+pub use protocol::test_equivocation::twin_block_hash;
 pub use protocol::{ConsensusEngine, ConsensusEvent, EngineOutput, Pacemaker, Phase, RoundState,
     TimeoutCollector, ViewTiming, VoteCollector};
 pub use validator::{

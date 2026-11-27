@@ -505,6 +505,9 @@ pub struct ConsensusEngine {
     pub(super) equivocation_tracker: super::equivocation::EquivocationTracker,
     /// Tracks R2 (CommitVote) per validator per view for equivocation detection.
     pub(super) commit_equivocation_tracker: super::equivocation::EquivocationTracker,
+    /// Commit votes of closed views, for the conflicts that arrive after the
+    /// CommitQC (E15; [`super::equivocation::LateCommitVotes`]).
+    pub(super) late_commit_votes: super::equivocation::LateCommitVotes,
     /// Tracks the signed-message commitment per proposer in the current view,
     /// with the first signed proposal as evidence. The commitment includes
     /// validator changes, so reusing a block hash with a different
@@ -678,6 +681,7 @@ impl ConsensusEngine {
             unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
+            late_commit_votes: Default::default(),
             proposal_equivocation_tracker: HashMap::new(),
             processed_proposal: None,
             vote_log_retry: None,
@@ -814,6 +818,7 @@ impl ConsensusEngine {
             unauthenticated: None,
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
+            late_commit_votes: Default::default(),
             proposal_equivocation_tracker: HashMap::new(),
             processed_proposal: None,
             vote_log_retry: None,
@@ -1638,6 +1643,11 @@ impl ConsensusEngine {
             if let ConsensusMessage::Vote(ref vote) = msg {
                 self.note_late_vote(vote);
             }
+            // A commit vote of a view this node led, after its CommitQC:
+            // checked for a conflict with the voter's other one (E15).
+            if let ConsensusMessage::CommitVote(ref cv) = msg {
+                self.note_late_commit_vote(cv)?;
+            }
             tracing::trace!(target: "n42::cl::engine", current_view, msg_view = view, "discarding stale consensus message");
             return Ok(());
         }
@@ -2041,6 +2051,7 @@ impl ConsensusEngine {
         if new_view <= self.round_state.current_view() {
             return Ok(());
         }
+        let closing_view = self.round_state.current_view();
 
         // Save current PrepareQC for piggybacking into the next Proposal (chained mode).
         self.previous_prepare_qc = self.prepare_qc.take();
@@ -2146,7 +2157,8 @@ impl ConsensusEngine {
             self.imported_parents.clear();
         }
         self.equivocation_tracker.clear();
-        self.commit_equivocation_tracker.clear();
+        let closed = std::mem::take(&mut self.commit_equivocation_tracker);
+        self.late_commit_votes.close_view(closing_view, closed);
         self.proposal_equivocation_tracker.clear();
         self.processed_proposal = None;
         self.held_prepare_qc = None;

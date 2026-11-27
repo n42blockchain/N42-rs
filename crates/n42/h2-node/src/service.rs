@@ -194,6 +194,18 @@ pub enum ServiceEvent {
         /// because it is far larger than the rest of the enum.
         commit_qc: Box<QuorumCertificate>,
     },
+    /// TEST ONLY: the injector ([`crate::test_equivocate`]) sent a second
+    /// signed message of `kind` for `view`.
+    EquivocationInjected {
+        /// The view both messages are for.
+        view: u64,
+        /// What was signed twice.
+        kind: n42_h2_consensus::EquivocationKind,
+        /// The block the engine's own message named.
+        first: B256,
+        /// The block the twin names.
+        second: B256,
+    },
     /// This node published a consensus message.
     Published {
         /// The view the message referred to.
@@ -747,6 +759,9 @@ pub struct H2Service<E> {
     /// Observed equivocations (E15): the signed pairs, in the datadir when
     /// one is given ([`Self::with_equivocation_log`]).
     equivocations: crate::equivocations::EquivocationLog,
+    /// TEST ONLY: the deliberate equivocation this node commits
+    /// ([`crate::test_equivocate`]); `None` on every real node.
+    test_equivocation: Option<crate::test_equivocate::TestEquivocation>,
     /// Blocks already counted in `n42_blocks_refused_total`, so one block
     /// refused on several paths counts once (cleared when large).
     refused_blocks: std::collections::HashSet<B256>,
@@ -2124,6 +2139,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             vote_log_failures_exported: 0,
             tcs_formed_exported: 0,
             equivocations: crate::equivocations::EquivocationLog::in_memory(),
+            test_equivocation: None,
             refused_blocks: std::collections::HashSet::new(),
             checkpoint_failures: 0,
             halt_reported: false,
@@ -2147,6 +2163,59 @@ impl<E: ExecutionLayer> H2Service<E> {
         metrics::counter!(crate::ops::METRIC_EQUIVOCATIONS_TOTAL).absolute(log.len() as u64);
         self.equivocations = log;
         self
+    }
+
+    /// TEST ONLY: makes this node equivocate as `config` says
+    /// ([`crate::test_equivocate`], `docs/P1_EQUIVOCATION_INJECTOR.md`).
+    /// Refused on a chain outside [`crate::test_equivocate::TEST_CHAIN_IDS`].
+    pub fn with_test_equivocation(
+        mut self,
+        config: crate::test_equivocate::TestEquivocation,
+    ) -> Result<Self, String> {
+        let chain_id = self.identity.chain_id;
+        if !crate::test_equivocate::TEST_CHAIN_IDS.contains(&chain_id) {
+            return Err(format!("refusing to equivocate on chain {chain_id}"));
+        }
+        error!(target: "n42.h2.node", injector = %config.describe(), chain_id,
+               "TEST EQUIVOCATION INJECTOR ON: this validator will sign conflicting messages");
+        self.test_equivocation = Some(config);
+        Ok(self)
+    }
+
+    /// TEST ONLY: after `message` went out, its twin, when the injector is on
+    /// and `message` is one it equivocates on: the same message for
+    /// [`n42_h2_consensus::twin_block_hash`], signed by this validator, sent
+    /// the same way (`target` for a vote to the leader, else to everyone).
+    /// gov5's standard transport has no per-peer consensus send, so a twin
+    /// proposal reaches every peer, after the real one.
+    fn inject_equivocation(
+        &mut self,
+        target: Option<u32>,
+        message: &n42_h2_primitives::consensus::ConsensusMessage,
+        events: &mut Vec<ServiceEvent>,
+    ) {
+        let Some(config) = self.test_equivocation else { return };
+        if self.safety_halt.is_some() || !config.applies(message) {
+            return;
+        }
+        let Some(twin) = self.engine.sign_equivocating_twin(message) else { return };
+        let view = message.view();
+        let kind = config.kind.label();
+        use n42_h2_primitives::consensus::ConsensusMessage as M;
+        let (first, second) = match (message, &twin) {
+            (M::Vote(a), M::Vote(b)) => (a.block_hash, b.block_hash),
+            (M::CommitVote(a), M::CommitVote(b)) => (a.block_hash, b.block_hash),
+            (M::Proposal(a), M::Proposal(b)) => (a.block_hash, b.block_hash),
+            _ => return,
+        };
+        error!(target: "n42.h2.node", kind, view, ?first, ?second, ?target,
+               "TEST EQUIVOCATION: sending a second signed message for this view");
+        metrics::counter!(crate::test_equivocate::METRIC_INJECTED_TOTAL, "kind" => kind).increment(1);
+        match target {
+            Some(target) => self.send_to_validator(target, twin, events),
+            None => self.publish(twin, events),
+        }
+        events.push(ServiceEvent::EquivocationInjected { view, kind: config.kind, first, second });
     }
 
     /// The observed equivocations (E15), for the `n42_equivocations` RPC.
@@ -4167,10 +4236,18 @@ impl<E: ExecutionLayer> H2Service<E> {
             // out. Treating these differently would mean inventing a channel
             // gov5 does not have.
             EngineOutput::BroadcastMessage(message) => {
+                let injected = self.test_equivocation.is_some().then(|| message.clone());
                 self.publish(message, events);
+                if let Some(message) = injected {
+                    self.inject_equivocation(None, &message, events);
+                }
             }
             EngineOutput::SendToValidator(target, message) => {
+                let injected = self.test_equivocation.is_some().then(|| message.clone());
                 self.send_to_validator(target, message, events);
+                if let Some(message) = injected {
+                    self.inject_equivocation(Some(target), &message, events);
+                }
             }
             EngineOutput::BlockCommitted {
                 view,

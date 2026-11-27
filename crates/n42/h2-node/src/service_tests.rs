@@ -1822,3 +1822,38 @@ async fn a_restart_reimports_the_journalled_blocks_the_execution_layer_lost() {
     assert!(svc.body_store.contains_key(&a), "served from the store");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// AM35 pitfall (b): replay is keyed by hash, not height. The execution
+/// layer holds a different block at the journalled block's height (its
+/// canonical one): the journalled block is still executed back in (served
+/// and voted on by hash), but no forkchoice names it -- that would move the
+/// layer's head back.
+#[tokio::test]
+async fn a_restart_replays_a_journalled_block_by_hash_when_the_layer_has_another_at_its_height() {
+    let dir = journal_dir("restore-by-hash");
+    let (a, _header_a, body_a) = block(1, ID.genesis_hash);
+    let other = MockExecutionLayer::built_block_on(1, B256::repeat_byte(0x99));
+    assert_ne!(other.execution_data.block_hash(), a);
+    {
+        let mut journal = crate::block_journal::BlockJournal::open(&dir).expect("journal");
+        journal.append(1, a, ID.genesis_hash, &body_a).expect("append");
+    }
+    let rig = node(4, 0, None).await;
+    let el = rig.el.clone();
+    n42_h2_execution::ExecutionDriver::pulled_new_payload(&el, other.execution_data.clone()).await.expect("the layer's own block 1");
+    assert_eq!(el.latest_block_number().await.expect("head"), Some(1));
+    let before = el.calls().len();
+    let mut svc = rig
+        .svc
+        .with_vote_rules(n42_h2_consensus::VoteRules::PROFILE1)
+        .with_block_journal(crate::block_journal::BlockJournal::open(&dir).expect("journal"));
+    assert_eq!(svc.restore_block_journal().await.expect("restore"), 1);
+    let calls = el.calls()[before..].to_vec();
+    assert!(calls.iter().any(|c| matches!(c, ElCall::NewPayload(h) if *h == a)), "re-executed by hash: {calls:?}");
+    assert!(
+        !calls.iter().any(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == a)),
+        "no forkchoice to a block below the layer's head: {calls:?}"
+    );
+    assert!(svc.body_store.contains_key(&a), "served from the store by hash");
+    let _ = std::fs::remove_dir_all(&dir);
+}

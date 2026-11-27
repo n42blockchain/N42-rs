@@ -123,3 +123,19 @@ tree defaults are the QMDB ones (8 / 6).
 
 See the gate record appended below (whole-set SIGKILL, kills timed right after a commit and right after
 a PrepareQC, at least five each, and one at old main with the same timing).
+
+## Gate record (2026-11-27, all-Rust 4+4 set, genesis_8s, ports 33600/24600)
+
+Whole-set SIGKILL with the two-part tool (`audit-notes/devnet/am35-trigger-watch.sh` and
+`am35-killer-n42rs.sh`, wrapped by `am35-kill.sh`). Trigger-to-kill latency was 2-10 ms.
+
+- Branch binaries, 15 kills on one chain, 15 RECOVERED (+3 blocks within 40 s, all four heads equal):
+  5 right after a `COMMIT` line, 5 on the first PrepareQC line (`QC formed` / `received valid
+  PrepareQC`), and 5 on the first `commit vote released after durable lock` line.
+- Old main (d8a5e54d2): 1 commit-timed kill and 1 PrepareQC-timed kill. Both HALTED: the execution
+  layers came back at height 6 with the chain at 13, and nothing moved in 120 s.
+- Steady at 150 tx/s (gov5 `load_core.py`, ~1,200 tx/block, 33 loaded blocks): block interval
+  8.000 s (p99 8.009). Journal append p50 2.1 ms, p99 10.4 ms. Commit-vote latency at the leader
+  (PrepareQC formed to each commit vote received) p50 5.0 ms, p99 13.1 ms. Commit QC p50 5.2 ms,
+  p99 13.2 ms. Followers' PrepareQC to Decide p50 2.2 ms. Old main idle, from earlier logs: commit
+  QC p50 2.5 ms, p99 3.0 ms. Old main at 150 tx/s was not run.

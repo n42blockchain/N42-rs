@@ -1993,4 +1993,48 @@ mod tests {
             Err(ConsensusError::BodyRequestsHashDiff(_))
         ));
     }
+
+    /// gov5's profile-1 vector V2 (`h2-consensus/testdata/profile1/gov5/V2`):
+    /// the executed block's receipts -- a CREATE with LOG2 + LOG0, a reverted
+    /// CREATE, a transfer with the EIP-7708 log -- through the root block
+    /// validation compares (`gov5_receipt_root_bloom`).
+    #[test]
+    fn profile1_v2_receipts_root_through_the_validation_path() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../h2-consensus/testdata/profile1/gov5/V2/roots.json");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).expect("V2")).expect("json");
+        let hex = |value: &serde_json::Value| alloy_primitives::hex::decode(value.as_str().expect("hex")).expect("hex");
+        let receipts: Vec<Receipt> = v["receipts"]
+            .as_array()
+            .expect("receipts")
+            .iter()
+            .map(|r| Receipt {
+                success: r["status"].as_u64() == Some(1),
+                cumulative_gas_used: r["cumulativeGasUsed"].as_u64().expect("gas"),
+                logs: r["logs"]
+                    .as_array()
+                    .expect("logs")
+                    .iter()
+                    .map(|log| {
+                        Log::new_unchecked(
+                            Address::from_slice(&hex(&log["address"])),
+                            log["topics"].as_array().expect("topics").iter().map(|t| B256::from_slice(&hex(t))).collect(),
+                            hex(&log["data"]).into(),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        for row in v["receiptsRoots"].as_array().expect("roots") {
+            let picked: Vec<Receipt> = row["receiptIndexes"]
+                .as_array()
+                .expect("indexes")
+                .iter()
+                .map(|i| receipts[i.as_u64().expect("index") as usize].clone())
+                .collect();
+            let (root, _) = gov5_receipt_root_bloom(&picked);
+            assert_eq!(root, B256::from_slice(&hex(&row["receiptsRoot"])), "{}", row["name"]);
+        }
+    }
 }

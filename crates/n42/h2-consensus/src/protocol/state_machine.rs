@@ -654,6 +654,7 @@ impl ConsensusEngine {
         vote_log: Arc<dyn VoteLogWriter>,
     ) -> Self {
         let local_public_key = secret_key.public_key();
+        let committee_size = epoch_manager.current_validator_set().len() as usize;
         Self {
             my_index,
             secret_key,
@@ -671,7 +672,7 @@ impl ConsensusEngine {
             held_prepare_qc: None,
             output_overflow: std::sync::Mutex::new(VecDeque::new()),
             round_state: RoundState::new(),
-            pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
+            pacemaker: Pacemaker::with_committee_size(base_timeout_ms, max_timeout_ms, committee_size),
             vote_collector: None,
             commit_collector: None,
             timeout_collector: None,
@@ -786,6 +787,7 @@ impl ConsensusEngine {
             );
         }
         let local_public_key = secret_key.public_key();
+        let committee_size = epoch_manager.current_validator_set().len() as usize;
         Self {
             my_index,
             secret_key,
@@ -810,7 +812,7 @@ impl ConsensusEngine {
                 last_voted_view,
                 last_commit_voted_view,
             ),
-            pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
+            pacemaker: Pacemaker::with_committee_size(base_timeout_ms, max_timeout_ms, committee_size),
             vote_collector: None,
             commit_collector: None,
             timeout_collector: None,
@@ -2139,8 +2141,7 @@ impl ConsensusEngine {
         }
 
         self.round_state.advance_view(new_view);
-        self.pacemaker
-            .reset_for_view(new_view, self.round_state.consecutive_timeouts());
+        self.arm_view_timer(new_view);
         self.vote_collector = None;
         self.commit_collector = None;
         self.timeout_collector = None;
@@ -2225,6 +2226,13 @@ impl ConsensusEngine {
 
     pub(super) fn validator_set(&self) -> &ValidatorSet {
         self.epoch_manager.current_validator_set()
+    }
+
+    /// Starts `view`'s timer at `timeout(c)` with `c` as it stands, the
+    /// backoff group taken from the validator set held now (AM33).
+    pub(super) fn arm_view_timer(&mut self, view: ViewNumber) {
+        self.pacemaker.set_committee_size(self.validator_set().len() as usize);
+        self.pacemaker.reset_for_view(view, self.round_state.consecutive_timeouts());
     }
 
     pub(super) fn validator_set_for_view(&self, view: ViewNumber) -> &ValidatorSet {

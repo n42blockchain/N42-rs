@@ -11,3 +11,21 @@ Byte-exact contracts: compare by SHA-256 of the raw bytes, never edit. Checked b
 | --- | --- |
 | `9267eb25ba6c8123a3b7825cb00fe9cc5c828da21f0b5ad725c3c60aa502504a` | `V6/consensus_messages_v6.json` |
 | `5d558cb00fafb82be0854d339d1d0a19de3f6bc15afada705b8ab180c075af38` | `V6/README.md` |
+
+# gov5 profile-1 vectors V2, V7 and AM33 (byte-exact copies)
+
+Copied unchanged from `/data/blockchain/wr-logs/qs-scratch/profile1/vectors/{V2,V7,AM33}/` on
+2026-11-26 (gov5 branch `feat/p1-vectors-e2`: V2 at `d4ef5137`, V7 and AM33 at `a64a7947`).
+V2 is checked by `tests/profile1_v2.rs` (and its receipts by engine-types'
+`profile1_v2_receipts_root_through_the_validation_path`), V7 by `tests/profile1_v7.rs`, AM33 by
+`tests/profile1_am33.rs`; V7 re-copied the same day after gov5 dropped the `tcView = 2^64-1`
+edge row (AM34); each test checks the JSON's SHA-256 before reading it.
+
+| SHA-256 | File |
+| --- | --- |
+| `deff5a4736778ef0b70aedc30f747d7ccd89422479393d37cba04fc541cdef18` | `V2/roots.json` |
+| `5a916260751639becbd6e37e0b5d4aa835d9c982e1b19bde1c66c3cfd24df393` | `V2/README.md` |
+| `a08180b1fc9625c0b6cd6128b775e40dcdf04a900b9ba3bf45aa9210340fd445` | `V7/leader_schedule.json` |
+| `64b98416fc70a0d07c3c89268b05e051f4869a57635fc1db14ad957e2968d107` | `V7/README.md` |
+| `dd23ae8d4f3e3a7af25ed36ed3e7bf25da860d3a03dd63d266f4687348e9b222` | `AM33/timeout_backoff.json` |
+| `1987a00c0307b2e76cb38a25c4c02295c94d78d7fe463e0b5404b67d2a7473e6` | `AM33/README.md` |

@@ -7653,8 +7653,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
-    /// AM35 at start: every journalled block the execution layer does not
-    /// hold is imported into it again (lowest first, as a pulled block:
+    /// AM35 at start: every journalled block above the execution layer's
+    /// head that it does not hold is imported into it again (lowest first,
+    /// as a pulled block:
     /// head only, neither safe nor finalized) and kept to serve, before
     /// the node serves, votes or builds. Returns how many were imported.
     /// A block that does not import stops the replay: those above it
@@ -7664,8 +7665,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         let entries = journal
             .entries()
             .map_err(|err| ServiceError::Fatal { reason: "block_journal", detail: err.to_string() })?;
+        // The execution layer's canonical chain is the committed one (and
+        // what a verified catch-up pulled): a journalled block at or below
+        // its head is either on it or a sibling no certificate can still
+        // need, and a forkchoice to such a sibling would move the head back.
+        let el_head = self.driver.execution_layer().latest_block_number().await.ok().flatten();
         let mut imported = 0;
         for entry in entries {
+            if el_head.is_some_and(|head| entry.number <= head) {
+                continue;
+            }
             let block = match decode_block_rlp_raw(&entry.body, self.header_profile) {
                 Ok(block) if block.block_hash == entry.hash => block,
                 Ok(block) => {

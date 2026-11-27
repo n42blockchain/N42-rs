@@ -86,6 +86,9 @@ fn reconcile_profile(frame_blocks: bool) {
     unsafe { n42_env::profile::reconcile_and_report("h2_validator", features) };
 }
 
+// The validator's whole service future is built on the main thread once; its
+// ~570 KB frame lives for the process and the main thread's stack holds it.
+#[allow(clippy::large_stack_frames)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Profile 1's allocator options (docs/P1_MEMORY.md): jemalloc reads them
     // before `main`, so a validator started without them restarts itself once

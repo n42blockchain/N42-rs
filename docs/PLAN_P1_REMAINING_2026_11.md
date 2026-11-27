@@ -48,6 +48,7 @@ Releases at the time of writing: gov5 main 5464ee6e, n42-rs main e9f15edc4, n42-
 | E1 | gov5 proposal-equivocation detection (M3d) | gov5 | DONE (gov5 b5cf49a7, ef2f6bb0); proven in M3d |
 | E2 | §7: validator-set changes (E2), B11 follower rule, kept-tail bounds, vectors V2/V5/V7/V9, tenure > 1, epoch-boundary TCs, a negative leader | all three | vectors published 11-26; n42-rs passes V2, V7, V9 (2 GossipSub fixes), AM33 (main d8a5e54d2); n42-26 pending |
 | E3 | Liveness risk: k consecutive absent leaders stall ~24 + 48 + 96·(k−2) s | standard | AM33 adopted (standard); gov5 60521778 and n42-rs d8a5e54d2 implement it; n42-26 pending |
+| E4 | Whole-set restart from the committed head: gov5 found (2d2c9690) that a set restarted together never voted again, because recovery did not count the committed head as imported. Check n42-rs (profile 1, import-gated votes): all-Rust devnet, stop every member, restart, chain must continue | n42-rs | open: code path not yet traced (vote_refusal / imported set after restart); one all-Rust leg after the agent legs |
 
 ## Closed while writing this list
 

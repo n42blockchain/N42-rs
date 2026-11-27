@@ -4169,7 +4169,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         // seals carries it, whatever happens to the commit below.
         if matches!(output, EngineOutput::BlockCommitted { .. }) {
             self.refresh_header_qc();
-            self.prune_block_journal();
+        }
+        if let EngineOutput::BlockCommitted { block_hash, .. } = &output {
+            self.prune_block_journal(*block_hash);
         }
         // Durability first, and only for the output that announces finality.
         // See the module docs: the Engine API has no way to un-finalise a block.
@@ -7649,14 +7651,31 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
-    /// Drops the journalled blocks the execution layer has persisted.
-    fn prune_block_journal(&mut self) {
-        let Some(journal) = self.block_journal.as_mut() else { return };
-        if let n42_h2_execution::PersistedHeight::Known(persisted) = self.driver.persisted_height() {
-            let removed = journal.prune_at_or_below(persisted);
-            if removed > 0 {
-                debug!(target: "n42.h2.node", persisted, removed, left = journal.len(), "block journal pruned below the persisted height");
+    /// Drops, by hash, the journalled blocks a restart no longer needs once
+    /// `committed` is committed: those on its chain (walked by parent hash)
+    /// at or below the execution layer's persisted height -- the layer holds
+    /// them, its canonical chain being the committed one -- and the siblings
+    /// at or below the committed height, which no certificate can commit.
+    fn prune_block_journal(&mut self, committed: B256) {
+        let n42_h2_execution::PersistedHeight::Known(persisted) = self.driver.persisted_height() else { return };
+        let Some(journal) = self.block_journal.as_ref() else { return };
+        let Some(lowest) = journal.lowest() else { return };
+        let Some(committed_number) = self.block_headers.get(&committed).map(|h| h.number) else { return };
+        let mut chain = std::collections::HashSet::new();
+        let mut current = committed;
+        while let Some(header) = self.block_headers.get(&current) {
+            if header.number < lowest {
+                break;
             }
+            chain.insert(current);
+            current = header.parent_hash;
+        }
+        let journal = self.block_journal.as_mut().expect("checked above");
+        let removed = journal.prune_where(|number, hash| {
+            (number <= persisted && chain.contains(hash)) || (number <= committed_number && !chain.contains(hash))
+        });
+        if removed > 0 {
+            debug!(target: "n42.h2.node", persisted, committed_number, removed, left = journal.len(), "block journal pruned");
         }
     }
 
@@ -7672,16 +7691,13 @@ impl<E: ExecutionLayer> H2Service<E> {
         let entries = journal
             .entries()
             .map_err(|err| ServiceError::Fatal { reason: "block_journal", detail: err.to_string() })?;
-        // The execution layer's canonical chain is the committed one (and
-        // what a verified catch-up pulled): a journalled block at or below
-        // its head is either on it or a sibling no certificate can still
-        // need, and a forkchoice to such a sibling would move the head back.
+        // Keyed by hash: a block the layer holds is not imported again. One
+        // it lacks at or below its head is executed back in without a
+        // forkchoice, which would move the head back; one above it is
+        // imported as a pulled block and made the head.
         let el_head = self.driver.execution_layer().latest_block_number().await.ok().flatten();
         let mut imported = 0;
         for entry in entries {
-            if el_head.is_some_and(|head| entry.number <= head) {
-                continue;
-            }
             let block = match decode_block_rlp_raw(&entry.body, self.header_profile) {
                 Ok(block) if block.block_hash == entry.hash => block,
                 Ok(block) => {
@@ -7694,7 +7710,17 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             };
             let held = matches!(self.driver.execution_layer().block_by_hash(entry.hash).await, Ok(Some(_)));
-            if !held {
+            if !held && el_head.is_some_and(|head| entry.number <= head) {
+                // Not on the canonical chain at its height: executed back into
+                // the layer (served and voted on by hash), not made the head.
+                let el = self.driver.execution_layer_arc();
+                if let Err(err) = ExecutionDriver::pulled_new_payload(&*el, block.execution_data()).await {
+                    warn!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, %err, "could not re-import a journalled side block; skipped");
+                    continue;
+                }
+                imported += 1;
+                info!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, "journalled side block re-imported (not made the head)");
+            } else if !held {
                 if let Err(err) = self.import_pulled_timed(block.execution_data()).await {
                     warn!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, %err, "could not re-import a journalled block; the replay stops here");
                     break;

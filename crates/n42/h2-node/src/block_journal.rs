@@ -130,6 +130,11 @@ impl BlockJournal {
         self.index.len()
     }
 
+    /// The lowest journalled block number.
+    pub fn lowest(&self) -> Option<u64> {
+        self.by_number.keys().next().copied()
+    }
+
     /// Whether nothing is journalled.
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
@@ -182,8 +187,31 @@ impl BlockJournal {
         Ok(out)
     }
 
-    /// Removes every block at or below `number`: the execution layer has
-    /// persisted that height, so a restart finds those blocks there. Returns
+    /// Removes every journalled block `remove(number, hash)` names; returns
+    /// how many were removed.
+    pub fn prune_where(&mut self, mut remove: impl FnMut(u64, &B256) -> bool) -> usize {
+        let mut removed = 0;
+        let doomed: Vec<(u64, B256)> = self
+            .by_number
+            .iter()
+            .flat_map(|(n, hashes)| hashes.iter().map(move |h| (*n, *h)))
+            .filter(|(n, h)| remove(*n, h))
+            .collect();
+        for (n, hash) in doomed {
+            let _ = fs::remove_file(self.path_of(n, &hash));
+            self.index.remove(&hash);
+            if let Some(at) = self.by_number.get_mut(&n) {
+                at.retain(|h| h != &hash);
+                if at.is_empty() {
+                    self.by_number.remove(&n);
+                }
+            }
+            removed += 1;
+        }
+        removed
+    }
+
+    /// Removes every block at or below `number`, whatever its hash. Returns
     /// how many were removed.
     pub fn prune_at_or_below(&mut self, number: u64) -> usize {
         let keep = self.by_number.split_off(&number.saturating_add(1));

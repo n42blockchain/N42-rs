@@ -1782,8 +1782,15 @@ async fn a_durability_request_journals_the_block_and_its_unjournalled_ancestors(
     let (c, header_c, body_c) = block(3, b);
     svc.remember_block(c, &header_c);
     svc.remember_body(c, body_c);
-    svc.prune_block_journal();
-    assert!(svc.block_journal().expect("journal").is_empty(), "pruned at the persisted height");
+    // A sibling of B (same height, another hash): journalled while it was
+    // proposed, dropped by hash once B is committed.
+    let (side, header_side, body_side) = block(2, ID.genesis_hash);
+    svc.remember_block(side, &header_side);
+    svc.remember_body(side, body_side);
+    svc.make_durable(side).await;
+    assert!(svc.block_journal().expect("journal").contains(&side));
+    svc.prune_block_journal(b);
+    assert!(svc.block_journal().expect("journal").is_empty(), "the committed chain at the persisted height and its sibling pruned");
     svc.make_durable(c).await;
     assert_eq!(svc.block_journal().expect("journal").len(), 1);
     let _ = std::fs::remove_dir_all(&dir);

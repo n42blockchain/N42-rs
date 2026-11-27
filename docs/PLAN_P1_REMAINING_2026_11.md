@@ -61,6 +61,7 @@ d8a5e54d2 (code; docs 1f6ad73bb), n42-26 main b64f650 (AM33, late equivocation; 
 
 | # | Item | Who | State |
 | --- | --- | --- | --- |
+| F4 | AM36 validate-then-forward in all three | all three | n42-26 PR #58 (10952c3); gov5 fix/p1-validate-then-forward (78c76e2e); n42-rs feat/p1-am36-validate-forward (755344831, 9671e6ff7, d0ca62c89; unit + 3-node tests pass; chain-identity mismatch to change from Reject to Ignore per item 11). Mixed smoke 2026-11-27 02:50 (n42-rs not yet on AM36) |
 | F1 | n42-26 catches up on v1.2: V2 (EIP-7708 transfer log in receipts), V7 (leader schedule, no 2^64-1 row), V9 (GossipSub), AM34 items 3-5 (refuse QC/TC for view 2^64-1, G2 topics only, no cohort topics) | n42-26 | open |
 | F2 | Re-baseline B1-B7 after AM35 merges on all three: AM35 adds a durable write on the commit-vote path, so catch-up and memory numbers taken before it do not carry over. Merge the catch-up branches (rs perf/p1-catchup, design/p1-run-root, perf/p1-memory-2; gov5 perf/p1-catchup; n42-26 PR #53, #55) onto post-AM35 main | each client | open |
 | F3 | Host: /data at 98% (147 GB free, scripts refuse under 50 GB). Free build caches and merged worktrees before the 6.5 h round and B3 | owner + each session | 11-27 01:20: n42-rs freed wt-docs/target, target-g5, target-g6, target-g6t (~174 GB); /data 740 GB free |

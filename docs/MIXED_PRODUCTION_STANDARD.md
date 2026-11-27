@@ -1129,3 +1129,8 @@ AM36 precisions (2026-11-27, after n42-26's implementation review, PR #58):
     certificate's view (today the fixed genesis set, AM5; the view's set once E2 lands). A non-genesis
     certificate whose n differs from that set size is rejected; so is an index outside the set. n42-rs
     emits exactly this (h2-consensus `wire_bridge.rs` `encode_bitmap`, sized by the collector's set size).
+11. A well-formed message whose chain identity is another chain's is ignored, not rejected (a misconfigured
+    peer is not misbehaving; gov5's rule). Signer indices of single-signer messages (proposer, voter,
+    timeout sender, NewView leader) below the genesis set size count as stateless on profile 1 (AM5) and may
+    be rejected before forwarding. A piggybacked high TC is checked for its views only (honest members relay
+    unverified high TCs); every other nested certificate gets the item-10 width check.

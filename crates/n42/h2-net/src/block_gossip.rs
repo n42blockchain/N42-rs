@@ -493,6 +493,24 @@ mod tests {
         assert!(decode_block_gossip(&wire, HeaderProfile::Ethereum).is_err());
     }
 
+    /// AM36 item 5: the profile-1 forward check accepts a body the consumer
+    /// decodes and rejects one cut short.
+    #[test]
+    fn the_profile1_block_check_accepts_what_the_consumer_decodes() {
+        let mut extra = Vec::new();
+        extra.extend_from_slice(GOV5_HEADER_EXTRA_MAGIC);
+        extra.extend_from_slice(&42u64.to_le_bytes());
+        extra.resize(12 + 65, 0);
+        let mut sealed = header(extra.into());
+        sealed.ommers_hash = B256::ZERO;
+        sealed.difficulty = U256::ZERO;
+        let wire = encode_block_gossip(&execution_data(sealed), HeaderProfile::Gov5H2).unwrap();
+        assert_eq!(crate::validate::check_block(&wire, HeaderProfile::Gov5H2), Ok(()));
+        let rlp = decompress_block_gossip(&wire).unwrap();
+        let cut = compress_block_rlp(&rlp[..rlp.len() - 1]).unwrap();
+        assert!(crate::validate::check_block(&cut, HeaderProfile::Gov5H2).is_err());
+    }
+
     #[test]
     fn a_header_that_does_not_hash_to_the_payload_is_refused() {
         let execution = execution_data(header(Bytes::new()));

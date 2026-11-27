@@ -28,6 +28,7 @@ pub mod status;
 pub mod sync_v11;
 pub mod topic;
 pub mod transport;
+pub mod validate;
 
 pub use block_gossip::{
     compress_block_rlp, decode_block_gossip, decode_block_rlp, decompress_block_gossip,
@@ -52,5 +53,6 @@ pub use transport::{
     TransportError, TransportEvent, MAX_CONNECTIONS_PER_PEER, MobileTopic, MOBILEVERIFY_PACKET_KIND,
     MOBILEVERIFY_REGISTRATION_KIND,
 };
+pub use validate::{CommitViewHint, GossipVerdict, MobilePacketCheck, MobilePacketGate, Profile1Gossip};
 pub use pump::{INBOUND_CAPACITY, PUBLISH_CAPACITY, RETRY_CAPACITY};
 pub use tx_gossip::{decode_tx_batch, encode_tx_batch, TxGossipError, TX_BATCH_MAX_BYTES, TX_BATCH_MAX_TXS};

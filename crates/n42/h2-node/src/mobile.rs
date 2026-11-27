@@ -376,6 +376,37 @@ async fn relay(
 mod tests {
     use super::*;
 
+    fn packet(number: u64, lie: bool) -> Vec<u8> {
+        use n42_mobileverify::packet::header::{marshal_header, EMPTY_UNCLE_HASH};
+        let header = n42_h2_consensus::N42Header::from(alloy_consensus::Header {
+            number,
+            ommers_hash: EMPTY_UNCLE_HASH,
+            ..Default::default()
+        });
+        n42_mobileverify::StreamPacket {
+            block_hash: if lie { B256::repeat_byte(0xEE) } else { header.hash_slow() },
+            header: Bytes::from(marshal_header(&header)),
+            read_log: Bytes::from_static(&[0, 0, 0, 0]),
+            ..Default::default()
+        }
+        .encode()
+    }
+
+    /// AM36 item 4, gov5's packet validator: a packet that does not decode or
+    /// self-certify is rejected, one outside the head window ignored.
+    #[test]
+    fn a_gossiped_packet_is_judged_before_it_is_forwarded() {
+        use n42_h2_net::GossipVerdict;
+        let packets = PacketCache::new(16);
+        assert_eq!(packet_verdict(&packets, Some(100), &packet(100, false)), GossipVerdict::Accept);
+        assert_eq!(packet_verdict(&packets, Some(100), &packet(102, false)), GossipVerdict::Accept);
+        assert_eq!(packet_verdict(&packets, None, &packet(7, false)), GossipVerdict::Accept, "no head yet");
+        assert!(matches!(packet_verdict(&packets, Some(100), &packet(103, false)), GossipVerdict::Ignore(_)));
+        assert!(matches!(packet_verdict(&packets, Some(100), &packet(80, false)), GossipVerdict::Ignore(_)));
+        assert!(matches!(packet_verdict(&packets, Some(100), &packet(100, true)), GossipVerdict::Reject(_)));
+        assert!(matches!(packet_verdict(&packets, Some(100), b"junk"), GossipVerdict::Reject(_)));
+    }
+
     /// AM21/AM23: without a mobileverify service today's rules name no root
     /// (the build then fails on a MobileAnchor chain); profile 1 repeats the
     /// parent's, zero for a parent without one. A service's root wins on

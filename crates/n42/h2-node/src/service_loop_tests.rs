@@ -566,6 +566,22 @@ async fn a_single_validator_leads_commits_and_announces_each_block() {
     assert_ne!(svc.driver.head(), ID.genesis_hash);
 }
 
+/// AM36 item 6: the transport judges staleness by the latest commit QC's
+/// view, which the loop hands it every step.
+#[tokio::test]
+async fn the_step_hands_the_transport_its_latest_commit_view() {
+    let rig = node(1, 0, None).await;
+    let mut svc = rig.svc.with_payload_attributes(|context| Some(attributes_for(&context)));
+    let hint = n42_h2_net::CommitViewHint::new();
+    svc.commit_view_hint = Some(hint.clone());
+    step_until(&mut svc, |_, events| events.iter().filter(|e| matches!(e, ServiceEvent::Committed { .. })).count() >= 2)
+        .await;
+    svc.step().await.expect("a step");
+    let committed = svc.engine.last_committed_qc().view;
+    assert!(committed >= 2, "two commits: {committed}");
+    assert!(hint.get() >= 2 && hint.get() <= committed, "hint {} vs commit view {committed}", hint.get());
+}
+
 /// Section 6.9 of `docs/MATURITY_HARDENING_2026_10.md`: a leader under
 /// gov5's profile embeds its last committed QC in every header it seals, as
 /// gov5's `buildHeaderExtra(view, committedQC)`; the first block, sealed

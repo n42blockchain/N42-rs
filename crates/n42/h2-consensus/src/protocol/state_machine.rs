@@ -1472,8 +1472,13 @@ impl ConsensusEngine {
     /// survive a restart with its lock (the vote log's reason to carry it).
     pub fn persistable_lock(&self) -> &QuorumCertificate {
         let lock = self.round_state.locked_qc();
-        if self.lock_is_durable(lock) || lock.view <= self.durable_lock.view {
+        let committed = self.round_state.last_committed_qc();
+        if self.lock_is_durable(lock) || lock.view <= self.durable_lock.view.max(committed.view) {
             lock
+        } else if committed.view > self.durable_lock.view {
+            // Never below the committed QC: a committed block is final and
+            // every honest node can serve it.
+            committed
         } else {
             &self.durable_lock
         }

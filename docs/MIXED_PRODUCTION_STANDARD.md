@@ -1079,7 +1079,7 @@ with a consensus-dir block journal synced with the lock (option A); n42-rs on br
 fix/p1-durable-commit-vote. Cost: one durable write on the commit-vote path per block (a journal append
 is about 1-5 ms; a full EL commit 15 ms empty to 0.5 s for a full block).
 
-## Amendment AM36 (2026-11-27, PROPOSED by n42-rs; raised by n42-26's F1 work): validate, then forward
+## Amendment AM36 (2026-11-27, PROPOSED by n42-rs; raised by n42-26's F1 work; gov5 reviewed): validate, then forward
 
 Survey (code, 2026-11-27): n42-rs forwards a gossip message only after it decodes as its topic's type
 (`validate_messages`, h2-net `transport.rs`; it does not verify BLS before forwarding, and accepts the
@@ -1093,7 +1093,10 @@ Rule (profile 1, every G2 topic):
 2. Verifying signatures (BLS) before forwarding is allowed, not required: it adds latency to every relay
    hop on the vote path. A member that verifies before forwarding hands the verified message to its
    handler so nothing is verified twice.
-3. A well-formed message for a view the member has already left, or a duplicate, is ignored (neither
-   forwarded nor penalised): late messages are normal (AM34 item 6), not misbehaviour.
+3. A well-formed message for a view the member has already left, or a duplicate, is not forwarded and not
+   penalised; the member still processes it locally where AM34 item 6 requires (late votes and proposals
+   within the retention window). Note: gossipsub's "Ignore" verdict also withholds local delivery, so an
+   implementation hands the stale message to its late-message store before returning Ignore (gov5's
+   review, 2026-11-27).
 4. The mobileverify topics decode as their packet / registration types under the same rule once a member
    runs the mobileverify service (I1/I2).

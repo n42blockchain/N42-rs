@@ -84,6 +84,17 @@ as quoted in the standard).
 > earned on the pre-AM24 vectors (genesis `0x6f733745…7e4f`) and holds for AM24 only once that client posts a
 > pass on the regenerated ones (gov5: its PR #6 on `feat/profile1`; n42-26: its `feat/profile1-genesis`).
 
+## Gate 5e: AM33 rerun of gate 5d (2026-11-27 01:35-02:05 EST) -- PASSED
+
+Same 100-validator mix and schedule as 5d (gov5 0..29 on 2d2c9690 with AM33 and the restart fix, n42-rs
+30..98 on main d8a5e54d2 over 4 execution layers, n42-26 99 on b64f650 with AM33): 33 members absent at once
+(gov5 10..19, n42-rs 40..62) from T0+8m to T0+18m, leaving exactly q = 67. Headers 0..175 equal on all 8
+dumps (4 n42-rs layers, gov5 0/20/29, n42-26 v99), 100 distinct proposers, 0 refusals, every absent member
+back and voting after its restart. Block intervals: 172 x 8 s, one 32 s (one absent leader at the restart
+edge, 24 + 8), one 48 s (start-up) and one **224 s** for six consecutive absent leaders (views 57..62: TCs
+24, 24, 24, 48, 48, 48 s = 216 s plus the 8 s slot), exactly AM33's sequence with g = 3; 5d paid 464 s for
+the same six. Closes plan item E3.
+
 ## M90b: 90-minute steady-load memory round (2026-11-26 22:50 - 2026-11-27 00:26 EST)
 
 Gate-6 set at ~150 tx/s for 92 min (gov5 main ef2f6bb0, n42-26 17e3a7c = PR #51, n42-rs main d8a5e54d2).

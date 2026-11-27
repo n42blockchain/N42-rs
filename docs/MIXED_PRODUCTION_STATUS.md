@@ -465,3 +465,12 @@ gov5 served 0), n42-rs main e9f15edc4 (n42 1a7ba3fa…, h2_validator 1ee5fe72…
   - reached the wipe-time head in 13.4 s.
 - No refusal, score change or INVALID naming v2 on gov5.
 
+
+## AM36 smokes smk / smk2 (2026-11-27)
+
+Gate-6 set (gov5 v0, v1 + verifier, n42-rs v2, n42-26 v3), 25 min each, ~150 tx/s (gov5 loader).
+- smk (02:50 EST): gov5 fix/p1-validate-then-forward (78c76e2e) and n42-26 PR #58 (10952c3) on AM36;
+  n42-rs on the AM35 branch (forwarding decode-only). Headers 0..168 equal on 7 dumps; 178k tx, 0 errors;
+  0 Reject on gov5 and n42-26 (74,157 messages received on n42-26), no peer penalised.
+- smk2 (03:25 EST): all three on AM36 (n42-rs integ/p1-am35-am36 7e9e3c165). Headers 0..165 equal on 7 dumps;
+  178k tx, 0 errors; 0 Reject / 0 Ignore on every client, no peer penalised. PASS.

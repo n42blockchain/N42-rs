@@ -1038,7 +1038,7 @@ timeouts sum to 456 s; the recorded 464 s gap includes the block interval.
    views. Each is verified only when it conflicts with a recorded one. Found by the n42-rs injector; gov5,
    n42-26 and n42-rs all had the gap for commit votes.
 
-## Amendment AM35 (2026-11-27, PROPOSED by n42-rs; gov5 reviewed OK with items 4-5; n42-26 checking): a commit vote means a durable block
+## Amendment AM35 (2026-11-27, PROPOSED by n42-rs; gov5 and n42-26 reviewed; journal equivalent added): a commit vote means a durable block
 
 Found by plan item E4 (whole-set restart). An all-Rust set killed at once (SIGKILL of every validator and
 execution layer) halted for good: the set had committed block 35, every execution layer had persisted only
@@ -1049,20 +1049,27 @@ has the same window for one block (its validators are told "executed" before the
 n42-26 persists every block immediately but asynchronously after the forkchoice update.
 
 Rule (profile 1):
-1. A member sends its commit (R2) vote for a block only after that block, and every ancestor, is durably
-   written by its execution layer (a crash at any instant after the vote leaves the block readable on
-   restart). The R1 vote may still follow execution, or the header rules, as today.
-2. Consequently a commit QC certifies a block held durably by at least q members, so any q of them
-   restarting together can serve it.
+1. A member sends its commit (R2) vote for block B only after (a) its lock (B's PrepareQC) and (b) B's block
+   data are durable: a crash at any instant after the vote leaves both readable on restart. Block data is
+   durable when either its execution layer has committed B with a full sync (static files, RocksDB and
+   MDBX each synced; SafeNoSync / UtterlyNoSync modes do not count), or the node has appended B's raw block
+   to its own journal and synced it with the lock write, and on restart re-imports every journalled block
+   above the execution layer's head before it serves, votes or builds. B's ancestors must be durable the
+   same way, checked by hash. The R1 vote may still follow execution, or the header rules, as today.
+2. Consequently every lock and commit QC that f+1 or more members hold names a block those members can
+   serve after any of them restart together; a whole-set restart never halts on a missing body.
 3. Finality reported to users (RPC `finalized`) is unchanged: certified and persisted locally.
-4. The leader's own block is covered the same way: its commit vote also waits for its own durable write.
+4. The leader's own block is covered the same way: its own commit vote also waits for its durable write.
 5. An implementation must not offer a profile-1 mode that defers or skips the durable write (gov5 refuses
    `N42_MDBX_SYNC=safe-nosync` on profile-1 chains; n42-rs refuses persistence-threshold overrides there).
 
-Gate: a whole-set SIGKILL of a mixed set at an arbitrary instant under load recovers without intervention,
-heads equal, repeated at least five times with the kill timed against the commit (the gov5 window is about
-0.2 s, so random timing alone does not prove it).
+Gate: a whole-set SIGKILL of a mixed set under load recovers without intervention, heads equal, at least
+five times with the kill timed right after a commit and five times timed between a PrepareQC and its commit
+QC (the windows are 0.02-0.5 s, so random timing alone does not prove it).
 
-Clients: n42-rs gates the commit vote on its persistence poller (`n42Engine_persistedBlock`) and persists
-every block on profile 1 (threshold 0); gov5 gates the commit vote on its post-persist import notice;
-n42-26 gates it on the completed save. Cost: one durable write on the commit-vote path per block.
+Clients: all three had the hole (n42-rs up to 8 blocks; gov5 and n42-26 about one block: n42-26's R2 is
+released on new_payload before any forkchoice update, gov5's on its executed hook before the MDBX write).
+To be implemented: gov5 on its post-persist import notice (branch feat/p1-am35-durable-commit-vote); n42-26
+with a consensus-dir block journal synced with the lock (option A); n42-rs on branch
+fix/p1-durable-commit-vote. Cost: one durable write on the commit-vote path per block (a journal append
+is about 1-5 ms; a full EL commit 15 ms empty to 0.5 s for a full block).

@@ -1164,6 +1164,18 @@ Case shape (each client, all members of the set run that client, under load):
    (a transient rate-limit or retry is fine; a member retrying without backoff is a failure), and the header dump of
    every member, the lagging one included, is equal.
 
+6. B1 under recovery (2026-11-28, from n42-rs's AM37 leg; gov5's existing rule, main 5ddf409d header_profile.go
+   checkProfile1QC): B1's "the QC names an ancestor" refuses only on a positive contradiction: a block stored
+   locally at the QC block's height with a different hash, or the parent walk passing below that height without
+   meeting it. A gap in local history (an ancestor this node does not hold) is undecided: the block is kept and the
+   missing ancestor fetched by hash, never refused and never counted against the peer. After a whole-set restart the
+   set may legitimately extend a lock only one member held (its timeout carries the PrepareQC); members without that
+   block must fetch it.
+7. Recovery of a replayed lock (proposed for AM35, 2026-11-28; n42-26's rule, n42-rs adopting): a journalled block
+   above the restored committed block (an uncommitted lock) is re-imported but not made canonical (no forkchoice to
+   it) until it is committed; the head stays at the committed block, so a committed sibling at the lock's height
+   imports as a normal child.
+
 Trigger note (gov5's leg, 2026-11-28): aiming a kill just before the next commit never left the lock above
 committed, because the lock is persisted with the commit vote, milliseconds before the CommitQC forms; killing the
 whole set the instant the first member logs a commit did, 5 of 6 times. A leg reports per kill whether locked !=

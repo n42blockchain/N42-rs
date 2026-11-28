@@ -546,3 +546,14 @@ Memory, MiB, last sample of each hour (hour 1 = 22:00-23:00):
 - **n42-26 (B5):** growth falls each hour (+579, +281, +234, +216, +123, +60 MiB) and reaches
   ~2.8 GB; plateau in reach, not yet flat. Its PR #56 A/B shows the remaining growth is not
   RocksDB.
+
+## gov5 main 4bf26dc8 — sync-pipeline stall fix (2026-11-28, owner-approved)
+
+gov5 main fast-forwarded 78c76e2e -> 4bf26dc8 (71d0d552 sync-pipeline stall fix + 4bf26dc8).
+No wire or consensus change. Re-test (fresh node from genesis against four gov5
+validators, 233-242 blocks, 269k tx, 0 header mismatches): serial sync 5.7 s (41 blocks/s);
+`N42_SYNC_PIPELINE=1` on 78c76e2e stalls at head 62; on the fix 5.2 s (46 blocks/s), in
+both enforce and observe mode. A whole gov5 fleet restarted on its old datadirs now
+advances (244 -> 267 in 4 min): the "restarted fleet stalls at head" item is closed.
+Next mixed round: gov5 members on >= 4bf26dc8 (`p1mixed/bin/n42-p1.main-4bf26dc8`),
+n42-rs member on main >= b6c13bdb7 (profile-1 RocksDB memtable default).

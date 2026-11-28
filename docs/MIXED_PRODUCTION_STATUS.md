@@ -543,6 +543,13 @@ Memory, MiB, last sample of each hour (hour 1 = 22:00-23:00):
   (0 not-ok), 0 refusals, no node down; top heap items on v0 at the end (504 MiB in use):
   receipt cache 94, sender cache 93, QMDB in-memory index 52 (grows with the ~372k accounts
   created), mobileverify packet cache 25 MiB; heap profiles in `p1mixed/mem1/run/heap-node*.pb.gz`.
+- **gov5 file-backed RSS closed (B4, 2026-11-28):** gov5 main 4bf26dc8, four validators in one
+  cgroup, 6 x 25 tx/s for 40 min on CPUs 128-191 (`catchup/memmap/memmap.log`): every datadir
+  mapping is 100% Private_Clean, 0 dirty; `memory.reclaim` dropped the cgroup's file pages
+  1,058 -> 0 MiB at once with anonymous memory unchanged (2,849 -> 2,848 MiB); `memory.high` =
+  anon + 256 MiB for 6 min under load held file pages at ~235-275 MiB, anon flat, 0 OOM, the
+  chain kept committing (573 -> 633), 0 failed receipts. mem7's +350 MiB/h is clean MDBX page
+  cache, not a leak; RssAnon is the gov5 number to watch.
 - **n42-26 (B5):** growth falls each hour (+579, +281, +234, +216, +123, +60 MiB) and reaches
   ~2.8 GB; plateau in reach, not yet flat. Its PR #56 A/B shows the remaining growth is not
   RocksDB.

@@ -1157,6 +1157,13 @@ Case shape (each client, all members of the set run that client, under load):
    action, and a header dump of every member over the whole chain is equal.
 4. The leg is recorded with the client's commit, the trigger used for each kill and the recovery time.
 
+5. Lagging-member variant (owner, 2026-11-28, after n42-26's F7 finding): one member of the set is empty (wiped:
+   no execution-layer data, no consensus state, keys kept) or behind by N blocks, and the whole set is killed or
+   restarted together under load. The restarted members must serve it by range from genesis or from its lag point.
+   Pass: the lagging member reaches the head without operator action, no range request is refused permanently
+   (a transient rate-limit or retry is fine; a member retrying without backoff is a failure), and the header dump of
+   every member, the lagging one included, is equal.
+
 Trigger note (gov5's leg, 2026-11-28): aiming a kill just before the next commit never left the lock above
 committed, because the lock is persisted with the commit vote, milliseconds before the CommitQC forms; killing the
 whole set the instant the first member logs a commit did, 5 of 6 times. A leg reports per kill whether locked !=

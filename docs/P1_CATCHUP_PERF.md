@@ -758,3 +758,31 @@ do not.
 - **B2:** raising the batch import's per-block cap to 4 MiB is 10% slower on the heavy
   chain (two legs each, 124.8 s against 112.7-112.8 s). The cap stays at 16 KiB; the knobs
   stay for measurement. B2 closed.
+
+### B3: a long heavy chain, and chain 94 re-estimated (2026-11-28)
+
+Chain `p1-catchup-long`: produced on main 6504495a4 (pinned to CPUs 0-63), 250 ms blocks,
+4 x 650 s at 4,800 tx/s: 10,869 blocks, 12.48M transfers, 1.50 GB of blocks (9,056 blocks of
+50-2k tx, 1,300 of 2k-8k). Member 3 pulls it from genesis on CPUs 0-31, servers on 32-63.
+
+| leg | pull | blocks/s | tx/s | MB/s | EL peak RSS | validator peak RSS | EL disk after | root mismatches |
+|---|---|---|---|---|---|---|---|---|
+| b3L1 | 107.7 s | 100.9 | 115,861 | 13.94 | 1,559 MiB | 352 MiB | 5,796 MiB | 0 |
+| b3L2 | 108.2 s | 100.4 | 115,324 | 13.88 | 1,568 MiB | 350 MiB | 5,756 MiB | 0 |
+
+The EL is the bound again (newPayload 107.4 of 107.5 s): 9.4 ms a small block (prewarm 9.3,
+receipt root 6.9, payload convert 2.9 ms; state root 0.6 ms), 17 ms a medium one; 8.6 EL cores busy.
+
+**Chain 94** (14.1M blocks, 10 GB; 13.2M near-empty, ~0.7M heavy with 128.7M txs, ~0.2M rest):
+
+| | near-empty | heavy | rest | total |
+|---|---|---|---|---|
+| this main (empty 8,500 blocks/s; 115-132k tx/s on transfers) | 13.2M / 8,500 = 0.43 h | 128.7M / 115-132k = 0.27-0.31 h | 0.01 h | **~0.7-0.8 h** |
+| pin2e (2026-11-25, section 6) | 8.2 h | 0.6 h | 0.1 h | ~9 h |
+| gov5 replay v2 (no network) | 0.5 h | ~0.9 h | | 1.5-2 h |
+
+Caveats: chain 94's heavy range is not all transfers (the heavy figure is a floor), its state
+is larger than the bench chains' (the root's cost grows with depth), and a real link adds RTT.
+Disk on this chain is ~3.9x the block bytes (5.8 GB EL for 1.5 GB of blocks: receipts,
+changesets, QMDB); chain 94's empty blocks carry less, so ~25-40 GB is the expected range.
+Measuring chain 94 itself needs its history in profile-1 form, which does not exist on this host.

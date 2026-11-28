@@ -1815,8 +1815,10 @@ async fn a_durability_request_journals_the_block_and_its_unjournalled_ancestors(
 }
 
 /// AM35 at restart: a journalled block the execution layer does not hold is
-/// imported again (newPayload, then a head-only forkchoice) and kept to
-/// serve; one it holds is only kept.
+/// imported again and kept to serve; one it holds is only kept. A block
+/// the restored commit does not reach is executed back in without a
+/// forkchoice (AM37: an uncommitted lock is not made the head); the
+/// committed case is `restore_tests`.
 #[tokio::test]
 async fn a_restart_reimports_the_journalled_blocks_the_execution_layer_lost() {
     let dir = journal_dir("restore");
@@ -1834,7 +1836,10 @@ async fn a_restart_reimports_the_journalled_blocks_the_execution_layer_lost() {
     assert_eq!(svc.restore_block_journal().await.expect("restore"), 1);
     let calls = el.calls();
     assert!(calls.iter().any(|c| matches!(c, ElCall::NewPayload(h) if *h == a)), "{calls:?}");
-    assert!(calls.iter().any(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == a)), "{calls:?}");
+    assert!(
+        !calls.iter().any(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == a)),
+        "nothing committed it: not made the head: {calls:?}"
+    );
     assert!(svc.imported.contains(&a));
     assert_eq!(svc.block_headers.get(&a), Some(&header_a));
     assert!(svc.body_store.contains_key(&a), "served from the store");

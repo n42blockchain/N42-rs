@@ -1055,6 +1055,27 @@ impl Twig {
         self.refresh_root();
     }
 
+    /// [`Self::recompute`] after only the leaves `first..=last` changed:
+    /// the nodes above that range, level by level, then the bit set and the
+    /// root. Every other node must already be the hash of its children,
+    /// which is what every write of a twig leaves (a fresh twig holds the
+    /// null levels; an apply, an undo and a hydration recompute what they
+    /// touched). Eleven levels of a node or two for a handful of appended
+    /// leaves, where the full recompute is 2,047 compressions.
+    fn recompute_range(&mut self, first: usize, last: usize) {
+        let nodes = self.nodes_mut();
+        let parents = twig_node_indices();
+        let (mut first, mut last) = (TWIG_SIZE + first, TWIG_SIZE + last);
+        while first > 1 {
+            first /= 2;
+            last /= 2;
+            crate::simd::hash_parents(&mut nodes[..], &parents[first..=last]);
+        }
+        self.leaf_root = nodes[1];
+        self.bits_root = hash_bits(&self.bits);
+        self.refresh_root();
+    }
+
     fn refresh_root(&mut self) {
         self.root = hash_node(&self.leaf_root, &self.bits_root);
     }
@@ -1152,6 +1173,47 @@ std::thread_local! {
     static PARALLEL_APPLY_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// The largest block (in leaf operations) whose apply stays on the calling
+/// thread and hashes only the paths it touched
+/// (`N42_QMDB_SMALL_APPLY_OPS`, default [`SMALL_APPLY_OPS`]; 0 turns it off),
+/// or what [`set_small_apply_ops`] chose for the process.
+///
+/// A near-empty block -- the reward accounts and the system contracts'
+/// slots -- is a handful of operations, and on the block path each of them
+/// was handed to the worker pool a dozen times and its twig rehashed whole
+/// (2,047 compressions for five leaves): ~0.12 ms a block, the floor of a
+/// catch-up run of empty blocks (`docs/P1_RUN_ROOT_DESIGN.md`). The tree,
+/// the undo record and the root are the same either way
+/// (`a_small_apply_equals_the_pooled_one`).
+pub fn small_apply_ops() -> usize {
+    match SMALL_APPLY_OPS_SET.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => {
+            static ENV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *ENV.get_or_init(|| n42_env::parse("N42_QMDB_SMALL_APPLY_OPS", SMALL_APPLY_OPS))
+        }
+        set => set,
+    }
+}
+
+/// Whether work on `items` items goes to the worker pool: not when a block
+/// of that many operations is a small apply ([`small_apply_ops`]), where a
+/// hand-off to the pool costs more than the work.
+pub fn pooled(items: usize) -> bool {
+    items > small_apply_ops()
+}
+
+/// Default of [`small_apply_ops`].
+pub const SMALL_APPLY_OPS: usize = 256;
+
+static SMALL_APPLY_OPS_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Tests and benches: the small-apply bound for the process, whatever the
+/// environment says (`None` follows it again).
+#[doc(hidden)]
+pub fn set_small_apply_ops(ops: Option<usize>) {
+    SMALL_APPLY_OPS_SET.store(ops.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether a block apply refreshes the cached upper tree from the twigs it
 /// marked dirty only (`N42_ROOT_UPPER_DIRTY=1`, off by default), instead of
 /// comparing every twig slot with the cached leaf level; or what
@@ -1232,9 +1294,11 @@ fn leaf_hashes<O: LeafOps + ?Sized>(operations: &O, out: &mut Vec<Option<Hash>>)
         }
     };
     #[cfg(feature = "rayon")]
-    {
+    if pooled(count) {
         use rayon::prelude::*;
         out.par_chunks_mut(LEAF_CHUNK).enumerate().for_each(chunk);
+    } else {
+        out.chunks_mut(LEAF_CHUNK).enumerate().for_each(chunk);
     }
     #[cfg(not(feature = "rayon"))]
     out.chunks_mut(LEAF_CHUNK).enumerate().for_each(chunk);
@@ -1436,6 +1500,10 @@ fn undo_entries(entries: &Entries, held: &[Option<u64>]) -> Vec<UndoEntry> {
         value: entries.value(*slot as usize).to_vec(),
     };
     #[cfg(feature = "rayon")]
+    if !pooled(held.len()) {
+        return held.iter().flatten().map(entry).collect();
+    }
+    #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
         // In chunks: an unindexed `flatten().collect()` assembles the result
@@ -1631,6 +1699,35 @@ fn twig_leaf_root(leaves: &[Hash]) -> Hash {
     nodes[TWIG_SIZE..TWIG_SIZE + leaves.len()].copy_from_slice(leaves);
     hash_twig_parents(&mut nodes);
     nodes[1]
+}
+
+/// [`rehash_dirty`] for a small apply ([`small_apply_ops`]) that appended
+/// slots `first_slot..next_slot`, on the calling thread: a twig that took
+/// new leaves rehashes only the paths above them
+/// ([`Twig::recompute_range`]; the appended slots are the only leaves an
+/// apply writes), a twig that only retired slots its bit set. The same
+/// twigs as [`rehash_dirty`] leaves.
+fn rehash_dirty_small(twigs: &mut [Twig], dirty: &[u8], first_slot: u64, next_slot: u64) {
+    for (twig_id, mark) in dirty.iter().enumerate().filter(|(_, mark)| **mark != 0) {
+        let Some(twig) = twigs.get_mut(twig_id) else { continue };
+        if *mark != DIRTY_LEAVES {
+            twig.rehash_bits();
+            continue;
+        }
+        let start = (twig_id * TWIG_SIZE) as u64;
+        let (from, to) = (first_slot.max(start), next_slot.min(start + TWIG_SIZE as u64));
+        if from < to {
+            twig.recompute_range((from - start) as usize, (to - 1 - start) as usize);
+            #[cfg(debug_assertions)]
+            {
+                let mut whole = twig.clone();
+                whole.recompute();
+                debug_assert!(whole.root == twig.root, "the ranged twig rehash diverged from the full recompute");
+            }
+        } else {
+            twig.recompute();
+        }
+    }
 }
 
 /// Recomputes every twig, a twig to a task on the worker pool.
@@ -2760,7 +2857,9 @@ impl QmdbCompatTree {
         let at = std::time::Instant::now();
         // The block's temporaries, the last block's with their pages in.
         let mut scratch = crate::prefault::take_apply_scratch(count);
-        let parallel = cfg!(feature = "rayon") && parallel_apply();
+        // A small block stays on this thread whatever the switches say.
+        let small = !pooled(count);
+        let parallel = cfg!(feature = "rayon") && parallel_apply() && !small;
         let pre = pre.filter(|pre| pre.len() == operations.op_count());
         if pre.is_some() {
             // Hashed ahead, off the caller's lock: only the lookups here.
@@ -3016,13 +3115,17 @@ impl QmdbCompatTree {
             phases.index_us = at.elapsed().as_micros() as u64;
             phases.index_faults += crate::prefault::thread_faults().saturating_sub(faults_hash);
             let at = std::time::Instant::now();
-            rehash_dirty(&mut self.twigs, &dirty);
+            if small {
+                rehash_dirty_small(&mut self.twigs, &dirty, first_slot, self.next_slot);
+            } else {
+                rehash_dirty(&mut self.twigs, &dirty);
+            }
             phases.rehash_us = at.elapsed().as_micros() as u64;
         }
         phases.twigs = self.twigs.len();
         phases.dirty_twigs = dirty.iter().filter(|mark| **mark != 0).count();
         let at = std::time::Instant::now();
-        let root = self.root_after_apply(upper_synced, old_twigs, &dirty);
+        let root = self.root_after_apply(upper_synced, old_twigs, &dirty, small);
         phases.root_us = at.elapsed().as_micros() as u64;
         phases.hash_faults = crate::prefault::thread_faults().saturating_sub(faults_hash);
         crate::prefault::recycle_apply_scratch(scratch);
@@ -3054,7 +3157,7 @@ impl QmdbCompatTree {
         #[cfg(feature = "rayon")]
         {
             let (first, last) = (appended.first()?.1, appended.last()?.1);
-            if !parallel_writes() {
+            if !parallel_writes() || !pooled(operations.op_count()) {
                 return None;
             }
             let (first_twig, last_twig) = (first as usize / TWIG_SIZE, last as usize / TWIG_SIZE);
@@ -3277,15 +3380,17 @@ impl QmdbCompatTree {
     /// upper tree in step with the twigs when the apply began (`synced`),
     /// only the twigs the block marked in `dirty` and those it opened past
     /// `old_twigs` are compared and their ancestors rehashed, O(dirty) where
-    /// [`Self::root`] scans every slot. A capacity change, or a cache not in
+    /// [`Self::root`] scans every slot. A small apply ([`small_apply_ops`])
+    /// takes this path whatever the switch says: the scan grows with the
+    /// state, a small block does not. A capacity change, or a cache not in
     /// step, takes [`Self::root`].
-    fn root_after_apply(&self, synced: bool, old_twigs: usize, dirty: &[u8]) -> Hash {
+    fn root_after_apply(&self, synced: bool, old_twigs: usize, dirty: &[u8], small: bool) -> Hash {
         if self.twigs.is_empty() {
             return NULL_HASH;
         }
         let cap = self.twigs.len().next_power_of_two();
         let mut upper = self.lock_upper();
-        if !synced || !root_upper_dirty() || upper.cap != cap || old_twigs > self.twigs.len() {
+        if !synced || !(small || root_upper_dirty()) || upper.cap != cap || old_twigs > self.twigs.len() {
             drop(upper);
             return self.root();
         }
@@ -3832,6 +3937,95 @@ mod tests {
             assert_eq!(root, expected_root, "root differs at block {block}");
             assert_eq!(undo, expected_undo, "undo record differs at block {block}");
             assert_eq!(batched.snapshot(), one_by_one.snapshot(), "snapshot differs at block {block}");
+        }
+    }
+
+    /// A small apply -- on the calling thread, each twig rehashed only above
+    /// the leaves it took, the upper tree refreshed from the dirty twigs --
+    /// leaves the tree, the undo record and the root the pooled apply
+    /// leaves: blocks of 1 to 48 operations, and of 200, that create, update
+    /// and delete keys across several twigs, a block over the bound now and
+    /// then (the pooled path on both), and reverts, on the heap and in an
+    /// entry file.
+    #[test]
+    fn a_small_apply_equals_the_pooled_one() {
+        for in_file in [false, true] {
+            let dir = std::env::temp_dir().join(format!("n42-twig-small-apply-{}-{in_file}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let key_of = |n: u64| {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&n.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+                key[24..].copy_from_slice(&n.to_be_bytes());
+                key
+            };
+            let mut pooled = QmdbCompatTree::new();
+            let mut small = QmdbCompatTree::new();
+            if in_file {
+                pooled.set_entry_file(&dir.join("pooled.log")).unwrap();
+                small.set_entry_file(&dir.join("small.log")).unwrap();
+            }
+            let both = |pooled: &mut QmdbCompatTree, small: &mut QmdbCompatTree, ops: &QmdbOps, at: &str| {
+                set_small_apply_ops(Some(0));
+                let (pooled_root, pooled_undo, _) = pooled.apply_ops_recorded_phased(ops).unwrap();
+                set_small_apply_ops(Some(SMALL_APPLY_OPS));
+                let (small_root, small_undo, _) = small.apply_ops_recorded_phased(ops).unwrap();
+                set_small_apply_ops(None);
+                assert_eq!(small_root, pooled_root, "root differs {at} (file {in_file})");
+                assert_eq!(small_root, small.root_full(), "the cached upper tree differs from the full fold {at}");
+                assert_eq!(small_undo, pooled_undo, "undo record differs {at} (file {in_file})");
+                assert_eq!(small.next_slot(), pooled.next_slot(), "cursor differs {at}");
+                (pooled_undo, small_undo)
+            };
+            for block in 0..700u64 {
+                let count = match block {
+                    b if b % 97 == 96 => 300,
+                    b if b % 31 == 30 => 200,
+                    _ => 1 + (next() % 48) as usize,
+                };
+                let mut seen = std::collections::HashSet::new();
+                let mut operations = Vec::new();
+                while operations.len() < count {
+                    let r = next();
+                    // Two thirds of the keys from a small live set (updates
+                    // and deletions), the rest new.
+                    let key = if r % 3 == 0 { key_of(1_000_000 + block * 1000 + operations.len() as u64) } else { key_of(r % 3_000) };
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let value = if r % 7 == 0 && block > 0 { None } else { Some((0..(4 + (r % 60) as usize)).map(|i| (r as u8).wrapping_add(i as u8)).collect()) };
+                    operations.push(QmdbOperation { key, value });
+                }
+                let mut ops = QmdbOps::from(operations);
+                ops.sort();
+                let at = format!("at block {block}");
+                let (pooled_undo, small_undo) = both(&mut pooled, &mut small, &ops, &at);
+                // Every seventh block is reverted on both and applied again,
+                // so appends land over abandoned slots and truncated twigs.
+                if block % 7 == 6 {
+                    pooled.apply_undo(&pooled_undo).unwrap();
+                    small.apply_undo(&small_undo).unwrap();
+                    assert_eq!(small.root(), pooled.root(), "root after the revert {at}");
+                    both(&mut pooled, &mut small, &ops, &format!("{at}, applied again"));
+                }
+                if block % 100 == 99 {
+                    assert_eq!(small.snapshot(), pooled.snapshot(), "snapshot differs {at} (file {in_file})");
+                }
+            }
+            assert!(small.next_slot() > 3 * TWIG_SIZE as u64, "the blocks crossed several twigs");
+            assert_eq!(small.snapshot(), pooled.snapshot(), "final snapshot differs (file {in_file})");
+            // A tree rebuilt from the snapshot (every twig recomputed whole) has the same root.
+            if !in_file {
+                assert_eq!(QmdbCompatTree::from_snapshot(&small.snapshot()).unwrap().root(), small.root());
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

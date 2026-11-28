@@ -101,6 +101,25 @@ pub const BATCH_IMPORT_BYTES: usize = 4 << 20;
 /// ~100 transfers.
 pub const BATCH_BLOCK_MAX_BYTES: usize = 16 << 10;
 
+/// Overrides [`BATCH_BLOCK_MAX_BYTES`], in KiB (a measurement knob).
+pub const BATCH_BLOCK_MAX_KIB_ENV: &str = "N42_SYNC_BATCH_BLOCK_MAX_KIB";
+
+/// Overrides [`BATCH_IMPORT_BYTES`], in MiB, at most 6 (the execution
+/// layer's request bound with hex encoding; a measurement knob).
+pub const BATCH_IMPORT_MIB_ENV: &str = "N42_SYNC_BATCH_IMPORT_MIB";
+
+/// The batched importer's (per-block cap, run bytes): the defaults, or the
+/// knobs' values when set.
+fn batch_limits() -> (usize, usize) {
+    static LIMITS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let read = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0);
+        let block = read(BATCH_BLOCK_MAX_KIB_ENV).map_or(BATCH_BLOCK_MAX_BYTES, |kib| kib << 10);
+        let run = read(BATCH_IMPORT_MIB_ENV).map_or(BATCH_IMPORT_BYTES, |mib| mib.min(6) << 20);
+        (block, run)
+    })
+}
+
 /// Transaction bytes the importer's queue holds at most, either importer
 /// (a job always goes into an empty queue). Each queued block is held twice
 /// on the validator -- its payload here and its RLP in the loop's
@@ -837,14 +856,15 @@ impl PulledImporter {
                 // engine's newPayload, whose prewarm and parallel state root
                 // run such a block faster than the range import's serial
                 // execution); a run gathers the small ones only.
-                let small = bytes <= BATCH_BLOCK_MAX_BYTES;
+                let (block_max, run_max) = batch_limits();
+                let small = bytes <= block_max;
                 let mut jobs = vec![first];
                 while small && jobs.len() < BATCH_IMPORT_BLOCKS {
                     match rx.try_recv().map(|job| took(&taken, job)) {
                         Ok(job)
                             if job.generation == generation
-                                && tx_bytes(&job) <= BATCH_BLOCK_MAX_BYTES
-                                && bytes + tx_bytes(&job) <= BATCH_IMPORT_BYTES =>
+                                && tx_bytes(&job) <= block_max
+                                && bytes + tx_bytes(&job) <= run_max =>
                         {
                             bytes += tx_bytes(&job);
                             jobs.push(job);

@@ -242,9 +242,7 @@ fn encode_account_pieces(accounts: &[(&Address, &reth_trie::bundle_state::Bundle
     // the worker pool, and the chunks are joined into one: a block's
     // operations are a few hundred allocations, not one a value, and so is
     // the forest record that keeps them (BREAKTHROUGH_DESIGN 10.39).
-    accounts
-        .par_chunks(ACCOUNTS_PER_CHUNK)
-        .map(|chunk| {
+    let encode = |chunk: &[(&Address, &reth_trie::bundle_state::BundleAccount)]| {
             let slots: usize = chunk.iter().map(|(_, account)| account.storage.len()).sum();
             // An account leaf is at most 76 bytes, typically ~10; a storage leaf is 32.
             let mut ops = QmdbOps::with_capacity(chunk.len() + slots, chunk.len() * 16 + slots * 32);
@@ -274,8 +272,15 @@ fn encode_account_pieces(accounts: &[(&Address, &reth_trie::bundle_state::Bundle
                 }
             }
             ops
-        })
-        .collect()
+    };
+    // A near-empty block's handful of accounts on the calling thread
+    // (`n42_twig_core::qmdb_compat::small_apply_ops`): the hand-off to the
+    // pool costs more than the encoding.
+    if n42_twig_core::qmdb_compat::pooled(accounts.len()) {
+        accounts.par_chunks(ACCOUNTS_PER_CHUNK).map(encode).collect()
+    } else {
+        accounts.chunks(ACCOUNTS_PER_CHUNK).map(encode).collect()
+    }
 }
 
 /// Accounts a worker writes into one arena in [`sorted_operations_from_accounts`].

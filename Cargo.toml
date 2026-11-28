@@ -645,7 +645,7 @@ ratatui = { version = "0.30", default-features = false }
 ringbuffer = "0.16.0"
 rmp-serde = "1.3"
 roaring = "0.11.4"
-rocksdb = { version = "0.24", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
+rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
 rolling-file = "0.2.0"
 sha3 = "0.10.5"
 snap = "1.1.1"

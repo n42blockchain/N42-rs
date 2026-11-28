@@ -598,7 +598,7 @@ Rejoin from genesis by range, under load:
 | --- | ---: | ---: | ---: | --- | --- |
 | n42-rs v2 (T+95) | 708 (98 MB) | 6.77 s | 104.5 blk/s (new_payload 6.5 s, fetch 2.0 s overlapped) | vote 23 s | EL 605 MiB at T+115 |
 | gov5 v4 (T+100, verifier) | 743 | 21.9 s | 33.9 blk/s | first live commit 20 s (non-voting) | HWM 998, anon 661 MiB |
-| n42-26 v6 (T+105) | 779 | 13.6 s (15:45:04.0 -> CaughtUp 15:45:17.7, head 782; restart to caught up 16.1 s) | 57 blk/s | v6.log: import-gated vote sent at 15:45:28 (view 786), 27 s | 1,358 MiB |
+| n42-26 v6 (T+105) | 779 | 13.6 s (15:45:04.0 -> CaughtUp 15:45:17.7, head 782; restart to caught up 16.1 s) | 57 blk/s | n/a (follower, no validator key; caught up at head 782 16.1 s after restart, then followed the head) | 1,358 MiB |
 
 Each member caught up with 0 range faults and then followed the head. n42-26's three header files (0..856) are
 byte-identical; the 10:45 guard picked v6 (v3 not wiped).

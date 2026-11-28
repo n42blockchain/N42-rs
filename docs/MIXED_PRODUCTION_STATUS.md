@@ -564,3 +564,40 @@ both enforce and observe mode. A whole gov5 fleet restarted on its old datadirs 
 advances (244 -> 267 in 4 min): the "restarted fleet stalls at head" item is closed.
 Next mixed round: gov5 members on >= 4bf26dc8 (`p1mixed/bin/n42-p1.main-4bf26dc8`),
 n42-rs member on main >= b6c13bdb7 (profile-1 RocksDB memtable default).
+
+## gc1 — closing mixed round on three post-AM35 mains (2026-11-28 09:00-11:00 EST, PASSED)
+
+Binaries: n42-rs main 6504495a4 (memtable default + small apply; h2_validator sha 9f3192bc863c81e5), gov5 main
+5ddf409d (sha c24601d1), n42-26 main 9b75e13. Shared CPUs 192-255. Load 6 x 25 tx/s (gov5 generators),
+~1.01M transactions, 0 send errors, receipt checks 20,188 with 3 not-ok. 95 min memory window, then one member of
+each client wiped and rejoined from genesis by range (n42-rs v2 T+95, gov5 v4 T+100, n42-26 v6 T+105).
+
+Headers 0..855 equal on 7 dumps (n42-rs v2 after its rejoin, gov5 v0/v1/v4, n42-26 v3/v5/v6). n42-rs: 0 halts,
+0 refusals, 1 view timeout (at start). gov5: 0 BAD BLOCK / vote-gate refusals.
+
+Memory over the 95 min window (RSS, MiB):
+
+| Client / member | T0 | T+30 | T+60 | T+90 | last 30 min |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| n42-rs v2 EL | 172 | 458 | 546 | 563 | +17 |
+| n42-rs v2 validator | | | | 58 | flat |
+| gov5 v0 (anon) | 146 | 676 | 761 | 794 | +33 |
+| gov5 v1 (anon) | 152 | 655 | 743 | 794 | +51 |
+| gov5 v4 verifier (anon) | 119 | 350 | 410 | 450 | +40 |
+| n42-26 v3 | 73 | 693 | 1,012 | 1,175 | +163 |
+| n42-26 v5 | 54 | 686 | 1,004 | 1,164 | +160 |
+| n42-26 v6 | 38 | 682 | 1,005 | 1,159 | +154 |
+
+n42-rs's EL ends the window at 563 MiB against 1,150 MiB at the end of mem7 (pre-default), and grows 34 MiB/h at
+the end of the window. gov5's file-backed RSS (v0 1,179 at T+115) is reclaimable mmap (B4); anon follows mem7's
+first two hours. n42-26's slope is reth's EthStateCache (B5): 9b75e13 does not carry PR #62.
+
+Rejoin from genesis by range, under load:
+
+| Member | Blocks | Catch-up | Rate | First vote / commit after restart | Peak memory |
+| --- | ---: | ---: | ---: | --- | --- |
+| n42-rs v2 (T+95) | 708 (98 MB) | 6.77 s | 104.5 blk/s (new_payload 6.5 s, fetch 2.0 s overlapped) | vote 23 s | EL 605 MiB at T+115 |
+| gov5 v4 (T+100, verifier) | 743 | 21.9 s | 33.9 blk/s | first live commit 20 s (non-voting) | HWM 998, anon 661 MiB |
+| n42-26 v6 (T+105) | 781 | 10.7 s (15:45:04 -> 14.7; CaughtUp at 17.7) | ~73 blk/s | vote 27 s | 1,391 MiB at +15 s |
+
+Each member caught up with 0 range faults and then followed the head.

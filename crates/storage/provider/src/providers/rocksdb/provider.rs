@@ -189,9 +189,46 @@ fn write_buffer_manager_size() -> usize {
 /// (`N42_ROCKSDB_WRITE_BUFFER_STALL`, on by default as upstream). Off, the
 /// budget only triggers flushes. With a 128 MiB budget a catch-up stopped
 /// for good right after a budget-triggered flush (`docs/P1_MEMORY.md`): the
-/// flushed memtable's memory stayed counted, so the stall never ended.
+/// flushed memtable stayed in the memtable history `OptimisticTransactionDB`
+/// keeps, still charged to the budget, so the stall never ended (see
+/// [`memtable_budget`] for the bound that makes a small budget safe).
 fn write_buffer_manager_stall() -> bool {
     std::env::var("N42_ROCKSDB_WRITE_BUFFER_STALL").map_or(true, |v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
+}
+
+/// The bounded memtable budget (`N42_ROCKSDB_MEMTABLE_MB`), unset by default.
+///
+/// The write buffer manager alone does not bound the memtables of this database:
+/// `OptimisticTransactionDB` turns on memtable history for every column family
+/// (`max_write_buffer_size_to_maintain = -1`, i.e. `max_write_buffer_number x
+/// write_buffer_size` = 256 MiB per column family) so that a transaction can check
+/// its keys for conflicts in memory. A flushed memtable then stays in the history,
+/// and charged to the budget, until a later write to the same column family trims
+/// it. With a budget below a few memtables that deadlocks the write stall: the
+/// first budget-triggered flush moves ~7/8 of the budget into the history, the
+/// next write finds the budget exceeded with less than half of it mutable, so it
+/// neither triggers a flush nor proceeds, and only a write could trim the history
+/// (`docs/P1_MEMORY.md`, "RocksDB memtables"). Nothing in the node checks
+/// transaction conflicts (it writes `WriteBatch`es and reads snapshots), so the
+/// history is dead memory here.
+///
+/// Set, the knob makes a small budget safe: the budget is the write buffer
+/// manager's size, every column family's memtable is `budget / 32` (at least
+/// 1 MiB, at most [`DEFAULT_WRITE_BUFFER_SIZE`]) and its history is bounded by one
+/// memtable, so the flushed-but-retained memory of five column families stays
+/// under half the budget and a stall always ends with a flush.
+fn memtable_budget() -> Option<usize> {
+    std::env::var("N42_ROCKSDB_MEMTABLE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .map(|mb| mb << 20)
+}
+
+/// The per-column-family memtable size and history bound for a bounded memtable
+/// budget (see [`memtable_budget`]).
+fn bounded_memtable_size(budget: usize) -> usize {
+    (budget / 32).clamp(1 << 20, DEFAULT_WRITE_BUFFER_SIZE)
 }
 
 /// Default cap on the total size of `RocksDB`'s write-ahead log (256 MiB).
@@ -245,6 +282,11 @@ pub struct RocksDBBuilder {
     log_level: rocksdb::LogLevel,
     block_cache: Cache,
     read_only: bool,
+    /// Bounded memtable budget in bytes (see [`memtable_budget`]); `None` keeps
+    /// upstream's memtables and the write buffer manager size in force.
+    memtable_budget: Option<usize>,
+    /// Write buffer manager size when no bounded memtable budget is set.
+    write_buffer_manager_size: usize,
 }
 
 impl fmt::Debug for RocksDBBuilder {
@@ -269,6 +311,32 @@ impl RocksDBBuilder {
             log_level: rocksdb::LogLevel::Info,
             block_cache: cache,
             read_only: false,
+            memtable_budget: memtable_budget(),
+            write_buffer_manager_size: write_buffer_manager_size(),
+        }
+    }
+
+    /// Sets a bounded memtable budget in bytes (see [`memtable_budget`]); `None`
+    /// keeps upstream's memtables. Overrides `N42_ROCKSDB_MEMTABLE_MB`.
+    pub const fn with_memtable_budget(mut self, budget_bytes: Option<usize>) -> Self {
+        self.memtable_budget = budget_bytes;
+        self
+    }
+
+    /// Sets the write buffer manager size in bytes, used when no bounded memtable
+    /// budget is set. Overrides `N42_ROCKSDB_WRITE_BUFFER_MB`.
+    pub const fn with_write_buffer_manager_size(mut self, size_bytes: usize) -> Self {
+        self.write_buffer_manager_size = size_bytes;
+        self
+    }
+
+    /// Applies a bounded memtable budget to one column family's options.
+    fn bound_memtables(cf_options: &mut Options, memtable_budget: Option<usize>) {
+        if let Some(budget) = memtable_budget {
+            let size = bounded_memtable_size(budget);
+            cf_options.set_write_buffer_size(size);
+            // Positive, so `OptimisticTransactionDB` keeps it instead of its -1.
+            cf_options.set_max_write_buffer_size_to_maintain(size as i64);
         }
     }
 
@@ -288,6 +356,7 @@ impl RocksDBBuilder {
         log_level: rocksdb::LogLevel,
         cache: &Cache,
         enable_statistics: bool,
+        write_buffer_manager_size: usize,
     ) -> Options {
         // Follow recommend tuning guide from RocksDB wiki, see https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning
         let table_options = Self::default_table_options(cache);
@@ -299,7 +368,7 @@ impl RocksDBBuilder {
         options.set_max_background_jobs(DEFAULT_MAX_BACKGROUND_JOBS);
         options.set_bytes_per_sync(DEFAULT_BYTES_PER_SYNC);
         let write_buffer_manager =
-            WriteBufferManager::new_write_buffer_manager(write_buffer_manager_size(), write_buffer_manager_stall());
+            WriteBufferManager::new_write_buffer_manager(write_buffer_manager_size, write_buffer_manager_stall());
         options.set_write_buffer_manager(&write_buffer_manager);
 
         options.set_bottommost_compression_type(DBCompressionType::Zstd);
@@ -466,20 +535,25 @@ impl RocksDBBuilder {
 
     /// Builds the [`RocksDBProvider`].
     pub fn build(self) -> ProviderResult<RocksDBProvider> {
-        let options =
-            Self::default_options(self.log_level, &self.block_cache, self.enable_statistics);
+        let options = Self::default_options(
+            self.log_level,
+            &self.block_cache,
+            self.enable_statistics,
+            self.memtable_budget.unwrap_or(self.write_buffer_manager_size),
+        );
 
         let mut cf_descriptors: Vec<ColumnFamilyDescriptor> = self
             .column_families
             .iter()
             .map(|name| {
-                let cf_options = if name == tables::TransactionHashNumbers::NAME {
+                let mut cf_options = if name == tables::TransactionHashNumbers::NAME {
                     Self::tx_hash_numbers_column_family_options(&self.block_cache)
                 } else if name == tables::BlockAccessLists::NAME {
                     Self::block_access_lists_column_family_options(&self.block_cache)
                 } else {
                     Self::default_column_family_options(&self.block_cache)
                 };
+                Self::bound_memtables(&mut cf_options, self.memtable_budget);
                 ColumnFamilyDescriptor::new(name.clone(), cf_options)
             })
             .collect();
@@ -516,10 +590,9 @@ impl RocksDBBuilder {
                     "Preserving unknown column families"
                 );
                 cf_descriptors.extend(unknown_column_families.into_iter().map(|name| {
-                    ColumnFamilyDescriptor::new(
-                        name,
-                        Self::default_column_family_options(&self.block_cache),
-                    )
+                    let mut cf_options = Self::default_column_family_options(&self.block_cache);
+                    Self::bound_memtables(&mut cf_options, self.memtable_budget);
+                    ColumnFamilyDescriptor::new(name, cf_options)
                 }));
             }
         }
@@ -3503,6 +3576,111 @@ mod tests {
         type Value = Vec<u8>;
     }
 
+    #[derive(Debug)]
+    struct TestTable2;
+
+    impl Table for TestTable2 {
+        const NAME: &'static str = "TestTable2";
+        const DUPSORT: bool = false;
+        type Key = u64;
+        type Value = Vec<u8>;
+    }
+
+    /// Memtable memory of one column family: (all memtables incl. flushed ones kept as
+    /// history, unflushed ones, flushed ones kept as history).
+    fn memtable_stats(provider: &RocksDBProvider, name: &str) -> (u64, u64, u64) {
+        let db = provider.0.db_rw();
+        let cf = db.cf_handle(name).unwrap();
+        let int = |p: &str| db.property_int_value_cf(cf, p).unwrap().unwrap_or(0);
+        (
+            int("rocksdb.size-all-mem-tables"),
+            int("rocksdb.cur-size-all-mem-tables"),
+            int("rocksdb.num-immutable-mem-table-flushed"),
+        )
+    }
+
+    /// Writes `total` bytes in 64 KiB values to `TestTable` and `TestTable2` on a thread;
+    /// returns whether it finished within `timeout`. A writer that does not finish is
+    /// left blocked (with its provider and directory leaked).
+    fn write_within(provider: RocksDBProvider, total: usize, timeout: std::time::Duration) -> bool {
+        let provider = Arc::new(provider);
+        let writer = Arc::clone(&provider);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let value = vec![7u8; 64 << 10];
+            for i in 0..(total / value.len()) as u64 {
+                if i % 2 == 0 {
+                    writer.put::<TestTable>(i, &value).unwrap();
+                } else {
+                    writer.put::<TestTable2>(i, &value).unwrap();
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        let finished = done_rx.recv_timeout(timeout).is_ok();
+        if !finished {
+            std::mem::forget(provider);
+        }
+        finished
+    }
+
+    /// The defect a small write buffer manager budget hits with upstream's memtables
+    /// (`docs/P1_MEMORY.md`, "RocksDB memtables"): the first budget-triggered flush
+    /// moves the memtable into the history `OptimisticTransactionDB` keeps, still
+    /// charged to the budget; the next write stalls with less than half the budget
+    /// mutable, so no flush is triggered and nothing frees the history. No iterator or
+    /// snapshot is open here. Ignored: it leaves a thread blocked for good.
+    #[test]
+    #[ignore = "demonstrates a permanent write stall; leaves a blocked thread"]
+    fn test_small_budget_with_upstream_memtables_stalls_for_good() {
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path())
+            .with_table::<TestTable>()
+            .with_table::<TestTable2>()
+            .with_memtable_budget(None)
+            .with_write_buffer_manager_size(32 << 20)
+            .build()
+            .unwrap();
+        let probe = provider.clone();
+        assert!(!write_within(provider, 256 << 20, std::time::Duration::from_secs(20)));
+        let (all1, cur1, flushed1) = memtable_stats(&probe, TestTable::NAME);
+        let (all2, cur2, flushed2) = memtable_stats(&probe, TestTable2::NAME);
+        let num_snapshots = probe.0.db_rw().property_int_value("rocksdb.num-snapshots").unwrap();
+        eprintln!(
+            "stalled: TestTable all {all1} unflushed {cur1} flushed-kept {flushed1}; \
+             TestTable2 all {all2} unflushed {cur2} flushed-kept {flushed2}; snapshots {num_snapshots:?}"
+        );
+        assert!(flushed1 + flushed2 >= 1, "a flushed memtable is kept as history");
+        // The stall persists because the kept history holds over half the budget and
+        // under half of it is mutable, so no write triggers a flush.
+        assert!((all1 - cur1) + (all2 - cur2) > 16 << 20, "the kept history holds the budget");
+        assert!(cur1 + cur2 < 16 << 20);
+        std::mem::forget(probe);
+        std::mem::forget(temp_dir);
+    }
+
+    /// With a bounded memtable budget the same writes go through a 32 MiB budget
+    /// (8x the budget written) and the memtables stay within it.
+    #[test]
+    fn test_bounded_memtable_budget_does_not_stall() {
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path())
+            .with_table::<TestTable>()
+            .with_table::<TestTable2>()
+            .with_memtable_budget(Some(32 << 20))
+            .build()
+            .unwrap();
+        let probe = provider.clone();
+        assert!(
+            write_within(provider, 256 << 20, std::time::Duration::from_secs(300)),
+            "writes stalled under a bounded memtable budget"
+        );
+        let (all1, _, _) = memtable_stats(&probe, TestTable::NAME);
+        let (all2, _, _) = memtable_stats(&probe, TestTable2::NAME);
+        assert!(all1 + all2 < 32 << 20, "memtables {} exceed the budget", all1 + all2);
+        assert_eq!(probe.get::<TestTable>(0).unwrap().map(|v| v.len()), Some(64 << 10));
+    }
+
     #[test]
     fn test_reopens_with_unknown_column_family() {
         let temp_dir = TempDir::new().unwrap();
@@ -3679,7 +3857,12 @@ mod tests {
     fn test_statistics_level_skips_timers() {
         let temp_dir = TempDir::new().unwrap();
         let cache = Cache::new_lru_cache(1 << 20);
-        let options = RocksDBBuilder::default_options(rocksdb::LogLevel::Info, &cache, true);
+        let options = RocksDBBuilder::default_options(
+            rocksdb::LogLevel::Info,
+            &cache,
+            true,
+            DEFAULT_WRITE_BUFFER_MANAGER_SIZE,
+        );
 
         let db = DB::open(&options, temp_dir.path()).unwrap();
         for i in 0..10u8 {

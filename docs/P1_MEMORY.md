@@ -351,3 +351,53 @@ the cross-block cache, the RocksDB cache and the QMDB pools do not depend on the
    ~256 MiB with upstream's write stall, no gain without it); the steady-state rounds
    (v1-v4) predate the RPC-cache bound and the entry file, which matter for catch-up and
    for a long-lived node's growth (heap entries grow with every state entry ever written).
+
+## RocksDB memtables (B6, branch `perf/p1-memory-2`, 2026-11-27)
+
+**What holds the memory.** Not an iterator and not a snapshot: `RocksDBProvider` opens
+an `OptimisticTransactionDB`, and `OptimisticTransactionDB::Open` sets
+`max_write_buffer_size_to_maintain = -1` on every column family whose value is 0
+(librocksdb-sys 10.4.2, `optimistic_transaction_db_impl.cc`), i.e. a memtable history of
+`max_write_buffer_number x write_buffer_size` = 2 x 128 MiB per column family, kept so a
+transaction can check its keys for conflicts in memory. A flushed memtable moves into that
+history (`MemTableListVersion::Remove`) instead of being freed, stays charged to the write
+buffer manager, and is trimmed only when the history exceeds its bound
+(`MemoryAllocatedBytesExcludingLast() + usage`, so the newest flushed memtable is never
+counted) -- in practice by a later write to the same column family. The node never checks a
+transaction conflict: production writes `WriteBatch`es (`commit_batch`) and reads snapshots;
+`RocksTx` is used only in tests. The history is dead memory.
+
+**Why a small budget stalled for good.** With the write stall on, a write waits while
+`memory_usage() >= budget`, and a flush is triggered only when the mutable memtables exceed
+7/8 of the budget or half of it while over budget (`WriteBufferManager::ShouldFlush`). The
+first budget-triggered flush moves ~7/8 of the budget into the history; the next write
+finds the budget exceeded with less than half of it mutable, so it neither flushes nor
+proceeds, and only a write could trim the history. Reproduced in a unit test with no
+iterator and no snapshot open (`test_small_budget_with_upstream_memtables_stalls_for_good`,
+ignored because it leaves a blocked thread): 32 MiB budget, two column families, the writer
+stops after ~28 MiB with each column family holding one flushed memtable (15.8 MB each, 2 MB
+unflushed, `rocksdb.num-snapshots` 0). That is the h5-wb / hv-wb hang (catch-up stopped
+right after the first budget flush) and why `N42_ROCKSDB_WRITE_BUFFER_STALL=0` moved the
+peak only inside the spread: without the stall the budget triggers flushes, but every
+flushed memtable still sits in the history.
+
+**Footprint** (ad-hoc test, 1 GiB written in 64 KiB values to two column families,
+`size-all-mem-tables` at the end):
+
+| configuration | memtables held | of which unflushed | write time |
+|---|---|---|---|
+| upstream (4 GiB budget, 128 MiB memtables, history -1) | 573 MiB | 62 MiB | 1.61 s |
+| `N42_ROCKSDB_MEMTABLE_MB=128` | 8 MiB | 8 MiB | 1.52 s |
+| `N42_ROCKSDB_MEMTABLE_MB=256` | 17 MiB | 17 MiB | 1.47 s |
+
+511 of upstream's 573 MiB are flushed history (two 128 MiB memtables per column family),
+the same order as the ~480 MiB of memtables in the heavy catch-up's heap profile.
+
+**Change** (be474d0f0, additive, off by default): `N42_ROCKSDB_MEMTABLE_MB=<n>` sets the
+write buffer manager to n MiB, every column family's memtable to n/32 (1-128 MiB) and its
+history bound to one memtable (a positive `max_write_buffer_size_to_maintain`, which
+`OptimisticTransactionDB` keeps). The history of five column families then stays under half
+the budget, so a stalled write always ends with a flush. Builder methods
+`with_memtable_budget` / `with_write_buffer_manager_size`;
+`test_bounded_memtable_budget_does_not_stall` writes 256 MiB through a 32 MiB budget and
+checks the memtables stay under it. `N42_ROCKSDB_WRITE_BUFFER_MB` is unchanged.

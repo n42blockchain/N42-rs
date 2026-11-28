@@ -351,3 +351,111 @@ the cross-block cache, the RocksDB cache and the QMDB pools do not depend on the
    ~256 MiB with upstream's write stall, no gain without it); the steady-state rounds
    (v1-v4) predate the RPC-cache bound and the entry file, which matter for catch-up and
    for a long-lived node's growth (heap entries grow with every state entry ever written).
+
+## RocksDB memtables (B6, branch `perf/p1-memory-2`, 2026-11-27)
+
+**What holds the memory.** Not an iterator and not a snapshot: `RocksDBProvider` opens
+an `OptimisticTransactionDB`, and `OptimisticTransactionDB::Open` sets
+`max_write_buffer_size_to_maintain = -1` on every column family whose value is 0
+(librocksdb-sys 10.4.2, `optimistic_transaction_db_impl.cc`), i.e. a memtable history of
+`max_write_buffer_number x write_buffer_size` = 2 x 128 MiB per column family, kept so a
+transaction can check its keys for conflicts in memory. A flushed memtable moves into that
+history (`MemTableListVersion::Remove`) instead of being freed, stays charged to the write
+buffer manager, and is trimmed only when the history exceeds its bound
+(`MemoryAllocatedBytesExcludingLast() + usage`, so the newest flushed memtable is never
+counted) -- in practice by a later write to the same column family. The node never checks a
+transaction conflict: production writes `WriteBatch`es (`commit_batch`) and reads snapshots;
+`RocksTx` is used only in tests. The history is dead memory.
+
+**Why a small budget stalled for good.** With the write stall on, a write waits while
+`memory_usage() >= budget`, and a flush is triggered only when the mutable memtables exceed
+7/8 of the budget or half of it while over budget (`WriteBufferManager::ShouldFlush`). The
+first budget-triggered flush moves ~7/8 of the budget into the history; the next write
+finds the budget exceeded with less than half of it mutable, so it neither flushes nor
+proceeds, and only a write could trim the history. Reproduced in a unit test with no
+iterator and no snapshot open (`test_small_budget_with_upstream_memtables_stalls_for_good`,
+ignored because it leaves a blocked thread): 32 MiB budget, two column families, the writer
+stops after ~28 MiB with each column family holding one flushed memtable (15.8 MB each, 2 MB
+unflushed, `rocksdb.num-snapshots` 0). That is the h5-wb / hv-wb hang (catch-up stopped
+right after the first budget flush) and why `N42_ROCKSDB_WRITE_BUFFER_STALL=0` moved the
+peak only inside the spread: without the stall the budget triggers flushes, but every
+flushed memtable still sits in the history.
+
+**Footprint** (ad-hoc test, 1 GiB written in 64 KiB values to two column families,
+`size-all-mem-tables` at the end):
+
+| configuration | memtables held | of which unflushed | write time |
+|---|---|---|---|
+| upstream (4 GiB budget, 128 MiB memtables, history -1) | 573 MiB | 62 MiB | 1.61 s |
+| `N42_ROCKSDB_MEMTABLE_MB=128` | 8 MiB | 8 MiB | 1.52 s |
+| `N42_ROCKSDB_MEMTABLE_MB=256` | 17 MiB | 17 MiB | 1.47 s |
+
+511 of upstream's 573 MiB are flushed history (two 128 MiB memtables per column family),
+the same order as the ~480 MiB of memtables in the heavy catch-up's heap profile.
+
+**Change** (be474d0f0, additive, off by default): `N42_ROCKSDB_MEMTABLE_MB=<n>` sets the
+write buffer manager to n MiB, every column family's memtable to n/32 (1-128 MiB) and its
+history bound to one memtable (a positive `max_write_buffer_size_to_maintain`, which
+`OptimisticTransactionDB` keeps). The history of five column families then stays under half
+the budget, so a stalled write always ends with a flush. Builder methods
+`with_memtable_budget` / `with_write_buffer_manager_size`;
+`test_bounded_memtable_budget_does_not_stall` writes 256 MiB through a 32 MiB budget and
+checks the memtables stay under it. `N42_ROCKSDB_WRITE_BUFFER_MB` is unchanged.
+
+## Heap rounds and the profile-1 memtable default (2026-11-28)
+
+Two `steady` rounds, four members each on the 8 s genesis, 300 s idle, 150 tx/s for 90 min,
+300 s idle; members 0-1 on main's RocksDB settings, members 2-3 with
+`N42_ROCKSDB_MEMTABLE_MB=128`; a jemalloc heap profile of every EL every 15 min
+(`MALLOC_CONF=prof:true,lg_prof_sample:19`, profiling build with `jemalloc-prof`).
+`heap1`: main 9b373ce00 + this branch (RocksDB 10.4.2); `heap2`: the same with `rocksdb`
+0.25.0 (RocksDB 11.8.1, branch `inv/rocksdb-0.25`). Profiles were diffed per allocation
+stack with `/data/n42-build/p1-memory/tools/heapdiff.py` (raw profiles, `addr2line` over
+the top stacks only: 30 s instead of ~11 min for `go tool pprof -traces` on this binary).
+
+EL VmRSS / `je_allocated`, MiB, end of each 15-min bin of the load phase:
+
+| round | members | 15 | 30 | 45 | 60 | 75 | 90 |
+|---|---|---|---|---|---|---|---|
+| heap1 | 0-1 (main) | 400/755 | 486/839 | 523-534/877-879 | 545-557/893-895 | 562-573/908 | 580-585/929 |
+| heap1 | 2-3 (knob) | 391-401/750-753 | 473-478/829 | 505-512/853-855 | 506-517/853-855 | 508-519/853-854 | 514-515/857-860 |
+| heap2 | 0-1 (main) | 401-404/758-760 | 497-501/843-844 | 526-535/879-880 | 559/895-897 | 567-583/913-914 | 592-596/931-932 |
+| heap2 | 2-3 (knob) | 403-405/754-756 | 485-490/832-834 | 507-510/855-858 | 510-512/854-858 | 511-515/859-861 | 519/860-864 |
+
+Where the heap went (member 0 / member 2 of heap1, in-use bytes by allocation stack):
+
+- 0-60 min, both: +120 MiB per 30 min, mostly the RPC state cache filling to its profile-1
+  bounds -- the transactions `convert_payload_to_block` decodes (kept as the cache's blocks,
+  0.7 -> 47 -> 92 MiB), receipts and logs cloned by `ChainChange::new` (~60 MiB), the
+  `EthStateCache` LRU table -- plus the fee-history cache. All of them stop growing by
+  60 min: they are bounded caches, not leaks (the decoded blocks hold ~90 MiB against the
+  64 MiB `--rpc-cache.max-blocks-bytes`, so the cache's size estimate reads low by ~1.4x).
+- 60-105 min, member 0 (main): +40.9 MiB, of which +45.4 MiB is RocksDB's memtable arena
+  (`ConcurrentArena::AllocateAligned`, 80 MiB held) -- the flushed-memtable history of
+  `AccountsHistory`, `StoragesHistory` and `TransactionHashNumbers`, which flush every
+  10-20 min at 128 MiB ("Write Buffer Full") and keep up to two flushed memtables each.
+- 60-105 min, member 2 (knob): +2.4 MiB in total; what grows is the Prometheus exporter's
+  histogram sketches (only with `--metrics`) and the fee-history cache.
+
+No allocation on the block-import or execution path grows once the caches are full.
+RocksDB 11.8.1 behaves like 10.4.2 (same curves within 1-2%): the upstream report of
+the history being charged to the write buffer manager (facebook/rocksdb#15535, fix PR
+#15551 open, not in any release as of 11.15.1) is not fixed by upgrading; the knob is
+the remedy. The bump compiles without changes and passes the provider's 96 RocksDB tests.
+
+**Change:** `N42_ROCKSDB_MEMTABLE_MB=128` joins the profile-1 env defaults
+(`STORAGE_KNOBS` in `crates/n42/qmdb-reth/src/profile1_memory.rs`; an operator's value
+wins). Same expected effect on the mixed fleet's n42-rs member: mem7's EL grew 196 ->
+1,085 MiB in 3.5 h with the history tables flushing on the same 10-20 min cadence.
+
+**Heavy catch-up with the default** (2026-11-28 05:00-05:25 EST, `scripts/catchup-bench.sh`
+legs on the catch-up lane's 2,277-block heavy chain, binary fbab5b278, member 3 pulls from
+genesis; `hm-off*` = `N42_ROCKSDB_MEMTABLE_MB=0`, upstream memtables): no stall, the same
+speed, a 20% lower EL peak.
+
+| leg | import 1..2,277 | member 3 EL VmRSS median/max | RssAnon max | je_allocated max |
+|---|---|---|---|---|
+| hm-off | 112.2 s | 2,233 / 2,881 MiB | 2,333 | 2,243 |
+| hm-off2 | 112.7 s | 2,296 / 2,906 MiB | 2,312 | 2,207 |
+| hm-def | 112.7 s | 1,743 / 2,314 MiB | 1,828 | 1,738 |
+| hm-def2 | 112.7 s | 1,749 / 2,304 MiB | 1,839 | 1,759 |

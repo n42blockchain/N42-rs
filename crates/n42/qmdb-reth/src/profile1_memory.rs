@@ -180,11 +180,22 @@ pub const PREFAULT_KNOBS: &[(&str, &str)] = &[
 /// environment says; roots and wire bytes are the same.
 pub const LAYOUT_KNOBS: &[(&str, &str)] = &[("N42_QMDB_ENTRY_FILE", "1")];
 
+/// The `RocksDB` knob a profile-1 member sets when the environment leaves it
+/// unset: a 128 MiB memtable budget (`N42_ROCKSDB_MEMTABLE_MB`, 4 MiB
+/// memtables, one flushed memtable of history per column family). Unset,
+/// `OptimisticTransactionDB` keeps two flushed 128 MiB memtables per column
+/// family as conflict history the node never reads; at 150 tx/s the history
+/// tables (accounts, storages, transaction hashes) grow the execution layer
+/// by ~45 MiB every 45 min for hours, with the knob it stays flat
+/// (`docs/P1_MEMORY.md`, heap rounds of 2026-11-28; upstream
+/// facebook/rocksdb#15535).
+pub const STORAGE_KNOBS: &[(&str, &str)] = &[("N42_ROCKSDB_MEMTABLE_MB", "128")];
+
 /// Sets, where the environment leaves them unset, `RAYON_NUM_THREADS` to
 /// [`MemoryDefaults::cores`] -- every rayon pool built with the default size
 /// follows it: the global pool (which clap's chain parser starts for the
 /// genesis root), reth's RPC blocking pool -- and every [`PREFAULT_KNOBS`]
-/// and [`LAYOUT_KNOBS`] entry. Returns what it set, as `NAME=value`.
+/// [`LAYOUT_KNOBS`] and [`STORAGE_KNOBS`] entry. Returns what it set, as `NAME=value`.
 ///
 /// # Safety
 ///
@@ -196,7 +207,7 @@ pub unsafe fn set_env_defaults(defaults: &MemoryDefaults) -> Vec<String> {
     let mut set = Vec::new();
     let cores = defaults.cores.map(|cores| cores.to_string());
     let rayon = cores.as_deref().map(|cores| ("RAYON_NUM_THREADS", cores));
-    let knobs = PREFAULT_KNOBS.iter().chain(LAYOUT_KNOBS).copied();
+    let knobs = PREFAULT_KNOBS.iter().chain(LAYOUT_KNOBS).chain(STORAGE_KNOBS).copied();
     for (name, value) in rayon.into_iter().chain(knobs) {
         if std::env::var_os(name).is_none() {
             // SAFETY: the caller guarantees no concurrent environment access.

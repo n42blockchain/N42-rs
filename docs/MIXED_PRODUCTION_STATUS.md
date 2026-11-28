@@ -539,7 +539,10 @@ Memory, MiB, last sample of each hour (hour 1 = 22:00-23:00):
   path grows once the RPC caches are full.
 - **gov5:** RSS rises ~350 MiB/h, but almost all of it is file-backed (mapped database pages,
   reclaimable); anonymous memory rises 8-9 MiB/h at the end and the Go heap is flat
-  (300-800 MiB, GC cycles).
+  (300-800 MiB, GC cycles). gov5's own report: 3,714,125 tx sent, 0 errors, 74k receipts checked
+  (0 not-ok), 0 refusals, no node down; top heap items on v0 at the end (504 MiB in use):
+  receipt cache 94, sender cache 93, QMDB in-memory index 52 (grows with the ~372k accounts
+  created), mobileverify packet cache 25 MiB; heap profiles in `p1mixed/mem1/run/heap-node*.pb.gz`.
 - **n42-26 (B5):** growth falls each hour (+579, +281, +234, +216, +123, +60 MiB) and reaches
   ~2.8 GB; plateau in reach, not yet flat. Its PR #56 A/B shows the remaining growth is not
   RocksDB.

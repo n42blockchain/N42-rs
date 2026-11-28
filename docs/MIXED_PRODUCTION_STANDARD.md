@@ -1157,4 +1157,9 @@ Case shape (each client, all members of the set run that client, under load):
    action, and a header dump of every member over the whole chain is equal.
 4. The leg is recorded with the client's commit, the trigger used for each kill and the recovery time.
 
+Trigger note (gov5's leg, 2026-11-28): aiming a kill just before the next commit never left the lock above
+committed, because the lock is persisted with the commit vote, milliseconds before the CommitQC forms; killing the
+whole set the instant the first member logs a commit did, 5 of 6 times. A leg reports per kill whether locked !=
+committed on at least one member, and the at-least-five count is of kills where it was.
+
 The mixed AM35 gate (E9) stays as it is; this adds to it.

@@ -1134,3 +1134,27 @@ AM36 precisions (2026-11-27, after n42-26's implementation review, PR #58):
     timeout sender, NewView leader) below the genesis set size count as stateless on profile 1 (AM5) and may
     be rejected before forwarding. A piggybacked high TC is checked for its views only (honest members relay
     unverified high TCs); every other nested certificate gets the item-10 width check.
+
+## Amendment AM37 (2026-11-28, ADOPTED by the owner; proposed by n42-rs after n42-26's F5 finding): AM35 gate per client
+
+Found by n42-26 (plan item F5): on n42-26 main 9b75e13 an all-n42-26 four-member set killed with SIGKILL as a
+whole right after a commit halts for good. Restart replays the locked block through `new_payload` without a
+forkchoice update, followers then receive only the gov5-format copy of the next block, buffer it because its
+parent is not their head, and never fetch the locked block, so votes stay import-gated. The AM35 gate (E9, a
+mixed set) did not catch it: in a mixed set the other clients serve and import what one client cannot, so a
+client's own recovery path is never exercised alone.
+
+Rule: the AM35 gate is also run once per client on a set made of that client only, and each client's
+single-client leg is required before v1.2 closes and after every change to its recovery, lock or
+block-intake path.
+
+Case shape (each client, all members of the set run that client, under load):
+1. Whole-set SIGKILL of every validator and execution layer, restarted together without intervention.
+2. At least five kills timed right after a commit and at least five timed between a PrepareQC and its commit
+   QC, so that locked != committed at the instant of the kill (the windows are 0.02-0.5 s: trigger on the log
+   line, matching message text only, not random timing).
+3. Pass: after every kill the chain resumes (height advances, every member votes again) without operator
+   action, and a header dump of every member over the whole chain is equal.
+4. The leg is recorded with the client's commit, the trigger used for each kill and the recovery time.
+
+The mixed AM35 gate (E9) stays as it is; this adds to it.

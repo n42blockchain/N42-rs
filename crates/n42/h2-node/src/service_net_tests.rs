@@ -1478,6 +1478,37 @@ async fn an_unnamed_held_child_fetches_its_parent_without_a_peer_height_hint() {
     assert!(a.el.block_by_hash(blocks[0].0).await.unwrap().is_some());
 }
 
+/// am35-am37rs6 kill 1: this node's tip is a block on another branch (it
+/// never had the lock the set extended), and a child arrives whose parent it
+/// has never seen -- here at the tip's own height (the layer read ahead of
+/// this branch), not only above it. The child is kept, its parent fetched by
+/// hash, and both import.
+#[tokio::test]
+async fn a_held_child_whose_parent_was_never_seen_fetches_it_and_both_import() {
+    let (mut a, mut b) = pair(0).await;
+    let (one, _, body_one) = block(1, ID.genesis_hash);
+    // The lock B at 2 (on `a`'s side), and the set's branch S (2) and C (3).
+    let (s, _, body_s) = block(2, one);
+    let (c, _, body_c) = block(3, s);
+    for body in [&body_one, &body_s, &body_c] {
+        b.el.new_payload(n42_h2_net::decode_block_rlp_raw(body, HeaderProfile::Ethereum).unwrap().execution_data()).await.unwrap();
+    }
+    a.svc.handle_direct_body(body_one.clone().into());
+    let mut events = Vec::new();
+    within(a.svc.drain_outputs(&mut events)).await.unwrap();
+    assert!(a.svc.imported.contains(&one));
+    a.svc.note_imported(3);
+    a.svc.handle_direct_body(body_c.clone().into());
+    a.svc.held_bodies.push(c);
+    a.svc.peer_heights.clear();
+    within(a.svc.consider_catch_up(&mut events)).await;
+    assert!(a.svc.awaiting_bodies.contains(&s), "the unseen parent is requested whatever the child's height");
+    assert!(events.iter().any(|event| matches!(event, ServiceEvent::PayloadMissing { block_hash } if *block_hash == s)));
+    pump(&mut a, &mut b, (true, true), &mut events, |a, _, _| a.svc.imported.contains(&s) && a.svc.imported.contains(&c)).await;
+    let calls = a.el.calls();
+    assert!(calls.iter().any(|call| matches!(call, n42_h2_execution::ElCall::NewPayload(h) | n42_h2_execution::ElCall::NewPayloadBody(h) if *h == c)));
+}
+
 #[tokio::test]
 async fn named_transactions_are_served_from_the_stored_whole_body() {
     let (mut a, mut b) = pair(0).await;

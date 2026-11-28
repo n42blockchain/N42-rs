@@ -7130,8 +7130,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             return Some(err.to_string());
         }
         // B1: a QC whose block is known here names an ancestor (gov5's
-        // reading: walked at most 4096 blocks; an unknown block is checked by
-        // its signature alone).
+        // reading: walked at most 4096 blocks; an unknown block, or a link of
+        // the walk not known here, is checked by its signature alone -- the
+        // body is kept and its parent fetched by hash).
         if let Err(err) = rules.check_qc_ancestry(header, |hash| {
             self.block_headers.get(hash).map(|known| (known.number, known.parent_hash))
         }) {
@@ -7840,19 +7841,17 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// status is refreshed. The earliest held child's parent hash still names
     /// exactly what is missing, without trusting an advertised height.
     ///
-    /// A held child at `tip + 1` counts too when its parent is not imported:
-    /// the tip is then a block on another branch (a restored lock the set
-    /// never committed), and the gap is a parent hash, not a height. A parent
+    /// A held child at any height counts too when its parent is not
+    /// imported: the tip is then a block on another branch (a restored lock
+    /// the set never committed, or a lock this node never had), and the gap
+    /// is a parent hash, not a height. A parent
     /// whose body is here is imported (see [`Self::import_unimported_ancestor`])
     /// instead of being asked for.
     fn request_missing_held_parent(&mut self, events: &mut Vec<ServiceEvent>) {
         let Some(tip) = self.imported_tip() else { return };
         let Some(parent) = self.held_bodies.iter()
             .filter_map(|hash| self.block_headers.get(hash))
-            .filter(|header| {
-                header.number > tip.saturating_add(1)
-                    || (header.number == tip.saturating_add(1) && !self.imported.contains(&header.parent_hash))
-            })
+            .filter(|header| header.number > tip.saturating_add(1) || !self.imported.contains(&header.parent_hash))
             .min_by_key(|header| header.number)
             .map(|header| header.parent_hash) else { return };
         if self.imported.contains(&parent) || self.driver.importing().any(|hash| *hash == parent) {

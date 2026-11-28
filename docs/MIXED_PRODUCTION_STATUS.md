@@ -511,3 +511,35 @@ release line x2). Kill latency after the trigger: n42-rs 1-7 ms, gov5 4-11 ms, n
 - Headers 0..104 equal on 5 dumps (n42-rs v2, gov5 node0/1/4, n42-26 v3).
 - Result: AM35 gate passed for all three clients. n42-rs merged integ/p1-am35-am36 into main as 9b373ce00
   (code identical to 7e9e3c165) under the owner's pre-approval.
+
+## mem7 — 7 h mixed memory round (2026-11-27 22:00 - 11-28 05:00 EST, PASSED)
+
+Seven members on the three mains (n42-rs 9b373ce00 member 2; gov5 78c76e2e members 0, 1, 4;
+n42-26 134a6df members 3, 5, 6), genesis `gate6/genesis-mem7.json` (hash 0xabfce178...),
+8 s blocks, 150 tx/s. Height 3,132 at the end, no halt, 2 timeouts and 0 refusals on
+member 2 for the whole round. Headers 0..3,128 are identical on six dumps (n42-rs node 2,
+gov5 nodes 0/1/4, n42-26 validator 3 twice); 0 mismatches.
+
+Memory, MiB, last sample of each hour (hour 1 = 22:00-23:00):
+
+| process | 1 | 2 | 3 | 4 | 5 | 6 | 7 | last 3 h |
+|---|---|---|---|---|---|---|---|---|
+| n42-rs EL RSS | 663 | 1,004 | 1,065 | 1,109 | 1,102 | 1,128 | 1,150 | +48 (16/h) |
+| n42-rs validator RSS | 56 | 56 | 57 | 58 | 56 | 56 | 54 | flat |
+| gov5 node0 RSS / anon / heap | 1,160/740/468 | 1,589/813/403 | 2,014/882/555 | 2,388/900/607 | 2,796/963/810 | 3,130/969/616 | 3,486/987/673 | anon +24 (8/h) |
+| gov5 node1 RSS / anon / heap | 905/519/439 | 1,300/596/356 | 1,669/647/407 | 2,021/673/307 | 2,401/735/550 | 2,705/744/476 | 3,021/754/551 | anon +19 |
+| gov5 node4 RSS / anon / heap | 1,047/627/453 | 1,477/701/328 | 1,875/742/479 | 2,252/765/564 | 2,633/799/395 | 2,978/816/415 | 3,327/826/514 | anon +27 |
+| n42-26 v3 RSS | 1,299 | 1,878 | 2,159 | 2,393 | 2,609 | 2,732 | 2,792 | +183, slowing (123, 60/h) |
+
+- **n42-rs (B7):** the EL levels off near 1.1 GB; the validator is flat. The residual growth is
+  RocksDB's flushed-memtable history (the 11-28 heap rounds, `docs/P1_MEMORY.md`): the
+  history tables flush every 10-20 min at 128 MiB and keep up to two flushed memtables each.
+  With `N42_ROCKSDB_MEMTABLE_MB=128` (profile-1 default on `perf/p1-memtable-default`) the
+  EL is flat ~515 MiB after 45 min at the same load. No allocation on the import/execution
+  path grows once the RPC caches are full.
+- **gov5:** RSS rises ~350 MiB/h, but almost all of it is file-backed (mapped database pages,
+  reclaimable); anonymous memory rises 8-9 MiB/h at the end and the Go heap is flat
+  (300-800 MiB, GC cycles).
+- **n42-26 (B5):** growth falls each hour (+579, +281, +234, +216, +123, +60 MiB) and reaches
+  ~2.8 GB; plateau in reach, not yet flat. Its PR #56 A/B shows the remaining growth is not
+  RocksDB.

@@ -447,3 +447,15 @@ the remedy. The bump compiles without changes and passes the provider's 96 Rocks
 (`STORAGE_KNOBS` in `crates/n42/qmdb-reth/src/profile1_memory.rs`; an operator's value
 wins). Same expected effect on the mixed fleet's n42-rs member: mem7's EL grew 196 ->
 1,085 MiB in 3.5 h with the history tables flushing on the same 10-20 min cadence.
+
+**Heavy catch-up with the default** (2026-11-28 05:00-05:25 EST, `scripts/catchup-bench.sh`
+legs on the catch-up lane's 2,277-block heavy chain, binary fbab5b278, member 3 pulls from
+genesis; `hm-off*` = `N42_ROCKSDB_MEMTABLE_MB=0`, upstream memtables): no stall, the same
+speed, a 20% lower EL peak.
+
+| leg | import 1..2,277 | member 3 EL VmRSS median/max | RssAnon max | je_allocated max |
+|---|---|---|---|---|
+| hm-off | 112.2 s | 2,233 / 2,881 MiB | 2,333 | 2,243 |
+| hm-off2 | 112.7 s | 2,296 / 2,906 MiB | 2,312 | 2,207 |
+| hm-def | 112.7 s | 1,743 / 2,314 MiB | 1,828 | 1,738 |
+| hm-def2 | 112.7 s | 1,749 / 2,304 MiB | 1,839 | 1,759 |

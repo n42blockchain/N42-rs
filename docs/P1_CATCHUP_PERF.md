@@ -730,3 +730,31 @@ Reproduce: `scripts/catchup-bench.sh produce` (once, ~25 min), then
 (`CB_CPUS=0-15,128-143 CB_SERVER_CPUS=64-95,192-223` for step 5,
 `CB_ENV=N42_SYNC_LAZY_VERIFY=1` for lazy screening). Legs and reports:
 `/data/n42-build/p1-catchup/legs/<name>/report.txt`.
+
+## 8. Re-baseline after AM35 (F2, 2026-11-28)
+
+Branch `integ/p1-f2-catchup`: main 7443f72c7 (AM35, AM36, the profile-1 memtable
+default) + `design/p1-run-root` (small applies on the calling thread,
+`N42_QMDB_SMALL_APPLY_OPS`, default 256) + `perf/p1-catchup` (batch import cap knobs,
+measurement only). Lib tests of twig-core, qmdb-state, qmdb-reth and h2-node: 609 pass.
+Legs alternate the arms back to back; member 3 on CPUs 0-31, the servers on 32-63
+(`/data/n42-build/p1-catchup-tools/legs-f2*.txt`). Pull rate is the validator's
+`catch-up timing` (wall time of the pull), which resolves what the 0.5 s height samples
+do not.
+
+| chain | arm | legs | pull wall | blocks/s | root mismatches |
+|---|---|---|---|---|---|
+| empty, 12,584 blocks | small apply (default) | 6 | 1,470-1,529 ms | 8,228-8,560 (median 8,500) | 0 |
+| empty | `N42_QMDB_SMALL_APPLY_OPS=0` | 6 | 1,627-1,871 ms | 6,724-7,734 (median 7,290) | 0 |
+| bench, 2,277 heavy blocks | small apply (default) | 2 | 112.7, 112.8 s | 131.9k tx/s | 0 |
+| bench | `N42_QMDB_SMALL_APPLY_OPS=0` | 2 | 111.3, 113.8 s | 131-134k tx/s | 0 |
+| bench | `N42_SYNC_BATCH_BLOCK_MAX_KIB=4096` | 2 | 124.8, 124.8 s | 119.2k tx/s (-10%) | 0 |
+
+- **B1:** the small apply lifts the empty-chain pull 16% (the ranges do not overlap) and
+  is neutral on heavy blocks; same roots everywhere. Adopted (default on). The empty
+  chain now pulls at ~8,500 blocks/s, ~66 Mbit/s at its ~1 KB blocks: still under a
+  100 Mbit/s link (~12,000 blocks/s). The pull's wall is newPayload (1,456-1,516 ms of
+  1,470-1,529), so the EL's per-block cost (~0.12 ms) remains the bound.
+- **B2:** raising the batch import's per-block cap to 4 MiB is 10% slower on the heavy
+  chain (two legs each, 124.8 s against 112.7-112.8 s). The cap stays at 16 KiB; the knobs
+  stay for measurement. B2 closed.

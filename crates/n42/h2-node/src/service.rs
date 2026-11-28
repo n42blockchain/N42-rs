@@ -1875,6 +1875,22 @@ const fn tip_of(head: Option<u64>, in_flight: Option<u64>, layer: Option<u64>) -
     higher(higher(head, in_flight), layer)
 }
 
+/// The journalled blocks on the committed chain: `committed` and every
+/// journalled ancestor reached from it by parent hash. Empty when `committed`
+/// is not journalled (its block is already persisted in the layer).
+fn journal_committed_chain(entries: &[crate::block_journal::JournalEntry], committed: B256) -> HashSet<B256> {
+    let parents: std::collections::HashMap<B256, B256> = entries.iter().map(|entry| (entry.hash, entry.parent)).collect();
+    let mut chain = HashSet::new();
+    let mut cursor = committed;
+    while let Some(parent) = parents.get(&cursor) {
+        if !chain.insert(cursor) {
+            break;
+        }
+        cursor = *parent;
+    }
+    chain
+}
+
 /// How many views back [`GossipedTimeouts`] remembers a timeout.
 const GOSSIPED_TIMEOUT_VIEWS: u64 = 64;
 
@@ -4228,6 +4244,14 @@ impl<E: ExecutionLayer> H2Service<E> {
             // fell behind for good: loop160 C10 node5, V10 node1).
             self.driver.commit_when_imported(*block_hash);
             debug!(target: "n42.h2.node", view, ?block_hash, "commit for a block the execution layer has not imported; finalised when its import lands");
+            // Nothing else may start that import: a proposal this node's
+            // lock refused emits no ExecuteBlock, and an unsolicited body
+            // at or below the tip waits for one (AM37: a restored lock's
+            // committed sibling sat unimported for minutes). A committed
+            // block whose body is here is imported, or its lowest
+            // unimported ancestor is.
+            let block_hash = *block_hash;
+            self.import_unimported_ancestor(block_hash);
             return Ok(());
         }
         // A block the eager import already brought in: the engine asked because
@@ -7720,6 +7744,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         // forkchoice, which would move the head back; one above it is
         // imported as a pulled block and made the head.
         let el_head = self.driver.execution_layer().latest_block_number().await.ok().flatten();
+        // The committed chain inside the journal: the restored commit's block
+        // and its journalled ancestors. Only these may become the head. A
+        // journalled block above the commit (a lock the set may never
+        // commit) is executed back in as a side block: made the head, it
+        // left the committed sibling at its height looking like a fork the
+        // node never imported, and the node stalled until a range pull
+        // reorganised it (AM37, run am35-am37rs4 kill 2).
+        let committed_chain = journal_committed_chain(&entries, self.engine.last_committed_qc().block_hash);
         let mut imported = 0;
         let mut restored = Vec::new();
         for entry in entries {
@@ -7735,16 +7767,18 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             };
             let held = matches!(self.driver.execution_layer().block_by_hash(entry.hash).await, Ok(Some(_)));
-            if !held && el_head.is_some_and(|head| entry.number <= head) {
-                // Not on the canonical chain at its height: executed back into
-                // the layer (served and voted on by hash), not made the head.
+            let committed = committed_chain.contains(&entry.hash);
+            if !held && (!committed || el_head.is_some_and(|head| entry.number <= head)) {
+                // Not on the canonical chain at its height, or not committed:
+                // executed back into the layer (served and voted on by hash),
+                // not made the head.
                 let el = self.driver.execution_layer_arc();
                 if let Err(err) = ExecutionDriver::pulled_new_payload(&*el, block.execution_data()).await {
                     warn!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, %err, "could not re-import a journalled side block; skipped");
                     continue;
                 }
                 imported += 1;
-                info!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, "journalled side block re-imported (not made the head)");
+                info!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, committed, "journalled side block re-imported (not made the head)");
             } else if !held {
                 if let Err(err) = self.import_pulled_timed(block.execution_data()).await {
                     warn!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, %err, "could not re-import a journalled block; the replay stops here");
@@ -7754,7 +7788,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 info!(target: "n42.h2.node", number = entry.number, hash = ?entry.hash, "journalled block re-imported");
             }
             self.remember_imported(entry.hash);
-            self.note_imported(entry.number);
+            // The tip moves only along the committed chain: an uncommitted
+            // block's height must not push its committed sibling out of the
+            // window an unsolicited body is imported in.
+            if committed {
+                self.note_imported(entry.number);
+            }
             self.remember_block(entry.hash, &block.header);
             self.remember_body(entry.hash, entry.body.clone());
             self.engine.remember_parent(entry.hash, entry.parent);
@@ -7800,16 +7839,27 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// A direct body may carry no source identity or arrive before its peer's
     /// status is refreshed. The earliest held child's parent hash still names
     /// exactly what is missing, without trusting an advertised height.
+    ///
+    /// A held child at `tip + 1` counts too when its parent is not imported:
+    /// the tip is then a block on another branch (a restored lock the set
+    /// never committed), and the gap is a parent hash, not a height. A parent
+    /// whose body is here is imported (see [`Self::import_unimported_ancestor`])
+    /// instead of being asked for.
     fn request_missing_held_parent(&mut self, events: &mut Vec<ServiceEvent>) {
         let Some(tip) = self.imported_tip() else { return };
         let Some(parent) = self.held_bodies.iter()
             .filter_map(|hash| self.block_headers.get(hash))
-            .filter(|header| header.number > tip.saturating_add(1))
+            .filter(|header| {
+                header.number > tip.saturating_add(1)
+                    || (header.number == tip.saturating_add(1) && !self.imported.contains(&header.parent_hash))
+            })
             .min_by_key(|header| header.number)
             .map(|header| header.parent_hash) else { return };
-        if self.imported.contains(&parent) || self.body_store.contains_key(&parent)
-            || self.driver.has_body(&parent) || self.driver.importing().any(|hash| *hash == parent)
-        {
+        if self.imported.contains(&parent) || self.driver.importing().any(|hash| *hash == parent) {
+            return;
+        }
+        if self.body_store.contains_key(&parent) || self.driver.has_body(&parent) || self.driver.has_payload(&parent) {
+            self.import_unimported_ancestor(parent);
             return;
         }
         let peers = self.transport.connected_peer_ids();
@@ -7821,6 +7871,40 @@ impl<E: ExecutionLayer> H2Service<E> {
         info!(target: "n42.h2.node", block_hash = ?parent, tip,
               "held child is missing its parent; asking peers by hash");
         events.push(ServiceEvent::PayloadMissing { block_hash: parent });
+    }
+
+    /// Starts the import of the lowest block on `start`'s branch that this
+    /// node holds the body of but has not imported, when that block's parent
+    /// is imported. Walks at most [`ANCESTOR_WALK`] parents; returns whether
+    /// an import was queued. For a block consensus has named (held, or
+    /// committed): its unimported ancestors are on the certified branch, so
+    /// this is not the unsolicited-body path (audit 2026-10 B-3, R2-I1).
+    fn import_unimported_ancestor(&mut self, start: B256) -> bool {
+        const ANCESTOR_WALK: usize = 16;
+        let mut cursor = start;
+        for _ in 0..ANCESTOR_WALK {
+            if self.imported.contains(&cursor)
+                || self.driver.importing().any(|hash| *hash == cursor)
+                || self.ready_bodies.contains(&cursor)
+                || !(self.body_store.contains_key(&cursor)
+                    || self.driver.has_body(&cursor)
+                    || self.driver.has_payload(&cursor))
+            {
+                return false;
+            }
+            let Some(parent) = self.block_headers.get(&cursor).map(|header| header.parent_hash) else {
+                return false;
+            };
+            if self.imported.contains(&parent) {
+                info!(target: "n42.h2.node", block_hash = ?cursor, ?parent, from = ?start,
+                      "a named block's unimported ancestor has its parent imported; importing it");
+                self.release_held(cursor);
+                self.import_eagerly(cursor);
+                return true;
+            }
+            cursor = parent;
+        }
+        false
     }
 
     fn note_peer_height(&mut self, peer: PeerId, height: u64) {

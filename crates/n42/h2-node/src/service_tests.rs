@@ -1230,6 +1230,9 @@ mod mesh_tests;
 #[path = "service_halt_tests.rs"]
 mod halt_tests;
 
+#[path = "service_restore_tests.rs"]
+mod restore_tests;
+
 // ---------------------------------------------------------------------------
 // Blocks taken without their transactions (N42_TAKE_COMPACT)
 // ---------------------------------------------------------------------------

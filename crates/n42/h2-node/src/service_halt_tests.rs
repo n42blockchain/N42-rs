@@ -18,6 +18,11 @@ fn commit_qc(rig: &Rig, signers: &[usize], view: u64, named: B256, signed: B256)
     to_engine_qc(&wire)
 }
 
+/// A commit QC of `rig`'s set over `hash` at `view`.
+pub(super) fn commit_qc_for(rig: &Rig, signers: &[usize], view: u64, hash: B256) -> QuorumCertificate {
+    commit_qc(rig, signers, view, hash, hash)
+}
+
 /// gov5's QC bytes as the engine's certificate.
 fn to_engine_qc(wire: &[u8]) -> QuorumCertificate {
     let decoded = n42_h2_wire::h2_wire::decode_h2_qc(wire).expect("a QC");

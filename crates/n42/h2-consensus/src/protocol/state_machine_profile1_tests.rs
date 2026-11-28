@@ -560,3 +560,46 @@ fn profile1_the_vote_log_never_carries_a_lock_on_a_block_not_durable_here() {
         .expect("the PrepareQC");
     assert_eq!(log.0.lock().unwrap().last(), Some(&(2, 2)), "the commit vote logs its lock, durable");
 }
+
+fn execute_asks(out: &[EngineOutput], block: B256) -> usize {
+    out.iter().filter(|o| matches!(o, EngineOutput::ExecuteBlock(h) if *h == block)).count()
+}
+
+/// AM37: the lock is on B (view 1), the set never saw it and committed the
+/// sibling S. Its proposal (justified below the lock) is refused, so it asks
+/// for no import; the PrepareQC for S then holds the commit vote until S
+/// imports, and must ask for that import itself. A proposal that was taken
+/// already asked: the PrepareQC does not ask twice.
+#[test]
+fn a_prepare_qc_for_a_block_whose_proposal_was_refused_asks_for_its_import() {
+    let me = follower_of(&[1, 3]);
+    let (b, s) = (B256::repeat_byte(0xC1), B256::repeat_byte(0xC5));
+    let (mut e, sks, vs, mut rx) = engine(me, true, VoteRules::PROFILE1);
+    let qc1 = prepare_qc(&e, &sks, &vs, 1, b);
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 1, block_hash: b, qc: qc1 })))
+        .expect("the PrepareQC for the lock");
+    e.advance_to_view(3).expect("view 3");
+    let _ = outputs(&mut rx);
+    let refused = propose(&mut e, &sks, 3, s, QuorumCertificate::genesis());
+    assert!(matches!(refused, Err(ConsensusError::SafetyViolation { .. })), "{refused:?}");
+    assert_eq!(execute_asks(&outputs(&mut rx), s), 0, "a refused proposal asks for nothing");
+    let qc3 = prepare_qc(&e, &sks, &vs, 3, s);
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 3, block_hash: s, qc: qc3 })))
+        .expect("the PrepareQC for the sibling");
+    let out = outputs(&mut rx);
+    assert_eq!(commit_votes(&out), 0, "held until the import");
+    assert_eq!(execute_asks(&out, s), 1, "the certified block's import is asked for");
+    e.process_event(ConsensusEvent::BlockDurable(s)).expect("durable");
+    e.process_event(ConsensusEvent::BlockImported(s)).expect("the import");
+    assert_eq!(commit_votes(&outputs(&mut rx)), 1, "the import releases the commit vote");
+
+    // A taken proposal asked on arrival; its PrepareQC does not ask again.
+    let (mut e, sks, vs, mut rx) = engine(me, true, VoteRules::PROFILE1);
+    e.advance_to_view(3).expect("view 3");
+    propose(&mut e, &sks, 3, s, QuorumCertificate::genesis()).expect("taken");
+    assert_eq!(execute_asks(&outputs(&mut rx), s), 1);
+    let qc3 = prepare_qc(&e, &sks, &vs, 3, s);
+    e.process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(PrepareQC { view: 3, block_hash: s, qc: qc3 })))
+        .expect("the PrepareQC");
+    assert_eq!(execute_asks(&outputs(&mut rx), s), 0, "no second ask");
+}

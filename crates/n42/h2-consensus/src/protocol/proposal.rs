@@ -651,7 +651,17 @@ impl ConsensusEngine {
         };
         if held {
             tracing::info!(target: "n42::interop::h2v4", view, block_hash = %pqc.block_hash, "two-phase vote: holding the commit vote until the block imports");
+            // A proposal this node refused (its lock is on a sibling the set
+            // never committed, AM37) asked for no import, and the held vote
+            // would wait for one nobody starts. The PrepareQC certifies the
+            // block: ask for its import here.
+            let block_hash = pqc.block_hash;
+            let asked = self.pending_changes_hashes.get(&block_hash).is_some();
             self.held_prepare_qc = Some(pqc);
+            if !asked {
+                tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "certified block whose proposal was not taken: asking for its import");
+                self.emit(EngineOutput::ExecuteBlock(block_hash))?;
+            }
             return Ok(());
         }
         // AM35 (profile 1): and until the block's data is durable here, so

@@ -219,3 +219,35 @@ fn v1_valid_headers_pass_and_every_refusal_is_refused_for_its_rule() {
     }
     assert!(mismatches.is_empty(), "V1 mismatches:\n{}", mismatches.join("\n"));
 }
+
+/// B1 with a gap: the QC's block is known here but a link between it and
+/// the header is not (the header's parent was never seen). gov5 accepts it
+/// on the QC's signature; the same header with the link known, contradicting
+/// the QC, is still refused (am35-am37rs6 kill 1: a member that never had
+/// the restored lock refused every child of it).
+#[test]
+fn b1_passes_a_gap_in_the_walk_and_refuses_a_contradiction() {
+    let v1 = v1();
+    let rules = rules(&v1);
+    let genesis = decode(&bytes(&v1["genesis"]["rlp"])).unwrap();
+    let block1 = decode(&bytes(&v1["headers"][0]["rlp"])).unwrap();
+    let refusal = v1["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "QC names a non-ancestor")
+        .expect("the non-ancestor case");
+    let header = decode(&bytes(&refusal["rlp"])).unwrap();
+    assert_eq!(header.parent_hash, block1.hash_slow());
+    let extra = HeaderExtra::decode(&header.extra_data).unwrap();
+    let qc = n42_h2_wire::h2_wire::decode_h2_qc(&extra.qc).unwrap();
+    let mut known: HashMap<B256, (u64, B256)> = HashMap::new();
+    known.insert(genesis.hash_slow(), (0, B256::ZERO));
+    known.insert(qc.block_hash, (1, genesis.hash_slow()));
+    rules
+        .check_qc_ancestry(&header, |hash| known.get(hash).copied())
+        .expect("the parent is not known here: a gap, accepted on the QC's signature");
+    known.insert(block1.hash_slow(), (1, genesis.hash_slow()));
+    let err = rules.check_qc_ancestry(&header, |hash| known.get(hash).copied()).expect_err("the walk meets height 1 on another block");
+    assert!(err.to_string().starts_with("B1"), "{err}");
+}

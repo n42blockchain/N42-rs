@@ -298,7 +298,10 @@ impl HeaderRules {
     /// is known here (`lookup` gives a block's number and parent hash) it
     /// must be on the header's parent chain, walked at most
     /// [`PROFILE1_ANCESTOR_WALK`] blocks; an unknown block is checked by the
-    /// QC's signature alone. Nothing off profile 1 or without a QC.
+    /// QC's signature alone. Refused only on a contradiction: the walk
+    /// reaches the QC block's height on another block. A link of the walk
+    /// not known here is a gap, not a contradiction, and passes. Nothing off
+    /// profile 1 or without a QC.
     pub fn check_qc_ancestry(
         &self,
         header: &N42Header,
@@ -323,7 +326,12 @@ impl HeaderRules {
             }
             match lookup(&cursor) {
                 Some((number, parent)) if number > target_number => cursor = parent,
-                _ => break,
+                // A link missing here is a gap in this node's history, not a
+                // contradiction: accepted on the QC's signature, as an unknown
+                // QC block is (gov5 checkProfile1QC). The block's parent is
+                // fetched by hash and the import waits for it.
+                None => return Ok(()),
+                Some(_) => break,
             }
         }
         Err(Profile1Error::Qc(format!("QC block {} is not an ancestor", qc.block_hash)))
